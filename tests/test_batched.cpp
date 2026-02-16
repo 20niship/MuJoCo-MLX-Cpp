@@ -67,15 +67,16 @@ int main(int argc, char** argv) {
         mjmlx_batched_step(sim, nullptr);
 
         if (i < 5 || i % 10 == 0 || i == num_steps - 1) {
-            auto* xpos = mjmlx_batched_get_xpos(sim, &n);
-            auto* qvel_ptr = mjmlx_batched_get_qvel(sim, &n);
+            int n_xpos = 0, n_qvel = 0;
+            auto* xpos = mjmlx_batched_get_xpos(sim, &n_xpos);
+            auto* qvel_ptr = mjmlx_batched_get_qvel(sim, &n_qvel);
 
-            // Check env 0 torso z
-            float z0 = (xpos && n >= info.nbody * 3) ? xpos[3 + 2] : 0.0f;
+            // Check env 0 torso z (body 1 z component)
+            float z0 = (xpos && n_xpos >= info.nbody * 3) ? xpos[3 + 2] : 0.0f;
 
             // Max velocity across all envs
             float max_vel = 0;
-            int total_vel = num_envs * info.nv;
+            int total_vel = n_qvel;
             if (qvel_ptr) {
                 for (int j = 0; j < total_vel; j++) {
                     float v = std::abs(qvel_ptr[j]);

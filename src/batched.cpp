@@ -16,7 +16,7 @@
 //
 // Architecture (hybrid 3-phase pipeline, same as Python mujoco-mlx):
 //   Phase 1: Metal kinematics kernel (single dispatch for all N envs)
-//   Phase 2: vmap(forward_dynamics_without_euler) — compiled, vmapped
+//   Phase 2: compile(vmap(forward_dynamics_without_euler))
 //   Phase 3: Metal Euler kernel (single dispatch for all N envs)
 //
 // Metal kernels are NOT vmap-compatible, so they run outside the vmap.
@@ -356,16 +356,14 @@ static std::string make_euler_source(
     return ss.str();
 }
 
-// ── Batched step implementation ──────────────────────────────────────────────
+// ── Context: Metal kernels + model constants ─────────────────────────────────
 
 using KernelFn = mx::fast::CustomKernelFunction;
 
 struct BatchedStepContext {
-    // Cached Metal kernels
     std::optional<KernelFn> kin_kernel;
     std::optional<KernelFn> euler_kernel;
 
-    // Model constants (pre-evaluated arrays for kernel inputs)
     mx::array body_parentid{mx::zeros({1}, mx::int32)};
     mx::array body_pos{mx::zeros({1})};
     mx::array body_quat{mx::zeros({1})};
@@ -382,7 +380,6 @@ struct BatchedStepContext {
     mx::array geom_pos_arr{mx::zeros({1})};
     mx::array geom_quat_arr{mx::zeros({1})};
 
-    // Dimensions
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
 
@@ -395,7 +392,6 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     ctx->nu = m.nu;
     ctx->ngeom = m.ngeom;
 
-    // Pre-evaluate and cast model arrays for kernel inputs
     ctx->body_parentid = mx::astype(m.body_parentid, mx::int32);
     ctx->body_pos = mx::astype(mx::flatten(m.body_pos), mx::float32);
     ctx->body_quat = mx::astype(mx::flatten(m.body_quat), mx::float32);
@@ -417,7 +413,6 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     ctx->geom_quat_arr = (m.ngeom > 0)
         ? mx::astype(mx::flatten(m.geom_quat), mx::float32) : mx::zeros({1});
 
-    // Evaluate all model arrays upfront
     mx::eval(ctx->body_parentid); mx::eval(ctx->body_pos); mx::eval(ctx->body_quat);
     mx::eval(ctx->body_ipos); mx::eval(ctx->body_iquat);
     mx::eval(ctx->body_jntadr); mx::eval(ctx->body_jntnum);
@@ -446,7 +441,6 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     // Build Euler kernel
     int euler_stack = 2 * m.nv * m.nv + 4 * m.nv + m.nq;
     if (euler_stack * 4 <= 24000 && m.nv <= 80) {
-        // Extract joint integration plan from model
         mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
         mx::eval(m.dof_damping);
         auto jt_ptr = m.jnt_type.data<int32_t>();
@@ -485,26 +479,178 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     return ctx;
 }
 
+// ── Hybrid batched step ──────────────────────────────────────────────────────
+
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu) {
+    m.init_cache();
     auto ctx = build_context(m);
     int B = num_envs;
 
-    // The returned function takes: [qpos(B,nq), qvel(B,nv), ctrl(B,nu)]
-    // Returns: [new_qpos(B,nq), new_qvel(B,nv), xpos(B,nbody,3)]
+    int nq = m.nq, nv = m.nv, nu = m.nu;
+    int nb = m.nbody, nj = m.njnt, ng = m.ngeom;
+
+    bool has_kin = ctx->kin_kernel.has_value();
+    bool has_euler = ctx->euler_kernel.has_value();
+
     const Model* mp = &m;
+
+    if (has_kin && has_euler && use_gpu) {
+        // ── Primary path: Metal kin → compile(vmap(forward)) → Metal euler ──
+
+        // Per-env forward function: takes per-env arrays, returns per-env results
+        // This runs under vmap — no eval, no data<>, pure graph building
+        auto forward_fn = [mp, nq, nv, nu, nb, nj, ng](
+            const std::vector<mx::array>& inputs) -> std::vector<mx::array>
+        {
+            const Model& m_ref = *mp;
+            Data d;
+
+            // Unpack per-env state (vmap slices batch dim away)
+            d.qpos = inputs[0];                               // (nq,)
+            d.qvel = inputs[1];                               // (nv,)
+            d.ctrl = (nu > 0) ? inputs[2] : mx::zeros({1});  // (nu,) or dummy
+
+            // Kinematics results from Metal kernel
+            d.xpos = mx::reshape(inputs[3], {nb, 3});
+            d.xquat = mx::reshape(inputs[4], {nb, 4});
+            d.xmat = mx::reshape(inputs[5], {nb, 3, 3});
+            d.xipos = mx::reshape(inputs[6], {nb, 3});
+            d.ximat = mx::reshape(inputs[7], {nb, 3, 3});
+            if (nj > 0) {
+                d.xanchor = mx::reshape(inputs[8], {nj, 3});
+                d.xaxis = mx::reshape(inputs[9], {nj, 3});
+            }
+            if (ng > 0) {
+                d.geom_xpos = mx::reshape(inputs[10], {ng, 3});
+                d.geom_xmat = mx::reshape(inputs[11], {ng, 3, 3});
+            }
+
+            // Initialize non-state fields to zeros
+            d.qfrc_applied = mx::zeros(mx::Shape{nv});
+            d.xfrc_applied = mx::zeros(mx::Shape{nb, 6});
+
+            // Forward dynamics (no kinematics, no euler)
+            d = vmap_forward(m_ref, d);
+
+            // Pack outputs needed by Metal euler + observations
+            return {
+                mx::flatten(d.qM),       // 0: mass matrix (nv*nv,)
+                d.qfrc_smooth,            // 1: smooth forces (nv,)
+                d.qfrc_constraint,        // 2: constraint forces (nv,)
+                mx::flatten(d.xpos)       // 3: body positions (nb*3,)
+            };
+        };
+
+        // vmap: batch axis 0 for all 12 inputs and 4 outputs
+        std::vector<int> in_axes(12, 0);
+        std::vector<int> out_axes = {0, 0, 0, 0};
+        auto vmapped_fwd = mx::vmap(forward_fn, in_axes, out_axes);
+
+        // Full hybrid pipeline: Metal kin → vmapped forward → Metal euler
+        // Wrapped in compile for fused graph execution
+        std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
+            [ctx, vmapped_fwd, B, nq, nv, nu, nb, nj, ng](
+                const std::vector<mx::array>& state) -> std::vector<mx::array>
+        {
+            auto qpos_batch = state[0];  // (B, nq)
+            auto qvel_batch = state[1];  // (B, nv)
+            auto ctrl_batch = state[2];  // (B, max(1,nu))
+
+            // ── Phase 1: Metal kinematics (single dispatch for all B envs) ──
+            auto qpos_flat = mx::astype(mx::flatten(qpos_batch), mx::float32);
+
+            std::vector<mx::Shape> kin_shapes = {
+                mx::Shape{B * nb * 3},   // xpos
+                mx::Shape{B * nb * 4},   // xquat
+                mx::Shape{B * nb * 9},   // xmat
+                mx::Shape{B * nb * 3},   // xipos
+                mx::Shape{B * nb * 9},   // ximat
+                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},  // xanchor
+                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},  // xaxis
+                (ng > 0) ? mx::Shape{B * ng * 3} : mx::Shape{1},  // geom_xpos
+                (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},  // geom_xmat
+            };
+            std::vector<mx::Dtype> kin_dtypes(9, mx::float32);
+
+            auto kin = (*ctx->kin_kernel)(
+                {ctx->body_parentid, ctx->body_pos, ctx->body_quat,
+                 ctx->body_ipos, ctx->body_iquat,
+                 ctx->body_jntadr, ctx->body_jntnum,
+                 ctx->jnt_type_arr, ctx->jnt_qposadr_arr,
+                 ctx->jnt_pos_arr, ctx->jnt_axis_arr,
+                 ctx->qpos0,
+                 ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
+                 qpos_flat},
+                kin_shapes,
+                kin_dtypes,
+                std::make_tuple(B, 1, 1),
+                std::make_tuple(1, 1, 1),
+                {},              // template_args
+                std::nullopt,    // init_value
+                false,           // verbose
+                {}               // default stream
+            );
+
+            // Reshape kin outputs to (B, ...)
+            auto xpos   = mx::reshape(kin[0], {B, nb, 3});
+            auto xquat  = mx::reshape(kin[1], {B, nb, 4});
+            auto xmat   = mx::reshape(kin[2], {B, nb, 3, 3});
+            auto xipos  = mx::reshape(kin[3], {B, nb, 3});
+            auto ximat  = mx::reshape(kin[4], {B, nb, 3, 3});
+            auto xanchor = (nj > 0) ? mx::reshape(kin[5], {B, nj, 3}) : mx::zeros({B, 1});
+            auto xaxis   = (nj > 0) ? mx::reshape(kin[6], {B, nj, 3}) : mx::zeros({B, 1});
+            auto gxpos   = (ng > 0) ? mx::reshape(kin[7], {B, ng, 3}) : mx::zeros({B, 1});
+            auto gxmat   = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
+
+            // ── Phase 2: compile(vmap(forward_dynamics)) ──
+            auto mid = vmapped_fwd({
+                qpos_batch, qvel_batch, ctrl_batch,
+                xpos, xquat, xmat, xipos, ximat,
+                xanchor, xaxis, gxpos, gxmat
+            });
+            // mid[0] = qM (B, nv*nv), mid[1] = qfrc_smooth (B, nv)
+            // mid[2] = qfrc_constraint (B, nv), mid[3] = xpos_flat (B, nb*3)
+
+            // ── Phase 3: Metal Euler (single dispatch for all B envs) ──
+            auto euler = (*ctx->euler_kernel)(
+                {mx::astype(mx::flatten(mid[0]), mx::float32),       // qM flat
+                 mx::astype(mx::flatten(mid[1]), mx::float32),       // qfrc_smooth flat
+                 mx::astype(mx::flatten(mid[2]), mx::float32),       // qfrc_constraint flat
+                 mx::astype(mx::flatten(qvel_batch), mx::float32),   // qvel flat
+                 mx::astype(mx::flatten(qpos_batch), mx::float32)},  // qpos flat
+                {{B * nq}, {B * nv}, {B * nv}},                      // output shapes
+                {mx::float32, mx::float32, mx::float32},             // output dtypes
+                std::make_tuple(B, 1, 1),
+                std::make_tuple(1, 1, 1),
+                {},              // template_args
+                std::nullopt,    // init_value
+                false,           // verbose
+                {}               // default stream
+            );
+
+            auto new_qpos = mx::reshape(euler[0], {B, nq});
+            auto new_qvel = mx::reshape(euler[1], {B, nv});
+            auto xpos_out = mx::reshape(mid[3], {B, nb, 3});
+
+            return {new_qpos, new_qvel, xpos_out};
+        };
+
+        // Return pipeline directly (skip compile for debugging)
+        // TODO: re-enable: return mx::compile(pipeline);
+        return pipeline;
+    }
+
+    // ── Fallback: per-env loop using validated scalar pipeline ──
     auto step_fn = [ctx, B, mp](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
         const Model& m = *mp;
-        auto qpos_batch = inputs[0];  // (B, nq)
-        auto qvel_batch = inputs[1];  // (B, nv)
-        auto ctrl_batch = inputs[2];  // (B, nu)
+        auto qpos_batch = inputs[0];
+        auto qvel_batch = inputs[1];
+        auto ctrl_batch = inputs[2];
 
         int nq = ctx->nq, nv = ctx->nv, nu = ctx->nu;
         int nb = ctx->nbody;
 
-        // Per-env step using the full validated pipeline from forward.cpp
-        // This will be replaced with Metal-accelerated hybrid pipeline once
-        // vmap integration is complete.
         std::vector<mx::array> new_qpos_list, new_qvel_list, xpos_list;
         new_qpos_list.reserve(B);
         new_qvel_list.reserve(B);
@@ -512,27 +658,18 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
 
         for (int e = 0; e < B; e++) {
             Data d = make_data(m);
-
-            // Extract per-env state from batched arrays
             d.qpos = mx::reshape(mx::slice(qpos_batch, {e, 0}, {e + 1, nq}), {nq});
             d.qvel = mx::reshape(mx::slice(qvel_batch, {e, 0}, {e + 1, nv}), {nv});
             if (nu > 0) {
                 d.ctrl = mx::reshape(mx::slice(ctrl_batch, {e, 0}, {e + 1, nu}), {nu});
             }
-
-            // Full forward + integrate (reuses the validated step() function)
             d = step(m, d);
-
             new_qpos_list.push_back(d.qpos);
             new_qvel_list.push_back(d.qvel);
             xpos_list.push_back(d.xpos);
         }
 
-        auto new_qpos = mx::stack(new_qpos_list);  // (B, nq)
-        auto new_qvel = mx::stack(new_qvel_list);  // (B, nv)
-        auto xpos = mx::stack(xpos_list);           // (B, nb, 3)
-
-        return {new_qpos, new_qvel, xpos};
+        return {mx::stack(new_qpos_list), mx::stack(new_qvel_list), mx::stack(xpos_list)};
     };
 
     return step_fn;
@@ -556,6 +693,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
 
         int B = config->num_envs;
         int nq = model->model.nq, nv = model->model.nv;
+        int nu = model->model.nu;
 
         // Initialize batched state from qpos0
         std::vector<mx::array> qpos_list, qvel_list;
@@ -581,10 +719,11 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     auto& s = sim->sim;
     int B = s.num_envs;
     int nu = s.model->nu;
+    int ctrl_dim = std::max(1, nu);
 
     mx::array ctrl = (ctrl_flat && nu > 0)
         ? mx::reshape(mx::array(ctrl_flat, {B * nu}, mx::float32), {B, nu})
-        : mx::zeros({B, nu});
+        : mx::zeros({B, ctrl_dim});
 
     auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
     s.qpos = results[0];

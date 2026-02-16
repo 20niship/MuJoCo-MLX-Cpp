@@ -215,6 +215,111 @@ struct Model {
 
     // Exclude
     mx::array exclude_signature{mx::array({})};
+
+    // ── Precomputed cache (for vmap-compatible pipeline) ─────
+    // Populated once at load time. All data is read eagerly so
+    // the vmap-traced path never calls eval()/data<>().
+
+    struct ModelCache {
+        bool initialized = false;
+
+        // Tree topology: bodies grouped by tree depth (for level-parallel scatter-add)
+        // tree_levels[0] = {0} (world), tree_levels[1] = {children of world}, etc.
+        std::vector<std::vector<int>> tree_levels;
+
+        // Collision pairs: precomputed (g1, g2) with properties
+        struct CollisionPair {
+            int g1, g2;
+            int type1, type2;
+            int body1, body2;
+            float margin, gap;
+            float friction[5];
+            float solref[2];
+            float solimp[5];
+            float size1[3], size2[3];
+            int condim;
+        };
+        std::vector<CollisionPair> collision_pairs;
+        int max_ncon = 0;  // = collision_pairs.size()
+
+        // Joint limit plan: which joints are limited (HINGE/SLIDE)
+        struct LimitInfo {
+            int jnt_idx;
+            int dof_adr;
+            float range_low, range_high;
+            float solref[2];
+            float solimp[5];
+            float margin;
+        };
+        std::vector<LimitInfo> limits;
+        int max_nl = 0;  // = limits.size()
+        int max_nefc = 0; // = max_nl + max_ncon (fixed constraint budget)
+
+        // DOF info: precomputed for vectorized cdof
+        struct DofInfo {
+            int dof_idx;
+            int body_id;
+            int jnt_type;  // JointType enum
+            int jnt_idx;
+            int qpos_adr;
+        };
+        std::vector<DofInfo> dof_info;
+
+        // Body-DOF mapping: for each body, list of its DOF indices
+        std::vector<std::vector<int>> body_dofs;
+
+        // Joint integration plan (for Euler / Metal euler)
+        std::vector<int> simple_qa, simple_da;  // HINGE/SLIDE
+        std::vector<std::pair<int,int>> free_joints;   // (qa, da) for FREE
+        std::vector<std::pair<int,int>> ball_joints;    // (qa, da) for BALL
+        std::vector<float> dof_damping_vals;
+
+        // Actuator plan
+        struct ActuatorInfo {
+            int act_idx;
+            int jnt_idx;   // target joint
+            int dof_adr;   // target DOF address
+            float gain;
+        };
+        std::vector<ActuatorInfo> actuator_info;
+
+        // Plain C++ vectors for loop indexing (no eval needed)
+        std::vector<int> body_parentid_vec;
+        std::vector<int> body_rootid_vec;
+        std::vector<int> dof_bodyid_vec;
+
+        // CDoF plan (for vectorized cdof computation)
+        struct CdofPlan {
+            mx::array bids{mx::zeros({1}, mx::int32)};
+            mx::array jidxs{mx::zeros({1}, mx::int32)};
+            mx::array root_bids{mx::zeros({1}, mx::int32)};  // rootid[bids]
+            mx::array is_hinge{mx::zeros({1})};
+            mx::array is_slide{mx::zeros({1})};
+            mx::array is_free_trans{mx::zeros({1})};
+            mx::array is_free_rot{mx::zeros({1})};
+            mx::array is_ball{mx::zeros({1})};
+            mx::array free_trans_unit{mx::zeros({1})};
+            mx::array rot_col0_mask{mx::zeros({1})};
+            mx::array rot_col1_mask{mx::zeros({1})};
+            mx::array rot_col2_mask{mx::zeros({1})};
+        };
+        CdofPlan cdof_plan;
+
+        // Body DOF ancestor masks: for Jacobian computation in constraints
+        // body_dof_masks[body_id] = (nv,) float where 1.0 if DOF i is ancestor of body
+        std::vector<mx::array> body_dof_masks;
+
+        // Dense mass matrix tree mask: (nv, nv) float
+        mx::array make_m_mask{mx::zeros({1})};
+
+        // Precomputed MLX arrays (model constants in the vmap graph)
+        mx::array gravity_6d{mx::zeros({6})};
+    };
+
+    mutable ModelCache cache;
+
+    // Populate cache (called once after loading)
+    void init_cache() const;
 };
 
 // ── Data ─────────────────────────────────────────────────────
@@ -410,6 +515,32 @@ Data step(const Model& m, Data d);
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu);
+
+// ── Vmap-compatible functions (pure MLX graph, no eval/data) ──
+
+// smooth_vmap.cpp
+Data vmap_com_pos(const Model& m, Data d);
+Data vmap_crb(const Model& m, Data d);
+Data vmap_factor_m(const Model& m, Data d);
+mx::array vmap_solve_m(const Model& m, const Data& d, const mx::array& rhs);
+Data vmap_com_vel(const Model& m, Data d);
+Data vmap_rne(const Model& m, Data d);
+Data vmap_transmission(const Model& m, Data d);
+
+// constraint_vmap.cpp
+Data vmap_collision(const Model& m, Data d);
+Data vmap_make_constraint(const Model& m, Data d);
+
+// solver_vmap.cpp
+Data vmap_solve(const Model& m, Data d);
+
+// forward_vmap.cpp
+Data vmap_forward(const Model& m, Data d);
+
+// Batched math helpers (math.cpp)
+mx::array batched_cross(const mx::array& a, const mx::array& b);
+mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel);
+mx::array batched_motion_cross_force(const mx::array& v, const mx::array& f);
 
 } // namespace mjmlx
 

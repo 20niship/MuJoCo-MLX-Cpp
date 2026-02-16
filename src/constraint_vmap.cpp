@@ -1,0 +1,432 @@
+// Copyright 2026 Arghya Sur
+// Licensed under the Apache License, Version 2.0
+//
+// Vmap-compatible collision detection and constraint construction.
+// Fixed-size outputs: always evaluates all pre-computed collision pairs.
+// Inactive constraints get D=0 (no-ops in solver).
+// NO eval(), NO data<>(), NO CPU sync.
+
+#include "internal.h"
+
+namespace mjmlx {
+
+static constexpr float MJMINVAL_CV = 1e-8f;
+static constexpr float MJMINIMP = 1e-3f;
+static constexpr float MJMAXIMP = 0.9999f;
+
+// ── Vmap-compatible KBI ──────────────────────────────────────────────────────
+
+static void vmap_kbi(
+    float timeconst_init, float dampratio, float timestep, bool refsafe,
+    float si0, float si1, float si2, float si3, float si4,
+    const mx::array& pos,
+    mx::array& k_out, mx::array& b_out, mx::array& imp_out)
+{
+    float tc = timeconst_init;
+    if (!refsafe) tc = std::max(tc, 2.0f * timestep);
+
+    float dmin = std::max(MJMINIMP, std::min(MJMAXIMP, si0));
+    float dmax = std::max(MJMINIMP, std::min(MJMAXIMP, si1));
+    float width = std::max(si2, MJMINVAL_CV);
+    float mid = std::max(MJMINIMP, std::min(MJMAXIMP, si3));
+    float power = std::max(si4, 1.0f);
+
+    float k_val = (tc > 0) ? 1.0f / (dmax*dmax*tc*tc*dampratio*dampratio)
+                            : -tc / (dmax*dmax);
+    float b_val = (dampratio > 0) ? 2.0f / (dmax*tc) : -dampratio / dmax;
+
+    auto imp_x = mx::divide(mx::abs(pos), mx::array(width));
+    auto imp_a = mx::multiply(
+        mx::array(1.0f / std::pow(mid, power - 1.0f)),
+        mx::power(imp_x, mx::array(power)));
+    auto imp_b = mx::subtract(mx::array(1.0f),
+        mx::multiply(mx::array(1.0f / std::pow(1.0f - mid, power - 1.0f)),
+                      mx::power(mx::subtract(mx::array(1.0f), imp_x), mx::array(power))));
+    auto imp_y = mx::where(mx::less(imp_x, mx::array(mid)), imp_a, imp_b);
+    auto imp = mx::add(mx::array(dmin), mx::multiply(imp_y, mx::array(dmax - dmin)));
+    imp = mx::clip(imp, mx::array(dmin), mx::array(dmax));
+    imp = mx::where(mx::greater(imp_x, mx::array(1.0f)), mx::array(dmax), imp);
+
+    k_out = mx::array(k_val);
+    b_out = mx::array(b_val);
+    imp_out = imp;
+}
+
+// ── Vmap-compatible Jacobian ─────────────────────────────────────────────────
+
+static std::pair<mx::array, mx::array> vmap_jac(
+    const Model& m, const Data& d, const mx::array& point, int body_id)
+{
+    const auto& c = m.cache;
+    int rid = c.body_rootid_vec[body_id];
+    auto root_com = mx::flatten(mx::slice(d.subtree_com, mx::Shape{rid, 0}, mx::Shape{rid+1, 3}));
+    auto offset = mx::subtract(point, root_com);
+
+    auto mask = c.body_dof_masks[body_id]; // (nv,) float
+
+    auto cdof_ang = mx::slice(d.cdof, mx::Shape{0, 0}, mx::Shape{m.nv, 3}); // (nv, 3)
+    auto cdof_lin = mx::slice(d.cdof, mx::Shape{0, 3}, mx::Shape{m.nv, 6}); // (nv, 3)
+
+    auto off_broad = mx::broadcast_to(mx::reshape(offset, {1, 3}), {m.nv, 3});
+    auto cross_result = batched_cross(cdof_ang, off_broad);
+
+    auto jacp = mx::multiply(mx::add(cdof_lin, cross_result),
+                              mx::reshape(mask, {m.nv, 1}));
+    auto jacr = mx::multiply(cdof_ang, mx::reshape(mask, {m.nv, 1}));
+
+    return {jacp, jacr}; // (nv, 3) each
+}
+
+// ── Vmap-compatible collision ────────────────────────────────────────────────
+
+// Collision functions that never call eval/data
+static mx::array vmap_norm(const mx::array& x) {
+    return mx::sqrt(mx::maximum(mx::sum(mx::multiply(x, x)), mx::array(1e-16f)));
+}
+
+static mx::array vmap_normalize(const mx::array& x) {
+    auto n = vmap_norm(x);
+    return mx::divide(x, mx::maximum(n, mx::array(1e-8f)));
+}
+
+struct VmapCollResult {
+    mx::array dist{mx::array(0.0f)};
+    mx::array pos{mx::array(0.0f)};
+    mx::array frame{mx::array(0.0f)};
+};
+
+static mx::array vmap_make_frame(const mx::array& normal) {
+    auto n = vmap_normalize(normal);
+    // Orthogonals: cross with [0,0,1], fallback to [0,1,0]
+    auto t1 = batched_cross(mx::reshape(n, {1, 3}),
+              mx::reshape(mx::array({0.0f, 0.0f, 1.0f}), {1, 3}));
+    t1 = mx::flatten(t1);
+    auto t1_len = vmap_norm(t1);
+    auto t1_alt = batched_cross(mx::reshape(n, {1, 3}),
+                  mx::reshape(mx::array({0.0f, 1.0f, 0.0f}), {1, 3}));
+    t1_alt = mx::flatten(t1_alt);
+    auto is_degen = mx::less(t1_len, mx::array(1e-6f));
+    t1 = mx::where(is_degen, t1_alt, t1);
+    auto b = vmap_normalize(t1);
+    auto cc = vmap_normalize(cross(n, b));
+    return mx::stack({n, b, cc});
+}
+
+static VmapCollResult vmap_plane_sphere(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& spos, float radius)
+{
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto dist = mx::subtract(mx::sum(mx::multiply(normal, mx::subtract(spos, ppos))),
+                              mx::array(radius));
+    auto pos = mx::subtract(spos, mx::multiply(normal, mx::add(dist, mx::array(radius))));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_sphere_sphere(
+    const mx::array& p1, float r1, const mx::array& p2, float r2)
+{
+    auto diff = mx::subtract(p2, p1);
+    auto d = vmap_norm(diff);
+    auto normal = mx::divide(diff, mx::maximum(d, mx::array(1e-8f)));
+    auto fallback = mx::array({0.0f, 0.0f, 1.0f});
+    normal = mx::where(mx::less(d, mx::array(1e-8f)), fallback, normal);
+    auto dist = mx::subtract(d, mx::array(r1 + r2));
+    auto pos = mx::add(p1, mx::multiply(normal, mx::array(r1)));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_plane_capsule(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& cpos, const mx::array& cmat, float radius, float half_len)
+{
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto axis = mx::flatten(mx::slice(mx::reshape(cmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto p0 = mx::subtract(cpos, mx::multiply(axis, mx::array(half_len)));
+    auto p1 = mx::add(cpos, mx::multiply(axis, mx::array(half_len)));
+    auto d0 = mx::subtract(mx::sum(mx::multiply(normal, mx::subtract(p0, ppos))), mx::array(radius));
+    auto d1 = mx::subtract(mx::sum(mx::multiply(normal, mx::subtract(p1, ppos))), mx::array(radius));
+    auto use_p0 = mx::less(d0, d1);
+    auto dist = mx::where(use_p0, d0, d1);
+    auto center = mx::where(use_p0, p0, p1);
+    auto pos = mx::subtract(center, mx::multiply(normal, mx::add(dist, mx::array(radius))));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_sphere_capsule(
+    const mx::array& spos, float r_s,
+    const mx::array& cpos, const mx::array& cmat, float r_c, float half_len)
+{
+    auto axis = mx::flatten(mx::slice(mx::reshape(cmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto p0 = mx::subtract(cpos, mx::multiply(axis, mx::array(half_len)));
+    auto p1 = mx::add(cpos, mx::multiply(axis, mx::array(half_len)));
+
+    // Closest point on segment
+    auto seg = mx::subtract(p1, p0);
+    auto t_num = mx::sum(mx::multiply(mx::subtract(spos, p0), seg));
+    auto seg_sq = mx::sum(mx::multiply(seg, seg));
+    auto param = mx::clip(mx::divide(t_num, mx::maximum(seg_sq, mx::array(1e-8f))),
+                           mx::array(0.0f), mx::array(1.0f));
+    auto closest = mx::add(p0, mx::multiply(seg, param));
+
+    auto diff = mx::subtract(spos, closest);
+    auto d = vmap_norm(diff);
+    auto normal = mx::where(mx::less(d, mx::array(1e-8f)),
+                             mx::array({0.0f, 0.0f, 1.0f}),
+                             mx::divide(diff, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(r_s + r_c));
+    auto pos = mx::add(closest, mx::multiply(normal, mx::array(r_c)));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_capsule_capsule(
+    const mx::array& p1, const mx::array& m1, float r1, float h1,
+    const mx::array& p2, const mx::array& m2, float r2, float h2)
+{
+    auto ax1 = mx::flatten(mx::slice(mx::reshape(m1, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto ax2 = mx::flatten(mx::slice(mx::reshape(m2, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto a0 = mx::subtract(p1, mx::multiply(ax1, mx::array(h1)));
+    auto a1 = mx::add(p1, mx::multiply(ax1, mx::array(h1)));
+    auto b0 = mx::subtract(p2, mx::multiply(ax2, mx::array(h2)));
+    auto b1 = mx::add(p2, mx::multiply(ax2, mx::array(h2)));
+
+    // Closest segment-to-segment (vmap-compatible)
+    auto d1v = mx::subtract(a1, a0);
+    auto d2v = mx::subtract(b1, b0);
+    auto r = mx::subtract(a0, b0);
+    auto a = mx::sum(mx::multiply(d1v, d1v));
+    auto e = mx::sum(mx::multiply(d2v, d2v));
+    auto f = mx::sum(mx::multiply(d2v, r));
+    auto bv = mx::sum(mx::multiply(d1v, d2v));
+    auto cv = mx::sum(mx::multiply(d1v, r));
+    auto denom = mx::subtract(mx::multiply(a, e), mx::multiply(bv, bv));
+    auto s_num = mx::subtract(mx::multiply(bv, f), mx::multiply(cv, e));
+    auto s = mx::clip(mx::divide(s_num, mx::maximum(denom, mx::array(1e-8f))),
+                       mx::array(0.0f), mx::array(1.0f));
+    auto t = mx::clip(mx::divide(mx::add(mx::multiply(bv, s), f),
+                                  mx::maximum(e, mx::array(1e-8f))),
+                       mx::array(0.0f), mx::array(1.0f));
+    s = mx::clip(mx::divide(mx::add(mx::negative(cv), mx::multiply(bv, t)),
+                              mx::maximum(a, mx::array(1e-8f))),
+                  mx::array(0.0f), mx::array(1.0f));
+
+    auto best_a = mx::add(a0, mx::multiply(d1v, s));
+    auto best_b = mx::add(b0, mx::multiply(d2v, t));
+
+    auto diff = mx::subtract(best_b, best_a);
+    auto d = vmap_norm(diff);
+    auto normal = mx::where(mx::less(d, mx::array(1e-8f)),
+                             mx::array({0.0f, 0.0f, 1.0f}),
+                             mx::divide(diff, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(r1 + r2));
+    auto pos = mx::add(best_a, mx::multiply(normal, mx::array(r1)));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+// ── Vmap-compatible collision (top level) ────────────────────────────────────
+
+Data vmap_collision(const Model& m, Data d) {
+    if (m.opt.disableflags & DisableBit::CONTACT) {
+        d.ncon = 0;
+        d.contact = Contact();
+        return d;
+    }
+
+    const auto& c = m.cache;
+    int n_pairs = (int)c.collision_pairs.size();
+    if (n_pairs == 0) {
+        d.ncon = 0;
+        d.contact = Contact();
+        return d;
+    }
+
+    // Helper to get geom world pos and mat from data
+    auto gpos = [&](int gi) { return mx::flatten(mx::slice(d.geom_xpos, mx::Shape{gi,0}, mx::Shape{gi+1,3})); };
+    auto gmat = [&](int gi) { return mx::flatten(mx::slice(d.geom_xmat, mx::Shape{gi,0,0}, mx::Shape{gi+1,3,3})); };
+
+    std::vector<mx::array> c_dist, c_pos, c_frame, c_geom;
+    std::vector<mx::array> c_friction, c_solref, c_solimp, c_incmarg;
+    std::vector<int> c_dim;
+
+    for (int pi = 0; pi < n_pairs; pi++) {
+        auto& cp = c.collision_pairs[pi];
+        auto p1 = gpos(cp.g1); auto m1 = gmat(cp.g1);
+        auto p2 = gpos(cp.g2); auto m2 = gmat(cp.g2);
+
+        VmapCollResult result;
+        int t1 = cp.type1, t2 = cp.type2;
+
+        if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::SPHERE) {
+            result = vmap_plane_sphere(p1, m1, p2, cp.size2[0]);
+        } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::CAPSULE) {
+            result = vmap_plane_capsule(p1, m1, p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::SPHERE && t2 == (int)GeomType::SPHERE) {
+            result = vmap_sphere_sphere(p1, cp.size1[0], p2, cp.size2[0]);
+        } else if (t1 == (int)GeomType::SPHERE && t2 == (int)GeomType::CAPSULE) {
+            result = vmap_sphere_capsule(p1, cp.size1[0], p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::CAPSULE) {
+            result = vmap_capsule_capsule(p1, m1, cp.size1[0], cp.size1[1],
+                                          p2, m2, cp.size2[0], cp.size2[1]);
+        } else {
+            result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+        }
+
+        c_dist.push_back(result.dist);
+        c_pos.push_back(result.pos);
+        c_frame.push_back(result.frame);
+        c_geom.push_back(mx::array({cp.g1, cp.g2}, mx::int32));
+        c_dim.push_back(cp.condim);
+        c_friction.push_back(mx::array(cp.friction, mx::Shape{5}));
+        c_solref.push_back(mx::array(cp.solref, mx::Shape{2}));
+        c_solimp.push_back(mx::array(cp.solimp, mx::Shape{5}));
+        c_incmarg.push_back(mx::array(cp.margin - cp.gap));
+    }
+
+    Contact contact;
+    contact.dist = mx::stack(c_dist);
+    contact.pos = mx::stack(c_pos);
+    contact.frame = mx::stack(c_frame);
+    contact.dim = mx::array(c_dim.data(), mx::Shape{n_pairs}, mx::int32);
+    contact.friction = mx::stack(c_friction);
+    contact.solref = mx::stack(c_solref);
+    contact.solimp = mx::stack(c_solimp);
+    contact.includemargin = mx::stack(c_incmarg);
+    contact.geom = mx::stack(c_geom);
+
+    d.contact = contact;
+    d.ncon = n_pairs;
+    return d;
+}
+
+// ── Vmap-compatible constraint construction ──────────────────────────────────
+
+Data vmap_make_constraint(const Model& m, Data d) {
+    if (m.opt.disableflags & DisableBit::CONSTRAINT) {
+        d.efc_J = mx::zeros({0, m.nv});
+        d.efc_D = mx::zeros({0});
+        d.efc_aref = mx::zeros({0});
+        d.efc_force = mx::zeros({0});
+        d.efc_frictionloss = mx::zeros({0});
+        d.nefc = 0;
+        return d;
+    }
+
+    const auto& c = m.cache;
+    bool refsafe = !(m.opt.disableflags & DisableBit::REFSAFE);
+
+    std::vector<mx::array> J_rows, D_vals, aref_vals, floss_vals;
+    int ne = 0, nf = 0, nl = 0;
+
+    // ── Joint limits (fixed-size: always iterate all limits, mask inactive) ──
+    if (!(m.opt.disableflags & DisableBit::LIMIT)) {
+        for (auto& li : c.limits) {
+            auto qval = mx::flatten(mx::slice(d.qpos, mx::Shape{li.dof_adr}, mx::Shape{li.dof_adr + 1}));
+            auto dist_min = mx::subtract(qval, mx::array(li.range_low));
+            auto dist_max = mx::subtract(mx::array(li.range_high), qval);
+            auto pos = mx::subtract(mx::minimum(dist_min, dist_max), mx::array(li.margin));
+            auto sign = mx::where(mx::less(dist_min, dist_max), mx::array(1.0f), mx::array(-1.0f));
+
+            // J row: sign at da
+            std::vector<float> jr(m.nv, 0.0f);
+            jr[li.dof_adr] = 1.0f;
+            auto J = mx::multiply(mx::array(jr.data(), mx::Shape{m.nv}, mx::float32), sign);
+
+            mx::array k(0.0f), b(0.0f), imp(0.0f);
+            vmap_kbi(li.solref[0], li.solref[1], m.opt.timestep, refsafe,
+                     li.solimp[0], li.solimp[1], li.solimp[2], li.solimp[3], li.solimp[4],
+                     pos, k, b, imp);
+
+            float invw = 1.0f;
+            if (m.dof_invweight0.size() > 0) {
+                mx::eval(m.dof_invweight0);
+                invw = m.dof_invweight0.data<float>()[li.dof_adr];
+            }
+            auto r = mx::maximum(mx::multiply(mx::array(invw),
+                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
+
+            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
+                                      mx::multiply(mx::multiply(k, imp), pos));
+
+            auto active = mx::less(pos, mx::array(0.0f));
+            auto d_val = mx::where(active, mx::divide(mx::array(1.0f), r), mx::array(0.0f));
+            auto aref_val = mx::where(active, aref, mx::array(0.0f));
+
+            J_rows.push_back(J);
+            D_vals.push_back(mx::flatten(d_val));
+            aref_vals.push_back(mx::flatten(aref_val));
+            floss_vals.push_back(mx::array({0.0f}));
+            nl++;
+        }
+    }
+
+    // ── Contact constraints ──
+    if (!(m.opt.disableflags & DisableBit::CONTACT) && d.ncon > 0) {
+        for (int ci = 0; ci < d.ncon; ci++) {
+            auto& cp = c.collision_pairs[ci];
+            auto c_dist = mx::flatten(mx::slice(d.contact.dist, mx::Shape{ci}, mx::Shape{ci+1}));
+            auto c_pos = mx::flatten(mx::slice(d.contact.pos, mx::Shape{ci, 0}, mx::Shape{ci+1, 3}));
+            auto c_frame = mx::slice(d.contact.frame, mx::Shape{ci, 0, 0}, mx::Shape{ci+1, 3, 3});
+            c_frame = mx::reshape(c_frame, {3, 3});
+            auto c_incm = mx::flatten(mx::slice(d.contact.includemargin, mx::Shape{ci}, mx::Shape{ci+1}));
+
+            auto pos = mx::subtract(c_dist, c_incm);
+            auto contact_active = mx::less(c_dist, mx::array(cp.margin));
+
+            auto [jacp1, jacr1] = vmap_jac(m, d, c_pos, cp.body1);
+            auto [jacp2, jacr2] = vmap_jac(m, d, c_pos, cp.body2);
+
+            auto djacp = mx::subtract(jacp2, jacp1);
+            auto normal = mx::flatten(mx::slice(c_frame, mx::Shape{0, 0}, mx::Shape{1, 3}));
+            auto j_row = mx::flatten(mx::matmul(mx::reshape(normal, {1, 3}),
+                                                  mx::transpose(djacp)));
+
+            float invw = 0.0f;
+            if (m.body_invweight0.size() > 0) {
+                mx::eval(m.body_invweight0);
+                auto iw = m.body_invweight0.data<float>();
+                invw = iw[cp.body1 * 2] + iw[cp.body2 * 2];
+            }
+
+            mx::array k(0.0f), b(0.0f), imp(0.0f);
+            vmap_kbi(cp.solref[0], cp.solref[1], m.opt.timestep, refsafe,
+                     cp.solimp[0], cp.solimp[1], cp.solimp[2], cp.solimp[3], cp.solimp[4],
+                     pos, k, b, imp);
+
+            auto r = mx::maximum(mx::multiply(mx::array(invw),
+                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
+            auto j_dot_qvel = mx::sum(mx::multiply(j_row, d.qvel));
+            auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
+                                      mx::multiply(mx::multiply(k, imp), pos));
+
+            auto d_val = mx::where(contact_active, mx::divide(mx::array(1.0f), r), mx::array(0.0f));
+            auto aref_val = mx::where(contact_active, aref, mx::array(0.0f));
+
+            J_rows.push_back(j_row);
+            D_vals.push_back(mx::flatten(d_val));
+            aref_vals.push_back(mx::flatten(aref_val));
+            floss_vals.push_back(mx::array({0.0f}));
+        }
+    }
+
+    int nefc = (int)J_rows.size();
+    if (nefc > 0) {
+        d.efc_J = mx::stack(J_rows);
+        d.efc_D = mx::concatenate(D_vals, 0);
+        d.efc_aref = mx::concatenate(aref_vals, 0);
+        d.efc_force = mx::zeros({nefc});
+        d.efc_frictionloss = mx::concatenate(floss_vals, 0);
+    } else {
+        d.efc_J = mx::zeros({0, m.nv});
+        d.efc_D = mx::zeros({0});
+        d.efc_aref = mx::zeros({0});
+        d.efc_force = mx::zeros({0});
+        d.efc_frictionloss = mx::zeros({0});
+    }
+
+    d.nefc = nefc;
+    d.ne = ne; d.nf = nf; d.nl = nl;
+    return d;
+}
+
+} // namespace mjmlx

@@ -313,6 +313,335 @@ Data make_data(const Model& model) {
     return d;
 }
 
+// ── Model cache initialization ───────────────────────────────
+
+void Model::init_cache() const {
+    if (cache.initialized) return;
+
+    // Eagerly evaluate topology arrays
+    mx::eval(body_parentid); mx::eval(body_rootid);
+    mx::eval(dof_bodyid);
+    if (njnt > 0) {
+        mx::eval(jnt_bodyid); mx::eval(jnt_type);
+        mx::eval(jnt_dofadr); mx::eval(jnt_qposadr);
+        mx::eval(jnt_limited);
+    }
+
+    // Plain C++ vectors for loop indexing
+    auto parent_ptr = body_parentid.data<int>();
+    auto rootid_ptr = body_rootid.data<int>();
+    cache.body_parentid_vec.assign(parent_ptr, parent_ptr + nbody);
+    cache.body_rootid_vec.assign(rootid_ptr, rootid_ptr + nbody);
+    if (nv > 0) {
+        auto dof_bid_ptr = dof_bodyid.data<int>();
+        cache.dof_bodyid_vec.assign(dof_bid_ptr, dof_bid_ptr + nv);
+    }
+
+    // ── Tree levels (BFS from root) ──
+    cache.tree_levels.push_back({0});
+    std::vector<bool> visited(nbody, false);
+    visited[0] = true;
+    while (true) {
+        auto& prev = cache.tree_levels.back();
+        std::vector<int> next;
+        for (int pid : prev) {
+            for (int bid = 1; bid < nbody; bid++) {
+                if (parent_ptr[bid] == pid && !visited[bid]) {
+                    next.push_back(bid);
+                    visited[bid] = true;
+                }
+            }
+        }
+        if (next.empty()) break;
+        cache.tree_levels.push_back(next);
+    }
+
+    // ── Body-DOF mapping ──
+    cache.body_dofs.resize(nbody);
+    if (njnt > 0) {
+        auto jnt_bid_ptr = jnt_bodyid.data<int>();
+        auto jnt_type_ptr = jnt_type.data<int>();
+        auto jnt_da_ptr = jnt_dofadr.data<int>();
+        auto jnt_qa_ptr = jnt_qposadr.data<int>();
+
+        for (int di = 0; di < nv; di++) {
+            int bid = cache.dof_bodyid_vec[di];
+            cache.body_dofs[bid].push_back(di);
+
+            for (int ji = 0; ji < njnt; ji++) {
+                if (jnt_bid_ptr[ji] != bid) continue;
+                int jt = jnt_type_ptr[ji];
+                int dw = (jt == 0) ? 6 : (jt == 1) ? 3 : 1;
+                int da = jnt_da_ptr[ji];
+                if (da <= di && di < da + dw) {
+                    cache.dof_info.push_back({di, bid, jt, ji, jnt_qa_ptr[ji]});
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── CDoF plan (vectorized cdof masks) ──
+    if (nv > 0) {
+        std::vector<int> bids(nv), jidxs(nv), root_bids(nv);
+        std::vector<float> is_h(nv,0), is_s(nv,0), is_ft(nv,0), is_fr(nv,0), is_b(nv,0);
+        std::vector<float> ftu(nv*3, 0);
+        std::vector<float> c0(nv,0), c1(nv,0), c2(nv,0);
+
+        for (auto& di : cache.dof_info) {
+            int idx = di.dof_idx;
+            bids[idx] = di.body_id;
+            jidxs[idx] = di.jnt_idx;
+            root_bids[idx] = rootid_ptr[di.body_id];
+            int local = idx - (njnt > 0 ?
+                (int)(mx::eval(jnt_dofadr), jnt_dofadr.data<int>()[di.jnt_idx]) : 0);
+
+            if (di.jnt_type == (int)JointType::HINGE) {
+                is_h[idx] = 1.0f;
+            } else if (di.jnt_type == (int)JointType::SLIDE) {
+                is_s[idx] = 1.0f;
+            } else if (di.jnt_type == (int)JointType::FREE) {
+                auto da = jnt_dofadr.data<int>()[di.jnt_idx];
+                int ld = idx - da;
+                if (ld < 3) {
+                    is_ft[idx] = 1.0f;
+                    ftu[idx*3 + ld] = 1.0f;
+                } else {
+                    is_fr[idx] = 1.0f;
+                    int col = ld - 3;
+                    if (col == 0) c0[idx] = 1.0f;
+                    else if (col == 1) c1[idx] = 1.0f;
+                    else c2[idx] = 1.0f;
+                }
+            } else if (di.jnt_type == (int)JointType::BALL) {
+                is_b[idx] = 1.0f;
+                auto da = jnt_dofadr.data<int>()[di.jnt_idx];
+                int ld = idx - da;
+                if (ld == 0) c0[idx] = 1.0f;
+                else if (ld == 1) c1[idx] = 1.0f;
+                else c2[idx] = 1.0f;
+            }
+        }
+
+        cache.cdof_plan.bids = mx::array(bids.data(), {nv}, mx::int32);
+        cache.cdof_plan.jidxs = mx::array(jidxs.data(), {nv}, mx::int32);
+        cache.cdof_plan.root_bids = mx::array(root_bids.data(), {nv}, mx::int32);
+        cache.cdof_plan.is_hinge = mx::reshape(mx::array(is_h.data(), {nv}), {nv, 1});
+        cache.cdof_plan.is_slide = mx::reshape(mx::array(is_s.data(), {nv}), {nv, 1});
+        cache.cdof_plan.is_free_trans = mx::reshape(mx::array(is_ft.data(), {nv}), {nv, 1});
+        cache.cdof_plan.is_free_rot = mx::reshape(mx::array(is_fr.data(), {nv}), {nv, 1});
+        cache.cdof_plan.is_ball = mx::reshape(mx::array(is_b.data(), {nv}), {nv, 1});
+        cache.cdof_plan.free_trans_unit = mx::array(ftu.data(), {nv, 3});
+        cache.cdof_plan.rot_col0_mask = mx::reshape(mx::array(c0.data(), {nv}), {nv, 1});
+        cache.cdof_plan.rot_col1_mask = mx::reshape(mx::array(c1.data(), {nv}), {nv, 1});
+        cache.cdof_plan.rot_col2_mask = mx::reshape(mx::array(c2.data(), {nv}), {nv, 1});
+    }
+
+    // ── Body DOF ancestor masks (for Jacobian computation) ──
+    cache.body_dof_masks.assign(nbody, mx::array(0.0f));
+    for (int body_id = 0; body_id < nbody; body_id++) {
+        std::set<int> ancestors;
+        int bid = body_id;
+        while (bid >= 0) {
+            ancestors.insert(bid);
+            bid = (bid > 0) ? parent_ptr[bid] : -1;
+        }
+        std::vector<float> mask(nv, 0.0f);
+        for (int di = 0; di < nv; di++) {
+            if (ancestors.count(cache.dof_bodyid_vec[di])) {
+                mask[di] = 1.0f;
+            }
+        }
+        cache.body_dof_masks[body_id] = mx::array(mask.data(), {nv}, mx::float32);
+    }
+
+    // ── Dense mass matrix tree mask ──
+    if (nv > 0 && !is_sparse(*this)) {
+        mx::eval(dof_parentid);
+        auto dof_par_ptr = dof_parentid.data<int>();
+        std::vector<float> mask_data(nv * nv, 0.0f);
+        for (int i = 0; i < nv; i++) {
+            int j = i;
+            while (j > -1) {
+                mask_data[i * nv + j] = 1.0f;
+                mask_data[j * nv + i] = 1.0f;
+                j = dof_par_ptr[j];
+            }
+        }
+        cache.make_m_mask = mx::array(mask_data.data(), {nv, nv}, mx::float32);
+    }
+
+    // ── Collision pairs (pre-computed from model topology) ──
+    if (ngeom > 0) {
+        mx::eval(geom_type); mx::eval(geom_bodyid);
+        mx::eval(geom_contype); mx::eval(geom_conaffinity);
+        mx::eval(body_weldid); mx::eval(geom_margin);
+        mx::eval(geom_size);
+
+        auto gtype = geom_type.data<int>();
+        auto gbid = geom_bodyid.data<int>();
+        auto gcon = geom_contype.data<int>();
+        auto gaff = geom_conaffinity.data<int>();
+        auto bwid_ptr = body_weldid.data<int>();
+        auto gmargin_ptr = geom_margin.data<float>();
+        auto gsize_ptr = geom_size.data<float>();
+
+        for (int g1 = 0; g1 < ngeom; g1++) {
+            for (int g2 = g1 + 1; g2 < ngeom; g2++) {
+                int t1 = gtype[g1], t2 = gtype[g2];
+                int g1_ = g1, g2_ = g2, t1_ = t1, t2_ = t2;
+                if (t1 > t2) { std::swap(g1_, g2_); std::swap(t1_, t2_); }
+
+                int mask = (gcon[g1_] & gaff[g2_]) | (gcon[g2_] & gaff[g1_]);
+                if (!mask) continue;
+
+                int b1 = gbid[g1_], b2 = gbid[g2_];
+                int w1 = bwid_ptr[b1], w2 = bwid_ptr[b2];
+                if (w1 == w2) continue;
+                if (!(opt.disableflags & DisableBit::FILTERPARENT)) {
+                    int w1p = (w1 > 0) ? bwid_ptr[parent_ptr[w1]] : 0;
+                    int w2p = (w2 > 0) ? bwid_ptr[parent_ptr[w2]] : 0;
+                    if (w1 != 0 && w2 != 0 && (w1 == w2p || w2 == w1p)) continue;
+                }
+
+                ModelCache::CollisionPair cp;
+                cp.g1 = g1_; cp.g2 = g2_;
+                cp.type1 = t1_; cp.type2 = t2_;
+                cp.body1 = b1; cp.body2 = b2;
+                cp.margin = gmargin_ptr[g1_] + gmargin_ptr[g2_];
+                float gap = 0.0f;
+                if (geom_gap.size() > 0) {
+                    mx::eval(geom_gap);
+                    auto gp = geom_gap.data<float>();
+                    gap = gp[g1_] + gp[g2_];
+                }
+                cp.gap = gap;
+                for (int k = 0; k < 3; k++) {
+                    cp.size1[k] = gsize_ptr[g1_ * 3 + k];
+                    cp.size2[k] = gsize_ptr[g2_ * 3 + k];
+                }
+                // Friction: max of both geoms
+                if (geom_friction.size() > 0) {
+                    mx::eval(geom_friction);
+                    auto gf = geom_friction.data<float>();
+                    float f0 = std::max(gf[g1_*3], gf[g2_*3]);
+                    cp.friction[0] = f0; cp.friction[1] = f0;
+                    cp.friction[2] = std::max(gf[g1_*3+1], gf[g2_*3+1]);
+                    cp.friction[3] = std::max(gf[g1_*3+2], gf[g2_*3+2]);
+                    cp.friction[4] = cp.friction[3];
+                }
+                // Solref: average
+                if (geom_solref.size() > 0) {
+                    mx::eval(geom_solref);
+                    auto sr = geom_solref.data<float>();
+                    cp.solref[0] = 0.5f * (sr[g1_*2] + sr[g2_*2]);
+                    cp.solref[1] = 0.5f * (sr[g1_*2+1] + sr[g2_*2+1]);
+                } else {
+                    cp.solref[0] = 0.02f; cp.solref[1] = 1.0f;
+                }
+                // Solimp: average
+                if (geom_solimp.size() > 0) {
+                    mx::eval(geom_solimp);
+                    auto si = geom_solimp.data<float>();
+                    for (int k = 0; k < 5; k++)
+                        cp.solimp[k] = 0.5f * (si[g1_*5+k] + si[g2_*5+k]);
+                } else {
+                    float def[] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+                    for (int k = 0; k < 5; k++) cp.solimp[k] = def[k];
+                }
+                // Condim
+                cp.condim = 1;
+                if (geom_condim.size() > 0) {
+                    mx::eval(geom_condim);
+                    auto cdp = geom_condim.data<int>();
+                    cp.condim = std::max(cdp[g1_], cdp[g2_]);
+                }
+
+                cache.collision_pairs.push_back(cp);
+            }
+        }
+        cache.max_ncon = (int)cache.collision_pairs.size();
+    }
+
+    // ── Joint limits ──
+    if (njnt > 0 && jnt_limited.size() > 0) {
+        auto limited = jnt_limited.data<int>();
+        auto jt_ptr = jnt_type.data<int>();
+        auto jda_ptr = jnt_dofadr.data<int>();
+
+        for (int j = 0; j < njnt; j++) {
+            if (!limited[j]) continue;
+            int jt = jt_ptr[j];
+            if (jt != (int)JointType::SLIDE && jt != (int)JointType::HINGE) continue;
+
+            ModelCache::LimitInfo li;
+            li.jnt_idx = j;
+            li.dof_adr = jda_ptr[j];
+            mx::eval(jnt_range);
+            auto jr = jnt_range.data<float>();
+            li.range_low = jr[j * 2];
+            li.range_high = jr[j * 2 + 1];
+            if (jnt_solref.size() > 0) {
+                mx::eval(jnt_solref);
+                auto sp = jnt_solref.data<float>();
+                li.solref[0] = sp[j*2]; li.solref[1] = sp[j*2+1];
+            } else {
+                li.solref[0] = 0.02f; li.solref[1] = 1.0f;
+            }
+            if (jnt_solimp.size() > 0) {
+                mx::eval(jnt_solimp);
+                auto sp = jnt_solimp.data<float>();
+                for (int k = 0; k < 5; k++) li.solimp[k] = sp[j*5+k];
+            } else {
+                float def[] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+                for (int k = 0; k < 5; k++) li.solimp[k] = def[k];
+            }
+            li.margin = 0.0f;
+            if (jnt_margin.size() > 0) {
+                mx::eval(jnt_margin);
+                li.margin = jnt_margin.data<float>()[j];
+            }
+            cache.limits.push_back(li);
+        }
+    }
+    cache.max_nl = (int)cache.limits.size();
+    cache.max_nefc = cache.max_nl + cache.max_ncon;
+
+    // ── Joint integration plan ──
+    if (njnt > 0) {
+        auto jt_ptr = jnt_type.data<int>();
+        auto jqa_ptr = jnt_qposadr.data<int>();
+        auto jda_ptr = jnt_dofadr.data<int>();
+        for (int j = 0; j < njnt; j++) {
+            int jt = jt_ptr[j];
+            if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) {
+                cache.simple_qa.push_back(jqa_ptr[j]);
+                cache.simple_da.push_back(jda_ptr[j]);
+            } else if (jt == (int)JointType::FREE) {
+                cache.free_joints.push_back({jqa_ptr[j], jda_ptr[j]});
+            } else if (jt == (int)JointType::BALL) {
+                cache.ball_joints.push_back({jqa_ptr[j], jda_ptr[j]});
+            }
+        }
+    }
+
+    // ── DOF damping ──
+    if (nv > 0) {
+        mx::eval(dof_damping);
+        auto dp = dof_damping.data<float>();
+        cache.dof_damping_vals.assign(dp, dp + nv);
+    }
+
+    // ── Gravity 6D ──
+    if (!(opt.disableflags & DisableBit::GRAVITY)) {
+        cache.gravity_6d = mx::concatenate({mx::zeros({3}), mx::negative(opt.gravity)}, 0);
+    } else {
+        cache.gravity_6d = mx::zeros({6});
+    }
+
+    cache.initialized = true;
+}
+
 } // namespace mjmlx
 
 // ── C API wrappers ───────────────────────────────────────────

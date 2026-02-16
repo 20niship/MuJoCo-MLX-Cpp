@@ -121,6 +121,10 @@ set(MJMLX_SOURCES
     src/constraint.cpp
     src/solver.cpp
     src/forward.cpp
+    src/smooth_vmap.cpp
+    src/constraint_vmap.cpp
+    src/solver_vmap.cpp
+    src/forward_vmap.cpp
     src/batched.cpp
     src/nn.cpp
     src/ppo.cpp

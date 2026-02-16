@@ -325,4 +325,78 @@ std::pair<mx::array, mx::array> closest_segment_to_segment_points(
     return {best_a, best_b};
 }
 
+// ── Batched math helpers (for vmap-compatible path) ───────────────────────────
+
+mx::array batched_cross(const mx::array& a, const mx::array& b) {
+    // a, b: (..., 3) → returns (..., 3)
+    int nd = a.ndim();
+    mx::Shape s0(nd, 0), s1(nd, 0), s2(nd, 0);
+    mx::Shape e0 = a.shape();
+    mx::Shape e1 = e0, e2 = e0;
+    s0[nd-1] = 0; e0[nd-1] = 1;
+    s1[nd-1] = 1; e1[nd-1] = 2;
+    s2[nd-1] = 2; e2[nd-1] = 3;
+
+    auto a0v = mx::slice(a, s0, e0);
+    auto a1v = mx::slice(a, s1, e1);
+    auto a2v = mx::slice(a, s2, e2);
+    auto b0v = mx::slice(b, s0, e0);
+    auto b1v = mx::slice(b, s1, e1);
+    auto b2v = mx::slice(b, s2, e2);
+
+    auto c0 = mx::subtract(mx::multiply(a1v, b2v), mx::multiply(a2v, b1v));
+    auto c1 = mx::subtract(mx::multiply(a2v, b0v), mx::multiply(a0v, b2v));
+    auto c2 = mx::subtract(mx::multiply(a0v, b1v), mx::multiply(a1v, b0v));
+
+    return mx::concatenate({c0, c1, c2}, nd - 1);
+}
+
+mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel) {
+    // inert: (..., 10), vel: (..., 6) → returns (..., 6)
+    int nd = inert.ndim();
+    auto sl = [nd](const mx::array& arr, int lo, int hi) {
+        mx::Shape s(nd, 0);
+        mx::Shape e = arr.shape();
+        s[nd-1] = lo; e[nd-1] = hi;
+        return mx::slice(arr, s, e);
+    };
+
+    auto I00 = sl(inert,0,1); auto I11 = sl(inert,1,2); auto I22 = sl(inert,2,3);
+    auto I01 = sl(inert,3,4); auto I02 = sl(inert,4,5); auto I12 = sl(inert,5,6);
+    auto px = sl(inert,6,7); auto py = sl(inert,7,8); auto pz = sl(inert,8,9);
+    auto mass = sl(inert,9,10);
+    auto pos = mx::concatenate({px, py, pz}, nd-1);
+
+    auto ang = sl(vel,0,3); auto lin = sl(vel,3,6);
+    auto w0 = sl(ang,0,1); auto w1 = sl(ang,1,2); auto w2 = sl(ang,2,3);
+
+    auto iw0 = mx::add(mx::add(mx::multiply(I00,w0), mx::multiply(I01,w1)), mx::multiply(I02,w2));
+    auto iw1 = mx::add(mx::add(mx::multiply(I01,w0), mx::multiply(I11,w1)), mx::multiply(I12,w2));
+    auto iw2 = mx::add(mx::add(mx::multiply(I02,w0), mx::multiply(I12,w1)), mx::multiply(I22,w2));
+    auto iw = mx::concatenate({iw0, iw1, iw2}, nd-1);
+
+    auto pcl = batched_cross(pos, lin);
+    auto ang_out = mx::add(iw, pcl);
+    auto ml = mx::multiply(mass, lin);
+    auto pca = batched_cross(pos, ang);
+    auto lin_out = mx::subtract(ml, pca);
+
+    return mx::concatenate({ang_out, lin_out}, nd-1);
+}
+
+mx::array batched_motion_cross_force(const mx::array& v, const mx::array& f) {
+    int nd = v.ndim();
+    auto sl = [nd](const mx::array& arr, int lo, int hi) {
+        mx::Shape s(nd, 0);
+        mx::Shape e = arr.shape();
+        s[nd-1] = lo; e[nd-1] = hi;
+        return mx::slice(arr, s, e);
+    };
+    auto va = sl(v,0,3); auto vl = sl(v,3,6);
+    auto fa = sl(f,0,3); auto fl = sl(f,3,6);
+    auto ang = mx::add(batched_cross(va, fa), batched_cross(vl, fl));
+    auto lin = batched_cross(va, fl);
+    return mx::concatenate({ang, lin}, nd-1);
+}
+
 } // namespace mjmlx
