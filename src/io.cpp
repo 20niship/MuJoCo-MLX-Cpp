@@ -639,6 +639,61 @@ void Model::init_cache() const {
         cache.gravity_6d = mx::zeros({6});
     }
 
+    // ── Precomputed actuator matrices ──
+    if (nu > 0 && njnt > 0) {
+        std::vector<float> moment_data(nu * nv, 0.0f);
+        std::vector<int> act_qpos_idx(nu, 0);
+        std::vector<float> act_gear_vals(nu, 0.0f);
+
+        mx::eval(actuator_trntype);
+        mx::eval(actuator_trnid);
+        mx::eval(actuator_gear);
+        auto trn_type_ptr = actuator_trntype.data<int>();
+        auto trn_id_ptr = actuator_trnid.data<int>();
+        auto gear_ptr = actuator_gear.data<float>();
+
+        for (int ai = 0; ai < nu; ai++) {
+            int trnt = trn_type_ptr[ai];
+            if (trnt != 0) continue; // Only JOINT transmission for now
+            int ji = trn_id_ptr[ai * 2];
+            float g0 = gear_ptr[ai * 6];
+
+            // Find the DOF address for this joint
+            int da = -1, qa = -1;
+            for (auto& di : cache.dof_info) {
+                if (di.jnt_idx == ji) {
+                    da = di.dof_idx;
+                    qa = di.qpos_adr;
+                    break;
+                }
+            }
+            if (da >= 0 && da < nv) {
+                moment_data[ai * nv + da] = g0;
+                act_qpos_idx[ai] = qa;
+                act_gear_vals[ai] = g0;
+                cache.actuator_info.push_back({ai, ji, da, qa, g0});
+            }
+        }
+        cache.act_moment_const = mx::array(moment_data.data(), mx::Shape{nu, nv}, mx::float32);
+        cache.act_qpos_idxs = mx::array(act_qpos_idx.data(), mx::Shape{nu}, mx::int32);
+        cache.act_gear = mx::array(act_gear_vals.data(), mx::Shape{nu}, mx::float32);
+    }
+
+    // ── Precomputed passive force arrays ──
+    if (nv > 0 && njnt > 0) {
+        std::vector<float> stiff_per_dof(nv, 0.0f);
+        std::vector<int> qpos_per_dof(nv, 0);
+
+        mx::eval(jnt_stiffness);
+        auto stiff_ptr = jnt_stiffness.data<float>();
+        for (auto& di : cache.dof_info) {
+            stiff_per_dof[di.dof_idx] = stiff_ptr[di.jnt_idx];
+            qpos_per_dof[di.dof_idx] = di.qpos_adr;
+        }
+        cache.passive_stiffness = mx::array(stiff_per_dof.data(), mx::Shape{nv}, mx::float32);
+        cache.passive_qpos_idxs = mx::array(qpos_per_dof.data(), mx::Shape{nv}, mx::int32);
+    }
+
     cache.initialized = true;
 }
 

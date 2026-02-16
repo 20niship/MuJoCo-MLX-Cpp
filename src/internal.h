@@ -7,6 +7,7 @@
 #pragma once
 
 #include <mlx/mlx.h>
+#include <mlx/linalg.h>
 #include <functional>
 #include <optional>
 #include <set>
@@ -279,9 +280,17 @@ struct Model {
             int act_idx;
             int jnt_idx;   // target joint
             int dof_adr;   // target DOF address
+            int qpos_adr;  // qpos address for length
             float gain;
         };
         std::vector<ActuatorInfo> actuator_info;
+        mx::array act_moment_const{mx::array(0.0f)};
+        mx::array act_qpos_idxs{mx::array(0.0f)};
+        mx::array act_gear{mx::array(0.0f)};
+
+        // Precomputed passive force arrays
+        mx::array passive_stiffness{mx::array(0.0f)};
+        mx::array passive_qpos_idxs{mx::array(0.0f)};  
 
         // Plain C++ vectors for loop indexing (no eval needed)
         std::vector<int> body_parentid_vec;
@@ -367,6 +376,7 @@ struct Data {
     mx::array cdof_dot{mx::array({})};       // (nv, 6)
     mx::array qM{mx::array({})};             // (nv, nv) or sparse
     mx::array qLD{mx::array({})};            // factored mass matrix
+    mx::array qM_inv{mx::array({})};         // precomputed M^{-1} for GPU solves
     mx::array qLDiagInv{mx::array({})};      // inverse diagonal
     mx::array qfrc_bias{mx::array({})};      // (nv,) Coriolis + gravity
     mx::array qfrc_passive{mx::array({})};   // (nv,) spring/damper

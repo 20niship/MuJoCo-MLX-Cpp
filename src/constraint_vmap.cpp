@@ -68,7 +68,7 @@ static std::pair<mx::array, mx::array> vmap_jac(
     auto cdof_lin = mx::slice(d.cdof, mx::Shape{0, 3}, mx::Shape{m.nv, 6}); // (nv, 3)
 
     auto off_broad = mx::broadcast_to(mx::reshape(offset, {1, 3}), {m.nv, 3});
-    auto cross_result = batched_cross(cdof_ang, off_broad);
+    auto cross_result = mx::linalg::cross(cdof_ang, off_broad);
 
     auto jacp = mx::multiply(mx::add(cdof_lin, cross_result),
                               mx::reshape(mask, {m.nv, 1}));
@@ -98,11 +98,11 @@ struct VmapCollResult {
 static mx::array vmap_make_frame(const mx::array& normal) {
     auto n = vmap_normalize(normal);
     // Orthogonals: cross with [0,0,1], fallback to [0,1,0]
-    auto t1 = batched_cross(mx::reshape(n, {1, 3}),
+    auto t1 = mx::linalg::cross(mx::reshape(n, {1, 3}),
               mx::reshape(mx::array({0.0f, 0.0f, 1.0f}), {1, 3}));
     t1 = mx::flatten(t1);
     auto t1_len = vmap_norm(t1);
-    auto t1_alt = batched_cross(mx::reshape(n, {1, 3}),
+    auto t1_alt = mx::linalg::cross(mx::reshape(n, {1, 3}),
                   mx::reshape(mx::array({0.0f, 1.0f, 0.0f}), {1, 3}));
     t1_alt = mx::flatten(t1_alt);
     auto is_degen = mx::less(t1_len, mx::array(1e-6f));

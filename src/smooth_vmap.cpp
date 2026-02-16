@@ -22,61 +22,80 @@ Data vmap_com_pos(const Model& m, Data d) {
     const auto& c = m.cache;
     int nb = m.nbody;
 
-    // Level-parallel backward accumulation of subtree COM
-    std::vector<mx::array> sub_pos(nb, mx::array(0.0f));
-    std::vector<mx::array> sub_mass(nb, mx::array(0.0f));
-    for (int i = 0; i < nb; i++) {
-        sub_pos[i] = mx::multiply(vrow(d.xipos, i), mx::slice(m.body_mass, mx::Shape{i}, mx::Shape{i+1}));
-        sub_mass[i] = mx::slice(m.body_mass, mx::Shape{i}, mx::Shape{i+1});
-    }
+    // Vectorized subtree COM: xipos * mass[:, None]
+    auto mass_col = mx::reshape(m.body_mass, mx::Shape{nb, 1});  // (nb, 1)
+    auto sub_pos = mx::multiply(d.xipos, mass_col);  // (nb, 3)
+    auto sub_mass = mx::copy(m.body_mass);  // (nb,)
 
+    // Level-parallel backward accumulation using precomputed scatter matrices
     for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        for (int bid : c.tree_levels[lvl]) {
-            int pid = c.body_parentid_vec[bid];
-            sub_pos[pid] = mx::add(sub_pos[pid], sub_pos[bid]);
-            sub_mass[pid] = mx::add(sub_mass[pid], sub_mass[bid]);
-        }
+        const auto& level = c.tree_levels[lvl];
+        if (level.empty()) continue;
+        int nc = (int)level.size();
+        // Gather child values
+        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
+        auto child_pos = mx::take(sub_pos, child_ids, 0);  // (nc, 3)
+        auto child_mass = mx::take(sub_mass, child_ids, 0);  // (nc,)
+        // Build parent IDs for this level
+        std::vector<int> pids(nc);
+        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
+        auto parent_ids = mx::array(pids.data(), mx::Shape{nc}, mx::int32);
+        // Scatter-add: for each child, add to its parent row
+        // Use precomputed (nb, nc) scatter matrix: scatter_mat[pid, idx] = 1
+        std::vector<float> smat(nb * nc, 0.0f);
+        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
+        auto scatter_mat = mx::array(smat.data(), mx::Shape{nb, nc}, mx::float32);
+        sub_pos = mx::add(sub_pos, mx::matmul(scatter_mat, child_pos));
+        sub_mass = mx::add(sub_mass, mx::flatten(mx::matmul(scatter_mat,
+            mx::reshape(child_mass, mx::Shape{nc, 1}))));
     }
 
-    std::vector<mx::array> subtree_com_vec(nb, mx::array(0.0f));
-    for (int i = 0; i < nb; i++) {
-        auto safe_m = mx::maximum(sub_mass[i], mx::array(MJMINVAL_V));
-        subtree_com_vec[i] = mx::divide(sub_pos[i], safe_m);
-    }
-    d.subtree_com = mx::stack(subtree_com_vec);
+    auto safe_mass = mx::maximum(sub_mass, mx::array(MJMINVAL_V));
+    d.subtree_com = mx::divide(sub_pos, mx::reshape(safe_mass, mx::Shape{nb, 1}));
 
-    // Vectorized cinert
-    std::vector<mx::array> cinert_vec(nb, mx::array(0.0f));
-    for (int i = 0; i < nb; i++) {
-        int rid = c.body_rootid_vec[i];
-        auto offset = mx::subtract(vrow(d.xipos, i), subtree_com_vec[rid]);
-        auto inertia = vrow(m.body_inertia, i);
-        auto mi = mx::slice(m.body_mass, mx::Shape{i}, mx::Shape{i+1});
+    // Fully vectorized cinert computation
+    auto root_ids = mx::array(c.body_rootid_vec.data(), mx::Shape{nb}, mx::int32);
+    auto root_com = mx::take(d.subtree_com, root_ids, 0);  // (nb, 3)
+    auto offsets = mx::subtract(d.xipos, root_com);  // (nb, 3)
+    auto masses = mx::reshape(m.body_mass, mx::Shape{nb, 1, 1});  // (nb, 1, 1)
 
-        auto R = mx::reshape(mx::slice(d.ximat, mx::Shape{i,0,0}, mx::Shape{i+1,3,3}), mx::Shape{3,3});
-        auto RI = mx::multiply(R, mx::reshape(inertia, mx::Shape{1, 3}));
-        auto I_global = mx::matmul(RI, mx::transpose(R));
+    // Transform inertia to global frame: R @ diag(I) @ R^T
+    // ximat: (nb, 3, 3), body_inertia: (nb, 3) → (nb, 1, 3)
+    auto RI = mx::multiply(d.ximat, mx::reshape(m.body_inertia, mx::Shape{nb, 1, 3}));
+    auto ximat_T = mx::transpose(d.ximat, {0, 2, 1});
+    auto I_global = mx::matmul(RI, ximat_T);  // (nb, 3, 3)
 
-        auto d2 = mx::sum(mx::multiply(offset, offset));
-        auto outer = mx::matmul(mx::reshape(offset, mx::Shape{3,1}), mx::reshape(offset, mx::Shape{1,3}));
-        auto pat = mx::multiply(mi, mx::subtract(mx::multiply(d2, mx::eye(3)), outer));
-        I_global = mx::add(I_global, pat);
+    // Parallel axis theorem: I += m * (d^2 * I3 - outer(d, d))
+    auto d2 = mx::sum(mx::multiply(offsets, offsets), -1, /* keepdims = */ true);  // (nb, 1)
+    auto off_col = mx::reshape(offsets, mx::Shape{nb, 3, 1});
+    auto off_row = mx::reshape(offsets, mx::Shape{nb, 1, 3});
+    auto outer_prod = mx::matmul(off_col, off_row);  // (nb, 3, 3)
+    auto d2_3d = mx::reshape(d2, mx::Shape{nb, 1, 1});
+    auto pat = mx::multiply(masses, mx::subtract(
+        mx::multiply(d2_3d, mx::eye(3)), outer_prod));
+    I_global = mx::add(I_global, pat);
 
-        auto Ixx = mx::slice(mx::flatten(I_global), mx::Shape{0}, mx::Shape{1});
-        auto Iyy = mx::slice(mx::flatten(I_global), mx::Shape{4}, mx::Shape{5});
-        auto Izz = mx::slice(mx::flatten(I_global), mx::Shape{8}, mx::Shape{9});
-        auto Ixy = mx::slice(mx::flatten(I_global), mx::Shape{1}, mx::Shape{2});
-        auto Ixz = mx::slice(mx::flatten(I_global), mx::Shape{2}, mx::Shape{3});
-        auto Iyz = mx::slice(mx::flatten(I_global), mx::Shape{5}, mx::Shape{6});
-        auto pm = mx::multiply(offset, mi);
+    // Extract inertia components: (nb, 3, 3) → 6 unique components
+    auto Ixx = mx::slice(I_global, mx::Shape{0,0,0}, mx::Shape{nb,1,1});  // (nb,1,1)
+    auto Iyy = mx::slice(I_global, mx::Shape{0,1,1}, mx::Shape{nb,2,2});
+    auto Izz = mx::slice(I_global, mx::Shape{0,2,2}, mx::Shape{nb,3,3});
+    auto Ixy = mx::slice(I_global, mx::Shape{0,0,1}, mx::Shape{nb,1,2});
+    auto Ixz = mx::slice(I_global, mx::Shape{0,0,2}, mx::Shape{nb,1,3});
+    auto Iyz = mx::slice(I_global, mx::Shape{0,1,2}, mx::Shape{nb,2,3});
+    // Reshape all to (nb, 1)
+    Ixx = mx::reshape(Ixx, mx::Shape{nb, 1});
+    Iyy = mx::reshape(Iyy, mx::Shape{nb, 1});
+    Izz = mx::reshape(Izz, mx::Shape{nb, 1});
+    Ixy = mx::reshape(Ixy, mx::Shape{nb, 1});
+    Ixz = mx::reshape(Ixz, mx::Shape{nb, 1});
+    Iyz = mx::reshape(Iyz, mx::Shape{nb, 1});
 
-        cinert_vec[i] = mx::concatenate({
-            Ixx, Iyy, Izz, Ixy, Ixz, Iyz,
-            mx::slice(pm, mx::Shape{0}, mx::Shape{1}), mx::slice(pm, mx::Shape{1}, mx::Shape{2}), mx::slice(pm, mx::Shape{2}, mx::Shape{3}),
-            mi
-        }, 0);
-    }
-    d.cinert = mx::stack(cinert_vec);
+    // pm = offset * mass, mass_1d for last column
+    auto pm = mx::multiply(offsets, mx::reshape(m.body_mass, mx::Shape{nb, 1}));  // (nb, 3)
+    auto mass_1d = mx::reshape(m.body_mass, mx::Shape{nb, 1});
+
+    // cinert: (nb, 10) = [Ixx, Iyy, Izz, Ixy, Ixz, Iyz, px, py, pz, mass]
+    d.cinert = mx::concatenate({Ixx, Iyy, Izz, Ixy, Ixz, Iyz, pm, mass_1d}, 1);
 
     // Vectorized cdof using pre-computed plan
     if (m.nv > 0) {
@@ -96,8 +115,8 @@ Data vmap_com_pos(const Model& m, Data d) {
             mx::multiply(col1, p.rot_col1_mask)),
             mx::multiply(col2, p.rot_col2_mask));
 
-        auto axis_x_off = batched_cross(axis, offset);
-        auto rot_x_off = batched_cross(rot_a, offset);
+        auto axis_x_off = mx::linalg::cross(axis, offset);
+        auto rot_x_off = mx::linalg::cross(rot_a, offset);
 
         auto hinge_cdof = mx::concatenate({axis, axis_x_off}, 1);
         auto slide_cdof = mx::concatenate({mx::zeros(mx::Shape{m.nv, 3}), axis}, 1);
@@ -121,20 +140,26 @@ Data vmap_crb(const Model& m, Data d) {
     const auto& c = m.cache;
     int nb = m.nbody;
 
-    // Level-parallel backward accumulation
-    std::vector<mx::array> crb_body(nb, mx::array(0.0f));
-    for (int i = 0; i < nb; i++) {
-        crb_body[i] = vrow(d.cinert, i);
-    }
+    // Level-parallel backward accumulation using scatter matrices
+    auto crb = mx::copy(d.cinert);  // (nb, 10)
 
     for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        for (int bid : c.tree_levels[lvl]) {
-            int pid = c.body_parentid_vec[bid];
-            crb_body[pid] = mx::add(crb_body[pid], crb_body[bid]);
-        }
+        const auto& level = c.tree_levels[lvl];
+        if (level.empty()) continue;
+        int nc = (int)level.size();
+        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
+        auto child_vals = mx::take(crb, child_ids, 0);  // (nc, 10)
+        std::vector<int> pids(nc);
+        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
+        std::vector<float> smat(nb * nc, 0.0f);
+        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
+        auto scatter_mat = mx::array(smat.data(), mx::Shape{nb, nc}, mx::float32);
+        crb = mx::add(crb, mx::matmul(scatter_mat, child_vals));
     }
-    crb_body[0] = mx::zeros({10});
-    d.crb = mx::stack(crb_body);
+    // Zero out world body
+    auto world_mask = mx::concatenate({mx::zeros(mx::Shape{1, 10}),
+                                        mx::ones(mx::Shape{nb - 1, 10})}, 0);
+    d.crb = mx::multiply(crb, world_mask);
 
     // Vectorized crb_cdof and mass matrix
     if (m.nv > 0) {
@@ -156,116 +181,36 @@ Data vmap_crb(const Model& m, Data d) {
     return d;
 }
 
-// ── Vmap-compatible GPU Cholesky (column-vectorized, pure MLX) ───────────────
+// ── Vmap-compatible mass matrix factorization (pure GPU) ─────────────────────
+// Uses Neumann series to approximate M^{-1} without CPU linalg.
+// For SPD mass matrices: M^{-1} ≈ D^{-1} (I + N + N^2 + N^3)
+// where D = diag(M), N = I - D^{-1} M.
+// All operations are GPU-native matmul + elementwise.
 
 Data vmap_factor_m(const Model& m, Data d) {
     int n = m.nv;
     auto A = mx::add(d.qM, mx::multiply(mx::eye(n), mx::array(1e-6f)));
-    auto L = mx::zeros({n, n});
+    d.qLD = A;  // store regularized M (used by Euler kernel via Metal)
 
-    for (int j = 0; j < n; j++) {
-        mx::array s(0.0f);
-        if (j > 0) {
-            auto row_j = mx::slice(L, mx::Shape{j, 0}, mx::Shape{j + 1, j});
-            s = mx::sum(mx::multiply(row_j, row_j), -1);
-            s = mx::flatten(s);
-        } else {
-            s = mx::array(0.0f);
-        }
-        auto diag_val = mx::sqrt(mx::maximum(
-            mx::subtract(mx::slice(mx::flatten(A), mx::Shape{j*n+j}, mx::Shape{j*n+j+1}), s),
-            mx::array(1e-6f)));
+    // GPU-native approximate inverse via Neumann series
+    auto diag_A = mx::diag(A);                                     // (n,)
+    auto D_inv = mx::reciprocal(mx::maximum(diag_A, mx::array(1e-10f)));  // (n,)
+    auto D_inv_mat = mx::diag(D_inv);                              // (n, n)
+    auto N = mx::subtract(mx::eye(n), mx::matmul(D_inv_mat, A));  // I - D^{-1}M
 
-        // Set L[j,j] = diag_val
-        std::vector<float> mask_data(n * n, 0.0f);
-        mask_data[j * n + j] = 1.0f;
-        auto pos_mask = mx::array(mask_data.data(), mx::Shape{n, n}, mx::float32);
-        L = mx::add(L, mx::multiply(pos_mask, diag_val));
+    // Neumann: (I + N + N^2 + N^3) @ D^{-1}
+    auto N2 = mx::matmul(N, N);
+    auto N3 = mx::matmul(N2, N);
+    auto poly = mx::add(mx::eye(n), mx::add(N, mx::add(N2, N3)));
+    d.qM_inv = mx::matmul(poly, D_inv_mat);
 
-        if (j < n - 1) {
-            mx::array s2(0.0f);
-            if (j > 0) {
-                auto below = mx::slice(L, mx::Shape{j+1, 0}, mx::Shape{n, j});
-                auto row_j2 = mx::slice(L, mx::Shape{j, 0}, mx::Shape{j + 1, j});
-                s2 = mx::sum(mx::multiply(below, mx::broadcast_to(row_j2, mx::Shape{n-j-1, j})), -1);
-            } else {
-                s2 = mx::zeros(mx::Shape{n - j - 1});
-            }
-
-            auto a_col = mx::flatten(mx::slice(A, mx::Shape{j+1, j}, mx::Shape{n, j+1}));
-            auto col = mx::divide(mx::subtract(a_col, mx::flatten(s2)), mx::flatten(diag_val));
-
-            // Set L[j+1:n, j] = col
-            std::vector<float> col_mask_data(n * n, 0.0f);
-            for (int i = j + 1; i < n; i++) col_mask_data[i * n + j] = 1.0f;
-            auto col_pos = mx::array(col_mask_data.data(), mx::Shape{n, n}, mx::float32);
-
-            // Expand col to (n, n) with values in the right positions
-            std::vector<float> col_expand_data(n * n, 0.0f);
-            // We need a smarter approach: scatter the column values
-            auto col_2d = mx::zeros({n, n});
-            for (int i = j + 1; i < n; i++) {
-                std::vector<float> m2(n * n, 0.0f);
-                m2[i * n + j] = 1.0f;
-                auto single = mx::array(m2.data(), mx::Shape{n, n}, mx::float32);
-                col_2d = mx::add(col_2d, mx::multiply(single,
-                    mx::slice(col, mx::Shape{i - j - 1}, mx::Shape{i - j})));
-            }
-            L = mx::add(L, col_2d);
-        }
-    }
-
-    d.qLD = L;
     return d;
 }
 
-// ── Vmap-compatible triangular solve ─────────────────────────────────────────
+// ── Vmap-compatible M^{-1} @ rhs using precomputed GPU inverse ──────────────
 
 mx::array vmap_solve_m(const Model& m, const Data& d, const mx::array& rhs) {
-    int n = m.nv;
-    auto L = d.qLD;
-    auto LT = mx::transpose(L);
-
-    // Forward substitution: L @ y = rhs
-    auto y = mx::zeros({n});
-    for (int i = 0; i < n; i++) {
-        mx::array s(0.0f);
-        if (i > 0) {
-            auto L_row = mx::flatten(mx::slice(L, mx::Shape{i, 0}, mx::Shape{i + 1, i}));
-            auto y_part = mx::slice(y, mx::Shape{0}, mx::Shape{i});
-            s = mx::sum(mx::multiply(L_row, y_part));
-        } else {
-            s = mx::array(0.0f);
-        }
-        auto Li = mx::flatten(mx::slice(L, mx::Shape{i, i}, mx::Shape{i+1, i+1}));
-        auto yi = mx::divide(mx::subtract(mx::slice(rhs, mx::Shape{i}, mx::Shape{i+1}), s), Li);
-
-        // Set y[i] = yi
-        std::vector<float> mask(n, 0.0f); mask[i] = 1.0f;
-        auto mi = mx::array(mask.data(), mx::Shape{n}, mx::float32);
-        y = mx::add(y, mx::multiply(mi, yi));
-    }
-
-    // Backward substitution: L^T @ x = y
-    auto x = mx::zeros({n});
-    for (int i = n - 1; i >= 0; i--) {
-        mx::array s(0.0f);
-        if (i < n - 1) {
-            auto LT_row = mx::flatten(mx::slice(LT, mx::Shape{i, i+1}, mx::Shape{i+1, n}));
-            auto x_part = mx::slice(x, mx::Shape{i+1}, mx::Shape{n});
-            s = mx::sum(mx::multiply(LT_row, x_part));
-        } else {
-            s = mx::array(0.0f);
-        }
-        auto LTi = mx::flatten(mx::slice(LT, mx::Shape{i, i}, mx::Shape{i+1, i+1}));
-        auto xi = mx::divide(mx::subtract(mx::slice(y, mx::Shape{i}, mx::Shape{i+1}), s), LTi);
-
-        std::vector<float> mask(n, 0.0f); mask[i] = 1.0f;
-        auto mi = mx::array(mask.data(), mx::Shape{n}, mx::float32);
-        x = mx::add(x, mx::multiply(mi, xi));
-    }
-
-    return x;
+    return mx::flatten(mx::matmul(d.qM_inv, mx::reshape(rhs, mx::Shape{m.nv, 1})));
 }
 
 // ── Vmap-compatible COM velocity ─────────────────────────────────────────────
@@ -326,19 +271,21 @@ Data vmap_rne(const Model& m, Data d) {
     auto vxIv = batched_motion_cross_force(d.cvel, Iv);
     auto loc_cfrc = mx::add(Ia, vxIv);
 
-    // Level-parallel backward force accumulation
-    std::vector<mx::array> cfrc(m.nbody, mx::array(0.0f));
-    for (int i = 0; i < m.nbody; i++) cfrc[i] = vrow(loc_cfrc, i);
-
+    // Level-parallel backward force accumulation using scatter matrices
+    auto cfrc_arr = mx::copy(loc_cfrc);  // (nb, 6)
     for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        for (int bid : c.tree_levels[lvl]) {
-            int pid = c.body_parentid_vec[bid];
-            cfrc[pid] = mx::add(cfrc[pid], cfrc[bid]);
-        }
+        const auto& level = c.tree_levels[lvl];
+        if (level.empty()) continue;
+        int nc = (int)level.size();
+        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
+        auto child_vals = mx::take(cfrc_arr, child_ids, 0);
+        std::vector<int> pids(nc);
+        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
+        std::vector<float> smat(m.nbody * nc, 0.0f);
+        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
+        auto scatter_mat = mx::array(smat.data(), mx::Shape{m.nbody, nc}, mx::float32);
+        cfrc_arr = mx::add(cfrc_arr, mx::matmul(scatter_mat, child_vals));
     }
-
-    // Vectorized joint-space projection
-    auto cfrc_arr = mx::stack(cfrc);
     auto dof_bid_arr = mx::array(c.dof_bodyid_vec.data(), mx::Shape{m.nv}, mx::int32);
     auto cfrc_dof = mx::take(cfrc_arr, dof_bid_arr, 0);
     d.qfrc_bias = mx::sum(mx::multiply(d.cdof, cfrc_dof), -1);
@@ -352,48 +299,13 @@ Data vmap_transmission(const Model& m, Data d) {
     if (m.nu == 0) return d;
     const auto& c = m.cache;
 
-    auto act_length = mx::zeros({m.nu});
-    auto act_moment = mx::zeros({m.nu, m.nv});
+    // Precomputed moment matrix (constant)
+    d.actuator_moment = c.act_moment_const;
 
-    // Use cache.dof_info and actuator properties
-    // For HINGE/SLIDE actuators: length = qpos[qa] * gear[0], moment[ai, da] = gear[0]
-    for (auto& ai_info : c.actuator_info) {
-        int ai = ai_info.act_idx;
-        int da = ai_info.dof_adr;
-        float g0 = ai_info.gain;
+    // Vectorized length: qpos[qa_indices] * gear
+    auto qpos_gathered = mx::take(d.qpos, c.act_qpos_idxs, 0);  // (nu,)
+    d.actuator_length = mx::multiply(qpos_gathered, c.act_gear);
 
-        // Set moment[ai, da] = g0
-        std::vector<float> m_mask(m.nu * m.nv, 0.0f);
-        m_mask[ai * m.nv + da] = 1.0f;
-        auto mask = mx::array(m_mask.data(), mx::Shape{m.nu, m.nv}, mx::float32);
-        act_moment = mx::add(act_moment, mx::multiply(mask, mx::array(g0)));
-    }
-
-    // Lengths: for each simple actuator, qpos[qa] * gear
-    for (auto& ai_info : c.actuator_info) {
-        int ai = ai_info.act_idx;
-        int ji = ai_info.jnt_idx;
-        float g0 = ai_info.gain;
-        int qa = c.dof_info[0].qpos_adr; // Need actual qa for this joint
-        // Find the qa from cache
-        for (auto& di : c.dof_info) {
-            if (di.jnt_idx == ji) {
-                qa = di.qpos_adr;
-                break;
-            }
-        }
-
-        auto qp = mx::slice(d.qpos, mx::Shape{qa}, mx::Shape{qa + 1});
-        auto len_val = mx::multiply(qp, mx::array(g0));
-
-        std::vector<float> l_mask(m.nu, 0.0f);
-        l_mask[ai] = 1.0f;
-        auto lm = mx::array(l_mask.data(), mx::Shape{m.nu}, mx::float32);
-        act_length = mx::add(act_length, mx::multiply(lm, mx::flatten(len_val)));
-    }
-
-    d.actuator_length = act_length;
-    d.actuator_moment = act_moment;
     return d;
 }
 

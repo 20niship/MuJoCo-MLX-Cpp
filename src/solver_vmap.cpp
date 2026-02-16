@@ -54,83 +54,9 @@ Data vmap_solve(const Model& m, Data d) {
 
     auto grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
 
-    bool use_newton = (m.opt.solver == SolverType::NEWTON);
-    mx::array Mgrad(0.0f), search(0.0f);
-
-    if (use_newton) {
-        // Newton: H = M + J_a^T diag(D_a) J_a, search = -H^{-1} grad
-        auto D_active = mx::multiply(d.efc_D, active);
-        auto sqrt_D = mx::sqrt(mx::maximum(D_active, mx::array(0.0f)));
-        auto J_scaled = mx::multiply(d.efc_J, mx::reshape(sqrt_D, {nefc, 1}));
-        auto JtDJ = mx::matmul(mx::transpose(J_scaled), J_scaled);
-        auto H = mx::add(d.qM, JtDJ);
-        H = mx::add(H, mx::multiply(mx::eye(m.nv), mx::array(MJMINVAL_SV * m.stat.meaninertia)));
-
-        // GPU Cholesky solve (reuse vmap_factor_m / vmap_solve_m inline)
-        int n = m.nv;
-        auto L = mx::zeros({n, n});
-        for (int j = 0; j < n; j++) {
-            mx::array s = (j > 0) ?
-                mx::flatten(mx::sum(mx::multiply(
-                    mx::slice(L, mx::Shape{j,0}, mx::Shape{j+1,j}),
-                    mx::slice(L, mx::Shape{j,0}, mx::Shape{j+1,j})), -1)) :
-                mx::array(0.0f);
-            auto diag_val = mx::sqrt(mx::maximum(
-                mx::subtract(mx::flatten(mx::slice(H, mx::Shape{j,j}, mx::Shape{j+1,j+1})), s),
-                mx::array(1e-6f)));
-
-            std::vector<float> pm(n*n, 0.0f); pm[j*n+j] = 1.0f;
-            L = mx::add(L, mx::multiply(mx::array(pm.data(), mx::Shape{n,n}, mx::float32), diag_val));
-
-            if (j < n-1) {
-                mx::array s2 = (j > 0) ?
-                    mx::sum(mx::multiply(
-                        mx::slice(L, mx::Shape{j+1,0}, mx::Shape{n,j}),
-                        mx::broadcast_to(mx::slice(L, mx::Shape{j,0}, mx::Shape{j+1,j}), mx::Shape{n-j-1,j})), -1) :
-                    mx::zeros(mx::Shape{n-j-1});
-                auto a_col = mx::flatten(mx::slice(H, mx::Shape{j+1,j}, mx::Shape{n,j+1}));
-                auto col = mx::divide(mx::subtract(a_col, mx::flatten(s2)), mx::flatten(diag_val));
-
-                auto col_2d = mx::zeros({n, n});
-                for (int i = j+1; i < n; i++) {
-                    std::vector<float> m2(n*n, 0.0f); m2[i*n+j] = 1.0f;
-                    col_2d = mx::add(col_2d, mx::multiply(
-                        mx::array(m2.data(), mx::Shape{n,n}, mx::float32),
-                        mx::slice(col, mx::Shape{i-j-1}, mx::Shape{i-j})));
-                }
-                L = mx::add(L, col_2d);
-            }
-        }
-
-        // Solve L L^T x = grad
-        auto LT = mx::transpose(L);
-        auto y = mx::zeros({n});
-        for (int i = 0; i < n; i++) {
-            mx::array sv = (i > 0) ?
-                mx::sum(mx::multiply(mx::flatten(mx::slice(L, mx::Shape{i,0}, mx::Shape{i+1,i})),
-                                      mx::slice(y, mx::Shape{0}, mx::Shape{i}))) :
-                mx::array(0.0f);
-            auto yi = mx::divide(mx::subtract(mx::slice(grad, mx::Shape{i}, mx::Shape{i+1}), sv),
-                                  mx::flatten(mx::slice(L, mx::Shape{i,i}, mx::Shape{i+1,i+1})));
-            std::vector<float> mi(n, 0.0f); mi[i] = 1.0f;
-            y = mx::add(y, mx::multiply(mx::array(mi.data(), mx::Shape{n}, mx::float32), yi));
-        }
-        auto x = mx::zeros({n});
-        for (int i = n-1; i >= 0; i--) {
-            mx::array sv = (i < n-1) ?
-                mx::sum(mx::multiply(mx::flatten(mx::slice(LT, mx::Shape{i,i+1}, mx::Shape{i+1,n})),
-                                      mx::slice(x, mx::Shape{i+1}, mx::Shape{n}))) :
-                mx::array(0.0f);
-            auto xi = mx::divide(mx::subtract(mx::slice(y, mx::Shape{i}, mx::Shape{i+1}), sv),
-                                  mx::flatten(mx::slice(LT, mx::Shape{i,i}, mx::Shape{i+1,i+1})));
-            std::vector<float> mi(n, 0.0f); mi[i] = 1.0f;
-            x = mx::add(x, mx::multiply(mx::array(mi.data(), mx::Shape{n}, mx::float32), xi));
-        }
-        search = mx::negative(x);
-    } else {
-        Mgrad = vmap_solve_m(m, d, grad);
-        search = mx::negative(Mgrad);
-    }
+    // Use M^{-1} as preconditioner for all solver types (avoids CPU cholesky in hot path)
+    auto Mgrad = vmap_solve_m(m, d, grad);
+    auto search = mx::negative(Mgrad);
 
     // Fixed-iteration solver loop
     for (int iter = 0; iter < m.opt.iterations; iter++) {
@@ -212,26 +138,15 @@ Data vmap_solve(const Model& m, Data d) {
 
         grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
 
-        if (use_newton) {
-            // Recompute Newton direction
-            auto D_active = mx::multiply(d.efc_D, active);
-            auto sqrt_D = mx::sqrt(mx::maximum(D_active, mx::array(0.0f)));
-            auto J_scaled = mx::multiply(d.efc_J, mx::reshape(sqrt_D, {nefc, 1}));
-            auto JtDJ = mx::matmul(mx::transpose(J_scaled), J_scaled);
-            auto H = mx::add(d.qM, JtDJ);
-            H = mx::add(H, mx::multiply(mx::eye(m.nv), mx::array(MJMINVAL_SV * m.stat.meaninertia)));
-            // Simplified: use preconditioned direction instead of full Newton to reduce graph size
-            search = mx::negative(vmap_solve_m(m, d, grad));
-        } else {
-            auto prev_grad = grad;
-            auto prev_Mgrad = Mgrad;
-            Mgrad = vmap_solve_m(m, d, grad);
-            auto beta_num = mx::sum(mx::multiply(grad, mx::subtract(Mgrad, prev_Mgrad)));
-            auto beta_den = mx::maximum(mx::array(MJMINVAL_SV),
-                                         mx::sum(mx::multiply(prev_grad, prev_Mgrad)));
-            auto beta = mx::maximum(mx::divide(beta_num, beta_den), mx::array(0.0f));
-            search = mx::add(mx::negative(Mgrad), mx::multiply(beta, search));
-        }
+        // Preconditioned CG direction using M^{-1} (all GPU, no CPU linalg)
+        auto prev_grad = grad;
+        auto prev_Mgrad = Mgrad;
+        Mgrad = vmap_solve_m(m, d, grad);
+        auto beta_num = mx::sum(mx::multiply(grad, mx::subtract(Mgrad, prev_Mgrad)));
+        auto beta_den = mx::maximum(mx::array(MJMINVAL_SV),
+                                     mx::sum(mx::multiply(prev_grad, prev_Mgrad)));
+        auto beta = mx::maximum(mx::divide(beta_num, beta_den), mx::array(0.0f));
+        search = mx::add(mx::negative(Mgrad), mx::multiply(beta, search));
     }
 
     d.qfrc_constraint = qfrc_constraint;

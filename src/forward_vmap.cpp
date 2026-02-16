@@ -17,22 +17,12 @@ static constexpr float MJMINVAL_FV = 1e-8f;
 static Data vmap_passive(const Model& m, Data d) {
     auto qfrc = mx::zeros(mx::Shape{m.nv});
 
-    // Spring forces: -stiffness * (qpos - qpos_spring)
-    if (m.jnt_stiffness.size() > 0 && m.njnt > 0) {
-        for (auto& di : m.cache.dof_info) {
-            int jt = di.jnt_type;
-            if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) {
-                int qa = di.qpos_adr;
-                int da = di.dof_idx;
-                auto stiff = mx::flatten(mx::slice(m.jnt_stiffness, mx::Shape{di.jnt_idx}, mx::Shape{di.jnt_idx + 1}));
-                auto diff = mx::subtract(mx::slice(d.qpos, mx::Shape{qa}, mx::Shape{qa+1}),
-                                          mx::slice(m.qpos_spring, mx::Shape{qa}, mx::Shape{qa+1}));
-                std::vector<float> mask(m.nv, 0.0f); mask[da] = 1.0f;
-                auto mi = mx::array(mask.data(), mx::Shape{m.nv}, mx::float32);
-                qfrc = mx::subtract(qfrc, mx::multiply(mi,
-                    mx::multiply(stiff, mx::flatten(diff))));
-            }
-        }
+    // Vectorized spring forces: -stiffness * (qpos[qa] - qpos_spring[qa])
+    if (m.cache.passive_stiffness.size() > 0 && m.njnt > 0) {
+        auto qpos_dofs = mx::take(d.qpos, m.cache.passive_qpos_idxs, 0);  // (nv,)
+        auto qspring_dofs = mx::take(m.qpos_spring, m.cache.passive_qpos_idxs, 0);  // (nv,)
+        auto diff = mx::subtract(qpos_dofs, qspring_dofs);
+        qfrc = mx::subtract(qfrc, mx::multiply(m.cache.passive_stiffness, diff));
     }
 
     // Damper forces: -damping * qvel
@@ -126,27 +116,51 @@ Data vmap_forward(const Model& m, Data d) {
     d = vmap_com_pos(m, d);
     d = vmap_crb(m, d);
     d = vmap_factor_m(m, d);
+
+#if defined(VMAP_MINIMAL)
+    d.qfrc_smooth = mx::zeros(mx::Shape{m.nv});
+    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
+#elif defined(VMAP_NO_SOLVER)
     d = vmap_collision(m, d);
     d = vmap_make_constraint(m, d);
     d = vmap_transmission(m, d);
-
-    // Velocity-dependent
     if (m.nu > 0 && d.actuator_moment.size() > 0) {
         d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
                                                       mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
     }
-
     d = vmap_com_vel(m, d);
     d = vmap_passive(m, d);
     d = vmap_rne(m, d);
-
-    // Actuation
     d = vmap_fwd_actuation(m, d);
-
-    // Acceleration
     d = vmap_fwd_acceleration(m, d);
-
-    // Solve constraints
+    d.qacc = d.qacc_smooth;
+    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
+#elif defined(VMAP_NO_COLLISION)
+    d = vmap_transmission(m, d);
+    if (m.nu > 0 && d.actuator_moment.size() > 0) {
+        d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
+                                                      mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
+    }
+    d = vmap_com_vel(m, d);
+    d = vmap_passive(m, d);
+    d = vmap_rne(m, d);
+    d = vmap_fwd_actuation(m, d);
+    d = vmap_fwd_acceleration(m, d);
+    d.qacc = d.qacc_smooth;
+    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
+#else
+    d = vmap_collision(m, d);
+    d = vmap_make_constraint(m, d);
+    d = vmap_transmission(m, d);
+    if (m.nu > 0 && d.actuator_moment.size() > 0) {
+        d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
+                                                      mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
+    }
+    d = vmap_com_vel(m, d);
+    d = vmap_passive(m, d);
+    d = vmap_rne(m, d);
+    d = vmap_fwd_actuation(m, d);
+    d = vmap_fwd_acceleration(m, d);
     int nefc_count = d.efc_J.shape(0);
     if (nefc_count == 0) {
         d.qacc = d.qacc_smooth;
@@ -154,6 +168,7 @@ Data vmap_forward(const Model& m, Data d) {
     } else {
         d = vmap_solve(m, d);
     }
+#endif
 
     return d;
 }

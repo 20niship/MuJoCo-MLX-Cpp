@@ -604,11 +604,22 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
             auto gxmat   = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
 
             // ── Phase 2: compile(vmap(forward_dynamics)) ──
+#ifdef PHASE2_SKIP
+            // Dummy forward for timing Metal kernels only
+            std::vector<mx::array> mid = {
+                mx::zeros({B, nv*nv}),   // qM
+                mx::zeros({B, nv}),       // qfrc_smooth
+                mx::zeros({B, nv}),       // qfrc_constraint
+                mx::flatten(xpos)         // xpos_flat → (B, nb*3) via reshape below
+            };
+            mid[3] = mx::reshape(mid[3], {B, nb*3});
+#else
             auto mid = vmapped_fwd({
                 qpos_batch, qvel_batch, ctrl_batch,
                 xpos, xquat, xmat, xipos, ximat,
                 xanchor, xaxis, gxpos, gxmat
             });
+#endif
             // mid[0] = qM (B, nv*nv), mid[1] = qfrc_smooth (B, nv)
             // mid[2] = qfrc_constraint (B, nv), mid[3] = xpos_flat (B, nb*3)
 
@@ -636,9 +647,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
             return {new_qpos, new_qvel, xpos_out};
         };
 
-        // Return pipeline directly (skip compile for debugging)
-        // TODO: re-enable: return mx::compile(pipeline);
-        return pipeline;
+        // Wrap in compile for fused Metal execution
+        auto compiled = mx::compile(pipeline);
+        return compiled;
     }
 
     // ── Fallback: per-env loop using validated scalar pipeline ──

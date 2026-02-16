@@ -375,10 +375,10 @@ mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel) {
     auto iw2 = mx::add(mx::add(mx::multiply(I02,w0), mx::multiply(I12,w1)), mx::multiply(I22,w2));
     auto iw = mx::concatenate({iw0, iw1, iw2}, nd-1);
 
-    auto pcl = batched_cross(pos, lin);
+    auto pcl = mx::linalg::cross(pos, lin);
     auto ang_out = mx::add(iw, pcl);
     auto ml = mx::multiply(mass, lin);
-    auto pca = batched_cross(pos, ang);
+    auto pca = mx::linalg::cross(pos, ang);
     auto lin_out = mx::subtract(ml, pca);
 
     return mx::concatenate({ang_out, lin_out}, nd-1);
@@ -394,8 +394,8 @@ mx::array batched_motion_cross_force(const mx::array& v, const mx::array& f) {
     };
     auto va = sl(v,0,3); auto vl = sl(v,3,6);
     auto fa = sl(f,0,3); auto fl = sl(f,3,6);
-    auto ang = mx::add(batched_cross(va, fa), batched_cross(vl, fl));
-    auto lin = batched_cross(va, fl);
+    auto ang = mx::add(mx::linalg::cross(va, fa), mx::linalg::cross(vl, fl));
+    auto lin = mx::linalg::cross(va, fl);
     return mx::concatenate({ang, lin}, nd-1);
 }
 
