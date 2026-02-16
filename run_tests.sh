@@ -67,6 +67,7 @@ run_test test_forward_full
 run_test test_physics_full
 run_test test_collision_full
 run_test test_linalg_full
+run_test test_vmap_smooth
 
 # Model-dependent tests
 if [ -n "$MODEL" ]; then
