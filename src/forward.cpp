@@ -433,4 +433,19 @@ MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* dat
   }
 }
 
+MJMLX_API void mjmlx_grad_step(
+    const MjmlxModel* model,
+    const MjmlxData* data,
+    float* grad_out) {
+  (void)model; (void)data; (void)grad_out;
+  // TODO: Phase 3 -- differentiable physics for empowerment
+}
+
+MJMLX_API void mjmlx_batched_grad_step(
+    MjmlxBatchedSim* sim,
+    float* grad_out) {
+  (void)sim; (void)grad_out;
+  // TODO: Phase 3 -- batched differentiable physics
+}
+
 }  // extern "C"

@@ -1,0 +1,565 @@
+// Copyright 2026 Arghya Sur
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Unified dual-backend implementation.
+// Dispatches to MuJoCo C (CPU) or MuJoCo-MLX (Metal GPU).
+
+#include "mjmlx/mjb.h"
+#include "mjmlx/mjmlx.h"
+#include <mujoco/mujoco.h>
+#include <dispatch/dispatch.h>
+#include <cstring>
+#include <vector>
+#include <cstdio>
+
+// ── Opaque handle definitions ────────────────────────────────────────────
+
+struct MjbBackend {
+    MjbBackendType type;
+};
+
+struct MjbModel {
+    MjbBackendType type;
+    // CPU backend
+    mjModel* mj = nullptr;
+    // MLX backend
+    MjmlxModel* mlx = nullptr;
+
+    ~MjbModel() {
+        if (mj) mj_deleteModel(mj);
+        if (mlx) mjmlx_free_model(mlx);
+    }
+};
+
+struct MjbData {
+    MjbBackendType type;
+    MjbModel* model_ref = nullptr;
+
+    // CPU backend
+    mjData* mj = nullptr;
+    mutable std::vector<float> fbuf;  // double->float conversion buffer
+
+    // MLX backend
+    MjmlxData* mlx = nullptr;
+
+    ~MjbData() {
+        if (mj) mj_deleteData(mj);
+        if (mlx) mjmlx_free_data(mlx);
+    }
+};
+
+struct MjbBatchedSim {
+    MjbBackendType type;
+    MjbModel* model_ref = nullptr;
+    int num_envs = 0;
+
+    // CPU backend: N independent mjData* + contiguous float buffers
+    std::vector<mjData*> cpu_datas;
+    mutable std::vector<float> qpos_buf, qvel_buf, xpos_buf;
+    mutable std::vector<float> subtree_com_buf, cinert_buf, cvel_buf;
+    mutable std::vector<float> qfrc_actuator_buf, cfrc_ext_buf;
+
+    // MLX backend
+    MjmlxBatchedSim* mlx_sim = nullptr;
+
+    ~MjbBatchedSim() {
+        for (auto* d : cpu_datas) if (d) mj_deleteData(d);
+        if (mlx_sim) mjmlx_batched_free(mlx_sim);
+    }
+};
+
+// ── CPU helpers ─────────────────────────────────────────────────────────
+
+// Convert double array to float buffer, return pointer
+static const float* d2f(const double* src, int n, std::vector<float>& buf) {
+    buf.resize(n);
+    for (int i = 0; i < n; i++) buf[i] = static_cast<float>(src[i]);
+    return buf.data();
+}
+
+// Fill float buffer from double array, return size
+static const float* cpu_get(const double* src, int n, int* n_out, std::vector<float>& buf) {
+    if (n_out) *n_out = n;
+    if (n == 0) return nullptr;
+    return d2f(src, n, buf);
+}
+
+// ── Backend lifecycle ───────────────────────────────────────────────────
+
+extern "C" {
+
+MJB_API MjbBackend* mjb_create_backend(MjbBackendType type) {
+    auto* b = new MjbBackend();
+    b->type = type;
+    return b;
+}
+
+MJB_API void mjb_free_backend(MjbBackend* backend) {
+    delete backend;
+}
+
+MJB_API MjbBackendType mjb_backend_type(const MjbBackend* backend) {
+    return backend ? backend->type : MJB_BACKEND_CPU;
+}
+
+// ── Model I/O ───────────────────────────────────────────────────────────
+
+MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path) {
+    if (!b || !xml_path) return nullptr;
+    auto* m = new MjbModel();
+    m->type = b->type;
+    try {
+        if (b->type == MJB_BACKEND_CPU) {
+            char error[1000] = "";
+            m->mj = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+            if (!m->mj) {
+                fprintf(stderr, "mjb_load_model CPU error: %s\n", error);
+                delete m;
+                return nullptr;
+            }
+        } else {
+            m->mlx = mjmlx_load_model(xml_path);
+            if (!m->mlx) { delete m; return nullptr; }
+        }
+    } catch (...) {
+        delete m;
+        return nullptr;
+    }
+    return m;
+}
+
+MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only) {
+    if (!b || !xml_path) return nullptr;
+    auto* m = new MjbModel();
+    m->type = b->type;
+    try {
+        if (b->type == MJB_BACKEND_CPU) {
+            char error[1000] = "";
+            m->mj = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+            if (!m->mj) {
+                fprintf(stderr, "mjb_load_model_filtered CPU error: %s\n", error);
+                delete m;
+                return nullptr;
+            }
+            if (foot_contacts_only) {
+                // Apply foot-contacts-only filter (same as mjmlx)
+                int floor_id = mj_name2id(m->mj, mjOBJ_GEOM, "floor");
+                int rfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "right_foot");
+                int lfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "left_foot");
+                for (int i = 0; i < m->mj->ngeom; i++) {
+                    if (i != floor_id && i != rfoot_id && i != lfoot_id) {
+                        m->mj->geom_contype[i] = 0;
+                        m->mj->geom_conaffinity[i] = 0;
+                    }
+                }
+            }
+        } else {
+            m->mlx = mjmlx_load_model_filtered(xml_path, foot_contacts_only);
+            if (!m->mlx) { delete m; return nullptr; }
+        }
+    } catch (...) {
+        delete m;
+        return nullptr;
+    }
+    return m;
+}
+
+MJB_API void mjb_free_model(MjbModel* model) {
+    delete model;
+}
+
+// ── Model accessors ─────────────────────────────────────────────────────
+
+MJB_API MjbModelInfo mjb_model_info(const MjbModel* model) {
+    if (!model) return {};
+    if (model->type == MJB_BACKEND_CPU) {
+        return {(int)model->mj->nq, (int)model->mj->nv, (int)model->mj->nu,
+                (int)model->mj->nbody, (int)model->mj->njnt, (int)model->mj->ngeom};
+    } else {
+        MjmlxModelInfo mi = mjmlx_model_info(model->mlx);
+        return {mi.nq, mi.nv, mi.nu, mi.nbody, mi.njnt, mi.ngeom};
+    }
+}
+
+MJB_API float mjb_model_opt_timestep(const MjbModel* model) {
+    if (!model) return 0.0f;
+    if (model->type == MJB_BACKEND_CPU) return (float)model->mj->opt.timestep;
+    return mjmlx_model_opt_timestep(model->mlx);
+}
+
+MJB_API void mjb_model_set_opt_timestep(MjbModel* model, float dt) {
+    if (!model) return;
+    if (model->type == MJB_BACKEND_CPU) model->mj->opt.timestep = dt;
+    else mjmlx_model_set_opt_timestep(model->mlx, dt);
+}
+
+MJB_API float mjb_model_body_mass(const MjbModel* model, int body_id) {
+    if (!model) return 0.0f;
+    if (model->type == MJB_BACKEND_CPU) {
+        if (body_id < 0 || body_id >= model->mj->nbody) return 0.0f;
+        return (float)model->mj->body_mass[body_id];
+    }
+    return mjmlx_model_body_mass(model->mlx, body_id);
+}
+
+MJB_API int mjb_name2id(const MjbModel* model, int obj_type, const char* name) {
+    if (!model || !name) return -1;
+    if (model->type == MJB_BACKEND_CPU) return mj_name2id(model->mj, obj_type, name);
+    return mjmlx_name2id(model->mlx, obj_type, name);
+}
+
+// ── Data lifecycle ──────────────────────────────────────────────────────
+
+MJB_API MjbData* mjb_make_data(MjbModel* model) {
+    if (!model) return nullptr;
+    auto* d = new MjbData();
+    d->type = model->type;
+    d->model_ref = model;
+    try {
+        if (model->type == MJB_BACKEND_CPU) {
+            d->mj = mj_makeData(model->mj);
+            if (!d->mj) { delete d; return nullptr; }
+        } else {
+            d->mlx = mjmlx_make_data(model->mlx);
+            if (!d->mlx) { delete d; return nullptr; }
+        }
+    } catch (...) {
+        delete d;
+        return nullptr;
+    }
+    return d;
+}
+
+MJB_API void mjb_free_data(MjbData* data) {
+    delete data;
+}
+
+MJB_API void mjb_reset_data(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        mj_resetData(model->mj, data->mj);
+    } else {
+        mjmlx_reset_data(model->mlx, data->mlx);
+    }
+}
+
+// ── Simulation ──────────────────────────────────────────────────────────
+
+MJB_API void mjb_step(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) mj_step(model->mj, data->mj);
+    else mjmlx_step(model->mlx, data->mlx);
+}
+
+MJB_API void mjb_forward(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) mj_forward(model->mj, data->mj);
+    else mjmlx_forward(model->mlx, data->mlx);
+}
+
+MJB_API void mjb_step1(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) mj_step1(model->mj, data->mj);
+    else mjmlx_step1(model->mlx, data->mlx);
+}
+
+MJB_API void mjb_step2(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) mj_step2(model->mj, data->mj);
+    else mjmlx_step2(model->mlx, data->mlx);
+}
+
+MJB_API void mjb_kinematics(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) mj_kinematics(model->mj, data->mj);
+    else mjmlx_kinematics(model->mlx, data->mlx);
+}
+
+// ── State access ────────────────────────────────────────────────────────
+
+MJB_API void mjb_set_qpos(MjbData* data, const float* qpos, int n) {
+    if (!data || !qpos || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        for (int i = 0; i < n; i++) data->mj->qpos[i] = qpos[i];
+    } else {
+        mjmlx_set_qpos(data->mlx, qpos, n);
+    }
+}
+
+MJB_API void mjb_set_qvel(MjbData* data, const float* qvel, int n) {
+    if (!data || !qvel || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        for (int i = 0; i < n; i++) data->mj->qvel[i] = qvel[i];
+    } else {
+        mjmlx_set_qvel(data->mlx, qvel, n);
+    }
+}
+
+MJB_API void mjb_set_ctrl(MjbData* data, const float* ctrl, int n) {
+    if (!data || !ctrl || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        for (int i = 0; i < n; i++) data->mj->ctrl[i] = ctrl[i];
+    } else {
+        mjmlx_set_ctrl(data->mlx, ctrl, n);
+    }
+}
+
+MJB_API const float* mjb_get_qpos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->qpos, data->model_ref->mj->nq, n_out, data->fbuf);
+    return mjmlx_get_qpos(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_qvel(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->qvel, data->model_ref->mj->nv, n_out, data->fbuf);
+    return mjmlx_get_qvel(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_ctrl(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->ctrl, data->model_ref->mj->nu, n_out, data->fbuf);
+    return mjmlx_get_ctrl(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_xpos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->xpos, data->model_ref->mj->nbody * 3, n_out, data->fbuf);
+    return mjmlx_get_xpos(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_xquat(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->xquat, data->model_ref->mj->nbody * 4, n_out, data->fbuf);
+    return mjmlx_get_xquat(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_xipos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->xipos, data->model_ref->mj->nbody * 3, n_out, data->fbuf);
+    return mjmlx_get_xipos(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_cvel(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->cvel, data->model_ref->mj->nbody * 6, n_out, data->fbuf);
+    return mjmlx_get_cvel(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_qfrc_actuator(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->qfrc_actuator, data->model_ref->mj->nv, n_out, data->fbuf);
+    return mjmlx_get_qfrc_actuator(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_subtree_com(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->subtree_com, data->model_ref->mj->nbody * 3, n_out, data->fbuf);
+    return mjmlx_get_subtree_com(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_cinert(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->cinert, data->model_ref->mj->nbody * 10, n_out, data->fbuf);
+    return mjmlx_get_cinert(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_cfrc_ext(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->cfrc_ext, data->model_ref->mj->nbody * 6, n_out, data->fbuf);
+    return mjmlx_get_cfrc_ext(data->mlx, n_out);
+}
+
+// ── Batched simulation ──────────────────────────────────────────────────
+
+MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfig* config) {
+    if (!model || !config || config->num_envs <= 0) return nullptr;
+    auto* sim = new MjbBatchedSim();
+    sim->type = model->type;
+    sim->model_ref = model;
+    sim->num_envs = config->num_envs;
+
+    try {
+        if (model->type == MJB_BACKEND_CPU) {
+            // Create N independent mjData instances for parallel stepping
+            sim->cpu_datas.resize(config->num_envs);
+            for (int i = 0; i < config->num_envs; i++) {
+                sim->cpu_datas[i] = mj_makeData(model->mj);
+                if (!sim->cpu_datas[i]) { delete sim; return nullptr; }
+            }
+            if (config->solver_iterations > 0) {
+                model->mj->opt.iterations = config->solver_iterations;
+            }
+        } else {
+            MjmlxBatchedConfig mlx_config = {};
+            mlx_config.num_envs = config->num_envs;
+            mlx_config.foot_contacts_only = config->foot_contacts_only;
+            mlx_config.integrator = MJMLX_INTEGRATOR_EULER;
+            mlx_config.use_gpu = 1;
+            mlx_config.solver_iterations = config->solver_iterations;
+            sim->mlx_sim = mjmlx_batched_create(model->mlx, &mlx_config);
+            if (!sim->mlx_sim) { delete sim; return nullptr; }
+        }
+    } catch (...) {
+        delete sim;
+        return nullptr;
+    }
+    return sim;
+}
+
+MJB_API void mjb_batched_free(MjbBatchedSim* sim) {
+    delete sim;
+}
+
+MJB_API void mjb_batched_step(MjbBatchedSim* sim, const float* ctrl) {
+    if (!sim || !ctrl) return;
+
+    if (sim->type == MJB_BACKEND_CPU) {
+        int ne = sim->num_envs;
+        int nu = sim->model_ref->mj->nu;
+        mjModel* m = sim->model_ref->mj;
+
+        // Parallel step using Grand Central Dispatch
+        dispatch_apply((size_t)ne,
+            dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+            ^(size_t i) {
+                mjData* d = sim->cpu_datas[i];
+                for (int j = 0; j < nu; j++)
+                    d->ctrl[j] = (double)ctrl[i * nu + j];
+                mj_step(m, d);
+            }
+        );
+    } else {
+        mjmlx_batched_step(sim->mlx_sim, ctrl);
+    }
+}
+
+MJB_API void mjb_batched_reset(MjbBatchedSim* sim, const int* reset_mask) {
+    if (!sim || !reset_mask) return;
+
+    if (sim->type == MJB_BACKEND_CPU) {
+        mjModel* m = sim->model_ref->mj;
+        for (int i = 0; i < sim->num_envs; i++) {
+            if (reset_mask[i]) {
+                mj_resetData(m, sim->cpu_datas[i]);
+            }
+        }
+    } else {
+        mjmlx_batched_reset(sim->mlx_sim, reset_mask);
+    }
+}
+
+// CPU batched state: gather from N mjData* into contiguous float buffer
+static const float* cpu_batched_gather(
+    const MjbBatchedSim* sim,
+    const double* (getter)(const mjData*),
+    int per_env, int* n_out,
+    std::vector<float>& buf)
+{
+    int ne = sim->num_envs;
+    int total = ne * per_env;
+    buf.resize(total);
+    for (int i = 0; i < ne; i++) {
+        const double* src = getter(sim->cpu_datas[i]);
+        for (int j = 0; j < per_env; j++)
+            buf[i * per_env + j] = (float)src[j];
+    }
+    if (n_out) *n_out = total;
+    return buf.data();
+}
+
+// Macros for CPU batched getters
+#define CPU_BATCHED_GET(field, per_env) \
+    cpu_batched_gather(sim, [](const mjData* d) -> const double* { return d->field; }, \
+                       per_env, n_out, sim->field##_buf)
+
+MJB_API const float* mjb_batched_get_qpos(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(qpos, sim->model_ref->mj->nq);
+    return mjmlx_batched_get_qpos(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_qvel(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(qvel, sim->model_ref->mj->nv);
+    return mjmlx_batched_get_qvel(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(xpos, sim->model_ref->mj->nbody * 3);
+    return mjmlx_batched_get_xpos(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(subtree_com, sim->model_ref->mj->nbody * 3);
+    return mjmlx_batched_get_subtree_com(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_cinert(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(cinert, sim->model_ref->mj->nbody * 10);
+    return mjmlx_batched_get_cinert(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(cvel, sim->model_ref->mj->nbody * 6);
+    return mjmlx_batched_get_cvel(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_qfrc_actuator(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(qfrc_actuator, sim->model_ref->mj->nv);
+    return mjmlx_batched_get_qfrc_actuator(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_cfrc_ext(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU)
+        return CPU_BATCHED_GET(cfrc_ext, sim->model_ref->mj->nbody * 6);
+    return mjmlx_batched_get_cfrc_ext(sim->mlx_sim, n_out);
+}
+
+#undef CPU_BATCHED_GET
+
+// ── Differentiable simulation ───────────────────────────────────────────
+
+MJB_API int mjb_grad_step(MjbModel* model, MjbData* data, float* grad_out) {
+    if (!model || !data || !grad_out) return -1;
+    if (model->type == MJB_BACKEND_CPU) return -1;  // CPU doesn't support grad
+    mjmlx_grad_step(model->mlx, data->mlx, grad_out);
+    return 0;
+}
+
+}  // extern "C"

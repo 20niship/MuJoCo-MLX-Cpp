@@ -169,6 +169,42 @@ if(MUJOCO_PKG_DIR AND _MJ_DYLIB_PATH)
     endif()
 endif()
 
+# ── Unified backend library: libmjb ──────────────────────────
+add_library(mjb SHARED src/mjb.cpp)
+target_include_directories(mjb
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(mjb PRIVATE mjmlx mujoco_imported)
+set_target_properties(mjb PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 0
+    BUILD_RPATH "${MLX_ROOT}/lib"
+    INSTALL_RPATH "${MLX_ROOT}/lib"
+)
+
+# Fix MuJoCo dylib reference for libmjb
+if(MUJOCO_PKG_DIR AND _MJ_DYLIB_PATH AND _MJ_OLD_NAME)
+    add_custom_command(TARGET mjb POST_BUILD
+        COMMAND install_name_tool -change
+            "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+            "$<TARGET_FILE:mjb>"
+        COMMENT "Fixing MuJoCo dylib for libmjb"
+    )
+endif()
+
+install(TARGETS mjb
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
 # ── Tests ─────────────────────────────────────────────────────
 if(MJMLX_BUILD_TESTS)
     enable_testing()
