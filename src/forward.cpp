@@ -291,4 +291,54 @@ MJMLX_API const float* mjmlx_get_qfrc_bias(const MjmlxData* data, int* n_out) {
   return get_array_ptr(data->data.qfrc_bias, n_out);
 }
 
+MJMLX_API const float* mjmlx_get_qacc(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qacc, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_qfrc_constraint(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qfrc_constraint, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_qfrc_actuator(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qfrc_actuator, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_qfrc_passive(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qfrc_passive, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_qfrc_smooth(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qfrc_smooth, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_qacc_smooth(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qacc_smooth, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_subtree_com(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.subtree_com, n_out);
+}
+
+MJMLX_API const float* mjmlx_get_cinert(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.cinert, n_out);
+}
+
+MJMLX_API int mjmlx_get_ncon(const MjmlxData* data) {
+  if (!data) return 0;
+  return data->data.ncon;
+}
+
+MJMLX_API int mjmlx_get_nefc(const MjmlxData* data) {
+  if (!data) return 0;
+  return data->data.nefc;
+}
+
 }  // extern "C"

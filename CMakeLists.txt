@@ -182,6 +182,38 @@ if(MJMLX_BUILD_TESTS)
     target_link_libraries(test_forward PRIVATE mjmlx)
     add_executable(test_batched tests/test_batched.cpp)
     target_link_libraries(test_batched PRIVATE mjmlx)
+
+    # Full test suite (ported from Python 228 tests)
+    # All full tests need mjmlx + mujoco + internal headers
+    # Tests using C API + MuJoCo C reference
+    foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full)
+        add_executable(${_test} tests/${_test}.cpp)
+        target_link_libraries(${_test} PRIVATE mjmlx mujoco_imported)
+        target_include_directories(${_test} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+    endforeach()
+
+    # Math test needs internal symbols -- link math.cpp directly
+    add_executable(test_math_full tests/test_math_full.cpp src/math.cpp)
+    target_link_libraries(test_math_full PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_math_full PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    # Fix MuJoCo dylib reference for test executables that link mujoco_imported
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full)
+            add_custom_command(TARGET ${_test} POST_BUILD
+                COMMAND install_name_tool -change
+                    "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                    "$<TARGET_FILE:${_test}>"
+                COMMENT "Fixing MuJoCo dylib for ${_test}"
+            )
+        endforeach()
+    endif()
 endif()
 
 # ── Python bindings ───────────────────────────────────────────

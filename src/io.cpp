@@ -20,6 +20,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <unistd.h>
 
 namespace mjmlx {
 
@@ -231,12 +232,25 @@ Model load_model(const char* xml_path) {
 }
 
 Model load_model_from_string(const char* xml_string) {
-    char error[1000] = "";
-    mjModel* m = mj_loadXML(nullptr, nullptr, error, sizeof(error));
-    // mj_loadXML doesn't support string loading directly.
-    // We need to use mj_loadXML with a VFS or write to a temp file.
-    // For now, throw not implemented.
-    throw std::runtime_error("load_model_from_string not yet implemented -- use load_model with a file path");
+    // Write XML to a temp file and load via mj_loadXML
+    char tmppath[] = "/tmp/mjmlx_model_XXXXXX.xml";
+    int fd = mkstemps(tmppath, 4);
+    if (fd < 0) throw std::runtime_error("Failed to create temp file for XML");
+    size_t len = strlen(xml_string);
+    ssize_t written = write(fd, xml_string, len);
+    close(fd);
+    if (written != (ssize_t)len) {
+        unlink(tmppath);
+        throw std::runtime_error("Failed to write XML to temp file");
+    }
+    try {
+        Model model = load_model(tmppath);
+        unlink(tmppath);
+        return model;
+    } catch (...) {
+        unlink(tmppath);
+        throw;
+    }
 }
 
 Data make_data(const Model& model) {
@@ -560,6 +574,84 @@ void Model::init_cache() const {
                 cache.collision_pairs.push_back(cp);
             }
         }
+
+        // Add explicit <pair> directives (even if contype/conaffinity mask is 0)
+        if (npair > 0 && pair_geom1.size() > 0) {
+            mx::eval(pair_geom1); mx::eval(pair_geom2);
+            auto pg1 = pair_geom1.data<int>();
+            auto pg2 = pair_geom2.data<int>();
+
+            // Optional pair properties
+            bool has_dim = (pair_dim.size() > 0);
+            bool has_margin = (pair_margin.size() > 0);
+            bool has_gap = (pair_gap.size() > 0);
+            bool has_solref = (pair_solref.size() > 0);
+            bool has_solimp = (pair_solimp.size() > 0);
+            bool has_friction = (pair_friction.size() > 0);
+            if (has_dim) mx::eval(pair_dim);
+            if (has_margin) mx::eval(pair_margin);
+            if (has_gap) mx::eval(pair_gap);
+            if (has_solref) mx::eval(pair_solref);
+            if (has_solimp) mx::eval(pair_solimp);
+            if (has_friction) mx::eval(pair_friction);
+
+            for (int pi = 0; pi < npair; pi++) {
+                int g1_ = pg1[pi], g2_ = pg2[pi];
+                int t1_ = gtype[g1_], t2_ = gtype[g2_];
+                // Canonical order: lower type first
+                if (t1_ > t2_) { std::swap(g1_, g2_); std::swap(t1_, t2_); }
+
+                // Check if this pair is already in the list (dedup)
+                bool dup = false;
+                for (auto& existing : cache.collision_pairs) {
+                    if ((existing.g1 == g1_ && existing.g2 == g2_) ||
+                        (existing.g1 == g2_ && existing.g2 == g1_)) {
+                        dup = true; break;
+                    }
+                }
+                if (dup) continue;
+
+                ModelCache::CollisionPair cp;
+                cp.g1 = g1_; cp.g2 = g2_;
+                cp.type1 = t1_; cp.type2 = t2_;
+                cp.body1 = gbid[g1_]; cp.body2 = gbid[g2_];
+                cp.margin = has_margin ? pair_margin.data<float>()[pi] :
+                            (gmargin_ptr[g1_] + gmargin_ptr[g2_]);
+                cp.gap = has_gap ? pair_gap.data<float>()[pi] : 0.0f;
+                for (int k = 0; k < 3; k++) {
+                    cp.size1[k] = gsize_ptr[g1_ * 3 + k];
+                    cp.size2[k] = gsize_ptr[g2_ * 3 + k];
+                }
+                if (has_friction) {
+                    auto fp = pair_friction.data<float>();
+                    for (int k = 0; k < 5; k++) cp.friction[k] = fp[pi * 5 + k];
+                } else if (geom_friction.size() > 0) {
+                    auto gf = geom_friction.data<float>();
+                    float f0 = std::max(gf[g1_*3], gf[g2_*3]);
+                    cp.friction[0] = f0; cp.friction[1] = f0;
+                    cp.friction[2] = std::max(gf[g1_*3+1], gf[g2_*3+1]);
+                    cp.friction[3] = std::max(gf[g1_*3+2], gf[g2_*3+2]);
+                    cp.friction[4] = cp.friction[3];
+                }
+                if (has_solref) {
+                    auto sr = pair_solref.data<float>();
+                    cp.solref[0] = sr[pi * 2]; cp.solref[1] = sr[pi * 2 + 1];
+                } else {
+                    cp.solref[0] = 0.02f; cp.solref[1] = 1.0f;
+                }
+                if (has_solimp) {
+                    auto si = pair_solimp.data<float>();
+                    for (int k = 0; k < 5; k++) cp.solimp[k] = si[pi * 5 + k];
+                } else {
+                    float def[] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+                    for (int k = 0; k < 5; k++) cp.solimp[k] = def[k];
+                }
+                cp.condim = has_dim ? pair_dim.data<int>()[pi] : 3;
+
+                cache.collision_pairs.push_back(cp);
+            }
+        }
+
         cache.max_ncon = (int)cache.collision_pairs.size();
     }
 

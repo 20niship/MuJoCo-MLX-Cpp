@@ -89,6 +89,16 @@ MJMLX_API const float* mjmlx_get_xquat(const MjmlxData* data, int* n_out);  // b
 MJMLX_API const float* mjmlx_get_xipos(const MjmlxData* data, int* n_out);  // body COM positions [nbody*3]
 MJMLX_API const float* mjmlx_get_cvel(const MjmlxData* data, int* n_out);   // body COM velocities [nbody*6]
 MJMLX_API const float* mjmlx_get_qfrc_bias(const MjmlxData* data, int* n_out); // Coriolis+gravity [nv]
+MJMLX_API const float* mjmlx_get_qacc(const MjmlxData* data, int* n_out);     // acceleration [nv]
+MJMLX_API const float* mjmlx_get_qfrc_constraint(const MjmlxData* data, int* n_out); // constraint forces [nv]
+MJMLX_API const float* mjmlx_get_qfrc_actuator(const MjmlxData* data, int* n_out);   // actuator forces [nv]
+MJMLX_API const float* mjmlx_get_qfrc_passive(const MjmlxData* data, int* n_out);    // passive forces [nv]
+MJMLX_API const float* mjmlx_get_qfrc_smooth(const MjmlxData* data, int* n_out);     // smooth forces [nv]
+MJMLX_API const float* mjmlx_get_qacc_smooth(const MjmlxData* data, int* n_out);     // smooth acceleration [nv]
+MJMLX_API const float* mjmlx_get_subtree_com(const MjmlxData* data, int* n_out);     // subtree COM [nbody*3]
+MJMLX_API const float* mjmlx_get_cinert(const MjmlxData* data, int* n_out);          // body inertias [nbody*10]
+MJMLX_API int mjmlx_get_ncon(const MjmlxData* data);                                 // number of contacts
+MJMLX_API int mjmlx_get_nefc(const MjmlxData* data);                                 // constraint rows
 
 // ============================================================
 // Batched simulation (compile + vmap -- Metal GPU)

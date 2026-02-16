@@ -250,6 +250,81 @@ Data collision(const Model& m, Data d) {
         }
     }
 
+    // Process explicit <pair> directives (even when contype=0, conaffinity=0)
+    if (m.npair > 0 && m.pair_geom1.size() > 0) {
+        mx::eval(m.pair_geom1); mx::eval(m.pair_geom2);
+        auto pg1 = m.pair_geom1.data<int>();
+        auto pg2 = m.pair_geom2.data<int>();
+
+        for (int pi = 0; pi < m.npair; pi++) {
+            int g1_ = pg1[pi], g2_ = pg2[pi];
+            int t1_ = gtype[g1_], t2_ = gtype[g2_];
+            if (t1_ > t2_) { std::swap(g1_, g2_); std::swap(t1_, t2_); }
+
+            // Skip if already detected by auto-detect
+            bool dup = false;
+            for (auto& cg : c_geom) {
+                mx::eval(cg);
+                auto cgp = cg.data<int>();
+                if ((cgp[0] == g1_ && cgp[1] == g2_) || (cgp[0] == g2_ && cgp[1] == g1_)) {
+                    dup = true; break;
+                }
+            }
+            if (dup) continue;
+
+            auto gpos1 = row(d.geom_xpos, g1_);
+            auto gpos2 = row(d.geom_xpos, g2_);
+            auto gmat1 = mx::reshape(mx::flatten(mx::slice(d.geom_xmat, {g1_, 0, 0}, {g1_ + 1, 3, 3})), {3, 3});
+            auto gmat2 = mx::reshape(mx::flatten(mx::slice(d.geom_xmat, {g2_, 0, 0}, {g2_ + 1, 3, 3})), {3, 3});
+            auto gsize1 = row(m.geom_size, g1_);
+            auto gsize2 = row(m.geom_size, g2_);
+
+            CollisionResult result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+            bool handled = false;
+
+            if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::SPHERE)) {
+                result = plane_sphere(gpos1, gmat1, gpos2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::CAPSULE)) {
+                result = plane_capsule(gpos1, gmat1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::SPHERE)) {
+                result = sphere_sphere(gpos1, gsize1, gpos2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::CAPSULE)) {
+                result = sphere_capsule(gpos1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CAPSULE)) {
+                result = capsule_capsule(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            }
+
+            if (!handled) continue;
+
+            // For explicit pairs, use pair margin (or geom margin as fallback)
+            float margin = gmargin[g1_] + gmargin[g2_];
+            if (m.pair_margin.size() > 0) {
+                mx::eval(m.pair_margin);
+                margin = m.pair_margin.data<float>()[pi];
+            }
+
+            mx::eval(result.dist);
+            if (result.dist.item<float>() < margin) {
+                int condim = 3;
+                if (m.pair_dim.size() > 0) {
+                    mx::eval(m.pair_dim);
+                    condim = m.pair_dim.data<int>()[pi];
+                }
+
+                c_dist.push_back(result.dist);
+                c_pos.push_back(result.pos);
+                c_frame.push_back(result.frame);
+                c_geom.push_back(mx::array({g1_, g2_}, mx::int32));
+                c_dim.push_back(condim);
+            }
+        }
+    }
+
     if (!c_dist.empty()) {
         int ncon = static_cast<int>(c_dist.size());
 
