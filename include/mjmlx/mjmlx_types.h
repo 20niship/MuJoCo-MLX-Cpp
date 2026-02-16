@@ -34,8 +34,6 @@ extern "C" {
 typedef struct MjmlxModel MjmlxModel;
 typedef struct MjmlxData MjmlxData;
 typedef struct MjmlxBatchedSim MjmlxBatchedSim;
-typedef struct MjmlxActorCritic MjmlxActorCritic;
-typedef struct MjmlxPPOTrainer MjmlxPPOTrainer;
 
 // Integrator types (matches MuJoCo mjtIntegrator)
 typedef enum {
@@ -89,36 +87,6 @@ typedef struct {
     int solver_iterations;            // 0 = use model default, >0 = override solver iterations
 } MjmlxBatchedConfig;
 
-// Actor-critic network config
-typedef struct {
-    int obs_dim;
-    int act_dim;
-    int hidden_sizes[4];    // up to 4 hidden layers (0-terminated)
-    float init_log_std;     // initial log standard deviation
-} MjmlxActorCriticConfig;
-
-// PPO hyperparameters
-typedef struct {
-    float learning_rate;
-    float gamma;
-    float gae_lambda;
-    float clip_coef;
-    float vf_coef;
-    float ent_coef;
-    float max_grad_norm;
-    float target_kl;
-    int num_steps;          // rollout length
-    int num_minibatches;
-    int update_epochs;
-    int anneal_lr;          // 1 = anneal learning rate
-} MjmlxPPOConfig;
-
-// Rollout step result (per environment)
-typedef struct {
-    float reward;
-    int terminated;
-    int truncated;
-} MjmlxStepResult;
 
 #ifdef __cplusplus
 }

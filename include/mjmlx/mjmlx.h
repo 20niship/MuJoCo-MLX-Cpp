@@ -16,7 +16,7 @@
 //
 // GPU-accelerated MuJoCo physics via Apple MLX.
 // Provides single-env and batched (compile+vmap) simulation,
-// differentiable physics, and actor-critic neural networks.
+// and differentiable physics.
 //
 // All handles are opaque. Data exchange uses float* pointers
 // into MLX unified memory (zero-copy on Apple Silicon).
@@ -157,66 +157,6 @@ MJMLX_API void mjmlx_grad_step(
 MJMLX_API void mjmlx_batched_grad_step(
     MjmlxBatchedSim* sim,
     float* grad_out);
-
-// ============================================================
-// Neural network (actor-critic via MLX C++)
-// ============================================================
-
-// Create actor-critic network with given architecture.
-MJMLX_API MjmlxActorCritic* mjmlx_nn_create(const MjmlxActorCriticConfig* config);
-
-// Free actor-critic network.
-MJMLX_API void mjmlx_nn_free(MjmlxActorCritic* nn);
-
-// Forward pass: observations -> actions (sampled) + log_probs + values.
-// obs:      float[batch * obs_dim]
-// actions:  float[batch * act_dim]  (output, sampled from policy)
-// logprobs: float[batch]            (output)
-// values:   float[batch]            (output)
-MJMLX_API void mjmlx_nn_get_action_and_value(
-    MjmlxActorCritic* nn,
-    const float* obs, int batch,
-    float* actions, float* logprobs, float* values);
-
-// Deterministic forward: observations -> mean actions.
-MJMLX_API void mjmlx_nn_get_deterministic_action(
-    MjmlxActorCritic* nn,
-    const float* obs, int batch,
-    float* actions);
-
-// Get value only.
-MJMLX_API void mjmlx_nn_get_value(
-    MjmlxActorCritic* nn,
-    const float* obs, int batch,
-    float* values);
-
-// Save/load network weights.
-MJMLX_API int mjmlx_nn_save(const MjmlxActorCritic* nn, const char* path);
-MJMLX_API int mjmlx_nn_load(MjmlxActorCritic* nn, const char* path);
-
-// ============================================================
-// PPO Training (full pipeline in C++)
-// ============================================================
-
-// Create PPO trainer with batched sim + actor-critic.
-MJMLX_API MjmlxPPOTrainer* mjmlx_ppo_create(
-    MjmlxBatchedSim* sim,
-    MjmlxActorCritic* nn,
-    const MjmlxPPOConfig* config);
-
-// Free PPO trainer (does NOT free sim or nn).
-MJMLX_API void mjmlx_ppo_free(MjmlxPPOTrainer* trainer);
-
-// Run one rollout iteration: collect numSteps of experience, then PPO update.
-// Returns average reward over the rollout.
-MJMLX_API float mjmlx_ppo_iterate(MjmlxPPOTrainer* trainer);
-
-// Get training statistics from the last iteration.
-MJMLX_API float mjmlx_ppo_policy_loss(const MjmlxPPOTrainer* trainer);
-MJMLX_API float mjmlx_ppo_value_loss(const MjmlxPPOTrainer* trainer);
-MJMLX_API float mjmlx_ppo_entropy(const MjmlxPPOTrainer* trainer);
-MJMLX_API float mjmlx_ppo_approx_kl(const MjmlxPPOTrainer* trainer);
-MJMLX_API int mjmlx_ppo_global_step(const MjmlxPPOTrainer* trainer);
 
 #ifdef __cplusplus
 }

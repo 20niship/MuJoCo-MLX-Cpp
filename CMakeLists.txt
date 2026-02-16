@@ -126,8 +126,6 @@ set(MJMLX_SOURCES
     src/solver_vmap.cpp
     src/forward_vmap.cpp
     src/batched.cpp
-    src/nn.cpp
-    src/ppo.cpp
 )
 
 add_library(mjmlx SHARED ${MJMLX_SOURCES})

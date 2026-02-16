@@ -429,40 +429,6 @@ struct BatchedSim {
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step;
 };
 
-// ── ActorCritic ──────────────────────────────────────────────
-
-struct ActorCritic {
-    MjmlxActorCriticConfig config;
-
-    // Network weights (variable number of hidden layers)
-    std::vector<mx::array> weights;
-    std::vector<mx::array> biases;
-
-    // Actor head
-    mx::array actor_w{mx::array({})};
-    mx::array actor_b{mx::array({})};
-    mx::array log_std{mx::array({})};
-
-    // Critic head
-    mx::array critic_w{mx::array({})};
-    mx::array critic_b{mx::array({})};
-};
-
-// ── PPOTrainer ───────────────────────────────────────────────
-
-struct PPOTrainer {
-    BatchedSim* sim;
-    ActorCritic* nn;
-    MjmlxPPOConfig config;
-
-    // Training state
-    int global_step = 0;
-    float last_policy_loss = 0;
-    float last_value_loss = 0;
-    float last_entropy = 0;
-    float last_approx_kl = 0;
-};
-
 // ── Module functions (internal C++ API) ──────────────────────
 
 // io.cpp
@@ -570,5 +536,3 @@ mx::array batched_motion_cross_force(const mx::array& v, const mx::array& f);
 struct MjmlxModel { mjmlx::Model model; };
 struct MjmlxData { mjmlx::Data data; const mjmlx::Model* model_ref; };
 struct MjmlxBatchedSim { mjmlx::BatchedSim sim; };
-struct MjmlxActorCritic { mjmlx::ActorCritic nn; };
-struct MjmlxPPOTrainer { mjmlx::PPOTrainer trainer; };
