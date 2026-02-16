@@ -13,13 +13,16 @@ A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipel
 | Envs | Steps/sec | Notes |
 |------|-----------|-------|
 | 1 | 46 | Single-env scalar pipeline |
-| 64 | 2,634 | |
-| 256 | 11,226 | |
-| 1,024 | 44,989 | |
-| 4,096 | 164,140 | |
-| 8,192 | **198,263** | Full contact physics |
+| 256 | 15,027 | |
+| 512 | 34,222 | |
+| 1,024 | 68,753 | |
+| 2,048 | 128,366 | |
+| 4,096 | 255,362 | Exceeds Python mujoco-mlx (214K) |
+| 8,192 | **331,207** | Peak throughput |
 
 Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal Euler`
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation and key decisions.
 
 ### Pipeline Architecture
 
@@ -89,7 +92,7 @@ while keeping Phase 2 as pure array ops for vmap compatibility.
 - Per-env reset while others continue, correct state isolation
 - All 64 envs produce identical output with no control input
 - Metal kernel source generators: kinematics FK + fused Euler (same MSL as Python)
-- 99 tests across 8 test suites: math (17), io (9), forward (7), physics (20), collision (7), solver (20), linalg (12), batched (7)
+- 111 tests across 9 test suites: math (17), io (9), forward (7), physics (20), collision (7), solver (20), linalg (12), batched (7), vmap_smooth (12)
 
 ### Phase 0 spike results
 
@@ -111,7 +114,7 @@ libmjmlx.dylib (this repo)
     +-- Metal kernels [DONE]
     |     kinematics FK, fused Euler (source-generated MSL)
     |
-    +-- Batched simulation [DONE - 198K SPS]
+    +-- Batched simulation [DONE - 331K SPS]
     |     Metal kin -> compile(vmap(forward)) -> Metal euler
     |     Full C API: create, step, reset, get_state
     |
@@ -167,9 +170,9 @@ ctest --output-on-failure
 ./build/test_batched_diag /path/to/humanoid.xml # 7 GPU accuracy tests
 ```
 
-Test suite: 99 tests across 8 suites covering math, I/O, kinematics, physics,
-collisions, solver (Newton + CG), linear algebra (Cholesky + solve), and
-batched GPU pipeline accuracy.
+Test suite: 111 tests across 9 suites covering math, I/O, kinematics, physics,
+collisions, solver (Newton + CG), linear algebra (Cholesky + solve),
+batched GPU pipeline accuracy, and vmap smooth dynamics (com_vel + rne).
 
 ### Benchmarking
 
@@ -193,7 +196,7 @@ mjmlx_step(model, data);                        // forward + integrate
 const float* qpos = mjmlx_get_qpos(data, &n);   // zero-copy (unified memory)
 const float* xpos = mjmlx_get_xpos(data, &n);   // body positions
 
-// Batched simulation (Metal GPU) -- 198K SPS on humanoid
+// Batched simulation (Metal GPU) -- 331K SPS on humanoid
 MjmlxBatchedConfig config = { .num_envs = 8192, .use_gpu = 1 };
 MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
 mjmlx_batched_step(sim, controls);

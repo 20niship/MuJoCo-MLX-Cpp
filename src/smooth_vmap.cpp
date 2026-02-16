@@ -14,6 +14,15 @@ namespace mjmlx {
 // Maintains single L matrix, reads submatrices directly via slice.
 // All ops are pure MLX graph nodes (no eval, no data<>) → works inside mx::vmap.
 // Matches Python gpu_cholesky() from gpu_linalg.py.
+//
+// DECISION: Uses one-hot mask + multiply to scatter each column into L, because
+// MLX arrays are immutable -- there is no in-place index assignment (L[i,j] = val)
+// in the computation graph. Each column is built as a full (n,1) vector and added
+// via outer product with a one-hot row selector. This creates ~35 graph nodes per
+// column (n columns total). For humanoid (nv=27), the graph has ~945 Cholesky nodes.
+//
+// DECISION: The 1e-6 floor on the diagonal prevents negative sqrt from numerical
+// noise. This matches Python's gpu_cholesky implementation.
 mx::array cholesky_gpu(const mx::array& A, int n) {
     auto L = mx::zeros_like(A);  // (n, n)
 
@@ -285,7 +294,10 @@ Data vmap_factor_m(const Model& m, Data d) {
     d.qLD = A;  // store regularized M (used by Euler kernel via Metal)
 
     // Cholesky factorization: A = L L^T
-    d.qM_inv = cholesky_gpu(A, n);  // store L in qM_inv (reusing field)
+    // DECISION: d.qM_inv stores the Cholesky factor L, NOT the actual inverse M^{-1}.
+    // The name is a legacy from when Neumann-series approximation was used. The field
+    // is consumed by vmap_solve_m() which calls cholesky_solve_gpu(L, rhs, n).
+    d.qM_inv = cholesky_gpu(A, n);
 
     return d;
 }
@@ -298,6 +310,20 @@ mx::array vmap_solve_m(const Model& m, const Data& d, const mx::array& rhs) {
 }
 
 // ── Vmap-compatible COM velocity ─────────────────────────────────────────────
+//
+// DECISION: Per-body sequential loops are INTENTIONAL here. An attempt was made to
+// vectorize this using level-parallel scatter matrices (batching all bodies in a tree
+// level into a single matmul). This REGRESSED performance from 198K to 47K SPS because:
+//   1. Scatter-add through the full (nb, 6) tensor creates long data dependency chains
+//      that prevent the compiler from parallelizing operations.
+//   2. The original per-body approach stores results in a std::vector<mx::array> where
+//      each body's computation is an independent graph branch. The final mx::stack()
+//      is the only convergence point, giving mx::compile maximum freedom to fuse and
+//      schedule ops in parallel.
+//   3. Small (6,)-element per-body ops are already very efficient on GPU after fusion.
+// The backward accumulation in vmap_com_pos and vmap_crb uses scatter matrices
+// successfully because scatter-add is commutative and each child's contribution to
+// its parent is independent. Forward propagation (parent → child) lacks this property.
 
 Data vmap_com_vel(const Model& m, Data d) {
     const auto& c = m.cache;
@@ -327,6 +353,9 @@ Data vmap_com_vel(const Model& m, Data d) {
 }
 
 // ── Vmap-compatible RNE ──────────────────────────────────────────────────────
+// DECISION: Forward pass (cacc accumulation) uses per-body loops for the same reason
+// as vmap_com_vel -- scatter matrices regressed performance. The backward pass (force
+// accumulation) DOES use scatter matrices because it is a commutative scatter-add.
 
 Data vmap_rne(const Model& m, Data d) {
     const auto& c = m.cache;

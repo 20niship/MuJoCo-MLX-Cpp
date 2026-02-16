@@ -2,8 +2,17 @@
 // Licensed under the Apache License, Version 2.0
 //
 // Vmap-compatible collision detection and constraint construction.
-// Fixed-size outputs: always evaluates all pre-computed collision pairs.
-// Inactive constraints get D=0 (no-ops in solver).
+//
+// DECISION: Fixed-size constraint outputs. All pre-computed collision pairs are always
+// evaluated (even if not in contact), and inactive constraints get D=0. This makes the
+// output shape constant across environments, which is required for vmap (which needs
+// uniform shapes across the batch dimension). The solver naturally ignores D=0 rows.
+//
+// DECISION: The degenerate-normal fallback in vmap_make_frame uses [0,0,1] as the
+// primary reference axis for computing tangent frames via cross product. When the
+// normal is near-parallel to [0,0,1] (cross product length < 1e-6), it falls back to
+// [0,1,0]. This is branch-free (uses mx::where) for vmap compatibility.
+//
 // NO eval(), NO data<>(), NO CPU sync.
 
 #include "internal.h"

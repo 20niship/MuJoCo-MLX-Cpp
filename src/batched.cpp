@@ -14,13 +14,27 @@
 
 // Batched simulation: Metal kernels + compile(vmap(step)) for N parallel envs.
 //
-// Architecture (hybrid 3-phase pipeline, same as Python mujoco-mlx):
-//   Phase 1: Metal kinematics kernel (single dispatch for all N envs)
+// ARCHITECTURE NOTE: 3-phase hybrid pipeline (same design as Python mujoco-mlx):
+//   Phase 1: Metal kinematics kernel (single GPU dispatch for all N envs)
 //   Phase 2: compile(vmap(forward_dynamics_without_euler))
-//   Phase 3: Metal Euler kernel (single dispatch for all N envs)
+//   Phase 3: Metal Euler kernel (single GPU dispatch for all N envs)
 //
-// Metal kernels are NOT vmap-compatible, so they run outside the vmap.
-// Inside vmap, Cholesky uses pure-MLX (column-vectorized, GPU-native).
+// DECISION: Metal kernels are NOT vmap-compatible (they operate on raw flat buffers
+// with explicit per-env indexing via thread_position_in_grid). Therefore they must run
+// OUTSIDE the vmap boundary. The vmap'd forward function (Phase 2) must use only pure
+// MLX array ops -- no eval(), no data<>(), no CPU sync. Any such call would break the
+// lazy computation graph that vmap traces.
+//
+// DECISION: The forward_fn lambda captures a Model pointer (mp). Inside vmap, this
+// lambda builds a per-env computation graph. All model constants (cache arrays, option
+// values) are accessed but never mutated. If solver iterations need overriding, a
+// shared_ptr<Model> copy is created OUTSIDE the lambda to ensure the pointer remains
+// valid for the lambda's lifetime.
+//
+// DECISION: Using mx::compile around the full pipeline (Metal kin → vmap(fwd) →
+// Metal euler) enables MLX to fuse the computation graph. This is critical for
+// performance: without compile, each MLX op dispatches a separate Metal kernel.
+// With compile, MLX fuses compatible ops into fewer, larger kernels.
 
 #include "internal.h"
 #include "mjmlx/mjmlx.h"
@@ -423,6 +437,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     mx::eval(ctx->geom_pos_arr); mx::eval(ctx->geom_quat_arr);
 
     // Build kinematics kernel
+    // DECISION: Metal kernel stack memory is limited (~24KB per thread). The kinematics
+    // kernel needs ~7 floats per body (pos, quat) as working storage. If nbody is too
+    // large, we skip the Metal kernel and fall back to the scalar CPU path.
     int stack_bytes = m.nbody * 7 * 4;
     if (stack_bytes <= 24000) {
         auto source = make_kinematics_source(m.nbody, m.njnt, m.nq, m.ngeom);
@@ -440,6 +457,10 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
     }
 
     // Build Euler kernel
+    // DECISION: The Euler kernel embeds Cholesky factorization and solve inline in Metal
+    // shader language (MSL). It needs ~2*nv*nv + 4*nv + nq floats of stack per thread.
+    // The nv <= 80 limit prevents excessive register pressure on the GPU. For humanoid
+    // (nv=27), this is well within limits. Larger models fall back to CPU integration.
     int euler_stack = 2 * m.nv * m.nv + 4 * m.nv + m.nq;
     if (euler_stack * 4 <= 24000 && m.nv <= 80) {
         mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
@@ -491,15 +512,13 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
     int nq = m.nq, nv = m.nv, nu = m.nu;
     int nb = m.nbody, nj = m.njnt, ng = m.ngeom;
 
-    // Apply solver iterations override: create a local mutable copy of opt
-    // The forward_fn lambda captures mp which points to the original model,
-    // so we need a different mechanism. We'll create a modified Model copy
-    // for the forward function if needed.
+    // DECISION: Solver iteration count comes from the model XML (e.g. humanoid.xml
+    // specifies iterations="1" for Newton). The caller can override via
+    // solver_iterations_override > 0. We do NOT artificially inflate the iteration count
+    // -- the XML value is authoritative. Previously, a forced minimum of 3 iterations
+    // was used as a workaround for mass matrix bugs. That has been fixed (see io.cpp
+    // make_m_mask fix) and the override removed.
     int effective_iters = (solver_iterations_override > 0) ? solver_iterations_override : m.opt.iterations;
-    // Ensure at least 3 iterations when contacts are present
-    if (m.cache.collision_pairs.size() > 0 && effective_iters < 3) {
-        effective_iters = 3;
-    }
 
     bool has_kin = ctx->kin_kernel.has_value();
     bool has_euler = ctx->euler_kernel.has_value();

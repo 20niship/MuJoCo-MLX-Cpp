@@ -44,6 +44,11 @@ Data vmap_solve(const Model& m, Data d) {
     bool use_newton = (m.opt.solver == SolverType::NEWTON);
 
     // ── Warmstart ────────────────────────────────────────────────────────────
+    // DECISION: Warmstart picks qacc_warmstart (from previous step) only if it gives
+    // a lower constraint cost than qacc_smooth (the unconstrained acceleration). This
+    // prevents divergence when the previous solution is stale (e.g., after contact
+    // loss). The cost metric is 0.5 * sum(D * Jaref^2 * active), evaluated for both
+    // candidates. This matches Python solver.py warmstart logic.
     auto qacc = d.qacc_smooth;
     if (!(m.opt.disableflags & DisableBit::WARMSTART) && d.qacc_warmstart.size() > 0) {
         auto warm_Jaref = mx::subtract(
@@ -60,7 +65,6 @@ Data vmap_solve(const Model& m, Data d) {
         auto smooth_cost = mx::multiply(mx::array(0.5f),
             mx::sum(mx::multiply(mx::multiply(d.efc_D, mx::multiply(smooth_Jaref, smooth_Jaref)), smooth_active)));
 
-        // Pick whichever has lower cost
         auto use_warm = mx::less(warm_cost, smooth_cost);
         qacc = mx::where(use_warm, d.qacc_warmstart, d.qacc_smooth);
     }
@@ -127,7 +131,12 @@ Data vmap_solve(const Model& m, Data d) {
                                      mx::maximum(denom, mx::array(MJMINVAL_SV)))),
             mx::array(-2.0f), mx::array(2.0f));
 
-        // 5-alpha vectorized line search
+        // DECISION: 5-alpha vectorized line search. Instead of binary/backtracking
+        // search (which would need conditional branches incompatible with vmap), we
+        // evaluate 5 candidate step sizes in parallel: the Newton/CG optimal alpha,
+        // 50% and 10% of it, and two fixed small alphas (0.01, 0.001) as safety nets.
+        // All 5 costs are computed in one batched matmul, and the minimum is selected
+        // via mx::argmin. This is branch-free and fully vectorizable.
         auto alphas = mx::stack({alpha_n,
             mx::multiply(alpha_n, mx::array(0.5f)),
             mx::multiply(alpha_n, mx::array(0.1f)),
@@ -181,6 +190,10 @@ Data vmap_solve(const Model& m, Data d) {
         total_cost = mx::add(cost_c, gauss);
 
         // Update gradient and CG direction
+        // DECISION: prev_grad must be captured BEFORE updating grad. An earlier bug
+        // used the already-updated grad in the Polak-Ribiere beta denominator,
+        // causing CG to diverge. The correct formula: beta = grad'*(Mgrad-prev_Mgrad)
+        // / (prev_grad'*prev_Mgrad), where prev_grad is from the PREVIOUS iteration.
         if (!use_newton) {
             auto prev_grad = grad;     // save BEFORE updating grad
             auto prev_Mgrad = Mgrad;

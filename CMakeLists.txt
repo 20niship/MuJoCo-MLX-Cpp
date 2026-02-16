@@ -217,9 +217,18 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Vmap smooth tests -- com_vel and rne against MuJoCo C reference
+    # Uses C API (mjmlx_forward) to run full pipeline, then compares internal Data fields
+    add_executable(test_vmap_smooth tests/test_vmap_smooth.cpp)
+    target_link_libraries(test_vmap_smooth PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_vmap_smooth PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -245,6 +254,7 @@ if(MJMLX_BUILD_TESTS)
         add_test(NAME linalg_full COMMAND test_linalg_full ${MJMLX_TEST_MODEL})
         add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
+        add_test(NAME vmap_smooth COMMAND test_vmap_smooth)
     else()
         add_test(NAME io_full COMMAND test_io_full)
         add_test(NAME forward_full COMMAND test_forward_full)
@@ -252,6 +262,7 @@ if(MJMLX_BUILD_TESTS)
         add_test(NAME solver_full COMMAND test_solver_full)
         add_test(NAME collision_full COMMAND test_collision_full)
         add_test(NAME linalg_full COMMAND test_linalg_full)
+        add_test(NAME vmap_smooth COMMAND test_vmap_smooth)
     endif()
 endif()
 

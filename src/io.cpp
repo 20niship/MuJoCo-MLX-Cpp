@@ -332,7 +332,10 @@ Data make_data(const Model& model) {
 void Model::init_cache() const {
     if (cache.initialized) return;
 
-    // Eagerly evaluate topology arrays
+    // DECISION: Eagerly evaluate topology arrays here so their data<>() pointers are
+    // safe to use for building C++ vectors. These are small model constants (O(nbody))
+    // that are accessed repeatedly during graph construction. Eager eval here is fine
+    // because init_cache() runs once at load time, NOT inside vmap.
     mx::eval(body_parentid); mx::eval(body_rootid);
     mx::eval(dof_bodyid);
     if (njnt > 0) {
@@ -470,12 +473,17 @@ void Model::init_cache() const {
     }
 
     // ── Dense mass matrix tree mask ──
+    // DECISION: make_m_mask is strictly lower-triangular. The mask encodes the DOF
+    // parent-chain topology: for each DOF i, walk from i toward the root setting
+    // mask[i][j]=1 for each ancestor j (which always satisfies j <= i). The full
+    // symmetric mass matrix is recovered later in vmap_crb via: qm = qm + tril(qm,-1)^T.
+    // An earlier bug had mask[j][i]=1 too (making it symmetric), which broke the
+    // Cholesky factorization (error=30.34). The Python reference _get_mass_matrix_mask
+    // in support.py is also strictly lower-triangular.
     if (nv > 0 && !is_sparse(*this)) {
         mx::eval(dof_parentid);
         auto dof_par_ptr = dof_parentid.data<int>();
         std::vector<float> mask_data(nv * nv, 0.0f);
-        // Lower-triangular mask only: j walks from i toward root (j <= i).
-        // Symmetrization happens later in vmap_crb: qm = qm + tril(qm,-1).T
         for (int i = 0; i < nv; i++) {
             int j = i;
             while (j > -1) {
