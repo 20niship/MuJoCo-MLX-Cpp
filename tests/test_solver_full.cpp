@@ -45,6 +45,34 @@ static const char* NO_CONTACT_HIGH_XML = R"(
 </mujoco>
 )";
 
+// Newton solver variant
+static const char* CONTACT_NEWTON_XML = R"(
+<mujoco model="contact_newton">
+  <option timestep="0.002" solver="Newton" iterations="10"/>
+  <worldbody>
+    <geom type="plane" size="5 5 0.1"/>
+    <body name="ball" pos="0 0 0.09">
+      <joint type="free"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+)";
+
+// CG solver variant (same model, different solver)
+static const char* CONTACT_CG_XML = R"(
+<mujoco model="contact_cg">
+  <option timestep="0.002" solver="CG" iterations="20"/>
+  <worldbody>
+    <geom type="plane" size="5 5 0.1"/>
+    <body name="ball" pos="0 0 0.09">
+      <joint type="free"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+)";
+
 int main(int argc, char** argv) {
     printf("=== test_solver_full ===\n");
 
@@ -339,6 +367,152 @@ int main(int argc, char** argv) {
         }
         TEST_END();
     }
+
+    // ── Newton vs CG solver comparison ──
+    TEST_SECTION("NewtonVsCG");
+
+    TEST_BEGIN("newton_produces_contact_forces");
+    {
+        MjmlxModel* model = mjmlx_load_xml_string(CONTACT_NEWTON_XML);
+        if (model) {
+            MjmlxData* data = mjmlx_make_data(model);
+            mjmlx_forward(model, data);
+            int n = 0;
+            const float* qfrc_c = mjmlx_get_qfrc_constraint(data, &n);
+            if (qfrc_c && n >= 3) {
+                CHECK_GT(qfrc_c[2], 0.0f, "Newton: z constraint force upward");
+            }
+            mjmlx_free_data(data); mjmlx_free_model(model);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("cg_produces_contact_forces");
+    {
+        MjmlxModel* model = mjmlx_load_xml_string(CONTACT_CG_XML);
+        if (model) {
+            MjmlxData* data = mjmlx_make_data(model);
+            mjmlx_forward(model, data);
+            int n = 0;
+            const float* qfrc_c = mjmlx_get_qfrc_constraint(data, &n);
+            if (qfrc_c && n >= 3) {
+                CHECK_GT(qfrc_c[2], 0.0f, "CG: z constraint force upward");
+            }
+            mjmlx_free_data(data); mjmlx_free_model(model);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("newton_vs_cg_qacc_close");
+    {
+        // Both solvers should produce similar qacc for same initial conditions
+        MjmlxModel* m_newton = mjmlx_load_xml_string(CONTACT_NEWTON_XML);
+        MjmlxModel* m_cg = mjmlx_load_xml_string(CONTACT_CG_XML);
+        if (m_newton && m_cg) {
+            MjmlxData* d_newton = mjmlx_make_data(m_newton);
+            MjmlxData* d_cg = mjmlx_make_data(m_cg);
+            mjmlx_forward(m_newton, d_newton);
+            mjmlx_forward(m_cg, d_cg);
+
+            int n1 = 0, n2 = 0;
+            const float* qacc_n = mjmlx_get_qacc(d_newton, &n1);
+            const float* qacc_c = mjmlx_get_qacc(d_cg, &n2);
+            if (qacc_n && qacc_c && n1 > 0 && n1 == n2) {
+                float max_diff = 0;
+                for (int i = 0; i < n1; i++) {
+                    float d = std::abs(qacc_n[i] - qacc_c[i]);
+                    if (d > max_diff) max_diff = d;
+                }
+                // Both solvers should agree within 10% relative or small absolute
+                CHECK_LT(max_diff, 5.0f, "Newton vs CG qacc difference < 5.0");
+            }
+            mjmlx_free_data(d_newton); mjmlx_free_model(m_newton);
+            mjmlx_free_data(d_cg); mjmlx_free_model(m_cg);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("newton_vs_cg_multi_step_stable");
+    {
+        // Both solvers should be stable over 20 steps
+        MjmlxModel* m_n = mjmlx_load_xml_string(CONTACT_NEWTON_XML);
+        MjmlxModel* m_c = mjmlx_load_xml_string(CONTACT_CG_XML);
+        if (m_n && m_c) {
+            MjmlxData* d_n = mjmlx_make_data(m_n);
+            MjmlxData* d_c = mjmlx_make_data(m_c);
+            for (int s = 0; s < 20; s++) {
+                mjmlx_step(m_n, d_n);
+                mjmlx_step(m_c, d_c);
+            }
+            int nq1 = 0, nq2 = 0;
+            const float* qpos_n = mjmlx_get_qpos(d_n, &nq1);
+            const float* qpos_c = mjmlx_get_qpos(d_c, &nq2);
+            CHECK_NO_NAN(qpos_n, nq1, "Newton: no NaN after 20 steps");
+            CHECK_NO_NAN(qpos_c, nq2, "CG: no NaN after 20 steps");
+            // z should be reasonable (ball near ground)
+            if (nq1 > 2 && nq2 > 2) {
+                CHECK_GT(qpos_n[2], -1.0f, "Newton: z > -1 after 20 steps");
+                CHECK_LT(qpos_n[2], 2.0f, "Newton: z < 2 after 20 steps");
+                CHECK_GT(qpos_c[2], -1.0f, "CG: z > -1 after 20 steps");
+                CHECK_LT(qpos_c[2], 2.0f, "CG: z < 2 after 20 steps");
+            }
+            mjmlx_free_data(d_n); mjmlx_free_model(m_n);
+            mjmlx_free_data(d_c); mjmlx_free_model(m_c);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("newton_vs_mujoco_c_qacc");
+    {
+        // Compare Newton solver against MuJoCo C reference
+        MjScope mj(CONTACT_NEWTON_XML);
+        MjmlxModel* model = mjmlx_load_xml_string(CONTACT_NEWTON_XML);
+        if (mj.ok() && model) {
+            mj_forward(mj.m, mj.d);
+            MjmlxData* data = mjmlx_make_data(model);
+            mjmlx_forward(model, data);
+
+            int n = 0;
+            const float* qacc = mjmlx_get_qacc(data, &n);
+            if (qacc && n > 0) {
+                float max_diff = 0;
+                int mn = (n < mj.m->nv) ? n : mj.m->nv;
+                for (int i = 0; i < mn; i++) {
+                    float d = std::abs(qacc[i] - (float)mj.d->qacc[i]);
+                    if (d > max_diff) max_diff = d;
+                }
+                // Float32 vs float64, different solver paths -- allow generous tolerance
+                CHECK_LT(max_diff, 2.0f, "Newton qacc close to MuJoCo C (tol=2.0)");
+            }
+            mjmlx_free_data(data); mjmlx_free_model(model);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("cg_vs_mujoco_c_qacc");
+    {
+        MjScope mj(CONTACT_CG_XML);
+        MjmlxModel* model = mjmlx_load_xml_string(CONTACT_CG_XML);
+        if (mj.ok() && model) {
+            mj_forward(mj.m, mj.d);
+            MjmlxData* data = mjmlx_make_data(model);
+            mjmlx_forward(model, data);
+
+            int n = 0;
+            const float* qacc = mjmlx_get_qacc(data, &n);
+            if (qacc && n > 0) {
+                float max_diff = 0;
+                int mn = (n < mj.m->nv) ? n : mj.m->nv;
+                for (int i = 0; i < mn; i++) {
+                    float d = std::abs(qacc[i] - (float)mj.d->qacc[i]);
+                    if (d > max_diff) max_diff = d;
+                }
+                CHECK_LT(max_diff, 2.0f, "CG qacc close to MuJoCo C (tol=2.0)");
+            }
+            mjmlx_free_data(data); mjmlx_free_model(model);
+        }
+    }
+    TEST_END();
 
     TEST_EXIT();
 }

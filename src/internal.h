@@ -418,6 +418,13 @@ struct BatchedSim {
     mx::array qvel{mx::array({})};
     mx::array xpos{mx::array({})};
 
+    // Observation fields: [num_envs, ...] arrays
+    mx::array subtree_com{mx::array({})};   // (B, nbody, 3)
+    mx::array cinert{mx::array({})};        // (B, nbody, 10)
+    mx::array cvel{mx::array({})};          // (B, nbody, 6)
+    mx::array qfrc_actuator{mx::array({})}; // (B, nv)
+    mx::array cfrc_ext{mx::array({})};      // (B, nbody, 6)
+
     // Compiled+vmapped step function
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step;
 };
@@ -524,9 +531,13 @@ Data step(const Model& m, Data d);
 
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu);
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0);
 
 // ── Vmap-compatible functions (pure MLX graph, no eval/data) ──
+
+// gpu_linalg (smooth_vmap.cpp) — vmap-compatible Cholesky for Newton solver
+mx::array cholesky_gpu(const mx::array& A, int n);
+mx::array cholesky_solve_gpu(const mx::array& L, const mx::array& b, int n);
 
 // smooth_vmap.cpp
 Data vmap_com_pos(const Model& m, Data d);

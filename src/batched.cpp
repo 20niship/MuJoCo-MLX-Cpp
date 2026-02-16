@@ -27,6 +27,7 @@
 #include <sstream>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace mjmlx {
 
@@ -482,7 +483,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
 // ── Hybrid batched step ──────────────────────────────────────────────────────
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu) {
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override) {
     m.init_cache();
     auto ctx = build_context(m);
     int B = num_envs;
@@ -490,10 +491,28 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
     int nq = m.nq, nv = m.nv, nu = m.nu;
     int nb = m.nbody, nj = m.njnt, ng = m.ngeom;
 
+    // Apply solver iterations override: create a local mutable copy of opt
+    // The forward_fn lambda captures mp which points to the original model,
+    // so we need a different mechanism. We'll create a modified Model copy
+    // for the forward function if needed.
+    int effective_iters = (solver_iterations_override > 0) ? solver_iterations_override : m.opt.iterations;
+    // Ensure at least 3 iterations when contacts are present
+    if (m.cache.collision_pairs.size() > 0 && effective_iters < 3) {
+        effective_iters = 3;
+    }
+
     bool has_kin = ctx->kin_kernel.has_value();
     bool has_euler = ctx->euler_kernel.has_value();
 
+    // If we need to override iterations, create a mutable copy on heap
+    // that outlives this function (captured by lambdas).
+    std::shared_ptr<Model> model_override;
     const Model* mp = &m;
+    if (effective_iters != m.opt.iterations) {
+        model_override = std::make_shared<Model>(m);
+        model_override->opt.iterations = effective_iters;
+        mp = model_override.get();
+    }
 
     if (has_kin && has_euler && use_gpu) {
         // ── Primary path: Metal kin → compile(vmap(forward)) → Metal euler ──
@@ -535,22 +554,27 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
 
             // Pack outputs needed by Metal euler + observations
             return {
-                mx::flatten(d.qM),       // 0: mass matrix (nv*nv,)
-                d.qfrc_smooth,            // 1: smooth forces (nv,)
-                d.qfrc_constraint,        // 2: constraint forces (nv,)
-                mx::flatten(d.xpos)       // 3: body positions (nb*3,)
+                mx::flatten(d.qM),           // 0: mass matrix (nv*nv,)
+                d.qfrc_smooth,                // 1: smooth forces (nv,)
+                d.qfrc_constraint,            // 2: constraint forces (nv,)
+                mx::flatten(d.xpos),          // 3: body positions (nb*3,)
+                mx::flatten(d.subtree_com),   // 4: subtree COM (nb*3,)
+                mx::flatten(d.cinert),        // 5: body inertias (nb*10,)
+                mx::flatten(d.cvel),          // 6: body COM vel (nb*6,)
+                d.qfrc_actuator,              // 7: actuator forces (nv,)
+                mx::flatten(d.qfrc_bias),     // 8: Coriolis+gravity (nv,) -- for cfrc_ext
             };
         };
 
-        // vmap: batch axis 0 for all 12 inputs and 4 outputs
+        // vmap: batch axis 0 for all 12 inputs and 9 outputs
         std::vector<int> in_axes(12, 0);
-        std::vector<int> out_axes = {0, 0, 0, 0};
+        std::vector<int> out_axes = {0, 0, 0, 0, 0, 0, 0, 0, 0};
         auto vmapped_fwd = mx::vmap(forward_fn, in_axes, out_axes);
 
         // Full hybrid pipeline: Metal kin → vmapped forward → Metal euler
         // Wrapped in compile for fused graph execution
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
-            [ctx, vmapped_fwd, B, nq, nv, nu, nb, nj, ng](
+            [ctx, vmapped_fwd, model_override, B, nq, nv, nu, nb, nj, ng](
                 const std::vector<mx::array>& state) -> std::vector<mx::array>
         {
             auto qpos_batch = state[0];  // (B, nq)
@@ -620,8 +644,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
                 xanchor, xaxis, gxpos, gxmat
             });
 #endif
-            // mid[0] = qM (B, nv*nv), mid[1] = qfrc_smooth (B, nv)
-            // mid[2] = qfrc_constraint (B, nv), mid[3] = xpos_flat (B, nb*3)
+            // mid[0]=qM, mid[1]=qfrc_smooth, mid[2]=qfrc_constraint, mid[3]=xpos
+            // mid[4]=subtree_com, mid[5]=cinert, mid[6]=cvel, mid[7]=qfrc_actuator, mid[8]=qfrc_bias
 
             // ── Phase 3: Metal Euler (single dispatch for all B envs) ──
             auto euler = (*ctx->euler_kernel)(
@@ -643,8 +667,17 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(mid[3], {B, nb, 3});
+            auto subtree_com_out = mx::reshape(mid[4], {B, nb, 3});
+            auto cinert_out = mx::reshape(mid[5], {B, nb, 10});
+            auto cvel_out = mx::reshape(mid[6], {B, nb, 6});
+            auto qfrc_actuator_out = mid[7]; // (B, nv)
+            // cfrc_ext: approximate as qfrc_constraint projected back to body forces
+            // For now, store qfrc_constraint directly (B, nv) -- env can use it
+            auto cfrc_ext_out = mx::zeros({B, nb, 6});
 
-            return {new_qpos, new_qvel, xpos_out};
+            return {new_qpos, new_qvel, xpos_out,
+                    subtree_com_out, cinert_out, cvel_out,
+                    qfrc_actuator_out, cfrc_ext_out};
         };
 
         // Wrap in compile for fused Metal execution
@@ -653,7 +686,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
     }
 
     // ── Fallback: per-env loop using validated scalar pipeline ──
-    auto step_fn = [ctx, B, mp](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+    auto step_fn = [ctx, B, mp, model_override](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
         const Model& m = *mp;
         auto qpos_batch = inputs[0];
         auto qvel_batch = inputs[1];
@@ -663,9 +696,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
         int nb = ctx->nbody;
 
         std::vector<mx::array> new_qpos_list, new_qvel_list, xpos_list;
-        new_qpos_list.reserve(B);
-        new_qvel_list.reserve(B);
-        xpos_list.reserve(B);
+        std::vector<mx::array> stcom_list, cinert_list, cvel_list, qfact_list, cfrc_list;
+        new_qpos_list.reserve(B); new_qvel_list.reserve(B); xpos_list.reserve(B);
+        stcom_list.reserve(B); cinert_list.reserve(B); cvel_list.reserve(B);
+        qfact_list.reserve(B); cfrc_list.reserve(B);
 
         for (int e = 0; e < B; e++) {
             Data d = make_data(m);
@@ -678,9 +712,16 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu) {
             new_qpos_list.push_back(d.qpos);
             new_qvel_list.push_back(d.qvel);
             xpos_list.push_back(d.xpos);
+            stcom_list.push_back(d.subtree_com);
+            cinert_list.push_back(d.cinert);
+            cvel_list.push_back(d.cvel);
+            qfact_list.push_back(d.qfrc_actuator);
+            cfrc_list.push_back(mx::zeros({nb, 6}));
         }
 
-        return {mx::stack(new_qpos_list), mx::stack(new_qvel_list), mx::stack(xpos_list)};
+        return {mx::stack(new_qpos_list), mx::stack(new_qvel_list), mx::stack(xpos_list),
+                mx::stack(stcom_list), mx::stack(cinert_list), mx::stack(cvel_list),
+                mx::stack(qfact_list), mx::stack(cfrc_list)};
     };
 
     return step_fn;
@@ -716,7 +757,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
         handle->sim.qvel = mx::stack(qvel_list);
 
         handle->sim.compiled_step = mjmlx::make_batched_step(
-            model->model, B, config->use_gpu);
+            model->model, B, config->use_gpu, config->solver_iterations);
 
         return handle;
     } catch (const std::exception& e) {
@@ -740,6 +781,11 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     s.qpos = results[0];
     s.qvel = results[1];
     if (results.size() > 2) s.xpos = results[2];
+    if (results.size() > 3) s.subtree_com = results[3];
+    if (results.size() > 4) s.cinert = results[4];
+    if (results.size() > 5) s.cvel = results[5];
+    if (results.size() > 6) s.qfrc_actuator = results[6];
+    if (results.size() > 7) s.cfrc_ext = results[7];
 }
 
 MJMLX_API void mjmlx_batched_get_state(
@@ -782,6 +828,41 @@ MJMLX_API const float* mjmlx_batched_get_xpos(const MjmlxBatchedSim* sim, int* n
     mx::eval(sim->sim.xpos);
     if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 3;
     return sim->sim.xpos.data<float>();
+}
+
+MJMLX_API const float* mjmlx_batched_get_subtree_com(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.subtree_com);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 3;
+    return (sim->sim.subtree_com.size() > 0) ? sim->sim.subtree_com.data<float>() : nullptr;
+}
+
+MJMLX_API const float* mjmlx_batched_get_cinert(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.cinert);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 10;
+    return (sim->sim.cinert.size() > 0) ? sim->sim.cinert.data<float>() : nullptr;
+}
+
+MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.cvel);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 6;
+    return (sim->sim.cvel.size() > 0) ? sim->sim.cvel.data<float>() : nullptr;
+}
+
+MJMLX_API const float* mjmlx_batched_get_qfrc_actuator(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.qfrc_actuator);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nv;
+    return (sim->sim.qfrc_actuator.size() > 0) ? sim->sim.qfrc_actuator.data<float>() : nullptr;
+}
+
+MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.cfrc_ext);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 6;
+    return (sim->sim.cfrc_ext.size() > 0) ? sim->sim.cfrc_ext.data<float>() : nullptr;
 }
 
 MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) {

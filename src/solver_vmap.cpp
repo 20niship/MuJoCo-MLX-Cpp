@@ -2,8 +2,13 @@
 // Licensed under the Apache License, Version 2.0
 //
 // Vmap-compatible constraint solver.
-// Fixed iteration count, batched 5-alpha linesearch, no early break.
-// NO eval(), NO data<>(), NO CPU sync.
+// Two modes (matches Python solver.py):
+//   Newton: Form H = M + J^T*D*J, Cholesky-solve for exact search direction.
+//           Converges in 1-2 iterations. Default for humanoid.
+//   CG:     M^{-1} preconditioned gradient descent with Polak-Ribière updates.
+//           Needs 4-10 iterations.
+// Both use warmstart + 5-alpha vectorized line search + active set.
+// NO eval(), NO data<>(), NO CPU sync. Pure MLX graph building.
 
 #include "internal.h"
 
@@ -12,8 +17,19 @@ namespace mjmlx {
 static constexpr float MJMINVAL_SV = 1e-8f;
 
 // Dense M @ v using pure MLX ops (no eval)
-static mx::array vmap_mul_m(const Data& d, int nv, const mx::array& vec) {
-    return mx::flatten(mx::matmul(d.qM, mx::reshape(vec, {nv, 1})));
+static mx::array mul_m(const mx::array& qM, int nv, const mx::array& vec) {
+    return mx::flatten(mx::matmul(qM, mx::reshape(vec, {nv, 1})));
+}
+
+// Active set: equality constraints always active, inequality when Jaref < 0
+static mx::array get_active(const mx::array& Jaref, int ne, int nf, int nefc) {
+    auto active = mx::astype(mx::less(Jaref, mx::array(0.0f)), mx::float32);
+    if (ne + nf > 0) {
+        auto always = mx::ones({ne + nf});
+        auto rest = mx::slice(active, {ne + nf}, {nefc});
+        active = mx::concatenate({always, rest}, 0);
+    }
+    return active;
 }
 
 Data vmap_solve(const Model& m, Data d) {
@@ -24,22 +40,37 @@ Data vmap_solve(const Model& m, Data d) {
         return d;
     }
 
-    // Start from smooth acceleration
+    int nv = m.nv;
+    bool use_newton = (m.opt.solver == SolverType::NEWTON);
+
+    // ── Warmstart ────────────────────────────────────────────────────────────
     auto qacc = d.qacc_smooth;
+    if (!(m.opt.disableflags & DisableBit::WARMSTART) && d.qacc_warmstart.size() > 0) {
+        auto warm_Jaref = mx::subtract(
+            mx::flatten(mx::matmul(d.efc_J, mx::reshape(d.qacc_warmstart, {nv, 1}))),
+            d.efc_aref);
+        auto warm_active = get_active(warm_Jaref, d.ne, d.nf, nefc);
+        auto warm_cost = mx::multiply(mx::array(0.5f),
+            mx::sum(mx::multiply(mx::multiply(d.efc_D, mx::multiply(warm_Jaref, warm_Jaref)), warm_active)));
 
-    // J @ qacc - aref
-    auto Jaref = mx::subtract(
-        mx::flatten(mx::matmul(d.efc_J, mx::reshape(qacc, {m.nv, 1}))),
-        d.efc_aref);
-    auto Ma = vmap_mul_m(d, m.nv, qacc);
+        auto smooth_Jaref = mx::subtract(
+            mx::flatten(mx::matmul(d.efc_J, mx::reshape(d.qacc_smooth, {nv, 1}))),
+            d.efc_aref);
+        auto smooth_active = get_active(smooth_Jaref, d.ne, d.nf, nefc);
+        auto smooth_cost = mx::multiply(mx::array(0.5f),
+            mx::sum(mx::multiply(mx::multiply(d.efc_D, mx::multiply(smooth_Jaref, smooth_Jaref)), smooth_active)));
 
-    // Active set: inequality constraints active when Jaref < 0
-    auto active = mx::astype(mx::less(Jaref, mx::array(0.0f)), mx::float32);
-    if (d.ne + d.nf > 0) {
-        auto always = mx::ones({d.ne + d.nf});
-        auto rest = mx::slice(active, mx::Shape{d.ne + d.nf}, mx::Shape{nefc});
-        active = mx::concatenate({always, rest}, 0);
+        // Pick whichever has lower cost
+        auto use_warm = mx::less(warm_cost, smooth_cost);
+        qacc = mx::where(use_warm, d.qacc_warmstart, d.qacc_smooth);
     }
+
+    // ── Initialize solver state ──────────────────────────────────────────────
+    auto Jaref = mx::subtract(
+        mx::flatten(mx::matmul(d.efc_J, mx::reshape(qacc, {nv, 1}))),
+        d.efc_aref);
+    auto Ma = mul_m(d.qM, nv, qacc);
+    auto active = get_active(Jaref, d.ne, d.nf, nefc);
 
     auto efc_force = mx::multiply(mx::multiply(d.efc_D, mx::negative(Jaref)), active);
     auto qfrc_constraint = mx::flatten(mx::matmul(
@@ -54,14 +85,35 @@ Data vmap_solve(const Model& m, Data d) {
 
     auto grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
 
-    // Use M^{-1} as preconditioner for all solver types (avoids CPU cholesky in hot path)
-    auto Mgrad = vmap_solve_m(m, d, grad);
-    auto search = mx::negative(Mgrad);
+    // For CG mode: initialize preconditioned direction
+    auto Mgrad = mx::zeros({nv});
+    auto search = mx::zeros({nv});
+    if (!use_newton) {
+        Mgrad = vmap_solve_m(m, d, grad);
+        search = mx::negative(Mgrad);
+    }
 
-    // Fixed-iteration solver loop
+    // ── Solver iterations ────────────────────────────────────────────────────
     for (int iter = 0; iter < m.opt.iterations; iter++) {
-        auto Mv = vmap_mul_m(d, m.nv, search);
-        auto Jv = mx::flatten(mx::matmul(d.efc_J, mx::reshape(search, {m.nv, 1})));
+
+        if (use_newton) {
+            // ── Direct Newton: H = M + J_a^T * diag(D_a) * J_a ──────────
+            auto D_active = mx::multiply(d.efc_D, active);
+            auto sqrt_D = mx::sqrt(mx::maximum(D_active, mx::array(0.0f)));
+            auto J_scaled = mx::multiply(d.efc_J, mx::reshape(sqrt_D, {nefc, 1}));
+            auto JtDJ = mx::matmul(mx::transpose(J_scaled), J_scaled);
+            auto H = mx::add(d.qM, JtDJ);
+            // Regularize for numerical stability
+            H = mx::add(H, mx::multiply(mx::eye(nv), mx::array(MJMINVAL_SV)));
+
+            // Cholesky-solve for exact Newton direction
+            auto L = cholesky_gpu(H, nv);
+            search = mx::negative(cholesky_solve_gpu(L, grad, nv));
+        }
+
+        // ── Line search (same for Newton and CG) ────────────────────────
+        auto Mv = mul_m(d.qM, nv, search);
+        auto Jv = mx::flatten(mx::matmul(d.efc_J, mx::reshape(search, {nv, 1})));
 
         auto quad_gauss = mx::multiply(mx::array(0.5f), mx::sum(mx::multiply(search, Mv)));
         auto linear_gauss = mx::sum(mx::multiply(search, mx::subtract(Ma, d.qfrc_smooth)));
@@ -75,7 +127,7 @@ Data vmap_solve(const Model& m, Data d) {
                                      mx::maximum(denom, mx::array(MJMINVAL_SV)))),
             mx::array(-2.0f), mx::array(2.0f));
 
-        // 5-alpha vectorized linesearch
+        // 5-alpha vectorized line search
         auto alphas = mx::stack({alpha_n,
             mx::multiply(alpha_n, mx::array(0.5f)),
             mx::multiply(alpha_n, mx::array(0.1f)),
@@ -84,17 +136,12 @@ Data vmap_solve(const Model& m, Data d) {
         auto x_all = mx::add(mx::reshape(Jaref, {1, nefc}),
             mx::multiply(mx::reshape(alphas, {5, 1}), mx::reshape(Jv, {1, nefc})));
         auto act_all = mx::astype(mx::less(x_all, mx::array(0.0f)), mx::float32);
+        // Force equality constraints always active
         if (d.ne + d.nf > 0) {
-            for (int k = 0; k < d.ne + d.nf; k++) {
-                std::vector<float> ones5(5, 1.0f);
-                auto mask5 = mx::reshape(mx::array(ones5.data(), mx::Shape{5}, mx::float32), mx::Shape{5, 1});
-                std::vector<float> pm(nefc, 0.0f); pm[k] = 1.0f;
-                auto col_mask = mx::reshape(mx::array(pm.data(), mx::Shape{nefc}, mx::float32), mx::Shape{1, nefc});
-                act_all = mx::add(act_all, mx::multiply(
-                    mx::multiply(mask5, col_mask),
-                    mx::subtract(mx::array(1.0f), mx::multiply(
-                        mx::slice(act_all, mx::Shape{0, k}, mx::Shape{5, k+1}), mx::ones(mx::Shape{5, 1})))));
-            }
+            auto eq_mask = mx::concatenate({mx::ones({d.ne + d.nf}),
+                                             mx::zeros({nefc - d.ne - d.nf})}, 0);
+            eq_mask = mx::reshape(eq_mask, {1, nefc});
+            act_all = mx::maximum(act_all, eq_mask);
         }
 
         auto c_all = mx::multiply(mx::array(0.5f),
@@ -109,22 +156,19 @@ Data vmap_solve(const Model& m, Data d) {
             mx::multiply(mx::array(0.5f), mx::multiply(mx::multiply(alphas, alphas), sMv))));
         auto total_all = mx::add(c_all, g_all);
 
+        // Pick best alpha (including alpha=0 = no step)
         auto all_costs = mx::concatenate({mx::reshape(total_cost, {1}), total_all}, 0);
-        auto all_alphas = mx::concatenate({mx::zeros(mx::Shape{1}), alphas}, 0);
+        auto all_alphas = mx::concatenate({mx::zeros({1}), alphas}, 0);
         auto best_idx = mx::argmin(all_costs);
         auto best_alpha = mx::take(all_alphas, best_idx);
 
+        // Apply step
         qacc = mx::add(qacc, mx::multiply(search, best_alpha));
         Ma = mx::add(Ma, mx::multiply(Mv, best_alpha));
         Jaref = mx::add(Jaref, mx::multiply(Jv, best_alpha));
 
-        active = mx::astype(mx::less(Jaref, mx::array(0.0f)), mx::float32);
-        if (d.ne + d.nf > 0) {
-            auto always = mx::ones({d.ne + d.nf});
-            auto rest = mx::slice(active, mx::Shape{d.ne + d.nf}, mx::Shape{nefc});
-            active = mx::concatenate({always, rest}, 0);
-        }
-
+        // Update active set and forces
+        active = get_active(Jaref, d.ne, d.nf, nefc);
         efc_force = mx::multiply(mx::multiply(d.efc_D, mx::negative(Jaref)), active);
         qfrc_constraint = mx::flatten(mx::matmul(
             mx::transpose(d.efc_J), mx::reshape(efc_force, {nefc, 1})));
@@ -136,17 +180,21 @@ Data vmap_solve(const Model& m, Data d) {
                                   mx::subtract(qacc, d.qacc_smooth))));
         total_cost = mx::add(cost_c, gauss);
 
-        grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
-
-        // Preconditioned CG direction using M^{-1} (all GPU, no CPU linalg)
-        auto prev_grad = grad;
-        auto prev_Mgrad = Mgrad;
-        Mgrad = vmap_solve_m(m, d, grad);
-        auto beta_num = mx::sum(mx::multiply(grad, mx::subtract(Mgrad, prev_Mgrad)));
-        auto beta_den = mx::maximum(mx::array(MJMINVAL_SV),
-                                     mx::sum(mx::multiply(prev_grad, prev_Mgrad)));
-        auto beta = mx::maximum(mx::divide(beta_num, beta_den), mx::array(0.0f));
-        search = mx::add(mx::negative(Mgrad), mx::multiply(beta, search));
+        // Update gradient and CG direction
+        if (!use_newton) {
+            auto prev_grad = grad;     // save BEFORE updating grad
+            auto prev_Mgrad = Mgrad;
+            grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
+            Mgrad = vmap_solve_m(m, d, grad);
+            // Polak-Ribière CG update
+            auto beta_num = mx::sum(mx::multiply(grad, mx::subtract(Mgrad, prev_Mgrad)));
+            auto beta_den = mx::maximum(mx::array(MJMINVAL_SV),
+                                         mx::sum(mx::multiply(prev_grad, prev_Mgrad)));
+            auto beta = mx::maximum(mx::divide(beta_num, beta_den), mx::array(0.0f));
+            search = mx::add(mx::negative(Mgrad), mx::multiply(beta, search));
+        } else {
+            grad = mx::subtract(Ma, mx::add(d.qfrc_smooth, qfrc_constraint));
+        }
     }
 
     d.qfrc_constraint = qfrc_constraint;

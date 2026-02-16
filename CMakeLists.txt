@@ -182,6 +182,12 @@ if(MJMLX_BUILD_TESTS)
     target_link_libraries(test_forward PRIVATE mjmlx)
     add_executable(test_batched tests/test_batched.cpp)
     target_link_libraries(test_batched PRIVATE mjmlx)
+    add_executable(test_batched_diag tests/test_batched_diag.cpp)
+    target_link_libraries(test_batched_diag PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_batched_diag PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
 
     # Full test suite (ported from Python 228 tests)
     # All full tests need mjmlx + mujoco + internal headers
@@ -203,9 +209,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Linalg test -- Cholesky and solve (needs internal symbols from smooth_vmap.cpp)
+    add_executable(test_linalg_full tests/test_linalg_full.cpp src/smooth_vmap.cpp src/math.cpp)
+    target_link_libraries(test_linalg_full PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_linalg_full PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -213,6 +227,31 @@ if(MJMLX_BUILD_TESTS)
                 COMMENT "Fixing MuJoCo dylib for ${_test}"
             )
         endforeach()
+    endif()
+
+    # ── CTest entries ─────────────────────────────────────────
+    set(MJMLX_TEST_MODEL "" CACHE FILEPATH "Path to humanoid.xml for model-dependent tests")
+
+    # Self-contained tests (no model path needed)
+    add_test(NAME math_full COMMAND test_math_full)
+
+    # Tests that optionally use a model path
+    if(MJMLX_TEST_MODEL)
+        add_test(NAME io_full COMMAND test_io_full)
+        add_test(NAME forward_full COMMAND test_forward_full)
+        add_test(NAME physics_full COMMAND test_physics_full)
+        add_test(NAME solver_full COMMAND test_solver_full ${MJMLX_TEST_MODEL})
+        add_test(NAME collision_full COMMAND test_collision_full)
+        add_test(NAME linalg_full COMMAND test_linalg_full ${MJMLX_TEST_MODEL})
+        add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
+        add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
+    else()
+        add_test(NAME io_full COMMAND test_io_full)
+        add_test(NAME forward_full COMMAND test_forward_full)
+        add_test(NAME physics_full COMMAND test_physics_full)
+        add_test(NAME solver_full COMMAND test_solver_full)
+        add_test(NAME collision_full COMMAND test_collision_full)
+        add_test(NAME linalg_full COMMAND test_linalg_full)
     endif()
 endif()
 

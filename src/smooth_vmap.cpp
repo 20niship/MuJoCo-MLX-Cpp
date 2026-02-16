@@ -9,6 +9,100 @@
 
 namespace mjmlx {
 
+// ── GPU-native Cholesky factorization (vmap-compatible) ──────────────────────
+// Column-vectorized: n iterations for n×n matrix.
+// Maintains single L matrix, reads submatrices directly via slice.
+// All ops are pure MLX graph nodes (no eval, no data<>) → works inside mx::vmap.
+// Matches Python gpu_cholesky() from gpu_linalg.py.
+mx::array cholesky_gpu(const mx::array& A, int n) {
+    auto L = mx::zeros_like(A);  // (n, n)
+
+    for (int j = 0; j < n; j++) {
+        // Diagonal: L[j,j] = sqrt(A[j,j] - sum(L[j,0:j]^2))
+        auto s = (j > 0)
+            ? mx::sum(mx::square(mx::slice(L, {j, 0}, {j+1, j})))
+            : mx::array(0.0f);
+        auto diag = mx::sqrt(mx::maximum(
+            mx::subtract(mx::flatten(mx::slice(A, {j, j}, {j+1, j+1})),
+                          mx::reshape(s, {1})),
+            mx::array({1e-6f})));  // (1,)
+
+        // Off-diagonal column: L[j+1:n, j] = (A[j+1:n, j] - L[j+1:n,0:j] @ L[j,0:j]^T) / diag
+        mx::array col = mx::zeros({0, 1});
+        if (j < n - 1) {
+            auto Acol = mx::slice(A, {j+1, j}, {n, j+1});  // (n-j-1, 1)
+            if (j > 0) {
+                auto L_below = mx::slice(L, {j+1, 0}, {n, j});  // (n-j-1, j)
+                auto L_jrow = mx::slice(L, {j, 0}, {j+1, j});   // (1, j)
+                auto dot = mx::matmul(L_below, mx::transpose(L_jrow));  // (n-j-1, 1)
+                Acol = mx::subtract(Acol, dot);
+            }
+            col = mx::divide(Acol, mx::reshape(diag, {1, 1}));  // (n-j-1, 1)
+        }
+
+        // Build full column vector and one-hot row mask, add to L
+        auto diag_2d = mx::reshape(diag, {1, 1});
+        mx::array full_col = (j < n - 1)
+            ? mx::concatenate({mx::zeros({j, 1}), diag_2d, col}, 0)     // (n, 1)
+            : mx::concatenate({mx::zeros({j, 1}), diag_2d}, 0);          // (n, 1)
+
+        // One-hot row vector: 1 at position j
+        mx::array one_hot = (j == 0)
+            ? mx::concatenate({mx::ones({1, 1}), mx::zeros({1, n - 1})}, 1)
+            : (j == n - 1)
+                ? mx::concatenate({mx::zeros({1, n - 1}), mx::ones({1, 1})}, 1)
+                : mx::concatenate({mx::zeros({1, j}), mx::ones({1, 1}), mx::zeros({1, n - j - 1})}, 1);
+
+        L = mx::add(L, mx::multiply(full_col, one_hot));  // scatter column j into L
+    }
+
+    return L;
+}
+
+// ── GPU-native forward substitution: L y = b (vmap-compatible) ───────────────
+static mx::array solve_triangular_lower(const mx::array& L, const mx::array& b, int n) {
+    auto y = mx::zeros({n});
+    for (int i = 0; i < n; i++) {
+        auto bi = mx::slice(b, {i}, {i+1});  // (1,)
+        if (i > 0) {
+            auto L_row = mx::flatten(mx::slice(L, {i, 0}, {i+1, i}));  // (i,)
+            auto y_prev = mx::slice(y, {0}, {i});  // (i,)
+            bi = mx::subtract(bi, mx::reshape(mx::sum(mx::multiply(L_row, y_prev)), {1}));
+        }
+        auto Lii = mx::flatten(mx::slice(L, {i, i}, {i+1, i+1}));  // (1,)
+        auto yi = mx::divide(bi, mx::maximum(Lii, mx::array({1e-10f})));
+        // Update y at position i
+        y = mx::concatenate({mx::slice(y, {0}, {i}), yi,
+                             (i < n-1) ? mx::slice(y, {i+1}, {n}) : mx::zeros({0})}, 0);
+    }
+    return y;
+}
+
+// ── GPU-native backward substitution: L^T x = y (vmap-compatible) ────────────
+static mx::array solve_triangular_upper(const mx::array& LT, const mx::array& y, int n) {
+    auto x = mx::zeros({n});
+    for (int i = n - 1; i >= 0; i--) {
+        auto yi = mx::slice(y, {i}, {i+1});  // (1,)
+        if (i < n - 1) {
+            auto U_row = mx::flatten(mx::slice(LT, {i, i+1}, {i+1, n}));  // (n-i-1,)
+            auto x_below = mx::slice(x, {i+1}, {n});  // (n-i-1,)
+            yi = mx::subtract(yi, mx::reshape(mx::sum(mx::multiply(U_row, x_below)), {1}));
+        }
+        auto Uii = mx::flatten(mx::slice(LT, {i, i}, {i+1, i+1}));
+        auto xi = mx::divide(yi, mx::maximum(Uii, mx::array({1e-10f})));
+        x = mx::concatenate({(i > 0) ? mx::slice(x, {0}, {i}) : mx::zeros({0}), xi,
+                             (i < n-1) ? mx::slice(x, {i+1}, {n}) : mx::zeros({0})}, 0);
+    }
+    return x;
+}
+
+// ── GPU-native Cholesky solve: L L^T x = b (vmap-compatible) ─────────────────
+mx::array cholesky_solve_gpu(const mx::array& L, const mx::array& b, int n) {
+    auto y = solve_triangular_lower(L, b, n);
+    auto x = solve_triangular_upper(mx::transpose(L), y, n);
+    return x;
+}
+
 static constexpr float MJMINVAL_V = 1e-8f;
 
 // Helper: row from 2D using pure array ops (no eval)
@@ -182,35 +276,25 @@ Data vmap_crb(const Model& m, Data d) {
 }
 
 // ── Vmap-compatible mass matrix factorization (pure GPU) ─────────────────────
-// Uses Neumann series to approximate M^{-1} without CPU linalg.
-// For SPD mass matrices: M^{-1} ≈ D^{-1} (I + N + N^2 + N^3)
-// where D = diag(M), N = I - D^{-1} M.
-// All operations are GPU-native matmul + elementwise.
+// Uses column-vectorized Cholesky decomposition with pure MLX ops.
+// All operations are GPU-native (no CPU sync) → vmap-compatible.
 
 Data vmap_factor_m(const Model& m, Data d) {
     int n = m.nv;
     auto A = mx::add(d.qM, mx::multiply(mx::eye(n), mx::array(1e-6f)));
     d.qLD = A;  // store regularized M (used by Euler kernel via Metal)
 
-    // GPU-native approximate inverse via Neumann series
-    auto diag_A = mx::diag(A);                                     // (n,)
-    auto D_inv = mx::reciprocal(mx::maximum(diag_A, mx::array(1e-10f)));  // (n,)
-    auto D_inv_mat = mx::diag(D_inv);                              // (n, n)
-    auto N = mx::subtract(mx::eye(n), mx::matmul(D_inv_mat, A));  // I - D^{-1}M
-
-    // Neumann: (I + N + N^2 + N^3) @ D^{-1}
-    auto N2 = mx::matmul(N, N);
-    auto N3 = mx::matmul(N2, N);
-    auto poly = mx::add(mx::eye(n), mx::add(N, mx::add(N2, N3)));
-    d.qM_inv = mx::matmul(poly, D_inv_mat);
+    // Cholesky factorization: A = L L^T
+    d.qM_inv = cholesky_gpu(A, n);  // store L in qM_inv (reusing field)
 
     return d;
 }
 
-// ── Vmap-compatible M^{-1} @ rhs using precomputed GPU inverse ──────────────
+// ── Vmap-compatible solve M x = rhs using Cholesky factorization ────────────
 
 mx::array vmap_solve_m(const Model& m, const Data& d, const mx::array& rhs) {
-    return mx::flatten(mx::matmul(d.qM_inv, mx::reshape(rhs, mx::Shape{m.nv, 1})));
+    // d.qM_inv holds the Cholesky factor L (not the actual inverse)
+    return cholesky_solve_gpu(d.qM_inv, rhs, m.nv);
 }
 
 // ── Vmap-compatible COM velocity ─────────────────────────────────────────────

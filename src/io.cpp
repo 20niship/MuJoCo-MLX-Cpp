@@ -474,11 +474,12 @@ void Model::init_cache() const {
         mx::eval(dof_parentid);
         auto dof_par_ptr = dof_parentid.data<int>();
         std::vector<float> mask_data(nv * nv, 0.0f);
+        // Lower-triangular mask only: j walks from i toward root (j <= i).
+        // Symmetrization happens later in vmap_crb: qm = qm + tril(qm,-1).T
         for (int i = 0; i < nv; i++) {
             int j = i;
             while (j > -1) {
                 mask_data[i * nv + j] = 1.0f;
-                mask_data[j * nv + i] = 1.0f;
                 j = dof_par_ptr[j];
             }
         }
