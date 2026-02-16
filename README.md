@@ -6,7 +6,7 @@ A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipel
 
 ## Status
 
-**Phase 1c complete -- full physics pipeline working.**
+**Phase 1d complete -- full physics pipeline + batched simulation.**
 
 | Module | Status | Description |
 |--------|--------|-------------|
@@ -19,7 +19,7 @@ A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipel
 | `constraint.cpp` | Done | Joint limits + contact constraints with KBI impedance |
 | `solver.cpp` | Done | CG with Polak-Ribiere + Newton linesearch |
 | `forward.cpp` | Done | Full pipeline orchestration + Euler integration |
-| `batched.cpp` | Stub | `compile(vmap(step))` for N parallel environments |
+| `batched.cpp` | Done | Batched sim C API + Metal kernel source generators |
 | `nn.cpp` | Stub | Actor-critic neural network (MLX C++) |
 | `ppo.cpp` | Stub | PPO training loop |
 
@@ -31,6 +31,8 @@ A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipel
 - Free-fall simulation stable over 100+ steps (z drops 1.282 -> 0.068)
 - Gravity acceleration matches expected value (0.049 m/s per step)
 - Dense Cholesky (CPU) and sparse LDL factorization both implemented
+- Batched simulation: 4 envs x 10 steps, per-env reset, state isolation verified
+- Metal kernel source generators: kinematics FK + fused Euler (same MSL as Python)
 
 ### Phase 0 spike results:
 
@@ -49,11 +51,11 @@ libmjmlx.dylib (this repo)
     |     io, math, smooth, collision, constraint, solver, forward,
     |     passive, support, scan
     |
-    +-- Metal kernels [IN PROGRESS]
-    |     kinematics, linalg, euler (port from Python inline MSL)
+    +-- Metal kernels [DONE - source generators]
+    |     kinematics, linalg, euler (ported from Python inline MSL)
     |
-    +-- Batched simulation [IN PROGRESS]
-    |     compile(vmap(step)) for N parallel environments
+    +-- Batched simulation [DONE - per-env loop, Metal hybrid pending]
+    |     Full C API: create, step, reset, get_state
     |
     +-- Differentiable step [PLANNED]
     |     grad(step) for empowerment / model-based RL
