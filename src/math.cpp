@@ -143,6 +143,16 @@ mx::array rotate(const mx::array& vec, const mx::array& quat) {
     return mx::add(mx::add(term1, term2), term3);
 }
 
+mx::array axis_angle_to_quat(const mx::array& axis, const mx::array& angle) {
+    auto half = mx::multiply(angle, mx::array(0.5f));
+    auto s = mx::cos(half);
+    auto c = mx::sin(half);
+    auto n = normalize(axis);
+    auto w = mx::reshape(s, {1});
+    auto xyz = mx::multiply(n, mx::reshape(c, {1}));
+    return mx::concatenate({w, xyz}, 0);
+}
+
 mx::array quat_integrate(const mx::array& q, const mx::array& v, float dt) {
     auto n = norm(v);
     auto eps = mx::array(1e-8f);
@@ -233,6 +243,86 @@ mx::array transform_motion(const mx::array& vel, const mx::array& offset,
     auto new_ang = mx::matmul(rotT, mx::reshape(ang, {3, 1}));
 
     return mx::concatenate({mx::flatten(new_ang), mx::flatten(new_lin)}, 0);
+}
+
+// ── Collision helpers ─────────────────────────────────────────────────────────
+
+std::pair<mx::array, mx::array> orthogonals(const mx::array& n) {
+    // Build two vectors perpendicular to n
+    mx::eval(n);
+    auto np = n.data<float>();
+    float nx = np[0], ny = np[1], nz = np[2];
+
+    // Choose the axis least aligned with n
+    float ax, ay, az;
+    if (std::abs(nx) < std::abs(ny) && std::abs(nx) < std::abs(nz)) {
+        ax = 0; ay = -nz; az = ny; // n x (1,0,0)
+    } else if (std::abs(ny) < std::abs(nz)) {
+        ax = nz; ay = 0; az = -nx; // n x (0,1,0)
+    } else {
+        ax = -ny; ay = nx; az = 0; // n x (0,0,1)
+    }
+
+    float len = std::sqrt(ax*ax + ay*ay + az*az);
+    if (len > MJMINVAL) { ax /= len; ay /= len; az /= len; }
+
+    // Second orthogonal: n x b
+    float cx = ny*az - nz*ay;
+    float cy = nz*ax - nx*az;
+    float cz = nx*ay - ny*ax;
+    len = std::sqrt(cx*cx + cy*cy + cz*cz);
+    if (len > MJMINVAL) { cx /= len; cy /= len; cz /= len; }
+
+    return {mx::array({ax, ay, az}), mx::array({cx, cy, cz})};
+}
+
+mx::array closest_segment_point(const mx::array& p0, const mx::array& p1,
+                                 const mx::array& point) {
+    // Closest point on segment [p0, p1] to point
+    auto seg = mx::subtract(p1, p0);
+    auto t = mx::sum(mx::multiply(mx::subtract(point, p0), seg));
+    auto seg_sq = mx::sum(mx::multiply(seg, seg));
+    mx::eval(t); mx::eval(seg_sq);
+    float tt = t.item<float>();
+    float ss = seg_sq.item<float>();
+    float param = (ss > MJMINVAL) ? tt / ss : 0.0f;
+    param = std::max(0.0f, std::min(1.0f, param));
+    return mx::add(p0, mx::multiply(seg, mx::array(param)));
+}
+
+std::pair<mx::array, mx::array> closest_segment_to_segment_points(
+    const mx::array& a0, const mx::array& a1,
+    const mx::array& b0, const mx::array& b1)
+{
+    auto d1 = mx::subtract(a1, a0);
+    auto d2 = mx::subtract(b1, b0);
+    auto r = mx::subtract(a0, b0);
+
+    mx::eval(d1); mx::eval(d2); mx::eval(r);
+    auto d1p = d1.data<float>(); auto d2p = d2.data<float>(); auto rp = r.data<float>();
+
+    float a = d1p[0]*d1p[0] + d1p[1]*d1p[1] + d1p[2]*d1p[2];
+    float e = d2p[0]*d2p[0] + d2p[1]*d2p[1] + d2p[2]*d2p[2];
+    float f = d2p[0]*rp[0] + d2p[1]*rp[1] + d2p[2]*rp[2];
+    float b_val = d1p[0]*d2p[0] + d1p[1]*d2p[1] + d1p[2]*d2p[2];
+    float c_val = d1p[0]*rp[0] + d1p[1]*rp[1] + d1p[2]*rp[2];
+
+    float denom = a * e - b_val * b_val;
+    float s = 0.0f, t_param = 0.0f;
+
+    if (denom > MJMINVAL) {
+        s = std::max(0.0f, std::min(1.0f, (b_val * f - c_val * e) / denom));
+    }
+
+    t_param = (b_val * s + f) / std::max(e, MJMINVAL);
+    t_param = std::max(0.0f, std::min(1.0f, t_param));
+
+    s = (-c_val + b_val * t_param) / std::max(a, MJMINVAL);
+    s = std::max(0.0f, std::min(1.0f, s));
+
+    auto best_a = mx::add(a0, mx::multiply(d1, mx::array(s)));
+    auto best_b = mx::add(b0, mx::multiply(d2, mx::array(t_param)));
+    return {best_a, best_b};
 }
 
 } // namespace mjmlx

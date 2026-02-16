@@ -31,6 +31,27 @@ enum class GeomType : int {
 enum class IntegratorType : int { EULER = 0, RK4 = 1, IMPLICIT = 2, IMPLICITFAST = 3 };
 enum class SolverType : int { PGS = 0, CG = 1, NEWTON = 2 };
 enum class ConeType : int { PYRAMIDAL = 0, ELLIPTIC = 1 };
+enum class GainType : int { FIXED = 0, AFFINE = 1, MUSCLE = 2 };
+enum class BiasType : int { NONE = 0, AFFINE = 1, MUSCLE = 2 };
+
+// Disable bit flags (matching MuJoCo C mjDisableBit)
+namespace DisableBit {
+    constexpr int CONSTRAINT   = (1 << 0);
+    constexpr int EQUALITY     = (1 << 1);
+    constexpr int FRICTIONLOSS = (1 << 2);
+    constexpr int LIMIT        = (1 << 3);
+    constexpr int CONTACT      = (1 << 4);
+    constexpr int SPRING       = (1 << 4);  // note: shares bit with CONTACT in some MuJoCo versions
+    constexpr int PASSIVE      = (1 << 5);
+    constexpr int DAMPER       = (1 << 6);
+    constexpr int GRAVITY      = (1 << 7);
+    constexpr int CLAMPCTRL    = (1 << 8);
+    constexpr int WARMSTART    = (1 << 9);
+    constexpr int FILTERPARENT = (1 << 10);
+    constexpr int ACTUATION    = (1 << 11);
+    constexpr int REFSAFE      = (1 << 12);
+    constexpr int EULERDAMP    = (1 << 18);
+}
 
 // ── Option ───────────────────────────────────────────────────
 
@@ -217,8 +238,20 @@ struct Data {
     mx::array site_xpos{mx::array({})};  // (nsite, 3) site positions
     mx::array site_xmat{mx::array({})};  // (nsite, 3, 3) site rotations
 
+    // Joint anchors/axes (computed by kinematics)
+    mx::array xanchor{mx::array({})};    // (njnt, 3) joint anchors
+    mx::array xaxis{mx::array({})};      // (njnt, 3) joint axes
+
     // Applied forces
     mx::array xfrc_applied{mx::array({})};  // (nbody, 6) external forces
+    mx::array qfrc_applied{mx::array({})};  // (nv,) applied joint forces
+
+    // Actuator
+    mx::array actuator_length{mx::array({})};    // (nu,)
+    mx::array actuator_moment{mx::array({})};    // (nu, nv)
+    mx::array actuator_velocity{mx::array({})};  // (nu,)
+    mx::array actuator_force{mx::array({})};     // (nu,)
+    mx::array act_dot{mx::array({})};            // (na,)
 
     // Dynamics
     mx::array subtree_com{mx::array({})};    // (nbody, 3)
@@ -237,15 +270,25 @@ struct Data {
     mx::array qfrc_smooth{mx::array({})};    // (nv,) smooth forces (bias+passive+actuator)
     mx::array qacc_smooth{mx::array({})};    // (nv,) acceleration from smooth forces
 
+    // Solver
+    mx::array qfrc_constraint{mx::array({})};  // (nv,) constraint forces
+    mx::array qacc_warmstart{mx::array({})};   // (nv,) warmstart acceleration
+
     // Constraint
     mx::array efc_J{mx::array({})};
     mx::array efc_D{mx::array({})};
     mx::array efc_aref{mx::array({})};
     mx::array efc_force{mx::array({})};
+    mx::array efc_frictionloss{mx::array({})};
     int nefc = 0;
+    int ne = 0, nf = 0, nl = 0;  // equality, friction, limit counts
+    int ncon = 0;
 
     // Contact
     Contact contact;
+
+    // Time
+    mx::array time{mx::array(0.0f)};
 };
 
 // ── BatchedSim ───────────────────────────────────────────────
@@ -306,10 +349,43 @@ Model load_model_from_string(const char* xml_string);
 Data make_data(const Model& model);
 
 // math.cpp
+mx::array cross(const mx::array& a, const mx::array& b);
+mx::array norm(const mx::array& x);
+mx::array normalize(const mx::array& x);
 mx::array quat_mul(const mx::array& q1, const mx::array& q2);
+mx::array quat_inv(const mx::array& q);
 mx::array quat_to_mat(const mx::array& q);
 mx::array rotate(const mx::array& vec, const mx::array& quat);
-mx::array normalize(const mx::array& x);
+mx::array quat_integrate(const mx::array& q, const mx::array& v, float dt);
+mx::array axis_angle_to_quat(const mx::array& axis, const mx::array& angle);
+mx::array inert_mul(const mx::array& inert, const mx::array& vel);
+mx::array motion_cross(const mx::array& u, const mx::array& v);
+mx::array motion_cross_force(const mx::array& v, const mx::array& f);
+std::pair<mx::array, mx::array> orthogonals(const mx::array& n);
+mx::array closest_segment_point(const mx::array& p0, const mx::array& p1,
+                                 const mx::array& point);
+std::pair<mx::array, mx::array> closest_segment_to_segment_points(
+    const mx::array& a0, const mx::array& a1,
+    const mx::array& b0, const mx::array& b1);
+
+// smooth.cpp
+Data kinematics(const Model& m, Data d);
+Data com_pos(const Model& m, Data d);
+Data crb(const Model& m, Data d);
+Data factor_m(const Model& m, Data d);
+mx::array solve_m(const Model& m, const Data& d, const mx::array& rhs);
+Data com_vel(const Model& m, Data d);
+Data rne(const Model& m, Data d, bool flg_acc = false);
+Data transmission(const Model& m, Data d);
+
+// collision.cpp
+Data collision(const Model& m, Data d);
+
+// constraint.cpp
+Data make_constraint(const Model& m, Data d);
+
+// solver.cpp
+Data solve(const Model& m, Data d);
 
 // passive.cpp
 Data passive(const Model& m, Data d);

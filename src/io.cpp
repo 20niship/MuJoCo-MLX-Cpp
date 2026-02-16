@@ -280,15 +280,35 @@ Data make_data(const Model& model) {
     d.qfrc_bias = mx::zeros({nv});
     d.qfrc_passive = mx::zeros({nv});
     d.qfrc_actuator = mx::zeros({nv});
+    d.qfrc_gravcomp = mx::zeros({nv});
     d.qfrc_smooth = mx::zeros({nv});
     d.qacc_smooth = mx::zeros({nv});
+
+    // Applied forces
+    d.xfrc_applied = mx::zeros({nbody, 6});
+    d.qfrc_applied = mx::zeros({nv});
+
+    // Actuator
+    d.actuator_length = mx::zeros({nu});
+    d.actuator_moment = mx::zeros({nu, nv});
+    d.actuator_velocity = mx::zeros({nu});
+    d.actuator_force = mx::zeros({nu});
+    d.act_dot = mx::zeros({model.na});
+
+    // Solver
+    d.qfrc_constraint = mx::zeros({nv});
+    d.qacc_warmstart = mx::zeros({nv});
 
     // Constraint
     d.efc_J = mx::zeros({0, nv});
     d.efc_D = mx::zeros({0});
     d.efc_aref = mx::zeros({0});
     d.efc_force = mx::zeros({0});
+    d.efc_frictionloss = mx::zeros({0});
     d.nefc = 0;
+    d.ne = 0; d.nf = 0; d.nl = 0;
+    d.ncon = 0;
+    d.time = mx::array(0.0f);
 
     return d;
 }

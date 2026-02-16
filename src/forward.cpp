@@ -22,18 +22,189 @@ namespace mx = mlx::core;
 
 namespace mjmlx {
 
-// TODO: Phase 1b - port from Python mjmlx._src.forward
-Data forward(const Model& m, Data d) {
-  (void)m;
-  (void)d;
-  throw std::runtime_error("not implemented");
+// ── Forward sub-pipelines ─────────────────────────────────────────────────────
+
+static Data fwd_position(const Model& m, Data d) {
+  d = kinematics(m, d);
+  d = com_pos(m, d);
+  d = crb(m, d);
+  d = factor_m(m, d);
+  d = collision(m, d);
+  d = make_constraint(m, d);
+  d = transmission(m, d);
+  return d;
 }
 
-// TODO: Phase 1b - port from Python mjmlx._src.forward
+static Data fwd_velocity(const Model& m, Data d) {
+  if (m.nu > 0 && d.actuator_moment.size() > 0) {
+    d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment, mx::reshape(d.qvel, {m.nv, 1})));
+  }
+  d = com_vel(m, d);
+  d = passive(m, d);
+  d = rne(m, d);
+  return d;
+}
+
+static Data fwd_actuation(const Model& m, Data d) {
+  if (m.nu == 0 || (m.opt.disableflags & DisableBit::ACTUATION)) {
+    d.qfrc_actuator = mx::zeros({m.nv});
+    return d;
+  }
+
+  auto ctrl = d.ctrl;
+
+  // Clamp control
+  if (!(m.opt.disableflags & DisableBit::CLAMPCTRL) && m.actuator_ctrllimited.size() > 0) {
+    mx::eval(m.actuator_ctrllimited); mx::eval(m.actuator_ctrlrange); mx::eval(ctrl);
+    auto lim_ptr = m.actuator_ctrllimited.data<int>();
+    for (int i = 0; i < m.nu; i++) {
+      if (!lim_ptr[i]) continue;
+      auto lo = mx::slice(m.actuator_ctrlrange, {i, 0}, {i + 1, 1});
+      auto hi = mx::slice(m.actuator_ctrlrange, {i, 1}, {i + 1, 2});
+      auto val = mx::clip(mx::slice(ctrl, {i}, {i + 1}), mx::flatten(lo), mx::flatten(hi));
+      auto before = mx::slice(ctrl, {0}, {i});
+      auto after = mx::slice(ctrl, {i + 1}, {m.nu});
+      ctrl = mx::concatenate({before, val, after}, 0);
+    }
+  }
+
+  // Compute actuator force (simplified: FIXED gain with AFFINE bias)
+  mx::eval(m.actuator_gaintype); mx::eval(m.actuator_gainprm);
+  mx::eval(m.actuator_biastype); mx::eval(m.actuator_biasprm);
+  auto gaintype_ptr = m.actuator_gaintype.data<int>();
+  auto biastype_ptr = m.actuator_biastype.data<int>();
+
+  std::vector<float> force_data(m.nu, 0.0f);
+  mx::eval(ctrl); mx::eval(d.actuator_length);
+  auto ctrl_ptr = ctrl.data<float>();
+
+  for (int i = 0; i < m.nu; i++) {
+    float gain = 0.0f;
+    mx::eval(m.actuator_gainprm);
+    auto gp = m.actuator_gainprm.data<float>();
+    if (gaintype_ptr[i] == static_cast<int>(GainType::FIXED)) {
+      gain = gp[i * 10];
+    } else {
+      gain = gp[i * 10];  // fallback
+    }
+
+    float bias = 0.0f;
+    if (biastype_ptr[i] == static_cast<int>(BiasType::AFFINE)) {
+      mx::eval(m.actuator_biasprm);
+      auto bp = m.actuator_biasprm.data<float>();
+      mx::eval(d.actuator_length);
+      auto len_ptr = d.actuator_length.data<float>();
+      bias = bp[i * 10] + bp[i * 10 + 1] * len_ptr[i];
+    }
+
+    force_data[i] = gain * ctrl_ptr[i] + bias;
+  }
+
+  // Clamp force
+  if (m.actuator_forcelimited.size() > 0) {
+    mx::eval(m.actuator_forcelimited); mx::eval(m.actuator_forcerange);
+    auto flim = m.actuator_forcelimited.data<int>();
+    auto frange = m.actuator_forcerange.data<float>();
+    for (int i = 0; i < m.nu; i++) {
+      if (flim[i]) {
+        float lo = frange[i * 2], hi = frange[i * 2 + 1];
+        force_data[i] = std::max(lo, std::min(hi, force_data[i]));
+      }
+    }
+  }
+
+  auto force = mx::array(force_data.data(), {m.nu}, mx::float32);
+  d.actuator_force = force;
+
+  // Map to joint space: qfrc = moment^T @ force
+  if (d.actuator_moment.size() > 0) {
+    d.qfrc_actuator = mx::flatten(mx::matmul(mx::transpose(d.actuator_moment),
+                                              mx::reshape(force, {m.nu, 1})));
+  } else {
+    d.qfrc_actuator = mx::zeros({m.nv});
+  }
+
+  return d;
+}
+
+static Data fwd_acceleration(const Model& m, Data d) {
+  auto qfrc_applied = d.qfrc_applied;
+  if (d.xfrc_applied.size() > 0) {
+    qfrc_applied = mx::add(qfrc_applied, xfrc_accumulate(m, d));
+  }
+  auto qfrc_smooth = mx::add(mx::subtract(d.qfrc_passive, d.qfrc_bias),
+                              mx::add(d.qfrc_actuator, qfrc_applied));
+  auto qacc_smooth = solve_m(m, d, qfrc_smooth);
+  d.qfrc_smooth = qfrc_smooth;
+  d.qacc_smooth = qacc_smooth;
+  return d;
+}
+
+static Data integrate_euler(const Model& m, Data d) {
+  float dt = m.opt.timestep;
+  auto qacc = d.qacc;
+
+  // Advance velocity
+  auto new_qvel = mx::add(d.qvel, mx::multiply(qacc, mx::array(dt)));
+
+  // Integrate position (simplified: handles free joints with quaternion integration)
+  mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+  auto jnt_type_ptr = m.jnt_type.data<int>();
+  auto jnt_qposadr_ptr = m.jnt_qposadr.data<int>();
+  auto jnt_dofadr_ptr = m.jnt_dofadr.data<int>();
+
+  std::vector<mx::array> parts;
+  for (int j = 0; j < m.njnt; j++) {
+    int jt = jnt_type_ptr[j];
+    int qa = jnt_qposadr_ptr[j];
+    int da = jnt_dofadr_ptr[j];
+
+    if (jt == static_cast<int>(JointType::FREE)) {
+      auto pos = mx::add(mx::slice(d.qpos, {qa}, {qa + 3}),
+                         mx::multiply(mx::array(dt), mx::slice(new_qvel, {da}, {da + 3})));
+      auto quat_new = quat_integrate(mx::slice(d.qpos, {qa + 3}, {qa + 7}),
+                                      mx::slice(new_qvel, {da + 3}, {da + 6}), dt);
+      parts.push_back(mx::concatenate({pos, quat_new}, 0));
+    } else if (jt == static_cast<int>(JointType::BALL)) {
+      auto quat_new = quat_integrate(mx::slice(d.qpos, {qa}, {qa + 4}),
+                                      mx::slice(new_qvel, {da}, {da + 3}), dt);
+      parts.push_back(quat_new);
+    } else {
+      // HINGE or SLIDE
+      auto val = mx::add(mx::slice(d.qpos, {qa}, {qa + 1}),
+                         mx::multiply(mx::array(dt), mx::slice(new_qvel, {da}, {da + 1})));
+      parts.push_back(val);
+    }
+  }
+
+  d.qpos = mx::concatenate(parts, 0);
+  d.qvel = new_qvel;
+  d.qacc_warmstart = d.qacc;
+  return d;
+}
+
+Data forward(const Model& m, Data d) {
+  d = fwd_position(m, d);
+  d = fwd_velocity(m, d);
+  d = fwd_actuation(m, d);
+  d = fwd_acceleration(m, d);
+
+  // Solve constraints
+  int nefc_count = d.efc_J.shape(0);
+  if (nefc_count == 0) {
+    d.qacc = d.qacc_smooth;
+    d.qfrc_constraint = mx::zeros({m.nv});
+  } else {
+    d = solve(m, d);
+  }
+
+  return d;
+}
+
 Data step(const Model& m, Data d) {
-  (void)m;
-  (void)d;
-  throw std::runtime_error("not implemented");
+  d = forward(m, d);
+  d = integrate_euler(m, d);
+  return d;
 }
 
 }  // namespace mjmlx
