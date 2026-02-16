@@ -58,52 +58,53 @@ int main(int argc, char** argv) {
                   << qpos[info.nq + 1] << ", " << qpos[info.nq + 2] << "]" << std::endl;
     }
 
-    // Run batched steps
-    std::cout << "\n=== Running " << num_steps << " batched steps ===" << std::endl;
-    auto t2 = std::chrono::high_resolution_clock::now();
-    bool had_nan = false;
+    // Warmup: 1 step to trigger mx::compile (first step builds + compiles the graph)
+    std::cout << "\n=== Warmup (1 step, triggers compile) ===" << std::endl;
+    auto tw0 = std::chrono::high_resolution_clock::now();
+    mjmlx_batched_step(sim, nullptr);
+    // Force eval by reading back one value
+    { int tmp; mjmlx_batched_get_xpos(sim, &tmp); }
+    auto tw1 = std::chrono::high_resolution_clock::now();
+    double warmup_ms = std::chrono::duration<double, std::milli>(tw1 - tw0).count();
+    std::cout << "  Warmup (compile + 1 step): " << warmup_ms << " ms" << std::endl;
 
+    // Pure throughput: no readback, no printing inside the loop
+    std::cout << "\n=== Pure throughput (" << num_steps << " steps, no readback) ===" << std::endl;
+    auto t2 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_steps; i++) {
         mjmlx_batched_step(sim, nullptr);
-
-        if (i < 5 || i % 10 == 0 || i == num_steps - 1) {
-            int n_xpos = 0, n_qvel = 0;
-            auto* xpos = mjmlx_batched_get_xpos(sim, &n_xpos);
-            auto* qvel_ptr = mjmlx_batched_get_qvel(sim, &n_qvel);
-
-            // Check env 0 torso z (body 1 z component)
-            float z0 = (xpos && n_xpos >= info.nbody * 3) ? xpos[3 + 2] : 0.0f;
-
-            // Max velocity across all envs
-            float max_vel = 0;
-            int total_vel = n_qvel;
-            if (qvel_ptr) {
-                for (int j = 0; j < total_vel; j++) {
-                    float v = std::abs(qvel_ptr[j]);
-                    if (v > max_vel) max_vel = v;
-                }
-            }
-
-            std::cout << "  step " << i << ": env0_z=" << z0
-                      << "  max|qvel|=" << max_vel << std::endl;
-
-            if (std::isnan(z0) || std::isinf(z0)) {
-                std::cerr << "  NaN/Inf at step " << i << std::endl;
-                had_nan = true;
-                break;
-            }
-        }
     }
-
+    // Single readback at the end to force all steps to complete
+    { int tmp; mjmlx_batched_get_xpos(sim, &tmp); }
     auto t3 = std::chrono::high_resolution_clock::now();
     double step_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     double sps = (num_steps * num_envs) / (step_ms / 1000.0);
 
-    std::cout << "\n=== Performance ===" << std::endl;
     std::cout << "  " << num_steps << " steps x " << num_envs << " envs = "
-              << num_steps * num_envs << " total steps" << std::endl;
+              << (long long)num_steps * num_envs << " total steps" << std::endl;
     std::cout << "  Time: " << step_ms << " ms" << std::endl;
     std::cout << "  Throughput: " << sps << " steps/sec" << std::endl;
+
+    // Stability check: readback final state
+    bool had_nan = false;
+    {
+        int n_xpos = 0, n_qvel = 0;
+        auto* xpos = mjmlx_batched_get_xpos(sim, &n_xpos);
+        auto* qvel_ptr = mjmlx_batched_get_qvel(sim, &n_qvel);
+        float z0 = (xpos && n_xpos >= info.nbody * 3) ? xpos[3 + 2] : 0.0f;
+        float max_vel = 0;
+        if (qvel_ptr) {
+            for (int j = 0; j < n_qvel; j++) {
+                float v = std::abs(qvel_ptr[j]);
+                if (v > max_vel) max_vel = v;
+            }
+        }
+        std::cout << "  Final state: env0_z=" << z0 << "  max|qvel|=" << max_vel << std::endl;
+        if (std::isnan(z0) || std::isinf(z0)) {
+            std::cerr << "  NaN/Inf detected!" << std::endl;
+            had_nan = true;
+        }
+    }
 
     // Test reset
     std::cout << "\n=== Test: Reset env 0 ===" << std::endl;
