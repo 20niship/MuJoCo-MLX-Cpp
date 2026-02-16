@@ -57,6 +57,24 @@ MJMLX_API void mjmlx_free_model(MjmlxModel* model);
 MJMLX_API MjmlxModelInfo mjmlx_model_info(const MjmlxModel* model);
 
 // ============================================================
+// Model field accessors (MuJoCo C conformance)
+// ============================================================
+
+// Get simulation timestep (model.opt.timestep).
+MJMLX_API float mjmlx_model_opt_timestep(const MjmlxModel* model);
+
+// Set simulation timestep.
+MJMLX_API void mjmlx_model_set_opt_timestep(MjmlxModel* model, float dt);
+
+// Get body mass for a specific body ID.
+MJMLX_API float mjmlx_model_body_mass(const MjmlxModel* model, int body_id);
+
+// Name-to-ID lookup (delegates to MuJoCo C mj_name2id).
+// obj_type: MuJoCo object type (e.g., mjOBJ_BODY=1, mjOBJ_JOINT=2, mjOBJ_GEOM=5).
+// Returns -1 if not found.
+MJMLX_API int mjmlx_name2id(const MjmlxModel* model, int obj_type, const char* name);
+
+// ============================================================
 // Single-environment simulation
 // ============================================================
 
@@ -66,11 +84,26 @@ MJMLX_API MjmlxData* mjmlx_make_data(const MjmlxModel* model);
 // Free simulation data.
 MJMLX_API void mjmlx_free_data(MjmlxData* data);
 
+// Reset data to initial state (qpos0, zero velocities). Analogous to mj_resetData.
+MJMLX_API void mjmlx_reset_data(const MjmlxModel* model, MjmlxData* data);
+
 // Run full forward kinematics + dynamics.
 MJMLX_API void mjmlx_forward(const MjmlxModel* model, MjmlxData* data);
 
 // Advance simulation by one timestep.
 MJMLX_API void mjmlx_step(const MjmlxModel* model, MjmlxData* data);
+
+// Split step: compute position, velocity, actuation (allows ctrl modification between).
+// Analogous to mj_step1 in MuJoCo C.
+MJMLX_API void mjmlx_step1(const MjmlxModel* model, MjmlxData* data);
+
+// Split step: compute acceleration, solve constraints, integrate.
+// Analogous to mj_step2 in MuJoCo C.
+MJMLX_API void mjmlx_step2(const MjmlxModel* model, MjmlxData* data);
+
+// Compute forward kinematics only (position-dependent quantities).
+// Analogous to mj_kinematics in MuJoCo C.
+MJMLX_API void mjmlx_kinematics(const MjmlxModel* model, MjmlxData* data);
 
 // Set generalized coordinates. qpos must have model.nq elements.
 MJMLX_API void mjmlx_set_qpos(MjmlxData* data, const float* qpos, int n);
@@ -101,8 +134,13 @@ MJMLX_API const float* mjmlx_get_qfrc_smooth(const MjmlxData* data, int* n_out);
 MJMLX_API const float* mjmlx_get_qacc_smooth(const MjmlxData* data, int* n_out);     // smooth acceleration [nv]
 MJMLX_API const float* mjmlx_get_subtree_com(const MjmlxData* data, int* n_out);     // subtree COM [nbody*3]
 MJMLX_API const float* mjmlx_get_cinert(const MjmlxData* data, int* n_out);          // body inertias [nbody*10]
+MJMLX_API const float* mjmlx_get_cfrc_ext(const MjmlxData* data, int* n_out);        // external contact forces [nbody*6]
 MJMLX_API int mjmlx_get_ncon(const MjmlxData* data);                                 // number of contacts
 MJMLX_API int mjmlx_get_nefc(const MjmlxData* data);                                 // constraint rows
+
+// Compute cfrc_ext (per-body contact forces) from constraint forces.
+// Analogous to mj_rnePostConstraint in MuJoCo C.
+MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* data);
 
 // ============================================================
 // Batched simulation (compile + vmap -- Metal GPU)

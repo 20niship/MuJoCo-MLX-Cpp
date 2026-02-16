@@ -67,8 +67,9 @@ static void apply_foot_contacts_only(mjModel* m) {
     }
 }
 
-// Convert an mjModel* to our internal Model struct, then free the mjModel.
-static Model convert_and_free(mjModel* m) {
+// Convert an mjModel* to our internal Model struct.
+// The mjModel* is NOT freed here -- caller manages its lifetime.
+static Model convert_model(mjModel* m) {
     Model model;
 
     // Counts
@@ -238,20 +239,22 @@ static Model convert_and_free(mjModel* m) {
     // (MLX is lazy -- this ensures everything is in GPU memory)
     // We skip this for now since model arrays are typically small
 
-    mj_deleteModel(m);
     return model;
 }
 
-Model load_model(const char* xml_path) {
+// Load a MuJoCo C model and convert to internal Model.
+// Returns {Model, mjModel*} pair -- caller owns the mjModel*.
+std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
     char error[1000] = "";
     mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
     if (!m) {
         throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
     }
-    return convert_and_free(m);
+    Model model = convert_model(m);
+    return {std::move(model), m};
 }
 
-Model load_model_filtered(const char* xml_path, bool foot_contacts_only) {
+std::pair<Model, mjModel*> load_model_filtered_pair(const char* xml_path, bool foot_contacts_only) {
     char error[1000] = "";
     mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
     if (!m) {
@@ -260,11 +263,11 @@ Model load_model_filtered(const char* xml_path, bool foot_contacts_only) {
     if (foot_contacts_only) {
         apply_foot_contacts_only(m);
     }
-    return convert_and_free(m);
+    Model model = convert_model(m);
+    return {std::move(model), m};
 }
 
-Model load_model_from_string(const char* xml_string) {
-    // Write XML to a temp file and load via mj_loadXML
+std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string) {
     char tmppath[] = "/tmp/mjmlx_model_XXXXXX.xml";
     int fd = mkstemps(tmppath, 4);
     if (fd < 0) throw std::runtime_error("Failed to create temp file for XML");
@@ -276,13 +279,32 @@ Model load_model_from_string(const char* xml_string) {
         throw std::runtime_error("Failed to write XML to temp file");
     }
     try {
-        Model model = load_model(tmppath);
+        auto result = load_model_pair(tmppath);
         unlink(tmppath);
-        return model;
+        return result;
     } catch (...) {
         unlink(tmppath);
         throw;
     }
+}
+
+// Legacy load functions (for internal C++ use where mjModel* isn't needed)
+Model load_model(const char* xml_path) {
+    auto [model, mj] = load_model_pair(xml_path);
+    mj_deleteModel(mj);
+    return model;
+}
+
+Model load_model_filtered(const char* xml_path, bool foot_contacts_only) {
+    auto [model, mj] = load_model_filtered_pair(xml_path, foot_contacts_only);
+    mj_deleteModel(mj);
+    return model;
+}
+
+Model load_model_from_string(const char* xml_string) {
+    auto [model, mj] = load_model_from_string_pair(xml_string);
+    mj_deleteModel(mj);
+    return model;
 }
 
 Data make_data(const Model& model) {
@@ -839,7 +861,9 @@ extern "C" {
 MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
     try {
         auto* handle = new MjmlxModel();
-        handle->model = mjmlx::load_model(xml_path);
+        auto [model, mj] = mjmlx::load_model_pair(xml_path);
+        handle->model = std::move(model);
+        handle->mj_model = mj;
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "mjmlx_load_model error: %s\n", e.what());
@@ -850,7 +874,9 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
 MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_contacts_only) {
     try {
         auto* handle = new MjmlxModel();
-        handle->model = mjmlx::load_model_filtered(xml_path, foot_contacts_only != 0);
+        auto [model, mj] = mjmlx::load_model_filtered_pair(xml_path, foot_contacts_only != 0);
+        handle->model = std::move(model);
+        handle->mj_model = mj;
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "mjmlx_load_model_filtered error: %s\n", e.what());
@@ -861,7 +887,9 @@ MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_c
 MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string) {
     try {
         auto* handle = new MjmlxModel();
-        handle->model = mjmlx::load_model_from_string(xml_string);
+        auto [model, mj] = mjmlx::load_model_from_string_pair(xml_string);
+        handle->model = std::move(model);
+        handle->mj_model = mj;
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "mjmlx_load_model_from_string error: %s\n", e.what());
@@ -896,6 +924,35 @@ MJMLX_API MjmlxData* mjmlx_make_data(const MjmlxModel* model) {
 
 MJMLX_API void mjmlx_free_data(MjmlxData* data) {
     delete data;
+}
+
+MJMLX_API void mjmlx_reset_data(const MjmlxModel* model, MjmlxData* data) {
+    if (!model || !data) return;
+    try {
+        data->data = mjmlx::make_data(model->model);
+        data->model_ref = &model->model;
+    } catch (...) {}
+}
+
+MJMLX_API float mjmlx_model_opt_timestep(const MjmlxModel* model) {
+    if (!model) return 0.0f;
+    return model->model.opt.timestep;
+}
+
+MJMLX_API void mjmlx_model_set_opt_timestep(MjmlxModel* model, float dt) {
+    if (!model) return;
+    model->model.opt.timestep = dt;
+}
+
+MJMLX_API float mjmlx_model_body_mass(const MjmlxModel* model, int body_id) {
+    if (!model || body_id < 0 || body_id >= model->model.nbody) return 0.0f;
+    mx::eval(model->model.body_mass);
+    return model->model.body_mass.data<float>()[body_id];
+}
+
+MJMLX_API int mjmlx_name2id(const MjmlxModel* model, int obj_type, const char* name) {
+    if (!model || !model->mj_model || !name) return -1;
+    return mj_name2id(model->mj_model, obj_type, name);
 }
 
 } // extern "C"

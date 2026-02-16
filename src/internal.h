@@ -8,6 +8,7 @@
 
 #include <mlx/mlx.h>
 #include <mlx/linalg.h>
+#include <mujoco/mujoco.h>
 #include <functional>
 #include <optional>
 #include <set>
@@ -402,6 +403,9 @@ struct Data {
     // Contact
     Contact contact;
 
+    // Contact forces (per-body external forces from constraints)
+    mx::array cfrc_ext{mx::array({})};   // (nbody, 6)
+
     // Time
     mx::array time{mx::array(0.0f)};
 };
@@ -435,6 +439,9 @@ struct BatchedSim {
 Model load_model(const char* xml_path);
 Model load_model_filtered(const char* xml_path, bool foot_contacts_only);
 Model load_model_from_string(const char* xml_string);
+std::pair<Model, mjModel*> load_model_pair(const char* xml_path);
+std::pair<Model, mjModel*> load_model_filtered_pair(const char* xml_path, bool foot_contacts_only);
+std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string);
 Data make_data(const Model& model);
 
 // math.cpp
@@ -495,6 +502,9 @@ std::pair<mx::array, mx::array> jac(const Model& m, const Data& d,
 // forward.cpp
 Data forward(const Model& m, Data d);
 Data step(const Model& m, Data d);
+Data step1(const Model& m, Data d);
+Data step2(const Model& m, Data d);
+Data rne_post_constraint(const Model& m, Data d);
 
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
@@ -533,6 +543,10 @@ mx::array batched_motion_cross_force(const mx::array& v, const mx::array& f);
 } // namespace mjmlx
 
 // Expose internal types as the opaque C handles
-struct MjmlxModel { mjmlx::Model model; };
+struct MjmlxModel {
+    mjmlx::Model model;
+    mjModel* mj_model = nullptr;  // kept alive for name2id / field accessors
+    ~MjmlxModel() { if (mj_model) mj_deleteModel(mj_model); }
+};
 struct MjmlxData { mjmlx::Data data; const mjmlx::Model* model_ref; };
 struct MjmlxBatchedSim { mjmlx::BatchedSim sim; };

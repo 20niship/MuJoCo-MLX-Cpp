@@ -207,6 +207,57 @@ Data step(const Model& m, Data d) {
   return d;
 }
 
+// step1: forward position + velocity + actuation (user can modify ctrl before step2)
+Data step1(const Model& m, Data d) {
+  d = fwd_position(m, d);
+  d = fwd_velocity(m, d);
+  d = fwd_actuation(m, d);
+  return d;
+}
+
+// step2: acceleration + constraint solve + integration
+Data step2(const Model& m, Data d) {
+  d = fwd_acceleration(m, d);
+  int nefc_count = d.efc_J.shape(0);
+  if (nefc_count == 0) {
+    d.qacc = d.qacc_smooth;
+    d.qfrc_constraint = mx::zeros({m.nv});
+  } else {
+    d = solve(m, d);
+  }
+  d = integrate_euler(m, d);
+  return d;
+}
+
+// rne_post_constraint: compute per-body contact forces from constraint forces.
+Data rne_post_constraint(const Model& m, Data d) {
+  int nbody = m.nbody;
+  int nv = m.nv;
+  d.cfrc_ext = mx::zeros({nbody, 6});
+
+  if (d.nefc == 0 || d.efc_J.size() == 0 || d.efc_force.size() == 0) {
+    return d;
+  }
+
+  m.init_cache();
+  mx::eval(d.qfrc_constraint);
+  mx::eval(d.cdof);
+  auto qfrc_ptr = d.qfrc_constraint.data<float>();
+  auto cdof_ptr = d.cdof.data<float>();
+
+  std::vector<float> cfrc_data(nbody * 6, 0.0f);
+  for (int di = 0; di < nv; di++) {
+    float f = qfrc_ptr[di];
+    if (f == 0.0f) continue;
+    int bid = m.cache.dof_bodyid_vec[di];
+    for (int k = 0; k < 6; k++) {
+      cfrc_data[bid * 6 + k] += cdof_ptr[di * 6 + k] * f;
+    }
+  }
+  d.cfrc_ext = mx::array(cfrc_data.data(), {nbody, 6}, mx::float32);
+  return d;
+}
+
 }  // namespace mjmlx
 
 extern "C" {
@@ -331,6 +382,11 @@ MJMLX_API const float* mjmlx_get_cinert(const MjmlxData* data, int* n_out) {
   return get_array_ptr(data->data.cinert, n_out);
 }
 
+MJMLX_API const float* mjmlx_get_cfrc_ext(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.cfrc_ext, n_out);
+}
+
 MJMLX_API int mjmlx_get_ncon(const MjmlxData* data) {
   if (!data) return 0;
   return data->data.ncon;
@@ -339,6 +395,42 @@ MJMLX_API int mjmlx_get_ncon(const MjmlxData* data) {
 MJMLX_API int mjmlx_get_nefc(const MjmlxData* data) {
   if (!data) return 0;
   return data->data.nefc;
+}
+
+MJMLX_API void mjmlx_step1(const MjmlxModel* model, MjmlxData* data) {
+  if (!model || !data) return;
+  try {
+    data->data = mjmlx::step1(model->model, data->data);
+  } catch (...) {
+    throw;
+  }
+}
+
+MJMLX_API void mjmlx_step2(const MjmlxModel* model, MjmlxData* data) {
+  if (!model || !data) return;
+  try {
+    data->data = mjmlx::step2(model->model, data->data);
+  } catch (...) {
+    throw;
+  }
+}
+
+MJMLX_API void mjmlx_kinematics(const MjmlxModel* model, MjmlxData* data) {
+  if (!model || !data) return;
+  try {
+    data->data = mjmlx::kinematics(model->model, data->data);
+  } catch (...) {
+    throw;
+  }
+}
+
+MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* data) {
+  if (!model || !data) return;
+  try {
+    data->data = mjmlx::rne_post_constraint(model->model, data->data);
+  } catch (...) {
+    throw;
+  }
 }
 
 }  // extern "C"
