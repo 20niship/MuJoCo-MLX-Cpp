@@ -268,7 +268,43 @@ endif()
 
 # ── Python bindings ───────────────────────────────────────────
 if(MJMLX_BUILD_PYTHON)
-    # add_subdirectory(python)
+    find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+
+    # Find nanobind via Python
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_VARIABLE nanobind_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+    find_package(nanobind CONFIG REQUIRED)
+    message(STATUS "nanobind found: ${nanobind_DIR}")
+
+    nanobind_add_module(_mjmlx_native
+        NB_STATIC STABLE_ABI LTO NOMINSIZE
+        NB_DOMAIN mlx
+        python/bindings.cpp
+    )
+    target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported)
+    target_include_directories(_mjmlx_native PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    # Put the .so next to libmjmlx in the build dir
+    set_target_properties(_mjmlx_native PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+
+    # Fix MuJoCo dylib reference for the Python extension
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET _mjmlx_native POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:_mjmlx_native>"
+            COMMENT "Fixing MuJoCo dylib for _mjmlx_native"
+        )
+    endif()
 endif()
 
 # ── Install ───────────────────────────────────────────────────

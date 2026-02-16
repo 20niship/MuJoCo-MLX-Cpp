@@ -51,13 +51,24 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
     return mx::array(buf.data(), {n}, mx::int32);
 }
 
-Model load_model(const char* xml_path) {
-    char error[1000] = "";
-    mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
-    if (!m) {
-        throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
-    }
+// Apply foot-contacts-only filtering on a MuJoCo C model.
+// Sets contype=0, conaffinity=0 on all geoms except feet and floor,
+// reducing collision pairs from ~126 to 2 for the humanoid.
+static void apply_foot_contacts_only(mjModel* m) {
+    int floor_id = mj_name2id(m, mjOBJ_GEOM, "floor");
+    int rfoot_id = mj_name2id(m, mjOBJ_GEOM, "right_foot");
+    int lfoot_id = mj_name2id(m, mjOBJ_GEOM, "left_foot");
 
+    for (int i = 0; i < m->ngeom; i++) {
+        if (i != floor_id && i != rfoot_id && i != lfoot_id) {
+            m->geom_contype[i] = 0;
+            m->geom_conaffinity[i] = 0;
+        }
+    }
+}
+
+// Convert an mjModel* to our internal Model struct, then free the mjModel.
+static Model convert_and_free(mjModel* m) {
     Model model;
 
     // Counts
@@ -229,6 +240,27 @@ Model load_model(const char* xml_path) {
 
     mj_deleteModel(m);
     return model;
+}
+
+Model load_model(const char* xml_path) {
+    char error[1000] = "";
+    mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+    if (!m) {
+        throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
+    }
+    return convert_and_free(m);
+}
+
+Model load_model_filtered(const char* xml_path, bool foot_contacts_only) {
+    char error[1000] = "";
+    mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+    if (!m) {
+        throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
+    }
+    if (foot_contacts_only) {
+        apply_foot_contacts_only(m);
+    }
+    return convert_and_free(m);
 }
 
 Model load_model_from_string(const char* xml_string) {
@@ -811,6 +843,17 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "mjmlx_load_model error: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_contacts_only) {
+    try {
+        auto* handle = new MjmlxModel();
+        handle->model = mjmlx::load_model_filtered(xml_path, foot_contacts_only != 0);
+        return handle;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "mjmlx_load_model_filtered error: %s\n", e.what());
         return nullptr;
     }
 }

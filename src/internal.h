@@ -467,6 +467,7 @@ struct PPOTrainer {
 
 // io.cpp
 Model load_model(const char* xml_path);
+Model load_model_filtered(const char* xml_path, bool foot_contacts_only);
 Model load_model_from_string(const char* xml_string);
 Data make_data(const Model& model);
 

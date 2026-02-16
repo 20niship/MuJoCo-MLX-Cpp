@@ -46,6 +46,10 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path);
 // Load model from MJCF XML string. Returns NULL on error.
 MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string);
 
+// Load model with contact filtering applied. foot_contacts_only=1 keeps only
+// foot-floor contacts (reduces collision pairs from ~126 to 2 for humanoid).
+MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_contacts_only);
+
 // Free model and all associated memory.
 MJMLX_API void mjmlx_free_model(MjmlxModel* model);
 
