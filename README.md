@@ -6,42 +6,65 @@ A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipel
 
 ## Status
 
-**Phase 1a: Repo scaffolding complete.** All 43 C API functions declared, library compiles and exports clean symbols. Physics modules are stubs pending port from [MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX) Python.
+**Phase 1c complete -- full physics pipeline working.**
 
-### Validated in Phase 0 spike:
+| Module | Status | Description |
+|--------|--------|-------------|
+| `io.cpp` | Done | Model loading (MuJoCo C -> MLX arrays), data initialization |
+| `math.cpp` | Done | Quaternion ops, spatial algebra, collision geometry helpers |
+| `passive.cpp` | Done | Spring/damper forces |
+| `support.cpp` | Done | Mass matrix ops (dense/sparse), Jacobians, xfrc accumulation |
+| `smooth.cpp` | Done | Kinematics, COM, CRB, Cholesky/LDL factorization, RNE, transmission |
+| `collision.cpp` | Done | 5 primitive pairs (plane/sphere/capsule) with broadphase |
+| `constraint.cpp` | Done | Joint limits + contact constraints with KBI impedance |
+| `solver.cpp` | Done | CG with Polak-Ribiere + Newton linesearch |
+| `forward.cpp` | Done | Full pipeline orchestration + Euler integration |
+| `batched.cpp` | Stub | `compile(vmap(step))` for N parallel environments |
+| `nn.cpp` | Stub | Actor-critic neural network (MLX C++) |
+| `ppo.cpp` | Stub | PPO training loop |
 
-- `mx::vmap` vectorizes correctly over batch dimension
-- `mx::compile` gives 3.4x JIT speedup
-- `mx::grad` computes correct autodiff
+### Validated:
+
+- Humanoid model loads correctly (nq=28, nv=27, nu=21, nbody=17, ngeom=20)
+- Forward kinematics produces correct body positions (torso at z=1.282)
+- Gravity forces computed correctly (max |qfrc_bias| = 400.68)
+- Free-fall simulation stable over 100+ steps (z drops 1.282 -> 0.068)
+- Gravity acceleration matches expected value (0.049 m/s per step)
+- Dense Cholesky (CPU) and sparse LDL factorization both implemented
+
+### Phase 0 spike results:
+
 - `compile(vmap(step))`: **204M SPS** on 8192 envs (double pendulum)
 - Custom Metal kernels dispatch from C++
-- `grad(vmap(step))`: differentiable 10-step batched rollout works
-- C API shared library: 25M SPS through C API, clean symbol exports
+- `grad(vmap(step))`: differentiable 10-step batched rollout
+- C API shared library: 25M SPS, clean symbol exports
+- Neural network in C++: 14.4M inferences/sec (batch 4096)
 
 ## Architecture
 
 ```
 libmjmlx.dylib (this repo)
     |
-    +-- Physics pipeline (C++ / MLX)
-    |     types, io, math, smooth, collision, constraint, solver, forward
+    +-- Physics pipeline (C++ / MLX) [DONE]
+    |     io, math, smooth, collision, constraint, solver, forward,
+    |     passive, support, scan
     |
-    +-- Metal kernels
-    |     kinematics, linalg, euler (ported from Python inline MSL)
+    +-- Metal kernels [IN PROGRESS]
+    |     kinematics, linalg, euler (port from Python inline MSL)
     |
-    +-- Batched simulation
+    +-- Batched simulation [IN PROGRESS]
     |     compile(vmap(step)) for N parallel environments
     |
-    +-- Differentiable step
+    +-- Differentiable step [PLANNED]
     |     grad(step) for empowerment / model-based RL
     |
-    +-- Actor-critic neural network (MLX C++)
+    +-- Actor-critic neural network (MLX C++) [PLANNED]
     |     forward, backward, PPO update
     |
-    +-- C API (mjmlx.h)
-    |     43 functions, opaque handles, float* data exchange
+    +-- C API (mjmlx.h) [DONE - 43 functions]
+    |     opaque handles, float* data exchange (unified memory)
     |
-    +-- nanobind Python extension (planned)
+    +-- nanobind Python extension [PLANNED]
           Exposes C++ as Python mx.array API
 ```
 
@@ -64,6 +87,14 @@ cmake -B build \
   -DMUJOCO_ROOT=/path/to/mujoco
 ```
 
+### Running tests
+
+```bash
+./build/test_io /path/to/humanoid.xml
+./build/test_smooth /path/to/humanoid.xml
+./build/test_forward /path/to/humanoid.xml 100
+```
+
 ## C API
 
 See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API. Key functions:
@@ -75,15 +106,17 @@ MjmlxModelInfo info = mjmlx_model_info(model);
 
 // Single-env simulation
 MjmlxData* data = mjmlx_make_data(model);
-mjmlx_step(model, data);
-const float* qpos = mjmlx_get_qpos(data, &n);
+mjmlx_forward(model, data);                     // position + velocity + acceleration
+mjmlx_step(model, data);                        // forward + integrate
+const float* qpos = mjmlx_get_qpos(data, &n);   // zero-copy (unified memory)
+const float* xpos = mjmlx_get_xpos(data, &n);   // body positions
 
-// Batched simulation (Metal GPU)
+// Batched simulation (Metal GPU) -- coming in Phase 1d
 MjmlxBatchedConfig config = { .num_envs = 8192, .use_gpu = 1 };
 MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
 mjmlx_batched_step(sim, controls);
 
-// Neural network + PPO training
+// Neural network + PPO training -- coming in Phase 2
 MjmlxActorCritic* nn = mjmlx_nn_create(&nn_config);
 MjmlxPPOTrainer* trainer = mjmlx_ppo_create(sim, nn, &ppo_config);
 float avg_reward = mjmlx_ppo_iterate(trainer);
@@ -92,7 +125,7 @@ float avg_reward = mjmlx_ppo_iterate(trainer);
 ## Consumers
 
 - **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) -- will use nanobind extension from this repo
-- **MuJoCo-MLX-Unity** (C#) -- will ship `libmjmlx.dylib` in Plugins/ and use P/Invoke
+- **MuJoCo-MLX-Unity** (C#, planned) -- will ship `libmjmlx.dylib` in Plugins/ and use P/Invoke
 
 ## License
 
