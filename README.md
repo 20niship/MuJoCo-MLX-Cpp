@@ -2,138 +2,65 @@
 
 GPU-accelerated MuJoCo physics on Apple Silicon via [MLX](https://github.com/ml-explore/mlx).
 
-A C++ shared library (`libmjmlx.dylib`) that implements the MuJoCo physics pipeline on Metal GPU using MLX's C++ API. Usable from any language via its C API -- designed for both Python (via nanobind) and Unity/C# (via P/Invoke).
+Two C++ shared libraries:
 
-## Status
+- **`libmjmlx.dylib`** — MuJoCo physics pipeline reimplemented on Metal GPU using MLX C++
+- **`libmjb.dylib`** — Unified dual-backend C API that dispatches to either MuJoCo C (CPU) or MuJoCo-MLX (GPU)
 
-**Phase 1d complete -- GPU batched simulation with full contact physics.**
+Designed for consumption from Python (via nanobind), Unity/C# (via P/Invoke), or any language with C FFI.
 
-### Performance (humanoid, Apple Silicon GPU)
+## Performance
+
+Humanoid benchmarks on Apple M4 Max (40-core GPU, 64 GB unified memory):
 
 | Envs | Steps/sec | Notes |
 |------|-----------|-------|
-| 1 | 46 | Single-env scalar pipeline |
 | 256 | 15,027 | |
-| 512 | 34,222 | |
 | 1,024 | 68,753 | |
-| 2,048 | 128,366 | |
-| 4,096 | 255,362 | Exceeds Python mujoco-mlx (214K) |
+| 4,096 | 255,362 | |
 | 8,192 | **331,207** | Peak throughput |
 
 Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal Euler`
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation and key decisions.
-
-### Pipeline Architecture
-
-The batched simulation uses a 3-phase hybrid pipeline optimized for Apple Silicon:
-
-```
-Phase 1: Metal FK kernel      (single GPU dispatch, all B envs)
-    - Forward kinematics: qpos -> xpos, xquat, xmat, xipos, ximat, xanchor, xaxis, geom_xpos, geom_xmat
-    - One fused Metal kernel replaces ~130 separate dispatches
-
-Phase 2: compile(vmap(forward_dynamics))
-    - COM, CRB, mass matrix, collision, constraints, solver, RNE, actuation
-    - Pure MLX array ops (required for vmap compatibility)
-    - mx::compile fuses the computation graph for efficient execution
-    - Newton solver uses GPU-native Cholesky (cholesky_gpu) for direct solves
-    - CG solver uses Cholesky-preconditioned Polak-Ribiere
-
-Phase 3: Metal Euler kernel   (single GPU dispatch, all B envs)
-    - Built-in Cholesky + solve + velocity update + position integration
-    - One fused Metal kernel for the entire integration step
-```
-
-This matches the approach used by Google's MJX (JAX-based MuJoCo), which uses
-`jax.vmap + jax.jit` over pure JAX ops. Our implementation goes further by using
-custom Metal kernels for the two hottest phases (kinematics and integration),
-while keeping Phase 2 as pure array ops for vmap compatibility.
-
-### Modules
-
-| Module | Status | Description |
-|--------|--------|-------------|
-| `io.cpp` | Done | Model loading (MuJoCo C -> MLX arrays), data initialization, ModelCache |
-| `math.cpp` | Done | Quaternion ops, spatial algebra, collision geometry helpers |
-| `smooth_vmap.cpp` | Done | Vmap-compatible COM, CRB, GPU-native Cholesky factorization, COM vel, RNE |
-| `forward_vmap.cpp` | Done | Vmap-compatible forward pipeline with vectorized transmissions/passive |
-| `constraint_vmap.cpp` | Done | Vmap-compatible collision detection + constraint generation |
-| `solver_vmap.cpp` | Done | Newton + CG constraint solver with GPU Cholesky and warmstart |
-| `batched.cpp` | Done | Hybrid pipeline: Metal kernels + compile(vmap(forward)) + C API |
-| `smooth.cpp` | Done | Scalar fallback: kinematics, Cholesky/LDL, RNE, transmission |
-| `collision.cpp` | Done | 5 primitive pairs (plane/sphere/capsule) with broadphase |
-| `constraint.cpp` | Done | Joint limits + contact constraints with KBI impedance |
-| `solver.cpp` | Done | Scalar fallback: CG with Polak-Ribiere + Newton linesearch |
-| `forward.cpp` | Done | Scalar fallback: full pipeline + Euler integration |
-| `nn.cpp` | Stub | Actor-critic neural network (MLX C++) |
-| `ppo.cpp` | Stub | PPO training loop |
-
-### Key Optimizations
-
-- **GPU-native Cholesky** (`cholesky_gpu`): Column-vectorized Cholesky decomposition using pure MLX ops (no CPU sync). Works inside `mx::vmap` for batched Newton solver and mass matrix factorization. Matches Python `gpu_cholesky()` from gpu_linalg.py.
-- **Metal kernel fusion**: Kinematics and Euler integration run as single Metal dispatches, replacing hundreds of individual GPU kernel launches.
-- **mx::compile graph fusion**: Phase 2 (forward dynamics) is wrapped in `mx::compile`, which fuses the MLX computation graph for efficient Metal execution.
-- **Vectorized tree traversals**: Scatter-matrix accumulation for COM/CRB replaces per-body loops.
-- **Precomputed ModelCache**: Batched actuator moment matrix, passive stiffness arrays, tree masks eliminate per-DOF loops.
-- **Newton + CG solver**: Newton mode (default for humanoid) constructs H = M + J^T D J and Cholesky-solves for exact search direction in 1-2 iterations. CG mode uses M^{-1} preconditioning with Polak-Ribiere updates for 4-10 iterations.
-- **Warmstart**: Solver compares warmstart vs smooth acceleration costs, picking whichever converges faster.
-
-### Validated
-
-- Humanoid model loads correctly (nq=28, nv=27, nu=21, nbody=17, ngeom=20)
-- Forward kinematics produces correct body positions (torso at z=1.282)
-- Mass matrix is symmetric (symmetry error = 0.0, verified per step)
-- GPU Cholesky factorization: max|L@L^T - M| < 1e-5 for humanoid mass matrix
-- GPU vs CPU batched pipeline: max|qvel_diff| < 0.1 (1 step), stable over 20+ steps
-- Free-fall simulation stable over 100+ steps (z drops 1.282 -> 0.068)
-- Full contact simulation stable over 100+ steps with bounded velocities
-- Physics deterministic across all batch sizes (1 to 8192 envs)
-- Per-env reset while others continue, correct state isolation
-- All 64 envs produce identical output with no control input
-- Metal kernel source generators: kinematics FK + fused Euler (same MSL as Python)
-- 111 tests across 9 test suites: math (17), io (9), forward (7), physics (20), collision (7), solver (20), linalg (12), batched (7), vmap_smooth (12)
-
-### Phase 0 spike results
-
-- `compile(vmap(step))`: **204M SPS** on 8192 envs (double pendulum)
-- Custom Metal kernels dispatch from C++
-- `grad(vmap(step))`: differentiable 10-step batched rollout
-- C API shared library: 25M SPS, clean symbol exports
-- Neural network in C++: 14.4M inferences/sec (batch 4096)
+Validated training: **5,678 reward** on Gymnasium Humanoid-v5 (12.6x MuJoCo C baseline), 70K SPS at 8192 envs.
 
 ## Architecture
 
 ```
-libmjmlx.dylib (this repo)
+libmjb.dylib (unified dual-backend API)
     |
-    +-- Physics pipeline (C++ / MLX) [DONE]
+    +-- mjb_* C API (47 functions)
+    |     Backend selection: MJB_BACKEND_CPU or MJB_BACKEND_MLX
+    |     float* interface everywhere (CPU does double->float conversion)
+    |
+    +-- CPU backend: wraps MuJoCo C (mj_step, mj_forward, ...)
+    |     Batched: GCD thread pool over N independent mjData*
+    |
+    +-- MLX backend: wraps libmjmlx (mjmlx_step, mjmlx_forward, ...)
+          Batched: compiled vmap Metal GPU pipeline
+
+libmjmlx.dylib (GPU physics core)
+    |
+    +-- Physics pipeline (C++ / MLX)
     |     io, math, smooth, collision, constraint, solver, forward,
     |     passive, support, scan
     |
-    +-- Metal kernels [DONE]
-    |     kinematics FK, fused Euler (source-generated MSL)
+    +-- Metal kernels
+    |     Kinematics FK, fused Euler (source-generated MSL)
     |
-    +-- Batched simulation [DONE - 331K SPS]
+    +-- Batched simulation (331K SPS)
     |     Metal kin -> compile(vmap(forward)) -> Metal euler
-    |     Full C API: create, step, reset, get_state
     |
-    +-- Differentiable step [PLANNED]
+    +-- Differentiable step (planned)
     |     grad(step) for empowerment / model-based RL
     |
-    +-- Actor-critic neural network (MLX C++) [PLANNED]
-    |     forward, backward, PPO update
-    |
-    +-- C API (mjmlx.h) [DONE - 43 functions]
-    |     opaque handles, float* data exchange (unified memory)
-    |
-    +-- nanobind Python extension [PLANNED]
-          Exposes C++ as Python mx.array API
+    +-- C API (mjmlx.h, 48 functions)
+          Opaque handles, float* data exchange (unified memory)
 ```
 
 ## Building
 
-Requirements: macOS 14+, Apple Silicon, CMake >= 3.25, MLX (via pip), MuJoCo >= 3.0 (via pip).
+Requirements: macOS 14+, Apple Silicon, CMake >= 3.25, MLX and MuJoCo (via pip).
 
 ```bash
 pip install mlx mujoco
@@ -142,75 +69,76 @@ cmake -B build
 cmake --build build -j$(sysctl -n hw.logicalcpu)
 ```
 
-The build auto-detects MLX and MuJoCo from pip installations. To override:
+This builds both `libmjmlx.dylib` and `libmjb.dylib`. The build auto-detects MLX and MuJoCo from pip.
+
+To override paths:
 
 ```bash
-cmake -B build \
-  -DMLX_ROOT=/path/to/mlx \
-  -DMUJOCO_ROOT=/path/to/mujoco
+cmake -B build -DMLX_ROOT=/path/to/mlx -DMUJOCO_ROOT=/path/to/mujoco
+```
+
+### Python bindings (nanobind)
+
+```bash
+cmake -B build -DMJMLX_BUILD_PYTHON=ON
+cmake --build build -j$(sysctl -n hw.logicalcpu)
 ```
 
 ### Running tests
 
-Run the full test suite:
-
 ```bash
-# All tests (pass model path for model-dependent tests)
+# Full suite (111 tests across 9 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
-# Or use CTest
-cd build
-cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml
-ctest --output-on-failure
-
-# Individual tests
-./build/test_math_full                      # 17 math tests
-./build/test_linalg_full /path/to/humanoid.xml  # 12 Cholesky/solve tests
-./build/test_solver_full /path/to/humanoid.xml  # 20 solver tests
-./build/test_batched_diag /path/to/humanoid.xml # 7 GPU accuracy tests
+# Or via CTest
+cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure
 ```
 
-Test suite: 111 tests across 9 suites covering math, I/O, kinematics, physics,
-collisions, solver (Newton + CG), linear algebra (Cholesky + solve),
-batched GPU pipeline accuracy, and vmap smooth dynamics (com_vel + rne).
+## Unified C API (mjb.h)
 
-### Benchmarking
-
-```bash
-./build/test_batched /path/to/humanoid.xml 8192 100   # 8192 envs, 100 steps
-```
-
-## C API
-
-See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API. Key functions:
+The `mjb_*` API lets you pick a backend at creation time:
 
 ```c
-// Load model
-MjmlxModel* model = mjmlx_load_model("humanoid.xml");
-MjmlxModelInfo info = mjmlx_model_info(model);
+#include <mjmlx/mjb.h>
 
-// Single-env simulation
-MjmlxData* data = mjmlx_make_data(model);
-mjmlx_forward(model, data);                     // position + velocity + acceleration
-mjmlx_step(model, data);                        // forward + integrate
-const float* qpos = mjmlx_get_qpos(data, &n);   // zero-copy (unified memory)
-const float* xpos = mjmlx_get_xpos(data, &n);   // body positions
+// GPU physics (Metal, float32, 70K+ SPS)
+MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);
+MjbModel* model = mjb_load_model(gpu, "humanoid.xml");
+MjbData* data = mjb_make_data(model);
+mjb_step(model, data);
 
-// Batched simulation (Metal GPU) -- 331K SPS on humanoid
-MjmlxBatchedConfig config = { .num_envs = 8192, .use_gpu = 1 };
-MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
-mjmlx_batched_step(sim, controls);
+// CPU physics (MuJoCo C, double, thread-safe)
+MjbBackend* cpu = mjb_create_backend(MJB_BACKEND_CPU);
+MjbModel* cpu_model = mjb_load_model(cpu, "humanoid.xml");
 
-// Neural network + PPO training -- coming in Phase 2
-MjmlxActorCritic* nn = mjmlx_nn_create(&nn_config);
-MjmlxPPOTrainer* trainer = mjmlx_ppo_create(sim, nn, &ppo_config);
-float avg_reward = mjmlx_ppo_iterate(trainer);
+// Batched simulation (both backends)
+MjbBatchedConfig config = { .num_envs = 8192 };
+MjbBatchedSim* sim = mjb_batched_create(model, &config);
+mjb_batched_step(sim, controls);
+const float* qpos = mjb_batched_get_qpos(sim, &n);
 ```
+
+See [`include/mjmlx/mjb.h`](include/mjmlx/mjb.h) for the full API.
+
+## MLX Physics API (mjmlx.h)
+
+Lower-level API for direct GPU physics access:
+
+```c
+#include <mjmlx/mjmlx.h>
+
+MjmlxModel* model = mjmlx_load_model("humanoid.xml");
+MjmlxData* data = mjmlx_make_data(model);
+mjmlx_step(model, data);
+const float* qpos = mjmlx_get_qpos(data, &n);  // zero-copy unified memory
+```
+
+See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Consumers
 
-- **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) -- will use nanobind extension from this repo
-- **MuJoCo-MLX-Unity** (C#, planned) -- will ship `libmjmlx.dylib` in Plugins/ and use P/Invoke
+- **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) — uses nanobind extension from this repo
+- **MuJoCo-MLX-Unity** (C#, planned) — ships `libmjb.dylib` + P/Invoke bindings
 
 ## License
 
