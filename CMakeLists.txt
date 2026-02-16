@@ -176,6 +176,8 @@ if(MJMLX_BUILD_TESTS)
     target_link_libraries(test_smooth PRIVATE mjmlx)
     add_executable(test_forward tests/test_forward.cpp)
     target_link_libraries(test_forward PRIVATE mjmlx)
+    add_executable(test_batched tests/test_batched.cpp)
+    target_link_libraries(test_batched PRIVATE mjmlx)
 endif()
 
 # ── Python bindings ───────────────────────────────────────────
