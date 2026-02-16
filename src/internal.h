@@ -9,8 +9,10 @@
 #include <mlx/mlx.h>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mjmlx/mjmlx_types.h"
@@ -215,6 +217,9 @@ struct Data {
     mx::array site_xpos{mx::array({})};  // (nsite, 3) site positions
     mx::array site_xmat{mx::array({})};  // (nsite, 3, 3) site rotations
 
+    // Applied forces
+    mx::array xfrc_applied{mx::array({})};  // (nbody, 6) external forces
+
     // Dynamics
     mx::array subtree_com{mx::array({})};    // (nbody, 3)
     mx::array cinert{mx::array({})};         // (nbody, 10)
@@ -228,6 +233,7 @@ struct Data {
     mx::array qfrc_bias{mx::array({})};      // (nv,) Coriolis + gravity
     mx::array qfrc_passive{mx::array({})};   // (nv,) spring/damper
     mx::array qfrc_actuator{mx::array({})};  // (nv,) actuator forces
+    mx::array qfrc_gravcomp{mx::array({})};   // (nv,) gravity compensation
     mx::array qfrc_smooth{mx::array({})};    // (nv,) smooth forces (bias+passive+actuator)
     mx::array qacc_smooth{mx::array({})};    // (nv,) acceleration from smooth forces
 
@@ -304,6 +310,22 @@ mx::array quat_mul(const mx::array& q1, const mx::array& q2);
 mx::array quat_to_mat(const mx::array& q);
 mx::array rotate(const mx::array& vec, const mx::array& quat);
 mx::array normalize(const mx::array& x);
+
+// passive.cpp
+Data passive(const Model& m, Data d);
+
+// support.cpp
+bool is_sparse(const Model& m);
+std::pair<mx::array, mx::array> local_to_global(
+    const mx::array& world_pos, const mx::array& world_quat,
+    const mx::array& local_pos, const mx::array& local_quat);
+mx::array make_m(const Model& m, const mx::array& a, const mx::array& b,
+                 const mx::array& d_diag = mx::array({}));
+mx::array full_m(const Model& m, const Data& d);
+mx::array mul_m(const Model& m, const Data& d, const mx::array& vec);
+mx::array xfrc_accumulate(const Model& m, const Data& d);
+std::pair<mx::array, mx::array> jac(const Model& m, const Data& d,
+                                     const mx::array& point, int body_id);
 
 // forward.cpp
 Data forward(const Model& m, Data d);

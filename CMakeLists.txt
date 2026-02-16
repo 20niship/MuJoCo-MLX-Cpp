@@ -141,13 +141,37 @@ set_target_properties(mjmlx PROPERTIES
     VISIBILITY_INLINES_HIDDEN ON
     VERSION ${PROJECT_VERSION}
     SOVERSION 0
+    BUILD_RPATH "${MLX_ROOT}/lib"
+    INSTALL_RPATH "${MLX_ROOT}/lib"
 )
+
+# Fix MuJoCo's framework-style install name for pip installs.
+# The pip mujoco dylib uses @rpath/mujoco.framework/Versions/A/libmujoco.X.Y.Z.dylib
+# but the actual file is a flat dylib. Rewrite the reference to an absolute path.
+if(MUJOCO_PKG_DIR AND _MJ_DYLIB_PATH)
+    execute_process(
+        COMMAND otool -D "${_MJ_DYLIB_PATH}"
+        OUTPUT_VARIABLE _MJ_INSTALL_NAME
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    # Extract the framework-style install name (second line of otool -D output)
+    string(REGEX MATCH "@rpath[^\n]+" _MJ_OLD_NAME "${_MJ_INSTALL_NAME}")
+    if(_MJ_OLD_NAME)
+        add_custom_command(TARGET mjmlx POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}"
+                "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:mjmlx>"
+            COMMENT "Fixing MuJoCo dylib reference: ${_MJ_OLD_NAME} -> ${_MJ_DYLIB_PATH}"
+        )
+    endif()
+endif()
 
 # ── Tests ─────────────────────────────────────────────────────
 if(MJMLX_BUILD_TESTS)
     enable_testing()
-    # Tests will be added as physics modules are ported
-    # add_subdirectory(tests)
+    add_executable(test_io tests/test_io.cpp)
+    target_link_libraries(test_io PRIVATE mjmlx)
 endif()
 
 # ── Python bindings ───────────────────────────────────────────
