@@ -421,37 +421,63 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 floss_vals.push_back(mx::array({0.0f}));
             } else {
                 // Pyramidal friction: 2*(condim-1) rows per contact
-                int n_tangent = std::min(cp.condim - 1, 2);
+                // Build direction Jacobians:
+                //   dir 0,1: tangent (frame[1,2] @ djacp)
+                //   dir 2:   torsion (frame[0] @ djacr) — condim>=4
+                //   dir 3,4: rolling (frame[1,2] @ djacr) — condim>=6
 
-                // Compute tangent Jacobians
-                std::vector<mx::array> j_tangents;
-                for (int tk = 1; tk <= n_tangent; tk++) {
-                    auto tangent = mx::flatten(mx::slice(c_frame, mx::Shape{tk, 0}, mx::Shape{tk + 1, 3}));
-                    auto j_t = mx::flatten(mx::matmul(mx::reshape(tangent, {1, 3}),
-                                                       mx::transpose(djacp)));
-                    j_tangents.push_back(j_t);
+                auto djacr = mx::subtract(jacr2, jacr1);
+
+                float invw_rot = 0.0f;
+                if (cp.condim > 3 && m.body_invweight0.size() > 0) {
+                    mx::eval(m.body_invweight0);
+                    auto iw = m.body_invweight0.data<float>();
+                    invw_rot = iw[cp.body1 * 2 + 1] + iw[cp.body2 * 2 + 1];
                 }
 
-                // Pyramidal impedance
-                float mu = cp.friction[0];
-                float mu_sq = mu * mu;
-                float invw_py = invw + mu_sq * invw;
+                std::vector<mx::array> jac_dirs;
+                // Tangent directions (translational)
+                int n_tran = std::min(cp.condim - 1, 2);
+                for (int tk = 1; tk <= n_tran; tk++) {
+                    auto tang = mx::flatten(mx::slice(c_frame, mx::Shape{tk, 0}, mx::Shape{tk + 1, 3}));
+                    jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(tang, {1, 3}),
+                                                               mx::transpose(djacp))));
+                }
+                // Torsion (rotational around normal)
+                if (cp.condim >= 4) {
+                    auto norm_dir = mx::flatten(mx::slice(c_frame, mx::Shape{0, 0}, mx::Shape{1, 3}));
+                    jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(norm_dir, {1, 3}),
+                                                               mx::transpose(djacr))));
+                }
+                // Rolling (rotational around tangent1, tangent2)
+                if (cp.condim >= 6) {
+                    for (int tk = 1; tk <= 2; tk++) {
+                        auto tang = mx::flatten(mx::slice(c_frame, mx::Shape{tk, 0}, mx::Shape{tk + 1, 3}));
+                        jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(tang, {1, 3}),
+                                                                   mx::transpose(djacr))));
+                    }
+                }
 
                 mx::array k_v(0.0f), b_v(0.0f), imp_v(0.0f);
                 vmap_kbi(cp.solref[0], cp.solref[1], m.opt.timestep, refsafe,
                          cp.solimp[0], cp.solimp[1], cp.solimp[2], cp.solimp[3], cp.solimp[4],
                          pos, k_v, b_v, imp_v);
 
-                auto r_normal = mx::maximum(mx::multiply(mx::array(invw_py),
+                // Pyramidal impedance: ALL rows use the same D from primary friction[0]
+                float mu0 = cp.friction[0];
+                float mu0_sq = mu0 * mu0;
+                float invw_py = invw + mu0_sq * invw;
+                auto r_first = mx::maximum(mx::multiply(mx::array(invw_py),
                     mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
-                auto r_py = mx::maximum(mx::multiply(mx::array(2.0f * mu_sq / m.opt.impratio), r_normal),
+                auto r_py = mx::maximum(mx::multiply(mx::array(2.0f * mu0_sq / m.opt.impratio), r_first),
                                          mx::array(MJMINVAL_CV));
 
-                for (int tk = 0; tk < n_tangent; tk++) {
+                int n_dirs = (int)jac_dirs.size();
+                for (int tk = 0; tk < n_dirs; tk++) {
                     float fri_k = cp.friction[tk];
 
-                    // Positive edge: J_normal + mu * J_tangent
-                    auto j_pos = mx::add(j_normal, mx::multiply(mx::array(fri_k), j_tangents[tk]));
+                    // Positive edge
+                    auto j_pos = mx::add(j_normal, mx::multiply(mx::array(fri_k), jac_dirs[tk]));
                     auto jdot_pos = mx::sum(mx::multiply(j_pos, d.qvel));
                     auto aref_pos = mx::subtract(mx::negative(mx::multiply(b_v, jdot_pos)),
                                                   mx::multiply(mx::multiply(k_v, imp_v), pos));
@@ -463,8 +489,8 @@ Data vmap_make_constraint(const Model& m, Data d) {
                     aref_vals.push_back(mx::flatten(aref_pos_v));
                     floss_vals.push_back(mx::array({0.0f}));
 
-                    // Negative edge: J_normal - mu * J_tangent
-                    auto j_neg = mx::subtract(j_normal, mx::multiply(mx::array(fri_k), j_tangents[tk]));
+                    // Negative edge
+                    auto j_neg = mx::subtract(j_normal, mx::multiply(mx::array(fri_k), jac_dirs[tk]));
                     auto jdot_neg = mx::sum(mx::multiply(j_neg, d.qvel));
                     auto aref_neg = mx::subtract(mx::negative(mx::multiply(b_v, jdot_neg)),
                                                   mx::multiply(mx::multiply(k_v, imp_v), pos));

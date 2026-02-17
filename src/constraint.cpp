@@ -232,59 +232,92 @@ Data make_constraint(const Model& m, Data d) {
                 efc_floss_vals.push_back(0.0f);
             } else {
                 // Pyramidal friction: 2*(condim-1) rows
-                // Each tangent direction k yields two edge rows:
-                //   J_edge_pos = J_normal + mu[k-1] * J_tangent_k
-                //   J_edge_neg = J_normal - mu[k-1] * J_tangent_k
-                int n_tangent = std::min(condim - 1, 2); // for condim=3: 2 tangents
+                // Build contact-frame Jacobian matrix (condim rows):
+                //   jac[0..2] = frame[0..2] @ djacp (translational)
+                //   jac[3]   = frame[0] @ djacr  (torsion, condim>=4)
+                //   jac[4..5] = frame[1..2] @ djacr (rolling, condim>=6)
+                // Then for k=1..condim-1:
+                //   J_pos = jac[0] + friction[k-1] * jac[k]
+                //   J_neg = jac[0] - friction[k-1] * jac[k]
 
-                // Compute tangent Jacobians
-                std::vector<mx::array> j_tangents;
-                for (int ti = 1; ti <= n_tangent; ti++) {
-                    auto tangent = mx::flatten(mx::slice(c_frame_all, {ci, ti, 0}, {ci + 1, ti + 1, 3}));
-                    auto j_t = mx::flatten(mx::matmul(mx::reshape(tangent, {1, 3}), mx::transpose(djacp)));
-                    j_tangents.push_back(j_t);
+                // Rotational Jacobian difference (needed for condim >= 4)
+                mx::array djacr = mx::zeros({0});
+                if (condim > 3) {
+                    djacr = mx::subtract(jacr2, jacr1);
                 }
 
-                // Pyramidal impedance: invw_py = invw * (1 + mu^2), then R_py = 2*mu^2*R_normal
-                float mu = fri_ptr[ci * 5];
-                float mu_sq = mu * mu;
-                float invw_py = invw + mu_sq * invw;
+                // Rotational invweight (for torsion/rolling impedance)
+                float invw_rot = 0.0f;
+                if (condim > 3 && m.body_invweight0.size() > 0) {
+                    mx::eval(m.body_invweight0);
+                    auto iw = m.body_invweight0.data<float>();
+                    invw_rot = iw[body1 * 2 + 1] + iw[body2 * 2 + 1];
+                }
 
+                // Build all direction Jacobians (jac[k] for k=1..condim-1)
+                std::vector<mx::array> jac_dirs;
+                // k=1,2: tangent directions (translational)
+                int n_tran = std::min(condim - 1, 2);
+                for (int ti = 1; ti <= n_tran; ti++) {
+                    auto tangent = mx::flatten(mx::slice(c_frame_all, {ci, ti, 0}, {ci + 1, ti + 1, 3}));
+                    jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(tangent, {1, 3}), mx::transpose(djacp))));
+                }
+                // k=3: torsion (rotational around normal)
+                if (condim >= 4) {
+                    auto norm_dir = mx::flatten(mx::slice(c_frame_all, {ci, 0, 0}, {ci + 1, 1, 3}));
+                    jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(norm_dir, {1, 3}), mx::transpose(djacr))));
+                }
+                // k=4,5: rolling (rotational around tangent1, tangent2)
+                if (condim >= 6) {
+                    for (int ti = 1; ti <= 2; ti++) {
+                        auto tang_dir = mx::flatten(mx::slice(c_frame_all, {ci, ti, 0}, {ci + 1, ti + 1, 3}));
+                        jac_dirs.push_back(mx::flatten(mx::matmul(mx::reshape(tang_dir, {1, 3}), mx::transpose(djacr))));
+                    }
+                }
+
+                // KBI (same for all rows of this contact)
                 auto [kbi_k, kbi_b, kbi_imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos);
-                float r_normal = std::max(invw_py * (1.0f - kbi_imp) / kbi_imp, MJMINVAL);
-                float r_py = std::max(2.0f * mu_sq * r_normal / m.opt.impratio, MJMINVAL);
+
+                // Pyramidal impedance: ALL rows share the same D, computed from
+                // the primary sliding friction (friction[0]) and translational invweight.
+                // MuJoCo C: R_py = 2*μ₀²*R_first where R_first uses dA = tran + μ₀²*tran
+                float mu0 = fri_ptr[ci * 5]; // primary sliding friction
+                float mu0_sq = mu0 * mu0;
+                float invw_py = invw + mu0_sq * invw;
+                float r_first = std::max(invw_py * (1.0f - kbi_imp) / kbi_imp, MJMINVAL);
+                float r_py = std::max(2.0f * mu0_sq * r_first / m.opt.impratio, MJMINVAL);
+                float d_py = 1.0f / r_py;
 
                 mx::eval(j_normal);
                 auto jn_ptr = j_normal.data<float>();
                 std::vector<float> j_n_vec(jn_ptr, jn_ptr + m.nv);
 
-                for (int ti = 0; ti < n_tangent; ti++) {
+                // Generate 2 pyramidal rows per direction
+                int n_dirs = (int)jac_dirs.size(); // condim-1 directions
+                for (int ti = 0; ti < n_dirs; ti++) {
                     float fri_k = fri_ptr[ci * 5 + ti];
-                    mx::eval(j_tangents[ti]);
-                    auto jt_ptr = j_tangents[ti].data<float>();
 
-                    // Positive edge: J_normal + mu * J_tangent
+                    mx::eval(jac_dirs[ti]);
+                    auto jt_ptr = jac_dirs[ti].data<float>();
+
+                    // Positive edge: J_normal + mu * J_direction
                     std::vector<float> j_pos(m.nv);
-                    for (int i = 0; i < m.nv; i++) {
-                        j_pos[i] = j_n_vec[i] + fri_k * jt_ptr[i];
-                    }
-                    float jdot_qvel_pos = 0.0f;
-                    for (int i = 0; i < m.nv; i++) jdot_qvel_pos += j_pos[i] * qvel_ptr[i];
-                    float aref_pos = -kbi_b * jdot_qvel_pos - kbi_k * kbi_imp * pos;
+                    for (int i = 0; i < m.nv; i++) j_pos[i] = j_n_vec[i] + fri_k * jt_ptr[i];
+                    float jdot_pos = 0.0f;
+                    for (int i = 0; i < m.nv; i++) jdot_pos += j_pos[i] * qvel_ptr[i];
+                    float aref_pos = -kbi_b * jdot_pos - kbi_k * kbi_imp * pos;
 
                     efc_J_rows.push_back(j_pos);
                     efc_D_vals.push_back(1.0f / r_py);
                     efc_aref_vals.push_back(aref_pos);
                     efc_floss_vals.push_back(0.0f);
 
-                    // Negative edge: J_normal - mu * J_tangent
+                    // Negative edge: J_normal - mu * J_direction
                     std::vector<float> j_neg(m.nv);
-                    for (int i = 0; i < m.nv; i++) {
-                        j_neg[i] = j_n_vec[i] - fri_k * jt_ptr[i];
-                    }
-                    float jdot_qvel_neg = 0.0f;
-                    for (int i = 0; i < m.nv; i++) jdot_qvel_neg += j_neg[i] * qvel_ptr[i];
-                    float aref_neg = -kbi_b * jdot_qvel_neg - kbi_k * kbi_imp * pos;
+                    for (int i = 0; i < m.nv; i++) j_neg[i] = j_n_vec[i] - fri_k * jt_ptr[i];
+                    float jdot_neg = 0.0f;
+                    for (int i = 0; i < m.nv; i++) jdot_neg += j_neg[i] * qvel_ptr[i];
+                    float aref_neg = -kbi_b * jdot_neg - kbi_k * kbi_imp * pos;
 
                     efc_J_rows.push_back(j_neg);
                     efc_D_vals.push_back(1.0f / r_py);
