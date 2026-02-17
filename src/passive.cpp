@@ -20,7 +20,7 @@
 namespace mjmlx {
 
 // DisableBit flags (matching MuJoCo C and Python types.py)
-static constexpr int DISABLE_SPRING = (1 << 4);
+static constexpr int DISABLE_SPRING = (1 << 5);
 static constexpr int DISABLE_DAMPER = (1 << 6);
 static constexpr int DISABLE_GRAVITY = (1 << 7);
 

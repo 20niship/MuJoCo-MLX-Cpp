@@ -43,8 +43,8 @@ namespace DisableBit {
     constexpr int FRICTIONLOSS = (1 << 2);
     constexpr int LIMIT        = (1 << 3);
     constexpr int CONTACT      = (1 << 4);
-    constexpr int SPRING       = (1 << 4);  // note: shares bit with CONTACT in some MuJoCo versions
-    constexpr int PASSIVE      = (1 << 5);
+    constexpr int SPRING       = (1 << 5);
+    constexpr int PASSIVE      = (1 << 5);  // alias for SPRING
     constexpr int DAMPER       = (1 << 6);
     constexpr int GRAVITY      = (1 << 7);
     constexpr int CLAMPCTRL    = (1 << 8);
@@ -52,7 +52,7 @@ namespace DisableBit {
     constexpr int FILTERPARENT = (1 << 10);
     constexpr int ACTUATION    = (1 << 11);
     constexpr int REFSAFE      = (1 << 12);
-    constexpr int EULERDAMP    = (1 << 18);
+    constexpr int EULERDAMP    = (1 << 15);
 }
 
 // ── Option ───────────────────────────────────────────────────

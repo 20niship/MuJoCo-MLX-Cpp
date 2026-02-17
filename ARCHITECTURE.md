@@ -55,8 +55,8 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
  -----------------------------------
  Single GPU dispatch for ALL N environments.
  Built-in Cholesky + solve + velocity update + position integration.
- Currently Euler only; RK4 is supported in the scalar pipeline but
- not yet in the batched Metal kernel.
+ Currently Euler only in Metal; RK4 and ImplicitFast are supported
+ in the scalar pipeline but not yet in the batched Metal kernel.
 ```
 
 The pipeline is orchestrated in `batched.cpp:make_batched_step()`.
@@ -500,7 +500,7 @@ Source-generated MSL in `batched.cpp:make_kinematics_source()`. Embeds model top
 
 ### Integration Kernel (Phase 3)
 
-Source-generated MSL in `batched.cpp:make_euler_source()`. Currently Euler-only (RK4 supported in scalar path but not Metal kernel). Embeds Cholesky factorization and solve inline:
+Source-generated MSL in `batched.cpp:make_euler_source()`. Currently Euler-only in Metal; RK4 and ImplicitFast are supported in the scalar path. Embeds Cholesky factorization and solve inline:
 - Stack memory: `2*nv*nv + 4*nv + nq` floats. Limited to `nv <= 80`
 - Performs: Cholesky(M) -> solve for qacc -> velocity update -> position integration
 - For humanoid (nv=27): ~5KB stack per thread, well within limits
@@ -605,7 +605,7 @@ See [Tendon System](#tendon-system) above.
 ### Phase 7: Advanced Integrators
 
 - **7.1 RK4**: Complete (scalar path only). Classic 4th-order Runge-Kutta with 4 forward evaluations per step. Weighted-average qacc for velocity update and weighted-average qvel for position update. Refactored `integrate_pos()` and `integrate_act()` as shared helpers used by both Euler and RK4.
-- **7.2 ImplicitFast**: Not yet implemented. Requires velocity derivative computation.
+- **7.2 ImplicitFast**: Complete (scalar path). Implicit velocity integration via `deriv_smooth_vel()` computing analytical ∂qfrc_smooth/∂qvel (joint damping + tendon damping + affine actuator velocity terms). Modified mass matrix M' = M - dt * qderiv, Cholesky factor and solve for qacc. Both `IMPLICIT` and `IMPLICITFAST` integrator types supported (difference: IMPLICIT would include RNE derivative, which is left as TODO matching MJX). MuJoCo C stores the standard qacc in `d->qacc` while using implicit qacc internally for velocity update; we match this behavior.
 
 ---
 
@@ -617,6 +617,7 @@ Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched)
 |---------|--------|------|-------|
 | Euler integration | Yes | Yes (Metal kernel) | |
 | RK4 integration | Yes | No | Metal kernel is Euler-only; deferred |
+| ImplicitFast integration | Yes | No | Needs dense Cholesky in vmap; deferred |
 | Activation dynamics (act_dot) | Yes | Yes | Vectorized via scatter-matmul |
 | Tendon passive forces | Yes | Yes | Vectorized via ten_J^T @ force |
 | Gravity compensation | Yes | No | Requires vmap-compatible Jacobian; deferred |
@@ -624,7 +625,7 @@ Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched)
 | Tendon friction loss | Yes | Yes | Precomputed tenJ_row in cache |
 | mesh-* collision | GJK/EPA (64 iter) | GJK + depth est. (32 iter) | Both use proper mesh support |
 
-Remaining gaps: **RK4** in batched (needs Metal kernel rewrite or multi-forward-pass) and **gravity compensation** in vmap (needs vmap-compatible body Jacobian computation). Both are deferred since they affect few RL models.
+Remaining gaps: **RK4/ImplicitFast** in batched (needs Metal kernel rewrite or dense Cholesky in vmap), and **gravity compensation** in vmap (needs vmap-compatible body Jacobian computation). All deferred since they affect few RL models.
 
 ---
 
@@ -644,8 +645,8 @@ Remaining gaps: **RK4** in batched (needs Metal kernel rewrite or multi-forward-
 
 6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics **deferred** (Phase 6.3). Biomechanical models only.
 
-7. **ImplicitFast integrator**: Not yet implemented (Phase 7.2). Requires velocity derivative computation.
+7. **Sensors**: Not implemented (Phase 8). ~50 sensor types; RL training reads joint/body state directly. **DEFERRED.**
 
-8. **Sensors**: Not yet implemented (Phase 8).
+8. **Differentiable physics**: `grad(step)` via `mx::grad` (Phase 9). Requires full pipeline to be autodiff-compatible. Separate project-scale effort. **DEFERRED.**
 
-9. **Differentiable physics**: `grad(step)` for empowerment/model-based RL is planned (Phase 9) and is the most important milestone for Project Sentience.
+9. **Inverse dynamics / constraint islands / noslip / sleep** (Phase 10): Niche features not needed for common RL. **DEFERRED.**

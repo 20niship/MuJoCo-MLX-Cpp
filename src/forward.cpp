@@ -296,6 +296,129 @@ static Data integrate_act(const Model& m, Data d, const mx::array& act_dot, floa
     return d;
 }
 
+// Analytical derivative of smooth forces w.r.t. velocity: d(qfrc_smooth)/d(qvel)
+// Used by ImplicitFast integrator. Returns (nv, nv) dense matrix or empty if no velocity-dependent forces.
+static mx::array deriv_smooth_vel(const Model& m, const Data& d) {
+    bool has_deriv = false;
+    auto qderiv = mx::zeros({m.nv, m.nv});
+
+    // d(qfrc_actuator)/d(qvel): for affine gain/bias, the velocity-dependent term
+    if (!(m.opt.disableflags & DisableBit::ACTUATION) && m.nu > 0 &&
+        m.actuator_gaintype.size() > 0 && m.actuator_biastype.size() > 0 &&
+        d.actuator_moment.size() > 0) {
+
+        mx::eval(m.actuator_gaintype); mx::eval(m.actuator_gainprm);
+        mx::eval(m.actuator_biastype); mx::eval(m.actuator_biasprm);
+        mx::eval(m.actuator_dyntype); mx::eval(m.actuator_actadr);
+        mx::eval(d.ctrl); mx::eval(d.act); mx::eval(d.actuator_moment);
+
+        auto gaintype_ptr = m.actuator_gaintype.data<int>();
+        auto biastype_ptr = m.actuator_biastype.data<int>();
+        auto gp = m.actuator_gainprm.data<float>();
+        auto bp = m.actuator_biasprm.data<float>();
+        auto dyntype_ptr = m.actuator_dyntype.data<int>();
+        auto actadr_ptr = m.actuator_actadr.data<int>();
+        auto ctrl_ptr = d.ctrl.data<float>();
+        auto act_ptr = (d.act.size() > 0) ? d.act.data<float>() : nullptr;
+
+        // vel[i] = bias_vel + gain_vel * ctrl_act
+        // bias_vel = biasprm[2] if AFFINE bias, else 0
+        // gain_vel = gainprm[2] if AFFINE gain, else 0
+        // ctrl_act = act if dyntype != NONE, else ctrl
+        std::vector<float> vel_data(m.nu, 0.0f);
+        bool any_nonzero = false;
+        for (int i = 0; i < m.nu; i++) {
+            float bias_vel = 0.0f;
+            if (biastype_ptr[i] == static_cast<int>(BiasType::AFFINE))
+                bias_vel = bp[i * 10 + 2];
+
+            float gain_vel = 0.0f;
+            if (gaintype_ptr[i] == static_cast<int>(GainType::AFFINE))
+                gain_vel = gp[i * 10 + 2];
+
+            float ctrl_act = ctrl_ptr[i];
+            if (dyntype_ptr[i] != 0 && actadr_ptr[i] >= 0 && act_ptr)
+                ctrl_act = act_ptr[actadr_ptr[i]];
+
+            vel_data[i] = bias_vel + gain_vel * ctrl_act;
+            if (vel_data[i] != 0.0f) any_nonzero = true;
+        }
+
+        if (any_nonzero) {
+            // qderiv += moment^T @ diag(vel) @ moment
+            auto vel = mx::array(vel_data.data(), {m.nu}, mx::float32);
+            auto moment = d.actuator_moment;  // (nu, nv)
+            // diag(vel) @ moment = vel[:, None] * moment
+            auto scaled = mx::multiply(mx::reshape(vel, {m.nu, 1}), moment);
+            qderiv = mx::add(qderiv, mx::matmul(mx::transpose(moment), scaled));
+            has_deriv = true;
+        }
+    }
+
+    // d(qfrc_passive)/d(qvel): joint damping + tendon damping
+    if (!(m.opt.disableflags & DisableBit::DAMPER)) {
+        // -diag(dof_damping)
+        if (m.dof_damping.size() > 0) {
+            qderiv = mx::subtract(qderiv, mx::diag(m.dof_damping));
+            has_deriv = true;
+        }
+
+        // Tendon damping: -ten_J^T @ diag(tendon_damping) @ ten_J
+        if (m.ntendon > 0 && d.ten_J.size() > 0 && m.tendon_damping.size() > 0) {
+            mx::eval(m.tendon_damping);
+            auto td_ptr = m.tendon_damping.data<float>();
+            bool any_td = false;
+            for (int i = 0; i < m.ntendon; i++) {
+                if (td_ptr[i] != 0.0f) { any_td = true; break; }
+            }
+            if (any_td) {
+                auto td_scaled = mx::multiply(mx::reshape(m.tendon_damping, {m.ntendon, 1}), d.ten_J);
+                qderiv = mx::subtract(qderiv, mx::matmul(mx::transpose(d.ten_J), td_scaled));
+                has_deriv = true;
+            }
+        }
+    }
+
+    if (!has_deriv) return mx::array({});
+    return qderiv;
+}
+
+static Data integrate_implicit(const Model& m, Data d) {
+    float dt = m.opt.timestep;
+
+    auto qderiv = deriv_smooth_vel(m, d);
+
+    // Use original qacc from forward pass as the "observation" qacc
+    auto qacc_for_vel = d.qacc;
+    if (qderiv.size() > 0) {
+        // Modified mass matrix: M_mod = M - dt * qderiv
+        auto qm_full = full_m(m, d);
+        auto qm_mod = mx::subtract(qm_full, mx::multiply(mx::array(dt), qderiv));
+
+        // Add small regularization for numerical stability
+        qm_mod = mx::add(qm_mod, mx::multiply(mx::eye(m.nv), mx::array(1e-8f)));
+
+        // Cholesky factor and solve: qacc_impl = M_mod^{-1} @ (qfrc_smooth + qfrc_constraint)
+        auto qfrc = mx::add(d.qfrc_smooth, d.qfrc_constraint);
+        auto L = mx::linalg::cholesky(qm_mod, false, mx::Device::cpu);
+        auto y = mx::linalg::solve_triangular(L, mx::reshape(qfrc, {m.nv, 1}), false, mx::Device::cpu);
+        auto x = mx::linalg::solve_triangular(mx::transpose(L), y, true, mx::Device::cpu);
+        qacc_for_vel = mx::flatten(x);
+    }
+
+    // Advance: use implicit qacc for velocity update, but store original qacc
+    d.qvel = mx::add(d.qvel, mx::multiply(qacc_for_vel, mx::array(dt)));
+    d = integrate_pos(m, d, d.qvel, dt);
+    d.qacc_warmstart = d.qacc;
+
+    // Integrate activation state
+    if (m.na > 0 && d.act.size() > 0 && d.act_dot.size() > 0) {
+        d = integrate_act(m, d, d.act_dot, dt);
+    }
+
+    return d;
+}
+
 static Data integrate_euler(const Model& m, Data d) {
   float dt = m.opt.timestep;
 
@@ -400,6 +523,9 @@ Data step(const Model& m, Data d) {
   d = forward(m, d);
   if (m.opt.integrator == IntegratorType::RK4) {
     d = integrate_rk4(m, d);
+  } else if (m.opt.integrator == IntegratorType::IMPLICIT ||
+             m.opt.integrator == IntegratorType::IMPLICITFAST) {
+    d = integrate_implicit(m, d);
   } else {
     d = integrate_euler(m, d);
   }
@@ -426,6 +552,9 @@ Data step2(const Model& m, Data d) {
   }
   if (m.opt.integrator == IntegratorType::RK4) {
     d = integrate_rk4(m, d);
+  } else if (m.opt.integrator == IntegratorType::IMPLICIT ||
+             m.opt.integrator == IntegratorType::IMPLICITFAST) {
+    d = integrate_implicit(m, d);
   } else {
     d = integrate_euler(m, d);
   }

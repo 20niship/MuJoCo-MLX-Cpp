@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-17 (Phase 3.3 MESH/GJK/EPA collisions complete).
+Last updated: 2026-02-11 (Phase 7.2 ImplicitFast complete, all remaining phases deferred).
 
 ## Table of Contents
 
@@ -578,36 +578,36 @@ architectural answer to the conformance gap:
 | COM position | `mj_comPos` | `com_pos()` | Full parity |
 | CRB inertia | `mj_crb` | `crb()` | Full parity |
 | Mass matrix | `mj_makeM` | `factor_m()` | Dense Cholesky (GPU) or sparse LDL |
-| Collision | `mj_collision` | `collision()` | 5 of 36+ pairs |
-| Constraints | `mj_makeConstraint` | `make_constraint()` | Limits + normal contact only |
-| Transmission | `mj_transmission` | `transmission()` | JOINT only |
+| Collision | `mj_collision` | `collision()` | 18+ pairs (plane/sphere/capsule/box/cylinder/mesh/hfield/ellipsoid) |
+| Constraints | `mj_makeConstraint` | `make_constraint()` | Equality + DOF friction + joint limits + tendon limits + tendon friction + contact (condim 1/3/4/6) |
+| Transmission | `mj_transmission` | `transmission()` | JOINT + TENDON + SITE |
 | COM velocity | `mj_comVel` | `com_vel()` | Full parity |
-| Passive forces | `mj_passive` | `passive()` | Spring + damper + **gravcomp (Phase 1.1)** |
+| Passive forces | `mj_passive` | `passive()` | Spring + damper + gravcomp + tendon spring/damping |
 | RNE | `mj_rne` | `rne()` | Full parity |
-| Actuation | `mj_fwdActuation` | `fwd_actuation()` | FIXED + AFFINE gain only |
+| Actuation | `mj_fwdActuation` | `fwd_actuation()` | FIXED + AFFINE gain, NONE/FILTER/FILTEREXACT/INTEGRATOR dynamics |
 | Acceleration | `mj_fwdAcceleration` | `fwd_acceleration()` | Full parity |
 | Solve | `mj_fwdConstraint` | `solve()` | CG + Newton (no PGS) |
-| Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | **Yes (Phase 1.2)** — computes `cfrc_ext` |
+| Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | Yes — computes `cfrc_ext` |
 | Euler | `mj_Euler` | `integrate_euler()` | Full parity + Metal kernel |
-| RK4 | `mj_RungeKutta` | -- | Not implemented |
-| Implicit | `mj_implicit` | -- | Not implemented |
-| Flex | `mj_flex` | -- | Not implemented |
-| Tendon | `mj_tendon` | -- | Not implemented |
-| Sensor | `mj_sensorPos/Vel/Acc` | -- | Not implemented |
-| Inverse | `mj_inverse` | -- | Not implemented |
+| RK4 | `mj_RungeKutta` | `integrate_rk4()` | Full parity (scalar path) |
+| Implicit/Fast | `mj_implicit` | `integrate_implicit()` | Full parity (scalar path) |
+| Tendon | `mj_tendon` | `tendon()` | Fixed tendons (spatial DEFERRED) |
+| Flex | `mj_flex` | -- | Not implemented (DEFERRED) |
+| Sensor | `mj_sensorPos/Vel/Acc` | -- | Not implemented (DEFERRED) |
+| Inverse | `mj_inverse` | -- | Not implemented (DEFERRED) |
 
 ### Summary Statistics
 
 | Metric | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |--------|----------|-----|----------------|
-| Collision pairs | 36+ | ~25 | 5 |
-| Constraint types | 8 | 7 | 2 |
-| Integrators | 4 | 3 | 1 |
-| Transmission types | 6 | 4 | 1 |
-| Gain types | 4 | 3 | 2 |
-| Dynamics types | 6 | 5 | 1 |
-| Sensor types | 49 | ~30 | 0 |
-| Solvers | 3 (+noslip) | 2 | 2 |
+| Collision pairs | 36+ | ~25 | 18+ |
+| Constraint types | 8 | 7 | 8 (equality/DOF friction/joint limit/tendon limit/tendon friction/contact condim 1/3/4/6) |
+| Integrators | 4 | 3 | 4 (Euler, RK4, Implicit, ImplicitFast) |
+| Transmission types | 6 | 4 | 3 (JOINT, TENDON, SITE) |
+| Gain types | 4 | 3 | 2 (FIXED, AFFINE) |
+| Dynamics types | 6 | 5 | 4 (NONE, INTEGRATOR, FILTER, FILTEREXACT) |
+| Sensor types | 49 | ~30 | 0 (DEFERRED) |
+| Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
 | Batched GPU sim | No | Yes (CUDA/TPU) | Yes (Metal) |
-| Differentiable | External | Native (JAX) | Planned |
+| Differentiable | External | Native (JAX) | DEFERRED |

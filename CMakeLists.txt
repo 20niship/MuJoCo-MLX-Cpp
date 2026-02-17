@@ -413,9 +413,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Phase 7.2: ImplicitFast integrator tests
+    add_executable(test_implicit tests/test_implicit.cpp)
+    target_link_libraries(test_implicit PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_implicit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh test_collision_hfield test_collision_ellipsoid test_equality test_dof_friction test_fixed_tendon test_transmission test_tendon_constraint test_rk4 test_filter_dynamics)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh test_collision_hfield test_collision_ellipsoid test_equality test_dof_friction test_fixed_tendon test_transmission test_tendon_constraint test_rk4 test_filter_dynamics test_implicit)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -473,7 +481,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME tendon_constraint COMMAND test_tendon_constraint)
     add_test(NAME rk4 COMMAND test_rk4)
     add_test(NAME filter_dynamics COMMAND test_filter_dynamics)
-    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh collision_hfield collision_ellipsoid equality dof_friction fixed_tendon transmission tendon_constraint rk4 filter_dynamics PROPERTIES LABELS "correctness")
+    add_test(NAME implicit COMMAND test_implicit)
+    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh collision_hfield collision_ellipsoid equality dof_friction fixed_tendon transmission tendon_constraint rk4 filter_dynamics implicit PROPERTIES LABELS "correctness")
 
     # Label all correctness tests
     set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)

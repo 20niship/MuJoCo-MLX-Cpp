@@ -361,9 +361,7 @@ static void validate_model(const mjModel* m) {
             fprintf(stderr, "[mjmlx WARNING] Model has spatial tendons (wrapping geometry) -- only fixed (joint) tendons supported.\n");
     }
 
-    // Check integrator type
-    if (m->opt.integrator == mjINT_IMPLICIT || m->opt.integrator == mjINT_IMPLICITFAST)
-        fprintf(stderr, "[mjmlx WARNING] Model uses implicit integrator -- only Euler and RK4 supported, using Euler.\n");
+    // Integrator types: Euler, RK4, Implicit, ImplicitFast all supported
 
     // Check for sensors (not supported)
     if (m->nsensor > 0)

@@ -166,7 +166,7 @@ int main() {
         TEST_END();
     }
 
-    // ── Test 6: RK4 integrator warning ──
+    // ── Test 6: RK4 integrator loads without warning ──
     {
         static const char* RK4_XML = R"(
 <mujoco>
@@ -179,14 +179,14 @@ int main() {
   </worldbody>
 </mujoco>
 )";
-        TEST_BEGIN("rk4_integrator_warning");
+        TEST_BEGIN("rk4_integrator_no_warning");
         auto warnings = capture_stderr_load(RK4_XML);
         printf("    warnings: '%s'\n", warnings.c_str());
-        CHECK(warnings.find("RK4") != std::string::npos, "should warn about RK4 integrator");
+        CHECK(warnings.find("RK4") == std::string::npos, "no warning for RK4 integrator (now supported)");
         TEST_END();
     }
 
-    // ── Test 7: Implicit integrator warning ──
+    // ── Test 7: Implicit integrator loads without warning ──
     {
         static const char* IMPLICIT_XML = R"(
 <mujoco>
@@ -199,10 +199,10 @@ int main() {
   </worldbody>
 </mujoco>
 )";
-        TEST_BEGIN("implicit_integrator_warning");
+        TEST_BEGIN("implicit_integrator_no_warning");
         auto warnings = capture_stderr_load(IMPLICIT_XML);
         printf("    warnings: '%s'\n", warnings.c_str());
-        CHECK(warnings.find("implicit") != std::string::npos, "should warn about implicit integrator");
+        CHECK(warnings.find("implicit") == std::string::npos, "no warning for implicit integrator (now supported)");
         TEST_END();
     }
 

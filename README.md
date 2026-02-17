@@ -92,7 +92,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (230 tests across 27 suites)
+# Full suite (237 tests across 28 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -145,7 +145,7 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Conformance
 
-All features validated against MuJoCo C reference implementation. **230 tests across 27 test suites, all passing.**
+All features validated against MuJoCo C reference implementation. **237 tests across 28 test suites, all passing.**
 
 ### Phase 1: Synth Physics Foundation
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
@@ -196,10 +196,16 @@ All features validated against MuJoCo C reference implementation. **230 tests ac
 - Mixed stateless (NONE) + stateful actuators in the same model
 - **MUSCLE dynamics** -- DEFERRED (biomechanical models only)
 
-### Phase 7: Advanced Integrators (scalar path only)
+### Phase 7: Advanced Integrators (scalar path)
 - **RK4 (4th-order Runge-Kutta)** -- 4 forward evaluations per step, weighted average; qpos diff ~3e-8 vs MuJoCo C
-- Euler and RK4 supported; Implicit/ImplicitFast pending
-- Batched (Metal) pipeline uses Euler only
+- **ImplicitFast** -- implicit velocity integration via velocity derivative (`deriv_smooth_vel`): modified mass matrix M' = M - dt * dqfrc/dqvel, Cholesky solve; qvel diff ~1e-6 vs MuJoCo C
+- Euler, RK4, Implicit, ImplicitFast all supported in scalar path
+- Batched (Metal) pipeline uses Euler only; vmap RK4/Implicit DEFERRED (needs Metal kernel rewrite)
+
+### Deferred Phases
+- **Sensors** (Phase 8) -- ~50 sensor types, large surface area; RL training reads joint/body state directly, not XML sensors
+- **Differentiable physics** (Phase 9) -- `grad(step)` via `mx::grad`; requires making full pipeline autodiff-compatible, separate project-scale effort
+- **Inverse dynamics / constraint islands / noslip / sleep** (Phase 10) -- niche features, not needed for common RL workflows
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 
@@ -234,7 +240,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | test_tendon_constraint | 6 | Tendon limits + friction loss |
 | test_rk4 | 6 | RK4 integrator |
 | test_filter_dynamics | 7 | Activation dynamics (FILTER/INTEGRATOR) |
-| **TOTAL** | **230** | |
+| test_implicit | 7 | ImplicitFast integrator |
+| **TOTAL** | **237** | |
 
 ## Consumers
 

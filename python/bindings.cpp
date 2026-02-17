@@ -325,5 +325,5 @@ NB_MODULE(_mjmlx_native, m) {
     m.attr("SOLVER_CG") = 1;
     m.attr("SOLVER_NEWTON") = 2;
     m.attr("DISABLE_CONTACT") = (1 << 4);
-    m.attr("DISABLE_EULERDAMP") = (1 << 18);
+    m.attr("DISABLE_EULERDAMP") = (1 << 15);
 }
