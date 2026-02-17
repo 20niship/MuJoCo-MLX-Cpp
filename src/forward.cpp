@@ -185,105 +185,6 @@ static Data fwd_acceleration(const Model& m, Data d) {
   return d;
 }
 
-static Data integrate_euler(const Model& m, Data d) {
-  float dt = m.opt.timestep;
-  auto qacc = d.qacc;
-
-  // Advance velocity
-  auto new_qvel = mx::add(d.qvel, mx::multiply(qacc, mx::array(dt)));
-
-  // Integrate position (simplified: handles free joints with quaternion integration)
-  mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
-  auto jnt_type_ptr = m.jnt_type.data<int>();
-  auto jnt_qposadr_ptr = m.jnt_qposadr.data<int>();
-  auto jnt_dofadr_ptr = m.jnt_dofadr.data<int>();
-
-  std::vector<mx::array> parts;
-  for (int j = 0; j < m.njnt; j++) {
-    int jt = jnt_type_ptr[j];
-    int qa = jnt_qposadr_ptr[j];
-    int da = jnt_dofadr_ptr[j];
-
-    if (jt == static_cast<int>(JointType::FREE)) {
-      auto pos = mx::add(mx::slice(d.qpos, {qa}, {qa + 3}),
-                         mx::multiply(mx::array(dt), mx::slice(new_qvel, {da}, {da + 3})));
-      auto quat_new = quat_integrate(mx::slice(d.qpos, {qa + 3}, {qa + 7}),
-                                      mx::slice(new_qvel, {da + 3}, {da + 6}), dt);
-      parts.push_back(mx::concatenate({pos, quat_new}, 0));
-    } else if (jt == static_cast<int>(JointType::BALL)) {
-      auto quat_new = quat_integrate(mx::slice(d.qpos, {qa}, {qa + 4}),
-                                      mx::slice(new_qvel, {da}, {da + 3}), dt);
-      parts.push_back(quat_new);
-    } else {
-      // HINGE or SLIDE
-      auto val = mx::add(mx::slice(d.qpos, {qa}, {qa + 1}),
-                         mx::multiply(mx::array(dt), mx::slice(new_qvel, {da}, {da + 1})));
-      parts.push_back(val);
-    }
-  }
-
-  d.qpos = mx::concatenate(parts, 0);
-  d.qvel = new_qvel;
-  d.qacc_warmstart = d.qacc;
-
-  // Integrate activation state: act += act_dot * dt
-  if (m.na > 0 && d.act.size() > 0 && d.act_dot.size() > 0) {
-      constexpr int DYN_FILTEREXACT = 3;
-      mx::eval(m.actuator_dyntype); mx::eval(m.actuator_dynprm);
-      mx::eval(m.actuator_actadr); mx::eval(m.actuator_actnum);
-      mx::eval(d.act); mx::eval(d.act_dot);
-
-      auto dyntype_ptr = m.actuator_dyntype.data<int>();
-      auto dynprm_ptr = m.actuator_dynprm.data<float>();
-      auto actadr_ptr = m.actuator_actadr.data<int>();
-      auto actnum_ptr = m.actuator_actnum.data<int>();
-      auto act_ptr = d.act.data<float>();
-      auto adot_ptr = d.act_dot.data<float>();
-
-      std::vector<float> new_act(m.na);
-      for (int i = 0; i < m.na; i++) new_act[i] = act_ptr[i];
-
-      for (int i = 0; i < m.nu; i++) {
-          int aa = actadr_ptr[i];
-          if (aa < 0 || aa >= m.na) continue;
-          int anum = actnum_ptr[i];
-          for (int k = 0; k < anum; k++) {
-              int idx = aa + k;
-              if (idx >= m.na) break;
-              if (dyntype_ptr[i] == DYN_FILTEREXACT) {
-                  float tau = std::max(dynprm_ptr[i * 10], 1e-15f);
-                  new_act[idx] = act_ptr[idx] + adot_ptr[idx] * tau * (1.0f - std::exp(-dt / tau));
-              } else {
-                  new_act[idx] = act_ptr[idx] + adot_ptr[idx] * dt;
-              }
-          }
-      }
-
-      // Clamp activation
-      if (m.actuator_actlimited.size() > 0) {
-          mx::eval(m.actuator_actlimited); mx::eval(m.actuator_actrange);
-          auto alim = m.actuator_actlimited.data<int>();
-          auto arange = m.actuator_actrange.data<float>();
-          for (int i = 0; i < m.nu; i++) {
-              int aa = actadr_ptr[i];
-              if (aa < 0) continue;
-              if (alim[i]) {
-                  int anum = actnum_ptr[i];
-                  for (int k = 0; k < anum; k++) {
-                      int idx = aa + k;
-                      if (idx >= m.na) break;
-                      new_act[idx] = std::max(arange[i * 2], std::min(arange[i * 2 + 1], new_act[idx]));
-                  }
-              }
-          }
-      }
-
-      d.act = mx::array(new_act.data(), {m.na}, mx::float32);
-  }
-
-  return d;
-}
-
 Data forward(const Model& m, Data d) {
   d = fwd_position(m, d);
   d = fwd_velocity(m, d);
@@ -306,9 +207,202 @@ Data forward(const Model& m, Data d) {
   return d;
 }
 
+static Data integrate_pos(const Model& m, Data d, const mx::array& qvel_for_pos, float dt) {
+    mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+    auto jnt_type_ptr = m.jnt_type.data<int>();
+    auto jnt_qposadr_ptr = m.jnt_qposadr.data<int>();
+    auto jnt_dofadr_ptr = m.jnt_dofadr.data<int>();
+
+    std::vector<mx::array> parts;
+    for (int j = 0; j < m.njnt; j++) {
+        int jt = jnt_type_ptr[j];
+        int qa = jnt_qposadr_ptr[j];
+        int da = jnt_dofadr_ptr[j];
+
+        if (jt == static_cast<int>(JointType::FREE)) {
+            auto pos = mx::add(mx::slice(d.qpos, {qa}, {qa + 3}),
+                               mx::multiply(mx::array(dt), mx::slice(qvel_for_pos, {da}, {da + 3})));
+            auto quat_new = quat_integrate(mx::slice(d.qpos, {qa + 3}, {qa + 7}),
+                                            mx::slice(qvel_for_pos, {da + 3}, {da + 6}), dt);
+            parts.push_back(mx::concatenate({pos, quat_new}, 0));
+        } else if (jt == static_cast<int>(JointType::BALL)) {
+            auto quat_new = quat_integrate(mx::slice(d.qpos, {qa}, {qa + 4}),
+                                            mx::slice(qvel_for_pos, {da}, {da + 3}), dt);
+            parts.push_back(quat_new);
+        } else {
+            auto val = mx::add(mx::slice(d.qpos, {qa}, {qa + 1}),
+                               mx::multiply(mx::array(dt), mx::slice(qvel_for_pos, {da}, {da + 1})));
+            parts.push_back(val);
+        }
+    }
+    d.qpos = mx::concatenate(parts, 0);
+    return d;
+}
+
+static Data integrate_act(const Model& m, Data d, const mx::array& act_dot, float dt) {
+    if (m.na <= 0 || d.act.size() == 0 || act_dot.size() == 0) return d;
+
+    constexpr int DYN_FILTEREXACT = 3;
+    mx::eval(m.actuator_dyntype); mx::eval(m.actuator_dynprm);
+    mx::eval(m.actuator_actadr); mx::eval(m.actuator_actnum);
+    mx::eval(d.act); mx::eval(act_dot);
+
+    auto dyntype_ptr = m.actuator_dyntype.data<int>();
+    auto dynprm_ptr = m.actuator_dynprm.data<float>();
+    auto actadr_ptr = m.actuator_actadr.data<int>();
+    auto actnum_ptr = m.actuator_actnum.data<int>();
+    auto act_ptr = d.act.data<float>();
+    auto adot_ptr = act_dot.data<float>();
+
+    std::vector<float> new_act(m.na);
+    for (int i = 0; i < m.na; i++) new_act[i] = act_ptr[i];
+
+    for (int i = 0; i < m.nu; i++) {
+        int aa = actadr_ptr[i];
+        if (aa < 0 || aa >= m.na) continue;
+        int anum = actnum_ptr[i];
+        for (int k = 0; k < anum; k++) {
+            int idx = aa + k;
+            if (idx >= m.na) break;
+            if (dyntype_ptr[i] == DYN_FILTEREXACT) {
+                float tau = std::max(dynprm_ptr[i * 10], 1e-15f);
+                new_act[idx] = act_ptr[idx] + adot_ptr[idx] * tau * (1.0f - std::exp(-dt / tau));
+            } else {
+                new_act[idx] = act_ptr[idx] + adot_ptr[idx] * dt;
+            }
+        }
+    }
+
+    // Clamp activation
+    if (m.actuator_actlimited.size() > 0) {
+        mx::eval(m.actuator_actlimited); mx::eval(m.actuator_actrange);
+        auto alim = m.actuator_actlimited.data<int>();
+        auto arange = m.actuator_actrange.data<float>();
+        for (int i = 0; i < m.nu; i++) {
+            int aa = actadr_ptr[i];
+            if (aa < 0) continue;
+            if (alim[i]) {
+                int anum = actnum_ptr[i];
+                for (int k = 0; k < anum; k++) {
+                    int idx = aa + k;
+                    if (idx >= m.na) break;
+                    new_act[idx] = std::max(arange[i * 2], std::min(arange[i * 2 + 1], new_act[idx]));
+                }
+            }
+        }
+    }
+
+    d.act = mx::array(new_act.data(), {m.na}, mx::float32);
+    return d;
+}
+
+static Data integrate_euler(const Model& m, Data d) {
+  float dt = m.opt.timestep;
+
+  // Semi-implicit: advance velocity first, then use new qvel for position
+  d.qvel = mx::add(d.qvel, mx::multiply(d.qacc, mx::array(dt)));
+  d = integrate_pos(m, d, d.qvel, dt);
+  d.qacc_warmstart = d.qacc;
+
+  // Integrate activation state
+  if (m.na > 0 && d.act.size() > 0 && d.act_dot.size() > 0) {
+      d = integrate_act(m, d, d.act_dot, dt);
+  }
+
+  return d;
+}
+
+static Data integrate_rk4(const Model& m, Data d) {
+    float dt = m.opt.timestep;
+
+    // Save initial state
+    auto qpos0 = d.qpos;
+    auto qvel0 = d.qvel;
+    auto act0 = d.act;
+
+    // k1: qacc and qvel from current forward pass (already computed)
+    auto k1_qacc = d.qacc;
+    auto k1_qvel = d.qvel;
+    auto k1_act_dot = d.act_dot;
+
+    // Weighted sums (B = [1/6, 1/3, 1/3, 1/6])
+    mx::eval(k1_qacc); mx::eval(k1_qvel);
+    auto qacc_sum = mx::multiply(mx::array(1.0f / 6.0f), k1_qacc);
+    auto qvel_sum = mx::multiply(mx::array(1.0f / 6.0f), k1_qvel);
+    auto act_dot_sum = (m.na > 0 && k1_act_dot.size() > 0)
+        ? mx::multiply(mx::array(1.0f / 6.0f), k1_act_dot) : mx::zeros({std::max(m.na, 1)});
+
+    // k2: forward at d0 + 0.5*dt*k1
+    {
+        d.qvel = mx::add(qvel0, mx::multiply(mx::array(0.5f * dt), k1_qacc));
+        d.qpos = qpos0;
+        d = integrate_pos(m, d, k1_qvel, 0.5f * dt);
+        if (m.na > 0 && act0.size() > 0 && k1_act_dot.size() > 0)
+            d.act = mx::add(act0, mx::multiply(mx::array(0.5f * dt), k1_act_dot));
+
+        d = forward(m, d);
+
+        auto k2_qacc = d.qacc;
+        auto k2_qvel = d.qvel;
+        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 3.0f), k2_qacc));
+        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 3.0f), k2_qvel));
+        if (m.na > 0 && d.act_dot.size() > 0)
+            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 3.0f), d.act_dot));
+
+        // k3: forward at d0 + 0.5*dt*k2
+        d.qvel = mx::add(qvel0, mx::multiply(mx::array(0.5f * dt), k2_qacc));
+        d.qpos = qpos0;
+        d = integrate_pos(m, d, k2_qvel, 0.5f * dt);
+        if (m.na > 0 && act0.size() > 0 && d.act_dot.size() > 0)
+            d.act = mx::add(act0, mx::multiply(mx::array(0.5f * dt), d.act_dot));
+
+        d = forward(m, d);
+
+        auto k3_qacc = d.qacc;
+        auto k3_qvel = d.qvel;
+        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 3.0f), k3_qacc));
+        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 3.0f), k3_qvel));
+        if (m.na > 0 && d.act_dot.size() > 0)
+            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 3.0f), d.act_dot));
+
+        // k4: forward at d0 + dt*k3
+        d.qvel = mx::add(qvel0, mx::multiply(mx::array(dt), k3_qacc));
+        d.qpos = qpos0;
+        d = integrate_pos(m, d, k3_qvel, dt);
+        if (m.na > 0 && act0.size() > 0 && d.act_dot.size() > 0)
+            d.act = mx::add(act0, mx::multiply(mx::array(dt), d.act_dot));
+
+        d = forward(m, d);
+
+        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 6.0f), d.qacc));
+        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 6.0f), d.qvel));
+        if (m.na > 0 && d.act_dot.size() > 0)
+            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 6.0f), d.act_dot));
+    }
+
+    // Final advance: use weighted average qacc for velocity, weighted average qvel for position
+    d.qpos = qpos0;
+    d.qvel = mx::add(qvel0, mx::multiply(mx::array(dt), qacc_sum));
+    d = integrate_pos(m, d, qvel_sum, dt);
+
+    // Integrate activation with weighted act_dot
+    if (m.na > 0 && act0.size() > 0) {
+        d.act = act0;
+        d = integrate_act(m, d, act_dot_sum, dt);
+    }
+
+    d.qacc_warmstart = d.qacc;
+
+    return d;
+}
+
 Data step(const Model& m, Data d) {
   d = forward(m, d);
-  d = integrate_euler(m, d);
+  if (m.opt.integrator == IntegratorType::RK4) {
+    d = integrate_rk4(m, d);
+  } else {
+    d = integrate_euler(m, d);
+  }
   return d;
 }
 
@@ -330,7 +424,11 @@ Data step2(const Model& m, Data d) {
   } else {
     d = solve(m, d);
   }
-  d = integrate_euler(m, d);
+  if (m.opt.integrator == IntegratorType::RK4) {
+    d = integrate_rk4(m, d);
+  } else {
+    d = integrate_euler(m, d);
+  }
   return d;
 }
 

@@ -362,10 +362,8 @@ static void validate_model(const mjModel* m) {
     }
 
     // Check integrator type
-    if (m->opt.integrator == mjINT_RK4)
-        fprintf(stderr, "[mjmlx WARNING] Model uses RK4 integrator -- only Euler supported, using Euler.\n");
     if (m->opt.integrator == mjINT_IMPLICIT || m->opt.integrator == mjINT_IMPLICITFAST)
-        fprintf(stderr, "[mjmlx WARNING] Model uses implicit integrator -- only Euler supported, using Euler.\n");
+        fprintf(stderr, "[mjmlx WARNING] Model uses implicit integrator -- only Euler and RK4 supported, using Euler.\n");
 
     // Check for sensors (not supported)
     if (m->nsensor > 0)

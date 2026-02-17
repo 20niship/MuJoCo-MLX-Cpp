@@ -591,6 +591,11 @@ See [Tendon System](#tendon-system) above.
 - **5.4 Tendon friction loss**: Complete. Friction constraints through tendons using `ten_J` as Jacobian, same `compute_kbi` as DOF friction.
 - **5.5 Tendon limits**: Complete. Limit constraints on tendon length, using `tendon_limited`/`tendon_range`/`tendon_margin` with `ten_J` Jacobian.
 
+### Phase 7: Advanced Integrators
+
+- **7.1 RK4**: Complete. Classic 4th-order Runge-Kutta with 4 forward evaluations per step. Weighted-average qacc for velocity update and weighted-average qvel for position update. Refactored `integrate_pos()` and `integrate_act()` as shared helpers used by both Euler and RK4.
+- **7.2 ImplicitFast**: Not yet implemented.
+
 ### Phase 6: Actuator Dynamics
 
 - **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete. Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless.
@@ -614,7 +619,7 @@ See [Tendon System](#tendon-system) above.
 
 6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics not yet implemented (Phase 6.3).
 
-7. **Advanced integrators**: RK4 and ImplicitFast not yet implemented (Phase 7).
+7. **ImplicitFast integrator**: Not yet implemented (Phase 7.2). Requires velocity derivative computation.
 
 8. **Sensors**: Not yet implemented (Phase 8).
 

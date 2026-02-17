@@ -91,7 +91,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (224 tests across 26 suites)
+# Full suite (230 tests across 27 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -144,7 +144,7 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Conformance
 
-All features validated against MuJoCo C reference implementation. **224 tests across 26 test suites, all passing.**
+All features validated against MuJoCo C reference implementation. **230 tests across 27 test suites, all passing.**
 
 ### Phase 1: Synth Physics Foundation
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
@@ -194,6 +194,10 @@ All features validated against MuJoCo C reference implementation. **224 tests ac
 - **Activation clamping** -- `actuator_actlimited` / `actuator_actrange`
 - Mixed stateless (NONE) + stateful actuators in the same model
 
+### Phase 7: Advanced Integrators
+- **RK4 (4th-order Runge-Kutta)** -- 4 forward evaluations per step, weighted average; qpos diff ~3e-8 vs MuJoCo C
+- Euler and RK4 supported; Implicit/ImplicitFast pending
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 
 ## Test Suite Summary
@@ -225,8 +229,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | test_fixed_tendon | 9 | Fixed tendon system |
 | test_transmission | 7 | TENDON + SITE transmission |
 | test_tendon_constraint | 6 | Tendon limits + friction loss |
+| test_rk4 | 6 | RK4 integrator |
 | test_filter_dynamics | 7 | Activation dynamics (FILTER/INTEGRATOR) |
-| **TOTAL** | **224** | |
+| **TOTAL** | **230** | |
 
 ## Consumers
 
