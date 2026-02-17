@@ -206,6 +206,26 @@ static Model convert_model(mjModel* m) {
         model.actuator_forcerange = to_mx_f2(m->actuator_forcerange, (int)m->nu, 2);
     }
 
+    // Tendon properties
+    model.nwrap = (int)m->nwrap;
+    if (m->ntendon > 0) {
+        model.tendon_adr = to_mx_i(m->tendon_adr, (int)m->ntendon);
+        model.tendon_num = to_mx_i(m->tendon_num, (int)m->ntendon);
+        model.tendon_limited = to_mx_byte(m->tendon_limited, (int)m->ntendon);
+        model.tendon_range = to_mx_f2(m->tendon_range, (int)m->ntendon, 2);
+        model.tendon_stiffness = to_mx_f(m->tendon_stiffness, (int)m->ntendon);
+        model.tendon_damping = to_mx_f(m->tendon_damping, (int)m->ntendon);
+        model.tendon_frictionloss = to_mx_f(m->tendon_frictionloss, (int)m->ntendon);
+        model.tendon_lengthspring = to_mx_f2(m->tendon_lengthspring, (int)m->ntendon, 2);
+        model.tendon_length0 = to_mx_f(m->tendon_length0, (int)m->ntendon);
+        model.tendon_invweight0 = to_mx_f(m->tendon_invweight0, (int)m->ntendon);
+    }
+    if (m->nwrap > 0) {
+        model.wrap_type = to_mx_i(m->wrap_type, (int)m->nwrap);
+        model.wrap_objid = to_mx_i(m->wrap_objid, (int)m->nwrap);
+        model.wrap_prm = to_mx_f(m->wrap_prm, (int)m->nwrap);
+    }
+
     // Geom properties (for collision)
     if (m->ngeom > 0) {
         model.geom_type = to_mx_i(m->geom_type, (int)m->ngeom);
@@ -329,9 +349,18 @@ static void validate_model(const mjModel* m) {
     if (has_integrator_dyn)
         fprintf(stderr, "[mjmlx WARNING] Model has INTEGRATOR actuator dynamics -- not implemented, dynamics ignored.\n");
 
-    // Check for tendons
-    if (m->ntendon > 0)
-        fprintf(stderr, "[mjmlx WARNING] Model has %lld tendons -- not supported, ignored.\n", (long long)m->ntendon);
+    // Check for spatial tendons (wrapping geometry types other than JOINT)
+    if (m->nwrap > 0) {
+        bool has_spatial = false;
+        for (int i = 0; i < m->nwrap; i++) {
+            if (m->wrap_type[i] != 1) {  // 1 = mjWRAP_JOINT
+                has_spatial = true;
+                break;
+            }
+        }
+        if (has_spatial)
+            fprintf(stderr, "[mjmlx WARNING] Model has spatial tendons (wrapping geometry) -- only fixed (joint) tendons supported.\n");
+    }
 
     // Check integrator type
     if (m->opt.integrator == mjINT_RK4)

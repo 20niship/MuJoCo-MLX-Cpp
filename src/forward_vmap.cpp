@@ -121,6 +121,7 @@ Data vmap_forward(const Model& m, Data d) {
     d.qfrc_smooth = mx::zeros(mx::Shape{m.nv});
     d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
 #elif defined(VMAP_NO_SOLVER)
+    d = vmap_tendon(m, d);
     d = vmap_collision(m, d);
     d = vmap_make_constraint(m, d);
     d = vmap_transmission(m, d);
@@ -136,6 +137,7 @@ Data vmap_forward(const Model& m, Data d) {
     d.qacc = d.qacc_smooth;
     d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
 #elif defined(VMAP_NO_COLLISION)
+    d = vmap_tendon(m, d);
     d = vmap_transmission(m, d);
     if (m.nu > 0 && d.actuator_moment.size() > 0) {
         d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
@@ -149,6 +151,7 @@ Data vmap_forward(const Model& m, Data d) {
     d.qacc = d.qacc_smooth;
     d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
 #else
+    d = vmap_tendon(m, d);
     d = vmap_collision(m, d);
     d = vmap_make_constraint(m, d);
     d = vmap_transmission(m, d);

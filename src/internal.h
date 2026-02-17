@@ -106,7 +106,7 @@ struct Model {
     // Counts
     int nq = 0, nv = 0, nu = 0, na = 0;
     int nbody = 0, njnt = 0, ngeom = 0, nsite = 0;
-    int ncam = 0, nmesh = 0, nmocap = 0, ntendon = 0;
+    int ncam = 0, nmesh = 0, nmocap = 0, ntendon = 0, nwrap = 0;
     int neq = 0, ncon = 0, ngravcomp = 0, npair = 0, nexclude = 0;
 
     Option opt;
@@ -182,6 +182,23 @@ struct Model {
     mx::array actuator_ctrlrange{mx::array({})};
     mx::array actuator_forcelimited{mx::array({})};
     mx::array actuator_forcerange{mx::array({})};
+
+    // Tendon properties
+    mx::array tendon_adr{mx::array({})};        // (ntendon,) int: start index in wrap arrays
+    mx::array tendon_num{mx::array({})};        // (ntendon,) int: number of wrap objects
+    mx::array tendon_limited{mx::array({})};    // (ntendon,) byte: has length limits
+    mx::array tendon_range{mx::array({})};      // (ntendon, 2) float: length limits
+    mx::array tendon_stiffness{mx::array({})};  // (ntendon,) float: spring stiffness
+    mx::array tendon_damping{mx::array({})};    // (ntendon,) float: damping
+    mx::array tendon_frictionloss{mx::array({})}; // (ntendon,) float: friction loss
+    mx::array tendon_lengthspring{mx::array({})}; // (ntendon, 2) float: spring rest length range
+    mx::array tendon_length0{mx::array({})};    // (ntendon,) float: length at qpos0
+    mx::array tendon_invweight0{mx::array({})};  // (ntendon,) float: inverse weight at qpos0
+
+    // Wrap object properties
+    mx::array wrap_type{mx::array({})};         // (nwrap,) int: wrap object type
+    mx::array wrap_objid{mx::array({})};        // (nwrap,) int: object id (joint/geom/site)
+    mx::array wrap_prm{mx::array({})};          // (nwrap,) float: coefficient/parameter
 
     // Geom properties (for collision)
     mx::array geom_type{mx::array({})};
@@ -384,6 +401,11 @@ struct Data {
     mx::array xfrc_applied{mx::array({})};  // (nbody, 6) external forces
     mx::array qfrc_applied{mx::array({})};  // (nv,) applied joint forces
 
+    // Tendon
+    mx::array ten_length{mx::array({})};     // (ntendon,) tendon lengths
+    mx::array ten_velocity{mx::array({})};   // (ntendon,) tendon velocities
+    mx::array ten_J{mx::array({})};          // (ntendon, nv) tendon Jacobian
+
     // Actuator
     mx::array actuator_length{mx::array({})};    // (nu,)
     mx::array actuator_moment{mx::array({})};    // (nu, nv)
@@ -495,6 +517,7 @@ Data factor_m(const Model& m, Data d);
 mx::array solve_m(const Model& m, const Data& d, const mx::array& rhs);
 Data com_vel(const Model& m, Data d);
 Data rne(const Model& m, Data d, bool flg_acc = false);
+Data tendon(const Model& m, Data d);
 Data transmission(const Model& m, Data d);
 
 // collision.cpp
@@ -546,6 +569,7 @@ Data vmap_factor_m(const Model& m, Data d);
 mx::array vmap_solve_m(const Model& m, const Data& d, const mx::array& rhs);
 Data vmap_com_vel(const Model& m, Data d);
 Data vmap_rne(const Model& m, Data d);
+Data vmap_tendon(const Model& m, Data d);
 Data vmap_transmission(const Model& m, Data d);
 
 // constraint_vmap.cpp

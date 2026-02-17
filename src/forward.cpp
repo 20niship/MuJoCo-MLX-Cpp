@@ -29,6 +29,7 @@ static Data fwd_position(const Model& m, Data d) {
   d = com_pos(m, d);
   d = crb(m, d);
   d = factor_m(m, d);
+  d = tendon(m, d);
   d = collision(m, d);
   d = make_constraint(m, d);
   d = transmission(m, d);

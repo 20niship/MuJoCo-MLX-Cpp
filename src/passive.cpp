@@ -155,8 +155,61 @@ static mx::array gravcomp(const Model& m, const Data& d) {
     return qfrc;
 }
 
+static mx::array tendon_passive(const Model& m, const Data& d) {
+    auto qfrc = mx::zeros({m.nv});
+    if (m.ntendon == 0 || d.ten_length.size() == 0) return qfrc;
+
+    mx::eval(m.tendon_stiffness); mx::eval(m.tendon_damping);
+    mx::eval(m.tendon_lengthspring);
+    mx::eval(d.ten_length); mx::eval(d.ten_velocity); mx::eval(d.ten_J);
+
+    auto stiff_ptr = m.tendon_stiffness.data<float>();
+    auto damp_ptr = m.tendon_damping.data<float>();
+    auto lspring_ptr = m.tendon_lengthspring.data<float>();
+    auto tlen_ptr = d.ten_length.data<float>();
+    auto tvel_ptr = d.ten_velocity.data<float>();
+
+    std::vector<float> force(m.ntendon, 0.0f);
+
+    for (int t = 0; t < m.ntendon; t++) {
+        float f = 0.0f;
+
+        // Spring force: -stiffness * (ten_length - rest_length)
+        float stiff = stiff_ptr[t];
+        if (stiff != 0.0f) {
+            // MuJoCo C uses tendon_lengthspring range:
+            // rest = clamp(ten_length, spring_lo, spring_hi)
+            float lo = lspring_ptr[t * 2];
+            float hi = lspring_ptr[t * 2 + 1];
+            float len = tlen_ptr[t];
+            float rest = std::min(std::max(len, lo), hi);
+            f -= stiff * (len - rest);
+        }
+
+        // Damping force: -damping * ten_velocity
+        float damp = damp_ptr[t];
+        if (damp != 0.0f) {
+            f -= damp * tvel_ptr[t];
+        }
+
+        force[t] = f;
+    }
+
+    // qfrc += ten_J^T * force  =>  (nv, ntendon) @ (ntendon, 1) -> (nv, 1) -> (nv,)
+    auto force_arr = mx::array(force.data(), {m.ntendon}, mx::float32);
+    auto contrib = mx::flatten(mx::matmul(
+        mx::transpose(d.ten_J),
+        mx::reshape(force_arr, {m.ntendon, 1})));
+    return contrib;
+}
+
 Data passive(const Model& m, Data d) {
     d.qfrc_passive = spring_damper(m, d);
+
+    // Tendon passive forces (spring + damping)
+    if (m.ntendon > 0) {
+        d.qfrc_passive = mx::add(d.qfrc_passive, tendon_passive(m, d));
+    }
 
     // Gravity compensation
     d.qfrc_gravcomp = gravcomp(m, d);

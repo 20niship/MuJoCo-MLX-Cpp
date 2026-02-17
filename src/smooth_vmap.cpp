@@ -406,6 +406,91 @@ Data vmap_rne(const Model& m, Data d) {
     return d;
 }
 
+// ── Vmap-compatible tendon ────────────────────────────────────────────────────
+
+Data vmap_tendon(const Model& m, Data d) {
+    if (m.ntendon == 0) {
+        d.ten_length = mx::zeros({0});
+        d.ten_velocity = mx::zeros({0});
+        d.ten_J = mx::zeros({0, m.nv});
+        return d;
+    }
+
+    // Pre-compute the tendon Jacobian as a constant matrix (for fixed tendons).
+    // For each wrap object of type JOINT: ten_J[tendon_id, jnt_dofadr[wrap_objid]] = wrap_prm
+    // This is the same as scalar path since the Jacobian is constant.
+    mx::eval(m.tendon_adr); mx::eval(m.tendon_num);
+    mx::eval(m.wrap_type); mx::eval(m.wrap_objid); mx::eval(m.wrap_prm);
+    mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+
+    auto ten_adr = m.tendon_adr.data<int>();
+    auto ten_num = m.tendon_num.data<int>();
+    auto wtype = m.wrap_type.data<int>();
+    auto wobjid = m.wrap_objid.data<int>();
+    auto wprm = m.wrap_prm.data<float>();
+    auto jqpa = m.jnt_qposadr.data<int>();
+    auto jda = m.jnt_dofadr.data<int>();
+
+    // Build constant Jacobian (same for all envs, fixed tendon coefficients)
+    std::vector<float> ten_j(m.ntendon * m.nv, 0.0f);
+    std::vector<int> qpos_indices;
+    std::vector<float> qpos_coefs;
+    std::vector<int> tendon_ids;
+
+    for (int t = 0; t < m.ntendon; t++) {
+        int adr = ten_adr[t];
+        int num = ten_num[t];
+        for (int w = adr; w < adr + num; w++) {
+            if (wtype[w] != 1) continue;  // mjWRAP_JOINT
+            int jnt = wobjid[w];
+            float coef = wprm[w];
+            int da = jda[jnt];
+            ten_j[t * m.nv + da] += coef;
+            qpos_indices.push_back(jqpa[jnt]);
+            qpos_coefs.push_back(coef);
+            tendon_ids.push_back(t);
+        }
+    }
+
+    d.ten_J = mx::array(ten_j.data(), {m.ntendon, m.nv}, mx::float32);
+
+    // ten_length = ten_J @ qpos (but only for scalar qpos entries that map to DOFs)
+    // For fixed tendons with HINGE/SLIDE joints, we use: length = sum(coef * qpos[qa])
+    // We do this via ten_J @ qpos_subset, but since qpos may have quaternions (nq != nv),
+    // we compute it via gathering and dotting.
+    // Actually, simplest vmap-compatible: just gather and sum.
+    // Build ten_length from qpos using the gathered indices.
+    if (!qpos_indices.empty()) {
+        auto idx = mx::array(qpos_indices.data(), {(int)qpos_indices.size()}, mx::int32);
+        auto coefs = mx::array(qpos_coefs.data(), {(int)qpos_coefs.size()}, mx::float32);
+        auto tids = mx::array(tendon_ids.data(), {(int)tendon_ids.size()}, mx::int32);
+
+        // Gather qpos values at the relevant indices
+        auto qvals = mx::take(d.qpos, idx);
+        auto products = mx::multiply(coefs, qvals);
+
+        // Scatter-add into ten_length using segment_sum equivalent
+        // Use mx::zeros + scatter_add (via index_put)
+        // Since MLX doesn't have segment_sum directly, use a loop or scatter
+        auto ten_length = mx::zeros({m.ntendon});
+        // For vmap compatibility, build a one-hot and matmul
+        std::vector<float> scatter_mat(qpos_indices.size() * m.ntendon, 0.0f);
+        for (size_t i = 0; i < tendon_ids.size(); i++) {
+            scatter_mat[i * m.ntendon + tendon_ids[i]] = 1.0f;
+        }
+        auto smat = mx::array(scatter_mat.data(),
+            {(int)qpos_indices.size(), m.ntendon}, mx::float32);
+        d.ten_length = mx::flatten(mx::matmul(mx::reshape(products, {1, (int)qpos_indices.size()}), smat));
+    } else {
+        d.ten_length = mx::zeros({m.ntendon});
+    }
+
+    // ten_velocity = ten_J @ qvel
+    d.ten_velocity = mx::flatten(mx::matmul(d.ten_J, mx::reshape(d.qvel, {m.nv, 1})));
+
+    return d;
+}
+
 // ── Vmap-compatible transmission ─────────────────────────────────────────────
 
 Data vmap_transmission(const Model& m, Data d) {

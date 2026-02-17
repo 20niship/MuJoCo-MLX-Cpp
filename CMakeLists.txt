@@ -373,9 +373,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Phase 5.1: Fixed tendon tests
+    add_executable(test_fixed_tendon tests/test_fixed_tendon.cpp)
+    target_link_libraries(test_fixed_tendon PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_fixed_tendon PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh test_collision_hfield test_collision_ellipsoid test_equality test_dof_friction)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh test_collision_hfield test_collision_ellipsoid test_equality test_dof_friction test_fixed_tendon)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -428,7 +436,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME collision_ellipsoid COMMAND test_collision_ellipsoid)
     add_test(NAME equality COMMAND test_equality)
     add_test(NAME dof_friction COMMAND test_dof_friction)
-    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh collision_hfield collision_ellipsoid equality dof_friction PROPERTIES LABELS "correctness")
+    add_test(NAME fixed_tendon COMMAND test_fixed_tendon)
+    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh collision_hfield collision_ellipsoid equality dof_friction fixed_tendon PROPERTIES LABELS "correctness")
 
     # Label all correctness tests
     set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)

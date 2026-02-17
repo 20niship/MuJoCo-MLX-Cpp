@@ -589,6 +589,61 @@ Data rne(const Model& m, Data d, bool flg_acc) {
     return d;
 }
 
+// ── Tendon ───────────────────────────────────────────────────────────────────
+
+Data tendon(const Model& m, Data d) {
+    if (m.ntendon == 0) {
+        d.ten_length = mx::zeros({0});
+        d.ten_velocity = mx::zeros({0});
+        d.ten_J = mx::zeros({0, m.nv});
+        return d;
+    }
+
+    mx::eval(m.tendon_adr); mx::eval(m.tendon_num);
+    mx::eval(m.wrap_type); mx::eval(m.wrap_objid); mx::eval(m.wrap_prm);
+    mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+    mx::eval(d.qpos); mx::eval(d.qvel);
+
+    auto ten_adr = m.tendon_adr.data<int>();
+    auto ten_num = m.tendon_num.data<int>();
+    auto wtype = m.wrap_type.data<int>();
+    auto wobjid = m.wrap_objid.data<int>();
+    auto wprm = m.wrap_prm.data<float>();
+    auto jqpa = m.jnt_qposadr.data<int>();
+    auto jda = m.jnt_dofadr.data<int>();
+    auto qpos_ptr = d.qpos.data<float>();
+
+    std::vector<float> ten_len(m.ntendon, 0.0f);
+    std::vector<float> ten_j(m.ntendon * m.nv, 0.0f);
+
+    for (int t = 0; t < m.ntendon; t++) {
+        int adr = ten_adr[t];
+        int num = ten_num[t];
+        float length = 0.0f;
+
+        for (int w = adr; w < adr + num; w++) {
+            if (wtype[w] != 1) continue;  // 1 = mjWRAP_JOINT, skip non-joint wraps
+            int jnt = wobjid[w];
+            float coef = wprm[w];
+            int qa = jqpa[jnt];
+            int da = jda[jnt];
+
+            length += coef * qpos_ptr[qa];
+            ten_j[t * m.nv + da] += coef;
+        }
+
+        ten_len[t] = length;
+    }
+
+    d.ten_length = mx::array(ten_len.data(), {m.ntendon}, mx::float32);
+    d.ten_J = mx::array(ten_j.data(), {m.ntendon, m.nv}, mx::float32);
+
+    // ten_velocity = ten_J @ qvel
+    d.ten_velocity = mx::flatten(mx::matmul(d.ten_J, mx::reshape(d.qvel, {m.nv, 1})));
+
+    return d;
+}
+
 // ── Transmission ─────────────────────────────────────────────────────────────
 
 Data transmission(const Model& m, Data d) {
