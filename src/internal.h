@@ -198,6 +198,11 @@ struct Model {
     mx::array tendon_lengthspring{mx::array({})}; // (ntendon, 2) float: spring rest length range
     mx::array tendon_length0{mx::array({})};    // (ntendon,) float: length at qpos0
     mx::array tendon_invweight0{mx::array({})};  // (ntendon,) float: inverse weight at qpos0
+    mx::array tendon_margin{mx::array({})};       // (ntendon,) float: min distance for limit detection
+    mx::array tendon_solref_lim{mx::array({})};   // (ntendon, 2) float: solver reference for limits
+    mx::array tendon_solimp_lim{mx::array({})};   // (ntendon, 5) float: solver impedance for limits
+    mx::array tendon_solref_fri{mx::array({})};   // (ntendon, 2) float: solver reference for friction
+    mx::array tendon_solimp_fri{mx::array({})};   // (ntendon, 5) float: solver impedance for friction
 
     // Wrap object properties
     mx::array wrap_type{mx::array({})};         // (nwrap,) int: wrap object type

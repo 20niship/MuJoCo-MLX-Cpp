@@ -519,6 +519,144 @@ Data make_constraint(const Model& m, Data d) {
         }
     }
 
+    // ── Tendon limits ─────────────────────────────────────────────────────
+    if (!(m.opt.disableflags & DisableBit::LIMIT) && m.ntendon > 0 &&
+        m.tendon_limited.size() > 0 && d.ten_length.size() > 0) {
+        mx::eval(m.tendon_limited); mx::eval(m.tendon_range);
+        mx::eval(d.ten_length); mx::eval(d.ten_J);
+
+        auto tlim = m.tendon_limited.data<int>();
+        auto trange = m.tendon_range.data<float>();
+        auto tlen = d.ten_length.data<float>();
+
+        float* tmargin = nullptr;
+        if (m.tendon_margin.size() > 0) {
+            mx::eval(m.tendon_margin);
+            tmargin = const_cast<float*>(m.tendon_margin.data<float>());
+        }
+        float* tsolref = nullptr;
+        if (m.tendon_solref_lim.size() > 0) {
+            mx::eval(m.tendon_solref_lim);
+            tsolref = const_cast<float*>(m.tendon_solref_lim.data<float>());
+        }
+        float* tsolimp = nullptr;
+        if (m.tendon_solimp_lim.size() > 0) {
+            mx::eval(m.tendon_solimp_lim);
+            tsolimp = const_cast<float*>(m.tendon_solimp_lim.data<float>());
+        }
+        float* tinvw = nullptr;
+        if (m.tendon_invweight0.size() > 0) {
+            mx::eval(m.tendon_invweight0);
+            tinvw = const_cast<float*>(m.tendon_invweight0.data<float>());
+        }
+
+        auto tenJ_ptr = d.ten_J.data<float>();
+
+        for (int t = 0; t < m.ntendon; t++) {
+            if (!tlim[t]) continue;
+
+            float length = tlen[t];
+            float lo = trange[t * 2], hi = trange[t * 2 + 1];
+            float margin = tmargin ? tmargin[t] : 0.0f;
+
+            float dist_min = length - lo;
+            float dist_max = hi - length;
+            float pos = std::min(dist_min, dist_max) - margin;
+
+            if (pos < 0) {
+                float sign = (dist_min < dist_max) ? 1.0f : -1.0f;
+
+                // Jacobian = sign * ten_J[t, :]
+                std::vector<float> j_row(m.nv, 0.0f);
+                for (int j = 0; j < m.nv; j++)
+                    j_row[j] = sign * tenJ_ptr[t * m.nv + j];
+
+                float solref0 = tsolref ? tsolref[t * 2] : 0.02f;
+                float solref1 = tsolref ? tsolref[t * 2 + 1] : 1.0f;
+                float si0 = tsolimp ? tsolimp[t*5] : 0.9f;
+                float si1 = tsolimp ? tsolimp[t*5+1] : 0.95f;
+                float si2 = tsolimp ? tsolimp[t*5+2] : 0.001f;
+                float si3 = tsolimp ? tsolimp[t*5+3] : 0.5f;
+                float si4 = tsolimp ? tsolimp[t*5+4] : 2.0f;
+
+                float invw = tinvw ? tinvw[t] : 1.0f;
+
+                auto [k, b, imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos);
+                float r = std::max(invw * (1.0f - imp) / imp, MJMINVAL);
+
+                float jdot_qvel = 0.0f;
+                for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+
+                float aref = -b * jdot_qvel - k * imp * pos;
+
+                efc_J_rows.push_back(j_row);
+                efc_D_vals.push_back(1.0f / r);
+                efc_aref_vals.push_back(aref);
+                efc_floss_vals.push_back(0.0f);
+                nl++;
+            }
+        }
+    }
+
+    // ── Tendon friction loss ─────────────────────────────────────────────
+    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS) && m.ntendon > 0 &&
+        m.tendon_frictionloss.size() > 0 && d.ten_J.size() > 0) {
+        mx::eval(m.tendon_frictionloss); mx::eval(d.ten_J);
+
+        auto tfloss = m.tendon_frictionloss.data<float>();
+        auto tenJ_ptr2 = d.ten_J.data<float>();
+
+        float* tsolref_f = nullptr;
+        if (m.tendon_solref_fri.size() > 0) {
+            mx::eval(m.tendon_solref_fri);
+            tsolref_f = const_cast<float*>(m.tendon_solref_fri.data<float>());
+        }
+        float* tsolimp_f = nullptr;
+        if (m.tendon_solimp_fri.size() > 0) {
+            mx::eval(m.tendon_solimp_fri);
+            tsolimp_f = const_cast<float*>(m.tendon_solimp_fri.data<float>());
+        }
+        float* tinvw2 = nullptr;
+        if (m.tendon_invweight0.size() > 0) {
+            mx::eval(m.tendon_invweight0);
+            tinvw2 = const_cast<float*>(m.tendon_invweight0.data<float>());
+        }
+
+        for (int t = 0; t < m.ntendon; t++) {
+            if (tfloss[t] <= 0.0f) continue;
+
+            // Jacobian = ten_J[t, :]
+            std::vector<float> j_row(m.nv, 0.0f);
+            for (int j = 0; j < m.nv; j++)
+                j_row[j] = tenJ_ptr2[t * m.nv + j];
+
+            float solref0 = tsolref_f ? tsolref_f[t * 2] : 0.02f;
+            float solref1 = tsolref_f ? tsolref_f[t * 2 + 1] : 1.0f;
+            float si0 = tsolimp_f ? tsolimp_f[t*5] : 0.9f;
+            float si1 = tsolimp_f ? tsolimp_f[t*5+1] : 0.95f;
+            float si2 = tsolimp_f ? tsolimp_f[t*5+2] : 0.001f;
+            float si3 = tsolimp_f ? tsolimp_f[t*5+3] : 0.5f;
+            float si4 = tsolimp_f ? tsolimp_f[t*5+4] : 2.0f;
+
+            float pos = 0.0f;  // no positional error for friction
+            float invw = tinvw2 ? tinvw2[t] : 1.0f;
+
+            auto [k, b, imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos);
+            float r = std::max(invw * (1.0f - imp) / imp, MJMINVAL);
+
+            float jdot_qvel = 0.0f;
+            for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+
+            float aref = -b * jdot_qvel - k * imp * pos;  // pos=0
+
+            efc_J_rows.push_back(j_row);
+            efc_D_vals.push_back(1.0f / r);
+            efc_aref_vals.push_back(aref);
+            efc_floss_vals.push_back(tfloss[t]);
+            nf++;
+        }
+    }
+
     // ── Contact constraints ──────────────────────────────────────────────
     if (!(m.opt.disableflags & DisableBit::CONTACT) && d.ncon > 0) {
         mx::eval(m.geom_bodyid);

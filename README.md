@@ -91,7 +91,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (218 tests across 25 suites)
+# Full suite (224 tests across 26 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -144,7 +144,7 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Conformance
 
-All features validated against MuJoCo C reference implementation. **218 tests across 25 test suites, all passing.**
+All features validated against MuJoCo C reference implementation. **224 tests across 26 test suites, all passing.**
 
 ### Phase 1: Synth Physics Foundation
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
@@ -182,6 +182,8 @@ All features validated against MuJoCo C reference implementation. **218 tests ac
 - **Tendon passive forces** -- spring + damping via `ten_J^T` projection
 - **TENDON transmission** -- actuators through tendons, moment = gear * ten_J
 - **SITE transmission** -- actuators at sites, full 6-DOF Jacobian projection
+- **Tendon limits** -- constraint rows for tendon length bounds, qacc diff ~1e-3
+- **Tendon friction loss** -- friction constraints through tendons, exact match
 - **Spatial tendons (wrapping geometry)** -- DEFERRED: MJX supports it but requires ~400 lines of geodesic path computation around spheres/cylinders; most RL models use fixed tendons only
 - Both scalar and vmap paths
 
@@ -222,8 +224,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | test_dof_friction | 9 | DOF friction loss + solver clamping |
 | test_fixed_tendon | 9 | Fixed tendon system |
 | test_transmission | 7 | TENDON + SITE transmission |
+| test_tendon_constraint | 6 | Tendon limits + friction loss |
 | test_filter_dynamics | 7 | Activation dynamics (FILTER/INTEGRATOR) |
-| **TOTAL** | **218** | |
+| **TOTAL** | **224** | |
 
 ## Consumers
 

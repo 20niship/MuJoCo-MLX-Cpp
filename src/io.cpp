@@ -223,6 +223,11 @@ static Model convert_model(mjModel* m) {
         model.tendon_lengthspring = to_mx_f2(m->tendon_lengthspring, (int)m->ntendon, 2);
         model.tendon_length0 = to_mx_f(m->tendon_length0, (int)m->ntendon);
         model.tendon_invweight0 = to_mx_f(m->tendon_invweight0, (int)m->ntendon);
+        model.tendon_margin = to_mx_f(m->tendon_margin, (int)m->ntendon);
+        model.tendon_solref_lim = to_mx_f2(m->tendon_solref_lim, (int)m->ntendon, 2);
+        model.tendon_solimp_lim = to_mx_f2(m->tendon_solimp_lim, (int)m->ntendon, 5);
+        model.tendon_solref_fri = to_mx_f2(m->tendon_solref_fri, (int)m->ntendon, 2);
+        model.tendon_solimp_fri = to_mx_f2(m->tendon_solimp_fri, (int)m->ntendon, 5);
     }
     if (m->nwrap > 0) {
         model.wrap_type = to_mx_i(m->wrap_type, (int)m->nwrap);

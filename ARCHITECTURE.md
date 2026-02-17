@@ -588,6 +588,8 @@ See [Tendon System](#tendon-system) above.
 - **5.1 Fixed tendons**: Complete. `ten_length`, `ten_velocity`, `ten_J`, passive spring/damping forces.
 - **5.2 Spatial tendons**: **Deferred**. MJX supports wrapping geometry (sphere/cylinder) but requires ~400 lines of geodesic path code. Most RL models use fixed tendons only.
 - **5.3 TENDON + SITE transmission**: Complete. TENDON transmission (`moment = gear * ten_J`), SITE transmission (full 6-DOF Jacobian at site, gear wrench projection). Both scalar and vmap paths.
+- **5.4 Tendon friction loss**: Complete. Friction constraints through tendons using `ten_J` as Jacobian, same `compute_kbi` as DOF friction.
+- **5.5 Tendon limits**: Complete. Limit constraints on tendon length, using `tendon_limited`/`tendon_range`/`tendon_margin` with `ten_J` Jacobian.
 
 ### Phase 6: Actuator Dynamics
 
