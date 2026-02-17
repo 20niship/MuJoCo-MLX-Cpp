@@ -246,6 +246,74 @@ static Model convert_model(mjModel* m) {
     return model;
 }
 
+// Validate model for unsupported features and emit warnings.
+// This prevents silent failure modes where models load but simulate incorrectly.
+static void validate_model(const mjModel* m) {
+    // Check for unsupported geom types (mesh, hfield, ellipsoid, cylinder, box)
+    bool has_mesh = false, has_box = false, has_hfield = false;
+    bool has_ellipsoid = false, has_cylinder = false;
+    for (int i = 0; i < m->ngeom; i++) {
+        switch (m->geom_type[i]) {
+            case mjGEOM_MESH:     has_mesh = true; break;
+            case mjGEOM_BOX:      has_box = true; break;
+            case mjGEOM_HFIELD:   has_hfield = true; break;
+            case mjGEOM_ELLIPSOID: has_ellipsoid = true; break;
+            case mjGEOM_CYLINDER: has_cylinder = true; break;
+            default: break;
+        }
+    }
+    if (has_mesh)
+        fprintf(stderr, "[mjmlx WARNING] Model has MESH geoms -- collision not supported, bodies will pass through.\n");
+    if (has_box)
+        fprintf(stderr, "[mjmlx WARNING] Model has BOX geoms -- collision not supported, bodies will pass through.\n");
+    if (has_hfield)
+        fprintf(stderr, "[mjmlx WARNING] Model has HFIELD geoms -- collision not supported.\n");
+    if (has_ellipsoid)
+        fprintf(stderr, "[mjmlx WARNING] Model has ELLIPSOID geoms -- collision not supported.\n");
+    if (has_cylinder)
+        fprintf(stderr, "[mjmlx WARNING] Model has CYLINDER geoms -- collision not supported.\n");
+
+    // Check for unsupported actuator types
+    bool has_tendon_trn = false, has_muscle = false, has_site_trn = false;
+    bool has_filter_dyn = false, has_integrator_dyn = false;
+    for (int i = 0; i < m->nu; i++) {
+        if (m->actuator_trntype[i] == mjTRN_TENDON) has_tendon_trn = true;
+        if (m->actuator_trntype[i] == mjTRN_SITE) has_site_trn = true;
+        if (m->actuator_gaintype[i] == mjGAIN_MUSCLE) has_muscle = true;
+        if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT ||
+            m->actuator_dyntype[i] == mjDYN_FILTER) has_filter_dyn = true;
+        if (m->actuator_dyntype[i] == mjDYN_INTEGRATOR) has_integrator_dyn = true;
+    }
+    if (has_tendon_trn)
+        fprintf(stderr, "[mjmlx WARNING] Model has TENDON transmission -- actuator will produce zero force.\n");
+    if (has_site_trn)
+        fprintf(stderr, "[mjmlx WARNING] Model has SITE transmission -- actuator will produce zero force.\n");
+    if (has_muscle)
+        fprintf(stderr, "[mjmlx WARNING] Model has MUSCLE actuators -- act_dot not computed, activation stays at zero.\n");
+    if (has_filter_dyn)
+        fprintf(stderr, "[mjmlx WARNING] Model has FILTER actuator dynamics -- not implemented, dynamics ignored.\n");
+    if (has_integrator_dyn)
+        fprintf(stderr, "[mjmlx WARNING] Model has INTEGRATOR actuator dynamics -- not implemented, dynamics ignored.\n");
+
+    // Check for tendons
+    if (m->ntendon > 0)
+        fprintf(stderr, "[mjmlx WARNING] Model has %lld tendons -- not supported, ignored.\n", (long long)m->ntendon);
+
+    // Check for equality constraints
+    if (m->neq > 0)
+        fprintf(stderr, "[mjmlx WARNING] Model has %lld equality constraints -- not enforced in MLX backend.\n", (long long)m->neq);
+
+    // Check integrator type
+    if (m->opt.integrator == mjINT_RK4)
+        fprintf(stderr, "[mjmlx WARNING] Model uses RK4 integrator -- only Euler supported, using Euler.\n");
+    if (m->opt.integrator == mjINT_IMPLICIT || m->opt.integrator == mjINT_IMPLICITFAST)
+        fprintf(stderr, "[mjmlx WARNING] Model uses implicit integrator -- only Euler supported, using Euler.\n");
+
+    // Check for sensors (not supported)
+    if (m->nsensor > 0)
+        fprintf(stderr, "[mjmlx WARNING] Model has %lld sensors -- not supported, ignored.\n", (long long)m->nsensor);
+}
+
 // Load a MuJoCo C model and convert to internal Model.
 // Returns {Model, mjModel*} pair -- caller owns the mjModel*.
 std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
@@ -254,6 +322,7 @@ std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
     if (!m) {
         throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
     }
+    validate_model(m);
     Model model = convert_model(m);
     return {std::move(model), m};
 }
