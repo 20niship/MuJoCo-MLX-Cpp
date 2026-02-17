@@ -1134,6 +1134,102 @@ static VmapCollResult vmap_plane_mesh_proper(
     return {dist, pos, vmap_make_frame(normal)};
 }
 
+// ── HFIELD collision (vmap-compatible) ───────────────────────────────────────
+// Bilinear height interpolation at the geom's projected position.
+// Computes a single contact from the height field surface.
+
+static VmapCollResult vmap_hfield_collision(
+    const mx::array& hf_pos, const mx::array& hf_mat,
+    const mx::array& hf_data,   // (nrow, ncol) pre-baked
+    const float* hf_size,        // (x_half, y_half, z_top, z_bottom)
+    int hf_nrow, int hf_ncol,
+    const mx::array& geom_pos, float geom_rbound)
+{
+    float sx = hf_size[0], sy = hf_size[1], sz_top = hf_size[2], sz_bot = hf_size[3];
+
+    // Transform geom center to hfield local frame: local = R^T * (geom_pos - hf_pos)
+    auto Rc = mx::reshape(hf_mat, {3,3});
+    auto RT = mx::transpose(Rc);
+    auto diff = mx::subtract(geom_pos, hf_pos);
+    auto local = mx::flatten(mx::matmul(RT, mx::reshape(diff, {3,1}))); // (3,)
+
+    // Local coordinates: x, y, z
+    auto lx = mx::reshape(mx::take(local, mx::array({0})), {});
+    auto ly = mx::reshape(mx::take(local, mx::array({1})), {});
+    auto lz = mx::reshape(mx::take(local, mx::array({2})), {});
+
+    // Map to grid coordinates (continuous)
+    float dx = (hf_ncol > 1) ? 2.0f * sx / (hf_ncol - 1) : 2.0f * sx;
+    float dy = (hf_nrow > 1) ? 2.0f * sy / (hf_nrow - 1) : 2.0f * sy;
+    auto col_f = mx::divide(mx::add(lx, mx::array(sx)), mx::array(dx));
+    auto row_f = mx::divide(mx::add(ly, mx::array(sy)), mx::array(dy));
+
+    // Clamp to valid range
+    col_f = mx::clip(col_f, mx::array(0.0f), mx::array((float)(hf_ncol - 2)));
+    row_f = mx::clip(row_f, mx::array(0.0f), mx::array((float)(hf_nrow - 2)));
+
+    auto c0 = mx::floor(col_f);
+    auto r0 = mx::floor(row_f);
+    auto cf = mx::subtract(col_f, c0);
+    auto rf = mx::subtract(row_f, r0);
+
+    // Bilinear interpolation indices: (r0,c0), (r0,c0+1), (r0+1,c0), (r0+1,c0+1)
+    auto r0i = mx::astype(r0, mx::int32);
+    auto c0i = mx::astype(c0, mx::int32);
+    auto ncol_arr = mx::array(hf_ncol);
+
+    auto idx00 = mx::add(mx::multiply(r0i, ncol_arr), c0i);
+    auto idx01 = mx::add(idx00, mx::array(1));
+    auto idx10 = mx::add(idx00, ncol_arr);
+    auto idx11 = mx::add(idx10, mx::array(1));
+
+    auto hf_flat = mx::flatten(hf_data);
+    auto h00 = mx::reshape(mx::take(hf_flat, mx::reshape(idx00, {1})), {});
+    auto h01 = mx::reshape(mx::take(hf_flat, mx::reshape(idx01, {1})), {});
+    auto h10 = mx::reshape(mx::take(hf_flat, mx::reshape(idx10, {1})), {});
+    auto h11 = mx::reshape(mx::take(hf_flat, mx::reshape(idx11, {1})), {});
+
+    // Bilinear interpolation
+    auto one_cf = mx::subtract(mx::array(1.0f), cf);
+    auto one_rf = mx::subtract(mx::array(1.0f), rf);
+    auto height = mx::add(
+        mx::add(mx::multiply(mx::multiply(one_rf, one_cf), h00),
+                mx::multiply(mx::multiply(one_rf, cf), h01)),
+        mx::add(mx::multiply(mx::multiply(rf, one_cf), h10),
+                mx::multiply(mx::multiply(rf, cf), h11)));
+
+    // Scale to world height: z_surface = height * sz_top (data in [0,1])
+    auto z_surface = mx::multiply(height, mx::array(sz_top));
+
+    // Surface normal via height gradient
+    auto dh_dc = mx::add(
+        mx::multiply(one_rf, mx::subtract(h01, h00)),
+        mx::multiply(rf, mx::subtract(h11, h10)));
+    auto dh_dr = mx::add(
+        mx::multiply(one_cf, mx::subtract(h10, h00)),
+        mx::multiply(cf, mx::subtract(h11, h01)));
+    auto dz_dx = mx::divide(mx::multiply(dh_dc, mx::array(sz_top)), mx::array(dx));
+    auto dz_dy = mx::divide(mx::multiply(dh_dr, mx::array(sz_top)), mx::array(dy));
+
+    // Normal in local frame: (-dz/dx, -dz/dy, 1), normalized
+    auto n_local = mx::stack({mx::negative(dz_dx), mx::negative(dz_dy), mx::array(1.0f)});
+    n_local = vmap_normalize(n_local);
+
+    // Transform normal to world frame
+    auto n_world = mx::flatten(mx::matmul(Rc, mx::reshape(n_local, {3,1})));
+
+    // Contact point in local frame: (lx, ly, z_surface)
+    auto contact_local = mx::stack({lx, ly, z_surface});
+    // Transform to world
+    auto contact_world = mx::add(hf_pos,
+        mx::flatten(mx::matmul(Rc, mx::reshape(contact_local, {3,1}))));
+
+    // Distance: geom center z_local - z_surface - geom_rbound
+    auto dist = mx::subtract(mx::subtract(lz, z_surface), mx::array(geom_rbound));
+
+    return {mx::reshape(dist, {}), contact_world, vmap_make_frame(n_world)};
+}
+
 // ── Vmap-compatible collision (top level) ────────────────────────────────────
 
 Data vmap_collision(const Model& m, Data d) {
@@ -1193,6 +1289,24 @@ Data vmap_collision(const Model& m, Data d) {
         } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::CYLINDER) {
             result = vmap_capsule_cylinder(p1, m1, cp.size1[0], cp.size1[1],
                                            p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t2 == (int)GeomType::HFIELD || t1 == (int)GeomType::HFIELD) {
+            // Hfield collision via bilinear height interpolation
+            if (cp.hf_nrow > 0 && cp.hf_ncol > 0 && cp.hf_data.size() > 0) {
+                auto hf_p = (t1 == (int)GeomType::HFIELD) ? p1 : p2;
+                auto hf_m = (t1 == (int)GeomType::HFIELD) ? m1 : m2;
+                auto geom_p = (t1 == (int)GeomType::HFIELD) ? p2 : p1;
+                float geom_rb = 0.0f;
+                if (t1 == (int)GeomType::HFIELD) {
+                    geom_rb = std::max({cp.size2[0], cp.size2[1], cp.size2[2]});
+                } else {
+                    geom_rb = std::max({cp.size1[0], cp.size1[1], cp.size1[2]});
+                }
+                if (geom_rb < 0.001f) geom_rb = 0.05f;
+                result = vmap_hfield_collision(hf_p, hf_m, cp.hf_data, cp.hf_size,
+                    cp.hf_nrow, cp.hf_ncol, geom_p, geom_rb);
+            } else {
+                result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+            }
         } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::MESH) {
             if (cp.mesh_verts2.size() > 0) {
                 result = vmap_plane_mesh_proper(p1, m1, p2, m2, cp.mesh_verts2);

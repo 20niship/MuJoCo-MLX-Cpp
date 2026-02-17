@@ -236,6 +236,20 @@ static Model convert_model(mjModel* m) {
         }
     }
 
+    // Hfield data (for height field collision)
+    if (m->nhfield > 0) {
+        model.nhfield = (int)m->nhfield;
+        model.hfield_nrow = to_mx_i(m->hfield_nrow, (int)m->nhfield);
+        model.hfield_ncol = to_mx_i(m->hfield_ncol, (int)m->nhfield);
+        model.hfield_size = to_mx_f2(m->hfield_size, (int)m->nhfield, 4);
+        model.hfield_adr = to_mx_i(m->hfield_adr, (int)m->nhfield);
+        int total_data = 0;
+        for (int i = 0; i < m->nhfield; i++)
+            total_data += m->hfield_nrow[i] * m->hfield_ncol[i];
+        if (total_data > 0)
+            model.hfield_data = to_mx_f2(m->hfield_data, total_data, 1);
+    }
+
     // Explicit contact pairs
     if (m->npair > 0) {
         model.pair_geom1 = to_mx_i(m->pair_geom1, (int)m->npair);
@@ -285,8 +299,7 @@ static void validate_model(const mjModel* m) {
     }
     // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
     // BOX geom collision is now supported (Phase 3.1)
-    if (has_hfield)
-        fprintf(stderr, "[mjmlx WARNING] Model has HFIELD geoms -- collision not supported.\n");
+    // HFIELD geom collision is now supported (Phase 3.4)
     if (has_ellipsoid)
         fprintf(stderr, "[mjmlx WARNING] Model has ELLIPSOID geoms -- collision not supported.\n");
     // CYLINDER geom collision is now supported (Phase 3.2)
@@ -860,6 +873,36 @@ void Model::init_cache() const {
                 }
             }
         }
+
+        // Pre-bake hfield data per collision pair for vmap path
+        if (hfield_data.size() > 0 && hfield_adr.size() > 0) {
+            mx::eval(hfield_adr); mx::eval(hfield_nrow); mx::eval(hfield_ncol);
+            mx::eval(hfield_size); mx::eval(hfield_data);
+            auto hadr = hfield_adr.data<int>();
+            auto hnrow = hfield_nrow.data<int>();
+            auto hncol = hfield_ncol.data<int>();
+            auto hsz = hfield_size.data<float>();
+            for (auto& cp : cache.collision_pairs) {
+                int hf_type = -1, hf_dataid = -1;
+                if (cp.type1 == (int)GeomType::HFIELD && cp.dataid1 >= 0) {
+                    hf_type = 1; hf_dataid = cp.dataid1;
+                } else if (cp.type2 == (int)GeomType::HFIELD && cp.dataid2 >= 0) {
+                    hf_type = 2; hf_dataid = cp.dataid2;
+                }
+                if (hf_dataid >= 0) {
+                    cp.hf_nrow = hnrow[hf_dataid];
+                    cp.hf_ncol = hncol[hf_dataid];
+                    for (int k = 0; k < 4; k++) cp.hf_size[k] = hsz[hf_dataid * 4 + k];
+                    int start = hadr[hf_dataid];
+                    int count = cp.hf_nrow * cp.hf_ncol;
+                    if (count > 0) {
+                        cp.hf_data = mx::reshape(
+                            mx::slice(hfield_data, {start, 0}, {start + count, 1}),
+                            {cp.hf_nrow, cp.hf_ncol});
+                    }
+                }
+            }
+        }
     }
 
     // ── Joint limits ──
@@ -931,6 +974,8 @@ void Model::init_cache() const {
         }
         else if (cp.type2 == (int)GeomType::MESH || cp.type1 == (int)GeomType::MESH)
             max_contacts = 1; // GJK/EPA returns 1 contact
+        else if (cp.type1 == (int)GeomType::HFIELD || cp.type2 == (int)GeomType::HFIELD)
+            max_contacts = 50; // MuJoCo C limit per hfield pair (mjMAXCONPAIR)
         max_contact_rows += max_contacts * rows_per_contact;
     }
     cache.max_nefc = cache.max_nl + max_contact_rows;

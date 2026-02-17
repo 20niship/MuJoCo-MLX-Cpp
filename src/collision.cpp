@@ -1441,6 +1441,139 @@ static CollisionResult plane_mesh_single(
     return {dist, pos, make_frame(normal)};
 }
 
+// ── HFIELD collision via GJK with triangular prisms ──────────────────────────
+// For each grid cell overlapping the geom's bounding sphere, build 2 triangular
+// prisms (6 vertices each) and test each prism against the geom using GJK/EPA.
+
+// Get geom bounding radius (conservative)
+static float geom_rbound(int type, const float* size) {
+    switch (type) {
+    case (int)GeomType::SPHERE:   return size[0];
+    case (int)GeomType::CAPSULE:  return size[0] + size[1];
+    case (int)GeomType::BOX:      return std::sqrt(size[0]*size[0] + size[1]*size[1] + size[2]*size[2]);
+    case (int)GeomType::CYLINDER: return std::sqrt(size[0]*size[0] + size[1]*size[1]);
+    case (int)GeomType::MESH:     return std::max({size[0], size[1], size[2]});
+    default:                      return 0.1f;
+    }
+}
+
+static int hfield_collision(
+    const mx::array& hf_pos, const mx::array& hf_mat,
+    int hf_dataid, const Model& model,
+    int geom_type, const mx::array& geom_pos, const mx::array& geom_mat,
+    const mx::array& geom_size, int geom_dataid,
+    float margin, int g_hf, int g_other, int condim,
+    std::vector<mx::array>& c_dist, std::vector<mx::array>& c_pos,
+    std::vector<mx::array>& c_frame, std::vector<mx::array>& c_geom,
+    std::vector<int>& c_dim)
+{
+    if (hf_dataid < 0 || model.hfield_data.size() == 0)
+        return 0;
+
+    mx::eval(hf_pos); mx::eval(hf_mat);
+    mx::eval(geom_pos); mx::eval(geom_mat); mx::eval(geom_size);
+    mx::eval(model.hfield_nrow); mx::eval(model.hfield_ncol);
+    mx::eval(model.hfield_size); mx::eval(model.hfield_adr); mx::eval(model.hfield_data);
+
+    auto hp = hf_pos.data<float>();
+    auto hm = hf_mat.data<float>();
+    int nrow = model.hfield_nrow.data<int>()[hf_dataid];
+    int ncol = model.hfield_ncol.data<int>()[hf_dataid];
+    auto hsz = model.hfield_size.data<float>() + hf_dataid * 4;
+    float sx = hsz[0], sy = hsz[1], sz_top = hsz[2], sz_bot = hsz[3];
+    int hadr = model.hfield_adr.data<int>()[hf_dataid];
+    auto hdata = model.hfield_data.data<float>() + hadr;
+
+    auto gp = geom_pos.data<float>();
+    auto gm = geom_mat.data<float>();
+    auto gs = geom_size.data<float>();
+
+    // Transform geom center to hfield local frame
+    float dx = gp[0] - hp[0], dy = gp[1] - hp[1], dz = gp[2] - hp[2];
+    // hm is column-major rotation: local = R^T * world_offset
+    float lx = hm[0]*dx + hm[3]*dy + hm[6]*dz;
+    float ly = hm[1]*dx + hm[4]*dy + hm[7]*dz;
+    float lz = hm[2]*dx + hm[5]*dy + hm[8]*dz;
+
+    float rb = geom_rbound(geom_type, gs) + margin;
+
+    // Grid cell spacing
+    float cell_dx = (ncol > 1) ? 2.0f * sx / (ncol - 1) : 2.0f * sx;
+    float cell_dy = (nrow > 1) ? 2.0f * sy / (nrow - 1) : 2.0f * sy;
+
+    // Sub-grid: columns and rows that overlap geom bounding sphere
+    int cmin = std::max(0, (int)std::floor((lx - rb + sx) / cell_dx));
+    int cmax = std::min(ncol - 2, (int)std::ceil((lx + rb + sx) / cell_dx));
+    int rmin = std::max(0, (int)std::floor((ly - rb + sy) / cell_dy));
+    int rmax = std::min(nrow - 2, (int)std::ceil((ly + rb + sy) / cell_dy));
+
+    if (cmin > cmax || rmin > rmax) return 0;
+
+    // Build the "other" ConvexGeom
+    ConvexGeom G = make_convex_geom(geom_type, gp, gm, gs, model, geom_dataid);
+
+    int ncon = 0;
+    const int MAX_HF_CONTACTS = 50; // MuJoCo C limit per pair
+
+    for (int r = rmin; r <= rmax && ncon < MAX_HF_CONTACTS; r++) {
+        for (int c = cmin; c <= cmax && ncon < MAX_HF_CONTACTS; c++) {
+            for (int tri = 0; tri < 2 && ncon < MAX_HF_CONTACTS; tri++) {
+                int r0, c0, r1, c1, r2, c2;
+                if (tri == 0) {
+                    r0 = r; c0 = c; r1 = r; c1 = c+1; r2 = r+1; c2 = c;
+                } else {
+                    r0 = r+1; c0 = c+1; r1 = r+1; c1 = c; r2 = r; c2 = c+1;
+                }
+
+                float prism_verts[18];
+                for (int k = 0; k < 3; k++) {
+                    int rk, ck;
+                    if (k == 0) { rk = r0; ck = c0; }
+                    else if (k == 1) { rk = r1; ck = c1; }
+                    else { rk = r2; ck = c2; }
+
+                    float vx = -sx + ck * cell_dx;
+                    float vy = -sy + rk * cell_dy;
+                    float vz_top = hdata[rk * ncol + ck] * sz_top;
+                    float vz_bot = -sz_bot;
+
+                    prism_verts[k*3 + 0] = vx;
+                    prism_verts[k*3 + 1] = vy;
+                    prism_verts[k*3 + 2] = vz_top;
+                    prism_verts[(k+3)*3 + 0] = vx;
+                    prism_verts[(k+3)*3 + 1] = vy;
+                    prism_verts[(k+3)*3 + 2] = vz_bot;
+                }
+
+                ConvexGeom P;
+                P.type = (int)GeomType::MESH;
+                for (int i = 0; i < 3; i++) P.pos[i] = hp[i];
+                for (int i = 0; i < 9; i++) P.mat[i] = hm[i];
+                for (int i = 0; i < 3; i++) P.size[i] = 0;
+                P.verts = prism_verts;
+                P.nverts = 6;
+
+                GJKSimplex simplex;
+                bool overlap = gjk(P, G, simplex);
+
+                if (overlap) {
+                    EPAResult er = epa(P, G, simplex);
+                    if (er.depth > 0) {
+                        Vec3 cpos = v3scale(v3add(er.point_a, er.point_b), 0.5f);
+                        c_dist.push_back(mx::array(-er.depth));
+                        c_pos.push_back(mx::array({cpos.x, cpos.y, cpos.z}));
+                        c_frame.push_back(make_frame(mx::array({er.normal.x, er.normal.y, er.normal.z})));
+                        c_geom.push_back(mx::array({g_hf, g_other}, mx::int32));
+                        c_dim.push_back(condim);
+                        ncon++;
+                    }
+                }
+            }
+        }
+    }
+    return ncon;
+}
+
 static CollisionResult capsule_capsule(
     const mx::array& pos1, const mx::array& mat1, const mx::array& size1,
     const mx::array& pos2, const mx::array& mat2, const mx::array& size2)
@@ -1597,6 +1730,36 @@ Data collision(const Model& m, Data d) {
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
                 result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
+            } else if (t2_ == static_cast<int>(GeomType::HFIELD) || t1_ == static_cast<int>(GeomType::HFIELD)) {
+                // HFIELD collision via GJK with triangular prisms
+                int hf_g, other_g;
+                if (t1_ == static_cast<int>(GeomType::HFIELD)) { hf_g = g1_; other_g = g2_; }
+                else { hf_g = g2_; other_g = g1_; }
+                int hf_dataid = -1, other_dataid = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    auto gdid = m.geom_dataid.data<int>();
+                    hf_dataid = gdid[hf_g];
+                    other_dataid = gdid[other_g];
+                }
+                float hf_margin = gmargin[hf_g] + gmargin[other_g];
+                int hf_condim = 3;
+                if (m.geom_condim.size() > 0) {
+                    mx::eval(m.geom_condim);
+                    auto cdp = m.geom_condim.data<int>();
+                    hf_condim = std::max(cdp[hf_g], cdp[other_g]);
+                }
+                auto hf_pos = row(d.geom_xpos, hf_g);
+                auto hf_mat = mx::flatten(mx::slice(d.geom_xmat, {hf_g,0,0}, {hf_g+1,3,3}));
+                auto oth_pos = row(d.geom_xpos, other_g);
+                auto oth_mat = mx::flatten(mx::slice(d.geom_xmat, {other_g,0,0}, {other_g+1,3,3}));
+                auto oth_size = row(m.geom_size, other_g);
+                int oth_type = gtype[other_g];
+                hfield_collision(hf_pos, hf_mat, hf_dataid, m,
+                    oth_type, oth_pos, oth_mat, oth_size, other_dataid,
+                    hf_margin, hf_g, other_g, hf_condim,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
             } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
                 float margin = gmargin[g1_] + gmargin[g2_];
                 int condim = 3;
@@ -1742,6 +1905,38 @@ Data collision(const Model& m, Data d) {
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
                 result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
+            } else if (t2_ == static_cast<int>(GeomType::HFIELD) || t1_ == static_cast<int>(GeomType::HFIELD)) {
+                int hf_g, other_g;
+                if (t1_ == static_cast<int>(GeomType::HFIELD)) { hf_g = g1_; other_g = g2_; }
+                else { hf_g = g2_; other_g = g1_; }
+                int hf_dataid = -1, other_dataid = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    auto gdid = m.geom_dataid.data<int>();
+                    hf_dataid = gdid[hf_g];
+                    other_dataid = gdid[other_g];
+                }
+                float hf_margin = gmargin[hf_g] + gmargin[other_g];
+                if (m.pair_margin.size() > 0) {
+                    mx::eval(m.pair_margin);
+                    hf_margin = m.pair_margin.data<float>()[pi];
+                }
+                int hf_condim = 3;
+                if (m.pair_dim.size() > 0) {
+                    mx::eval(m.pair_dim);
+                    hf_condim = m.pair_dim.data<int>()[pi];
+                }
+                auto hf_pos = row(d.geom_xpos, hf_g);
+                auto hf_mat_ = mx::flatten(mx::slice(d.geom_xmat, {hf_g,0,0}, {hf_g+1,3,3}));
+                auto oth_pos = row(d.geom_xpos, other_g);
+                auto oth_mat_ = mx::flatten(mx::slice(d.geom_xmat, {other_g,0,0}, {other_g+1,3,3}));
+                auto oth_size = row(m.geom_size, other_g);
+                int oth_type = gtype[other_g];
+                hfield_collision(hf_pos, hf_mat_, hf_dataid, m,
+                    oth_type, oth_pos, oth_mat_, oth_size, other_dataid,
+                    hf_margin, hf_g, other_g, hf_condim,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
             } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
                 float margin_pm = gmargin[g1_] + gmargin[g2_];
                 if (m.pair_margin.size() > 0) {

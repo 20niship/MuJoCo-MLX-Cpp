@@ -198,10 +198,18 @@ struct Model {
     mx::array geom_condim{mx::array({})};
 
     // Mesh data (for GJK/EPA convex collision)
-    mx::array geom_dataid{mx::array({})};     // (ngeom,) int: mesh id for mesh geoms, -1 otherwise
+    mx::array geom_dataid{mx::array({})};     // (ngeom,) int: mesh/hfield id for mesh/hfield geoms, -1 otherwise
     mx::array mesh_vertadr{mx::array({})};    // (nmesh,) int: start index of vertices for each mesh
     mx::array mesh_vertnum{mx::array({})};    // (nmesh,) int: number of vertices for each mesh
     mx::array mesh_vert{mx::array({})};       // (total_verts, 3) float: all mesh vertices
+
+    // Hfield data (for height field collision)
+    int nhfield = 0;
+    mx::array hfield_nrow{mx::array({})};     // (nhfield,) int: grid rows
+    mx::array hfield_ncol{mx::array({})};     // (nhfield,) int: grid columns
+    mx::array hfield_size{mx::array({})};     // (nhfield, 4) float: (x_half, y_half, z_top, z_bottom)
+    mx::array hfield_adr{mx::array({})};      // (nhfield,) int: start index in hfield_data
+    mx::array hfield_data{mx::array({})};     // (nhfielddata,) float: normalized elevation [0,1]
 
     // Pair properties
     mx::array pair_geom1{mx::array({})};
@@ -246,9 +254,13 @@ struct Model {
             float solimp[5];
             float size1[3], size2[3];
             int condim;
-            int dataid1 = -1, dataid2 = -1; // mesh id for mesh geoms, -1 otherwise
+            int dataid1 = -1, dataid2 = -1; // mesh/hfield id for mesh/hfield geoms, -1 otherwise
             mx::array mesh_verts1{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
             mx::array mesh_verts2{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
+            // Hfield data for vmap path (pre-baked per pair)
+            int hf_nrow = 0, hf_ncol = 0;
+            float hf_size[4] = {0,0,0,0};  // (x_half, y_half, z_top, z_bottom)
+            mx::array hf_data{mx::zeros({0})}; // (nrow, ncol) height grid for vmap
         };
         std::vector<CollisionPair> collision_pairs;
         int max_ncon = 0;  // = collision_pairs.size()
