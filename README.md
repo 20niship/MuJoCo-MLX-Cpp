@@ -87,7 +87,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (155 tests across 15 suites)
+# Full suite (162 tests across 16 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -149,8 +149,9 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ### Phase 2: Contact Friction
 - **Pyramidal friction (condim=3)** — 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
+- **Pyramidal friction (condim=4,6)** — torsion + rolling friction, 6/10 rows per contact, D values identical
 
-40 conformance tests across 6 test suites, all validated against MuJoCo C reference.
+47 conformance tests across 7 test suites, all validated against MuJoCo C reference.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
 

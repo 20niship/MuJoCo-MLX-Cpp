@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 2.1 pyramidal friction condim=3 complete).
+Last updated: 2026-02-11 (Phase 2 contact friction complete — all condim 1-6 pyramidal).
 
 ## Table of Contents
 
@@ -46,6 +46,7 @@ rows instead of 1 frictionless normal row.
 | Feature | Status | Tests |
 |---------|--------|-------|
 | Pyramidal friction condim=3 | Done | 7 tests in `test_friction_condim3.cpp` |
+| Pyramidal friction condim=4,6 | Done | 7 tests in `test_friction_condim46.cpp` |
 
 Key results:
 - D values match MuJoCo C within 0.001%
@@ -158,7 +159,7 @@ filters down to capsule-plane pairs.
 | Tendon friction loss | Yes | Yes | **No** |
 | Contact: frictionless (condim=1) | Yes | Yes | Yes |
 | Contact: pyramidal friction (condim=3) | Yes | Yes | **Yes (Phase 2.1)** |
-| Contact: pyramidal friction (condim=4,6) | Yes | Yes | **No** |
+| Contact: pyramidal friction (condim=4,6) | Yes | Yes | **Yes (Phase 2.2)** |
 | Contact: elliptic friction | Yes | Yes | **No** |
 
 ### Contact Dimension (condim)
