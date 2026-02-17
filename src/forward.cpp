@@ -198,6 +198,10 @@ Data forward(const Model& m, Data d) {
     d = solve(m, d);
   }
 
+  // Compute per-body contact forces (cfrc_ext) from constraint forces.
+  // Always called after constraint solve so cfrc_ext is available as observation.
+  d = rne_post_constraint(m, d);
+
   return d;
 }
 

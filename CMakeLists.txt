@@ -269,9 +269,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Phase 1.2: cfrc_ext (per-body contact forces) tests
+    add_executable(test_cfrc_ext tests/test_cfrc_ext.cpp)
+    target_link_libraries(test_cfrc_ext PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_cfrc_ext PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -311,7 +319,8 @@ if(MJMLX_BUILD_TESTS)
 
     # Self-contained Phase 1 tests (no model path needed)
     add_test(NAME gravcomp COMMAND test_gravcomp)
-    set_tests_properties(gravcomp PROPERTIES LABELS "correctness")
+    add_test(NAME cfrc_ext COMMAND test_cfrc_ext)
+    set_tests_properties(gravcomp cfrc_ext PROPERTIES LABELS "correctness")
 
     # Label all correctness tests
     set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)
