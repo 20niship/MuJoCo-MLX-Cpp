@@ -371,6 +371,8 @@ Data vmap_make_constraint(const Model& m, Data d) {
 
     // ── Contact constraints ──
     if (!(m.opt.disableflags & DisableBit::CONTACT) && d.ncon > 0) {
+        bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
+
         for (int ci = 0; ci < d.ncon; ci++) {
             auto& cp = c.collision_pairs[ci];
             auto c_dist = mx::flatten(mx::slice(d.contact.dist, mx::Shape{ci}, mx::Shape{ci+1}));
@@ -387,8 +389,8 @@ Data vmap_make_constraint(const Model& m, Data d) {
 
             auto djacp = mx::subtract(jacp2, jacp1);
             auto normal = mx::flatten(mx::slice(c_frame, mx::Shape{0, 0}, mx::Shape{1, 3}));
-            auto j_row = mx::flatten(mx::matmul(mx::reshape(normal, {1, 3}),
-                                                  mx::transpose(djacp)));
+            auto j_normal = mx::flatten(mx::matmul(mx::reshape(normal, {1, 3}),
+                                                     mx::transpose(djacp)));
 
             float invw = 0.0f;
             if (m.body_invweight0.size() > 0) {
@@ -397,24 +399,84 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 invw = iw[cp.body1 * 2] + iw[cp.body2 * 2];
             }
 
-            mx::array k(0.0f), b(0.0f), imp(0.0f);
-            vmap_kbi(cp.solref[0], cp.solref[1], m.opt.timestep, refsafe,
-                     cp.solimp[0], cp.solimp[1], cp.solimp[2], cp.solimp[3], cp.solimp[4],
-                     pos, k, b, imp);
+            if (cp.condim <= 1 || !use_pyramidal) {
+                // Frictionless: single normal constraint row
+                mx::array k_v(0.0f), b_v(0.0f), imp_v(0.0f);
+                vmap_kbi(cp.solref[0], cp.solref[1], m.opt.timestep, refsafe,
+                         cp.solimp[0], cp.solimp[1], cp.solimp[2], cp.solimp[3], cp.solimp[4],
+                         pos, k_v, b_v, imp_v);
 
-            auto r = mx::maximum(mx::multiply(mx::array(invw),
-                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
-            auto j_dot_qvel = mx::sum(mx::multiply(j_row, d.qvel));
-            auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
-                                      mx::multiply(mx::multiply(k, imp), pos));
+                auto r = mx::maximum(mx::multiply(mx::array(invw),
+                    mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
+                auto j_dot_qvel = mx::sum(mx::multiply(j_normal, d.qvel));
+                auto aref = mx::subtract(mx::negative(mx::multiply(b_v, j_dot_qvel)),
+                                          mx::multiply(mx::multiply(k_v, imp_v), pos));
 
-            auto d_val = mx::where(contact_active, mx::divide(mx::array(1.0f), r), mx::array(0.0f));
-            auto aref_val = mx::where(contact_active, aref, mx::array(0.0f));
+                auto d_val = mx::where(contact_active, mx::divide(mx::array(1.0f), r), mx::array(0.0f));
+                auto aref_val = mx::where(contact_active, aref, mx::array(0.0f));
 
-            J_rows.push_back(j_row);
-            D_vals.push_back(mx::flatten(d_val));
-            aref_vals.push_back(mx::flatten(aref_val));
-            floss_vals.push_back(mx::array({0.0f}));
+                J_rows.push_back(j_normal);
+                D_vals.push_back(mx::flatten(d_val));
+                aref_vals.push_back(mx::flatten(aref_val));
+                floss_vals.push_back(mx::array({0.0f}));
+            } else {
+                // Pyramidal friction: 2*(condim-1) rows per contact
+                int n_tangent = std::min(cp.condim - 1, 2);
+
+                // Compute tangent Jacobians
+                std::vector<mx::array> j_tangents;
+                for (int tk = 1; tk <= n_tangent; tk++) {
+                    auto tangent = mx::flatten(mx::slice(c_frame, mx::Shape{tk, 0}, mx::Shape{tk + 1, 3}));
+                    auto j_t = mx::flatten(mx::matmul(mx::reshape(tangent, {1, 3}),
+                                                       mx::transpose(djacp)));
+                    j_tangents.push_back(j_t);
+                }
+
+                // Pyramidal impedance
+                float mu = cp.friction[0];
+                float mu_sq = mu * mu;
+                float invw_py = invw + mu_sq * invw;
+
+                mx::array k_v(0.0f), b_v(0.0f), imp_v(0.0f);
+                vmap_kbi(cp.solref[0], cp.solref[1], m.opt.timestep, refsafe,
+                         cp.solimp[0], cp.solimp[1], cp.solimp[2], cp.solimp[3], cp.solimp[4],
+                         pos, k_v, b_v, imp_v);
+
+                auto r_normal = mx::maximum(mx::multiply(mx::array(invw_py),
+                    mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
+                auto r_py = mx::maximum(mx::multiply(mx::array(2.0f * mu_sq / m.opt.impratio), r_normal),
+                                         mx::array(MJMINVAL_CV));
+
+                for (int tk = 0; tk < n_tangent; tk++) {
+                    float fri_k = cp.friction[tk];
+
+                    // Positive edge: J_normal + mu * J_tangent
+                    auto j_pos = mx::add(j_normal, mx::multiply(mx::array(fri_k), j_tangents[tk]));
+                    auto jdot_pos = mx::sum(mx::multiply(j_pos, d.qvel));
+                    auto aref_pos = mx::subtract(mx::negative(mx::multiply(b_v, jdot_pos)),
+                                                  mx::multiply(mx::multiply(k_v, imp_v), pos));
+                    auto d_pos = mx::where(contact_active, mx::divide(mx::array(1.0f), r_py), mx::array(0.0f));
+                    auto aref_pos_v = mx::where(contact_active, aref_pos, mx::array(0.0f));
+
+                    J_rows.push_back(j_pos);
+                    D_vals.push_back(mx::flatten(d_pos));
+                    aref_vals.push_back(mx::flatten(aref_pos_v));
+                    floss_vals.push_back(mx::array({0.0f}));
+
+                    // Negative edge: J_normal - mu * J_tangent
+                    auto j_neg = mx::subtract(j_normal, mx::multiply(mx::array(fri_k), j_tangents[tk]));
+                    auto jdot_neg = mx::sum(mx::multiply(j_neg, d.qvel));
+                    auto aref_neg = mx::subtract(mx::negative(mx::multiply(b_v, jdot_neg)),
+                                                  mx::multiply(mx::multiply(k_v, imp_v), pos));
+                    auto d_neg = mx::where(contact_active, mx::divide(mx::array(1.0f), r_py), mx::array(0.0f));
+                    auto aref_neg_v = mx::where(contact_active, aref_neg, mx::array(0.0f));
+
+                    J_rows.push_back(j_neg);
+                    D_vals.push_back(mx::flatten(d_neg));
+                    aref_vals.push_back(mx::flatten(aref_neg_v));
+                    floss_vals.push_back(mx::array({0.0f}));
+                }
+            }
         }
     }
 

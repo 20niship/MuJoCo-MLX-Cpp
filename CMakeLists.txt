@@ -301,9 +301,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Phase 2.1: Pyramidal friction (condim=3) tests
+    add_executable(test_friction_condim3 tests/test_friction_condim3.cpp)
+    target_link_libraries(test_friction_condim3 PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_friction_condim3 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -347,7 +355,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME exclude COMMAND test_exclude)
     add_test(NAME validation COMMAND test_validation)
     add_test(NAME high_dof COMMAND test_high_dof)
-    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof PROPERTIES LABELS "correctness")
+    add_test(NAME friction_condim3 COMMAND test_friction_condim3)
+    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 PROPERTIES LABELS "correctness")
 
     # Label all correctness tests
     set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)

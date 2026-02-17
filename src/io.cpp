@@ -852,7 +852,13 @@ void Model::init_cache() const {
         }
     }
     cache.max_nl = (int)cache.limits.size();
-    cache.max_nefc = cache.max_nl + cache.max_ncon;
+    // Compute max contact constraint rows accounting for condim:
+    // condim=1: 1 row (frictionless), condim=3 pyramidal: 4 rows, condim=4: 6, condim=6: 10
+    int max_contact_rows = 0;
+    for (auto& cp : cache.collision_pairs) {
+        max_contact_rows += (cp.condim <= 1) ? 1 : 2 * (cp.condim - 1);
+    }
+    cache.max_nefc = cache.max_nl + max_contact_rows;
 
     // ── Joint integration plan ──
     if (njnt > 0) {
