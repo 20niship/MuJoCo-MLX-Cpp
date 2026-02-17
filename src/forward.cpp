@@ -362,6 +362,11 @@ MJMLX_API const float* mjmlx_get_qfrc_passive(const MjmlxData* data, int* n_out)
   return get_array_ptr(data->data.qfrc_passive, n_out);
 }
 
+MJMLX_API const float* mjmlx_get_qfrc_gravcomp(const MjmlxData* data, int* n_out) {
+  if (!data) { if (n_out) *n_out = 0; return nullptr; }
+  return get_array_ptr(data->data.qfrc_gravcomp, n_out);
+}
+
 MJMLX_API const float* mjmlx_get_qfrc_smooth(const MjmlxData* data, int* n_out) {
   if (!data) { if (n_out) *n_out = 0; return nullptr; }
   return get_array_ptr(data->data.qfrc_smooth, n_out);

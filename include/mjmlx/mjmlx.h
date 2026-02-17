@@ -130,6 +130,7 @@ MJMLX_API const float* mjmlx_get_qacc(const MjmlxData* data, int* n_out);     //
 MJMLX_API const float* mjmlx_get_qfrc_constraint(const MjmlxData* data, int* n_out); // constraint forces [nv]
 MJMLX_API const float* mjmlx_get_qfrc_actuator(const MjmlxData* data, int* n_out);   // actuator forces [nv]
 MJMLX_API const float* mjmlx_get_qfrc_passive(const MjmlxData* data, int* n_out);    // passive forces [nv]
+MJMLX_API const float* mjmlx_get_qfrc_gravcomp(const MjmlxData* data, int* n_out);  // gravity compensation [nv]
 MJMLX_API const float* mjmlx_get_qfrc_smooth(const MjmlxData* data, int* n_out);     // smooth forces [nv]
 MJMLX_API const float* mjmlx_get_qacc_smooth(const MjmlxData* data, int* n_out);     // smooth acceleration [nv]
 MJMLX_API const float* mjmlx_get_subtree_com(const MjmlxData* data, int* n_out);     // subtree COM [nbody*3]

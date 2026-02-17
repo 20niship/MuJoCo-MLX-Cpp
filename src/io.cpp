@@ -131,6 +131,8 @@ static Model convert_model(mjModel* m) {
     model.body_iquat = to_mx_f2(m->body_iquat, (int)m->nbody, 4);
     model.body_invweight0 = to_mx_f2(m->body_invweight0, (int)m->nbody, 2);
     model.body_mocapid = to_mx_i(m->body_mocapid, (int)m->nbody);
+    model.body_gravcomp = to_mx_f(m->body_gravcomp, (int)m->nbody);
+    model.ngravcomp = m->ngravcomp;
 
     // Compute body root IDs (matching Python logic)
     {

@@ -22,6 +22,7 @@ namespace mjmlx {
 // DisableBit flags (matching MuJoCo C and Python types.py)
 static constexpr int DISABLE_SPRING = (1 << 4);
 static constexpr int DISABLE_DAMPER = (1 << 6);
+static constexpr int DISABLE_GRAVITY = (1 << 7);
 
 // Forward declarations from math.cpp
 mx::array quat_mul(const mx::array& q1, const mx::array& q2);
@@ -116,10 +117,56 @@ static mx::array spring_damper(const Model& m, const Data& d) {
     return qfrc;
 }
 
+// Gravity compensation: for each body with gravcomp != 0,
+// apply an upward force = -(mass * gravcomp * gravity) at the body COM.
+// Matches MuJoCo C engine_passive.c :: mj_gravcomp.
+static mx::array gravcomp(const Model& m, const Data& d) {
+    auto qfrc = mx::zeros({m.nv});
+
+    if (m.ngravcomp == 0) return qfrc;
+    if (m.opt.disableflags & DISABLE_GRAVITY) return qfrc;
+
+    mx::eval(m.body_gravcomp);
+    mx::eval(m.body_mass);
+    mx::eval(m.opt.gravity);
+    mx::eval(d.xipos);
+
+    auto gc_ptr = m.body_gravcomp.data<float>();
+    auto mass_ptr = m.body_mass.data<float>();
+
+    for (int i = 1; i < m.nbody; i++) {
+        float gc = gc_ptr[i];
+        if (gc == 0.0f) continue;
+
+        float mass_i = mass_ptr[i];
+
+        // force = -(mass * gravcomp) * gravity  (3D vector)
+        auto force = mx::multiply(mx::array(-(mass_i * gc)), m.opt.gravity);
+
+        // Jacobian at body COM (xipos)
+        auto xipos_i = mx::flatten(mx::slice(d.xipos, {i, 0}, {i + 1, 3}));
+        auto [jacp, jacr] = jac(m, d, xipos_i, i);
+
+        // qfrc_gravcomp += J_p^T * force  =>  (nv,3) @ (3,1) -> (nv,1) -> (nv,)
+        auto contrib = mx::flatten(mx::matmul(jacp, mx::reshape(force, {3, 1})));
+        qfrc = mx::add(qfrc, contrib);
+    }
+
+    return qfrc;
+}
+
 Data passive(const Model& m, Data d) {
     d.qfrc_passive = spring_damper(m, d);
-    // Gravity compensation (placeholder - always zero for now)
-    // d.qfrc_gravcomp = mx::zeros({m.nv});
+
+    // Gravity compensation
+    d.qfrc_gravcomp = gravcomp(m, d);
+
+    // Add gravcomp to passive forces (matching MuJoCo C behavior:
+    // qfrc_passive += qfrc_gravcomp for joints without actgravcomp)
+    if (m.ngravcomp > 0) {
+        d.qfrc_passive = mx::add(d.qfrc_passive, d.qfrc_gravcomp);
+    }
+
     return d;
 }
 
