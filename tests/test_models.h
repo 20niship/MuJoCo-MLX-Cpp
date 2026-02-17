@@ -121,21 +121,24 @@ static const char* HIGH_DOF_TREE_XML = R"(
     <body name="root" pos="0 0 1.2">
       <freejoint/>
       <geom size="0.08 0.15" mass="10"/>
-      <!-- Spine chain (5 segments) -->
+      <!-- Spine chain (5 segments including neck) -->
       <body name="spine1" pos="0 0 0.16">
         <joint name="sp1x" type="hinge" axis="1 0 0"/><joint name="sp1y" type="hinge" axis="0 1 0"/><joint name="sp1z" type="hinge" axis="0 0 1"/>
         <geom/><body name="spine2" pos="0 0 0.16">
           <joint name="sp2x" type="hinge" axis="1 0 0"/><joint name="sp2y" type="hinge" axis="0 1 0"/><joint name="sp2z" type="hinge" axis="0 0 1"/>
           <geom/><body name="spine3" pos="0 0 0.16">
             <joint name="sp3x" type="hinge" axis="1 0 0"/><joint name="sp3y" type="hinge" axis="0 1 0"/><joint name="sp3z" type="hinge" axis="0 0 1"/>
-            <geom/><body name="head" pos="0 0 0.16">
-              <joint name="hdx" type="hinge" axis="1 0 0"/><joint name="hdy" type="hinge" axis="0 1 0"/><joint name="hdz" type="hinge" axis="0 0 1"/>
-              <geom type="sphere" size="0.08" mass="3"/>
+            <geom/><body name="neck" pos="0 0 0.14">
+              <joint name="nkx" type="hinge" axis="1 0 0"/><joint name="nky" type="hinge" axis="0 1 0"/><joint name="nkz" type="hinge" axis="0 0 1"/>
+              <geom size="0.025 0.06" mass="0.3"/><body name="head" pos="0 0 0.12">
+                <joint name="hdx" type="hinge" axis="1 0 0"/><joint name="hdy" type="hinge" axis="0 1 0"/><joint name="hdz" type="hinge" axis="0 0 1"/>
+                <geom type="sphere" size="0.08" mass="3"/>
+              </body>
             </body>
           </body>
         </body>
       </body>
-      <!-- Left arm chain -->
+      <!-- Left arm chain with fingers -->
       <body name="l_shoulder" pos="0.2 0 0.15">
         <joint name="lsx" type="hinge" axis="1 0 0"/><joint name="lsy" type="hinge" axis="0 1 0"/><joint name="lsz" type="hinge" axis="0 0 1"/>
         <geom/><body name="l_elbow" pos="0 0 -0.2">
@@ -143,10 +146,18 @@ static const char* HIGH_DOF_TREE_XML = R"(
           <geom/><body name="l_wrist" pos="0 0 -0.18">
             <joint name="lwx" type="hinge" axis="1 0 0"/><joint name="lwy" type="hinge" axis="0 1 0"/><joint name="lwz" type="hinge" axis="0 0 1"/>
             <geom size="0.02 0.05" mass="0.2"/>
+            <body name="l_finger1" pos="0.02 0 -0.06">
+              <joint name="lf1x" type="hinge" axis="1 0 0"/><joint name="lf1y" type="hinge" axis="0 1 0"/>
+              <geom size="0.008 0.03" mass="0.05"/>
+            </body>
+            <body name="l_finger2" pos="-0.02 0 -0.06">
+              <joint name="lf2x" type="hinge" axis="1 0 0"/><joint name="lf2y" type="hinge" axis="0 1 0"/>
+              <geom size="0.008 0.03" mass="0.05"/>
+            </body>
           </body>
         </body>
       </body>
-      <!-- Right arm chain -->
+      <!-- Right arm chain with fingers -->
       <body name="r_shoulder" pos="-0.2 0 0.15">
         <joint name="rsx" type="hinge" axis="1 0 0"/><joint name="rsy" type="hinge" axis="0 1 0"/><joint name="rsz" type="hinge" axis="0 0 1"/>
         <geom/><body name="r_elbow" pos="0 0 -0.2">
@@ -154,10 +165,18 @@ static const char* HIGH_DOF_TREE_XML = R"(
           <geom/><body name="r_wrist" pos="0 0 -0.18">
             <joint name="rwx" type="hinge" axis="1 0 0"/><joint name="rwy" type="hinge" axis="0 1 0"/><joint name="rwz" type="hinge" axis="0 0 1"/>
             <geom size="0.02 0.05" mass="0.2"/>
+            <body name="r_finger1" pos="0.02 0 -0.06">
+              <joint name="rf1x" type="hinge" axis="1 0 0"/><joint name="rf1y" type="hinge" axis="0 1 0"/>
+              <geom size="0.008 0.03" mass="0.05"/>
+            </body>
+            <body name="r_finger2" pos="-0.02 0 -0.06">
+              <joint name="rf2x" type="hinge" axis="1 0 0"/><joint name="rf2y" type="hinge" axis="0 1 0"/>
+              <geom size="0.008 0.03" mass="0.05"/>
+            </body>
           </body>
         </body>
       </body>
-      <!-- Left leg chain -->
+      <!-- Left leg chain with toes -->
       <body name="l_hip" pos="0.1 0 -0.15">
         <joint name="lhx" type="hinge" axis="1 0 0"/><joint name="lhy" type="hinge" axis="0 1 0"/><joint name="lhz" type="hinge" axis="0 0 1"/>
         <geom size="0.04 0.15" mass="2"/><body name="l_knee" pos="0 0 -0.3">
@@ -165,10 +184,14 @@ static const char* HIGH_DOF_TREE_XML = R"(
           <geom size="0.035 0.12" mass="1.5"/><body name="l_ankle" pos="0 0 -0.25">
             <joint name="lax" type="hinge" axis="1 0 0"/><joint name="lay" type="hinge" axis="0 1 0"/><joint name="laz" type="hinge" axis="0 0 1"/>
             <geom size="0.03 0.06" mass="0.5"/>
+            <body name="l_toe" pos="0 0.06 -0.06">
+              <joint name="ltx" type="hinge" axis="1 0 0"/>
+              <geom size="0.02 0.04" mass="0.1"/>
+            </body>
           </body>
         </body>
       </body>
-      <!-- Right leg chain -->
+      <!-- Right leg chain with toes -->
       <body name="r_hip" pos="-0.1 0 -0.15">
         <joint name="rhx" type="hinge" axis="1 0 0"/><joint name="rhy" type="hinge" axis="0 1 0"/><joint name="rhz" type="hinge" axis="0 0 1"/>
         <geom size="0.04 0.15" mass="2"/><body name="r_knee" pos="0 0 -0.3">
@@ -176,6 +199,10 @@ static const char* HIGH_DOF_TREE_XML = R"(
           <geom size="0.035 0.12" mass="1.5"/><body name="r_ankle" pos="0 0 -0.25">
             <joint name="rax" type="hinge" axis="1 0 0"/><joint name="ray" type="hinge" axis="0 1 0"/><joint name="raz" type="hinge" axis="0 0 1"/>
             <geom size="0.03 0.06" mass="0.5"/>
+            <body name="r_toe" pos="0 0.06 -0.06">
+              <joint name="rtx" type="hinge" axis="1 0 0"/>
+              <geom size="0.02 0.04" mass="0.1"/>
+            </body>
           </body>
         </body>
       </body>
@@ -185,19 +212,26 @@ static const char* HIGH_DOF_TREE_XML = R"(
     <motor joint="sp1x"/><motor joint="sp1y"/><motor joint="sp1z"/>
     <motor joint="sp2x"/><motor joint="sp2y"/><motor joint="sp2z"/>
     <motor joint="sp3x"/><motor joint="sp3y"/><motor joint="sp3z"/>
+    <motor joint="nkx"/><motor joint="nky"/><motor joint="nkz"/>
     <motor joint="hdx"/><motor joint="hdy"/><motor joint="hdz"/>
     <motor joint="lsx"/><motor joint="lsy"/><motor joint="lsz"/>
     <motor joint="lex"/><motor joint="ley"/><motor joint="lez"/>
     <motor joint="lwx"/><motor joint="lwy"/><motor joint="lwz"/>
+    <motor joint="lf1x"/><motor joint="lf1y"/>
+    <motor joint="lf2x"/><motor joint="lf2y"/>
     <motor joint="rsx"/><motor joint="rsy"/><motor joint="rsz"/>
     <motor joint="rex"/><motor joint="rey"/><motor joint="rez"/>
     <motor joint="rwx"/><motor joint="rwy"/><motor joint="rwz"/>
+    <motor joint="rf1x"/><motor joint="rf1y"/>
+    <motor joint="rf2x"/><motor joint="rf2y"/>
     <motor joint="lhx"/><motor joint="lhy"/><motor joint="lhz"/>
     <motor joint="lkx"/><motor joint="lky"/><motor joint="lkz"/>
     <motor joint="lax"/><motor joint="lay"/><motor joint="laz"/>
+    <motor joint="ltx"/>
     <motor joint="rhx"/><motor joint="rhy"/><motor joint="rhz"/>
     <motor joint="rkx"/><motor joint="rky"/><motor joint="rkz"/>
     <motor joint="rax"/><motor joint="ray"/><motor joint="raz"/>
+    <motor joint="rtx"/>
   </actuator>
 </mujoco>
 )";
