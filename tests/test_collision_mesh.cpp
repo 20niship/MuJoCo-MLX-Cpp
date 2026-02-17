@@ -177,8 +177,8 @@ int main() {
             if (diff > max_diff) max_diff = diff;
         }
         printf("    max qacc diff after 1 step: %.6f\n", max_diff);
-        // GJK/EPA may differ from MuJoCo C's convex collision slightly
-        CHECK(max_diff < 50.0f, "mesh-plane qacc reasonable");
+        // With proper multi-vertex plane-mesh, qacc is close to MuJoCo C
+        CHECK(max_diff < 10.0f, "mesh-plane qacc close to MuJoCo C");
 
         mj_deleteData(dj); mj_deleteModel(mj);
         mjmlx_free_data(dh); mjmlx_free_model(mh);
@@ -209,7 +209,7 @@ int main() {
             if (diff > max_diff) max_diff = diff;
         }
         printf("    max qpos diff after 100 steps: %.6f\n", max_diff);
-        CHECK(max_diff < 10.0f, "mesh-plane stable after 100 steps");
+        CHECK(max_diff < 1.0f, "mesh-plane stable after 100 steps");
 
         bool finite = true;
         for (int i = 0; i < n; i++) {
@@ -256,7 +256,7 @@ int main() {
             if (diff > max_diff) max_diff = diff;
         }
         printf("    max qpos diff after 50 steps: %.6f\n", max_diff);
-        CHECK(max_diff < 10.0f, "mesh-sphere qpos close to MuJoCo C");
+        CHECK(max_diff < 1.0f, "mesh-sphere qpos close to MuJoCo C");
 
         mj_deleteData(dj); mj_deleteModel(mj);
         mjmlx_free_data(dh); mjmlx_free_model(mh);

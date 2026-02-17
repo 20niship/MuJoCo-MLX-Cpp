@@ -839,6 +839,27 @@ void Model::init_cache() const {
         }
 
         cache.max_ncon = (int)cache.collision_pairs.size();
+
+        // Pre-bake mesh vertex slices for vmap collision path
+        if (mesh_vert.size() > 0 && mesh_vertadr.size() > 0 && mesh_vertnum.size() > 0) {
+            mx::eval(mesh_vertadr); mx::eval(mesh_vertnum); mx::eval(mesh_vert);
+            auto vadr = mesh_vertadr.data<int>();
+            auto vnum = mesh_vertnum.data<int>();
+            for (auto& cp : cache.collision_pairs) {
+                if (cp.type1 == (int)GeomType::MESH && cp.dataid1 >= 0) {
+                    int start = vadr[cp.dataid1];
+                    int count = vnum[cp.dataid1];
+                    if (count > 0)
+                        cp.mesh_verts1 = mx::slice(mesh_vert, {start, 0}, {start + count, 3});
+                }
+                if (cp.type2 == (int)GeomType::MESH && cp.dataid2 >= 0) {
+                    int start = vadr[cp.dataid2];
+                    int count = vnum[cp.dataid2];
+                    if (count > 0)
+                        cp.mesh_verts2 = mx::slice(mesh_vert, {start, 0}, {start + count, 3});
+                }
+            }
+        }
     }
 
     // ── Joint limits ──

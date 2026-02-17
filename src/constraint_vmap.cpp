@@ -580,37 +580,558 @@ static VmapCollResult vmap_capsule_cylinder(
     return {mx::reshape(dist, {}), bpt2, vmap_make_frame(norm)};
 }
 
-// ── MESH collision (vmap-compatible) ─────────────────────────────────────────
-// For vmap: uses the mesh center as a sphere approximation for simplicity.
-// The scalar path (collision.cpp) uses full GJK/EPA for accuracy.
-// This is adequate for batched training where exact mesh collision conformance
-// is less critical than stability.
+// ── MESH collision via vmap GJK (GPU-parallel) ──────────────────────────────
+// Proper GJK collision for mesh geoms using pure MLX array ops.
+// All branching via mx::where — no eval(), no data<>(), fully vmap-compatible.
+// Runs on GPU in parallel across N environments via compile(vmap(...)).
 
-static VmapCollResult vmap_plane_mesh(
-    const mx::array& ppos, const mx::array& pmat,
-    const mx::array& mpos, const mx::array& mmat, float mesh_radius)
+// ── Support functions (furthest point in a direction, world space) ───────────
+
+static mx::array vmap_support_sphere(
+    const mx::array& pos, float radius, const mx::array& dir)
 {
-    // Treat mesh as a sphere centered at its position with approximate radius
-    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
-    auto diff = mx::subtract(mpos, ppos);
-    auto dist = mx::subtract(mx::sum(mx::multiply(normal, diff)), mx::array(mesh_radius));
-    auto pos = mx::subtract(mpos, mx::multiply(normal, mx::add(dist, mx::array(mesh_radius))));
-    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+    return mx::add(pos, mx::multiply(vmap_normalize(dir), mx::array(radius)));
 }
 
-static VmapCollResult vmap_convex_mesh(
-    const mx::array& pos1, const mx::array& mat1, float size1_0,
-    const mx::array& pos2, const mx::array& mat2, float mesh_radius)
+static mx::array vmap_support_capsule(
+    const mx::array& pos, const mx::array& mat, float radius, float half_len,
+    const mx::array& dir)
 {
-    // Simplified: treat both as spheres at their centers
-    auto sep = mx::subtract(pos1, pos2);
-    auto d = vmap_norm(sep);
-    auto norm = mx::where(mx::less(d, mx::array(1e-8f)),
-                           mx::array({0.0f, 0.0f, 1.0f}),
-                           mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
-    auto dist = mx::subtract(d, mx::add(mx::array(size1_0), mx::array(mesh_radius)));
-    auto contact = mx::add(pos2, mx::multiply(norm, mx::array(mesh_radius)));
-    return {mx::reshape(dist, {}), contact, vmap_make_frame(norm)};
+    auto axis = mx::flatten(mx::slice(mx::reshape(mat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto d = mx::sum(mx::multiply(axis, dir));
+    auto endpoint = mx::add(pos, mx::multiply(axis, mx::where(mx::greater_equal(d, mx::array(0.0f)),
+                                                                mx::array(half_len), mx::array(-half_len))));
+    return mx::add(endpoint, mx::multiply(vmap_normalize(dir), mx::array(radius)));
+}
+
+static mx::array vmap_support_box(
+    const mx::array& pos, const mx::array& mat, const float* size, const mx::array& dir)
+{
+    auto Rc = mx::reshape(mat, {3,3});
+    auto xc = mx::flatten(mx::slice(Rc, mx::Shape{0,0}, mx::Shape{3,1}));
+    auto yc = mx::flatten(mx::slice(Rc, mx::Shape{0,1}, mx::Shape{3,2}));
+    auto zc = mx::flatten(mx::slice(Rc, mx::Shape{0,2}, mx::Shape{3,3}));
+    auto sx = mx::where(mx::greater_equal(mx::sum(mx::multiply(xc, dir)), mx::array(0.0f)),
+                         mx::array(size[0]), mx::array(-size[0]));
+    auto sy = mx::where(mx::greater_equal(mx::sum(mx::multiply(yc, dir)), mx::array(0.0f)),
+                         mx::array(size[1]), mx::array(-size[1]));
+    auto sz = mx::where(mx::greater_equal(mx::sum(mx::multiply(zc, dir)), mx::array(0.0f)),
+                         mx::array(size[2]), mx::array(-size[2]));
+    return mx::add(pos, mx::add(mx::add(mx::multiply(xc, sx), mx::multiply(yc, sy)),
+                                 mx::multiply(zc, sz)));
+}
+
+static mx::array vmap_support_cylinder(
+    const mx::array& pos, const mx::array& mat, float R, float H, const mx::array& dir)
+{
+    auto axis = mx::flatten(mx::slice(mx::reshape(mat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto da = mx::sum(mx::multiply(axis, dir));
+    auto tip = mx::add(pos, mx::multiply(axis, mx::where(mx::greater_equal(da, mx::array(0.0f)),
+                                                           mx::array(H), mx::array(-H))));
+    auto proj = mx::sum(mx::multiply(dir, axis));
+    auto perp = mx::subtract(dir, mx::multiply(axis, proj));
+    auto pl = vmap_norm(perp);
+    auto offset = mx::multiply(mx::divide(perp, mx::maximum(pl, mx::array(1e-8f))), mx::array(R));
+    offset = mx::where(mx::less(pl, mx::array(1e-8f)), mx::zeros({3}), offset);
+    return mx::add(tip, offset);
+}
+
+static mx::array vmap_support_mesh(
+    const mx::array& verts, const mx::array& pos, const mx::array& mat,
+    const mx::array& dir)
+{
+    auto Rc = mx::reshape(mat, {3,3});
+    auto RT = mx::transpose(Rc);
+    auto dir_local = mx::flatten(mx::matmul(RT, mx::reshape(dir, {3,1})));
+    auto dots = mx::flatten(mx::matmul(verts, mx::reshape(dir_local, {3,1})));
+    auto best_idx = mx::argmax(dots);
+    auto best_local = mx::flatten(mx::take(verts, mx::reshape(best_idx, {1}), 0));
+    return mx::add(pos, mx::flatten(mx::matmul(Rc, mx::reshape(best_local, {3,1}))));
+}
+
+// ── Generic support function dispatcher ─────────────────────────────────────
+
+enum VmapGeomKind { VGK_SPHERE=0, VGK_CAPSULE, VGK_BOX, VGK_CYLINDER, VGK_MESH };
+
+struct VmapConvexShape {
+    VmapGeomKind kind;
+    mx::array pos{mx::zeros({3})};
+    mx::array mat{mx::zeros({9})};
+    float size[3] = {0,0,0};
+    mx::array verts{mx::zeros({0})};
+};
+
+static mx::array vmap_support(const VmapConvexShape& g, const mx::array& dir) {
+    switch (g.kind) {
+    case VGK_SPHERE:   return vmap_support_sphere(g.pos, g.size[0], dir);
+    case VGK_CAPSULE:  return vmap_support_capsule(g.pos, g.mat, g.size[0], g.size[1], dir);
+    case VGK_BOX:      return vmap_support_box(g.pos, g.mat, g.size, dir);
+    case VGK_CYLINDER: return vmap_support_cylinder(g.pos, g.mat, g.size[0], g.size[1], dir);
+    case VGK_MESH:     return vmap_support_mesh(g.verts, g.pos, g.mat, dir);
+    default:           return g.pos;
+    }
+}
+
+static VmapGeomKind geom_type_to_kind(int t) {
+    switch (t) {
+    case (int)GeomType::SPHERE:   return VGK_SPHERE;
+    case (int)GeomType::CAPSULE:  return VGK_CAPSULE;
+    case (int)GeomType::BOX:      return VGK_BOX;
+    case (int)GeomType::CYLINDER: return VGK_CYLINDER;
+    case (int)GeomType::MESH:     return VGK_MESH;
+    default:                      return VGK_SPHERE;
+    }
+}
+
+// ── Vmap GJK: fixed 32 iterations, pure MLX ops ────────────────────────────
+
+// GJK simplex state — stored as fixed-size (4,3) arrays
+struct VmapGJKState {
+    mx::array sdiff; // (4, 3) Minkowski difference points
+    mx::array sa;    // (4, 3) witness points on shape A
+    mx::array sb;    // (4, 3) witness points on shape B
+    mx::array sn;    // scalar: simplex size (1-4)
+    mx::array dir;   // (3,) search direction
+    mx::array converged; // scalar bool
+    mx::array overlap;   // scalar bool
+};
+
+// Helper: set row i of a (4,3) array to a (3,) vector
+static mx::array set_row(const mx::array& mat, const mx::array& row_idx, const mx::array& val) {
+    auto result = mat;
+    for (int i = 0; i < 4; i++) {
+        auto is_i = mx::equal(row_idx, mx::array(i));
+        auto old_row = mx::flatten(mx::slice(mat, {i, 0}, {i+1, 3}));
+        auto new_row = mx::where(is_i, val, old_row);
+        // Build result by replacing row i
+        auto rows_before = (i > 0) ? mx::slice(result, {0, 0}, {i, 3}) : mx::array({});
+        auto rows_after = (i < 3) ? mx::slice(result, {i+1, 0}, {4, 3}) : mx::array({});
+        if (i == 0) {
+            result = mx::concatenate({mx::reshape(new_row, {1,3}),
+                                       mx::slice(result, {1,0}, {4,3})}, 0);
+        } else if (i == 3) {
+            result = mx::concatenate({mx::slice(result, {0,0}, {3,3}),
+                                       mx::reshape(new_row, {1,3})}, 0);
+        } else {
+            result = mx::concatenate({mx::slice(result, {0,0}, {i,3}),
+                                       mx::reshape(new_row, {1,3}),
+                                       mx::slice(result, {i+1,0}, {4,3})}, 0);
+        }
+    }
+    return result;
+}
+
+// GJK line update: simplex has 2 points (indices sn-1=newest, sn-2=older)
+static void gjk_update_line(
+    const mx::array& sdiff, const mx::array& sa, const mx::array& sb,
+    mx::array& out_sdiff, mx::array& out_sa, mx::array& out_sb,
+    mx::array& out_sn, mx::array& out_dir, mx::array& out_overlap)
+{
+    auto A = mx::flatten(mx::slice(sdiff, {1, 0}, {2, 3})); // newest
+    auto B = mx::flatten(mx::slice(sdiff, {0, 0}, {1, 3})); // older
+    auto AB = mx::subtract(B, A);
+    auto AO = mx::negative(A);
+    auto ab_dot_ao = mx::sum(mx::multiply(AB, AO));
+    auto toward_b = mx::greater(ab_dot_ao, mx::array(0.0f));
+
+    // If toward B: direction = AB × AO × AB (triple cross product)
+    auto abxao = mx::flatten(mx::linalg::cross(mx::reshape(AB, {1,3}), mx::reshape(AO, {1,3})));
+    auto new_dir_triple = mx::flatten(mx::linalg::cross(mx::reshape(abxao, {1,3}), mx::reshape(AB, {1,3})));
+    // Fallback if degenerate
+    auto tdl = vmap_norm(new_dir_triple);
+    new_dir_triple = mx::where(mx::less(tdl, mx::array(1e-12f)), AO, new_dir_triple);
+
+    // If not toward B: keep only A, direction = AO
+    out_dir = mx::where(toward_b, new_dir_triple, AO);
+    // If not toward B, shrink simplex to just A (put A at index 0)
+    out_sdiff = mx::where(toward_b, sdiff,
+        mx::concatenate({mx::reshape(A, {1,3}), mx::slice(sdiff, {1,0}, {4,3})}, 0));
+    out_sa = mx::where(toward_b, sa,
+        mx::concatenate({mx::reshape(mx::flatten(mx::slice(sa, {1,0}, {2,3})), {1,3}),
+                          mx::slice(sa, {1,0}, {4,3})}, 0));
+    out_sb = mx::where(toward_b, sb,
+        mx::concatenate({mx::reshape(mx::flatten(mx::slice(sb, {1,0}, {2,3})), {1,3}),
+                          mx::slice(sb, {1,0}, {4,3})}, 0));
+    out_sn = mx::where(toward_b, mx::array(2), mx::array(1));
+    out_overlap = mx::array(false);
+}
+
+// GJK triangle update: simplex has 3 points
+static void gjk_update_triangle(
+    const mx::array& sdiff, const mx::array& sa, const mx::array& sb,
+    mx::array& out_sdiff, mx::array& out_sa, mx::array& out_sb,
+    mx::array& out_sn, mx::array& out_dir, mx::array& out_overlap)
+{
+    auto A = mx::flatten(mx::slice(sdiff, {2, 0}, {3, 3})); // newest
+    auto B = mx::flatten(mx::slice(sdiff, {1, 0}, {2, 3}));
+    auto C = mx::flatten(mx::slice(sdiff, {0, 0}, {1, 3}));
+    auto AB = mx::subtract(B, A);
+    auto AC = mx::subtract(C, A);
+    auto AO = mx::negative(A);
+    auto ABC = mx::flatten(mx::linalg::cross(mx::reshape(AB, {1,3}), mx::reshape(AC, {1,3})));
+
+    // Test which region the origin is in
+    auto abc_x_ac = mx::flatten(mx::linalg::cross(mx::reshape(ABC, {1,3}), mx::reshape(AC, {1,3})));
+    auto ab_x_abc = mx::flatten(mx::linalg::cross(mx::reshape(AB, {1,3}), mx::reshape(ABC, {1,3})));
+
+    auto ac_side = mx::greater(mx::sum(mx::multiply(abc_x_ac, AO)), mx::array(0.0f));
+    auto ab_side = mx::greater(mx::sum(mx::multiply(ab_x_abc, AO)), mx::array(0.0f));
+    auto above = mx::greater(mx::sum(mx::multiply(ABC, AO)), mx::array(0.0f));
+
+    // Case 1: AC edge region — keep A, C
+    auto dir_ac = mx::flatten(mx::linalg::cross(
+        mx::linalg::cross(mx::reshape(AC, {1,3}), mx::reshape(AO, {1,3})),
+        mx::reshape(AC, {1,3})));
+    // Case 2: AB edge region — keep A, B
+    auto dir_ab = mx::flatten(mx::linalg::cross(
+        mx::linalg::cross(mx::reshape(AB, {1,3}), mx::reshape(AO, {1,3})),
+        mx::reshape(AB, {1,3})));
+    // Case 3: above triangle — direction = ABC
+    // Case 4: below triangle — flip winding, direction = -ABC
+
+    // Select direction
+    auto new_dir = mx::where(ac_side, dir_ac,
+                    mx::where(ab_side, dir_ab,
+                    mx::where(above, ABC, mx::negative(ABC))));
+    auto ndl = vmap_norm(new_dir);
+    new_dir = mx::where(mx::less(ndl, mx::array(1e-12f)), AO, new_dir);
+
+    // Select simplex: if ac_side or ab_side, shrink to 2 points
+    auto shrink = mx::logical_or(ac_side, ab_side);
+    auto sn_new = mx::where(shrink, mx::array(2), mx::array(3));
+
+    // For AC: simplex = {C, A} at indices 0,1
+    auto sdiff_ac = mx::concatenate({mx::reshape(C, {1,3}), mx::reshape(A, {1,3}),
+                                      mx::slice(sdiff, {2,0}, {4,3})}, 0);
+    auto sa_ac = mx::concatenate({mx::slice(sa, {0,0}, {1,3}), mx::slice(sa, {2,0}, {3,3}),
+                                   mx::slice(sa, {2,0}, {4,3})}, 0);
+    auto sb_ac = mx::concatenate({mx::slice(sb, {0,0}, {1,3}), mx::slice(sb, {2,0}, {3,3}),
+                                   mx::slice(sb, {2,0}, {4,3})}, 0);
+    // For AB: simplex = {B, A}
+    auto sdiff_ab = mx::concatenate({mx::reshape(B, {1,3}), mx::reshape(A, {1,3}),
+                                      mx::slice(sdiff, {2,0}, {4,3})}, 0);
+    auto sa_ab = mx::concatenate({mx::slice(sa, {1,0}, {2,3}), mx::slice(sa, {2,0}, {3,3}),
+                                   mx::slice(sa, {2,0}, {4,3})}, 0);
+    auto sb_ab = mx::concatenate({mx::slice(sb, {1,0}, {2,3}), mx::slice(sb, {2,0}, {3,3}),
+                                   mx::slice(sb, {2,0}, {4,3})}, 0);
+    // For below: flip B and C in simplex (swap indices 0 and 1)
+    auto sdiff_flip = mx::concatenate({mx::reshape(B, {1,3}), mx::reshape(C, {1,3}),
+                                        mx::reshape(A, {1,3}), mx::slice(sdiff, {3,0}, {4,3})}, 0);
+    auto sa_flip = mx::concatenate({mx::slice(sa, {1,0}, {2,3}), mx::slice(sa, {0,0}, {1,3}),
+                                     mx::slice(sa, {2,0}, {3,3}), mx::slice(sa, {3,0}, {4,3})}, 0);
+    auto sb_flip = mx::concatenate({mx::slice(sb, {1,0}, {2,3}), mx::slice(sb, {0,0}, {1,3}),
+                                     mx::slice(sb, {2,0}, {3,3}), mx::slice(sb, {3,0}, {4,3})}, 0);
+
+    out_sdiff = mx::where(ac_side, sdiff_ac, mx::where(ab_side, sdiff_ab,
+                mx::where(above, sdiff, sdiff_flip)));
+    out_sa = mx::where(ac_side, sa_ac, mx::where(ab_side, sa_ab,
+              mx::where(above, sa, sa_flip)));
+    out_sb = mx::where(ac_side, sb_ac, mx::where(ab_side, sb_ab,
+              mx::where(above, sb, sb_flip)));
+    out_sn = sn_new;
+    out_dir = new_dir;
+    out_overlap = mx::array(false);
+}
+
+// GJK tetrahedron update: simplex has 4 points
+static void gjk_update_tetrahedron(
+    const mx::array& sdiff, const mx::array& sa, const mx::array& sb,
+    mx::array& out_sdiff, mx::array& out_sa, mx::array& out_sb,
+    mx::array& out_sn, mx::array& out_dir, mx::array& out_overlap)
+{
+    auto A = mx::flatten(mx::slice(sdiff, {3, 0}, {4, 3})); // newest
+    auto B = mx::flatten(mx::slice(sdiff, {2, 0}, {3, 3}));
+    auto C = mx::flatten(mx::slice(sdiff, {1, 0}, {2, 3}));
+    auto D = mx::flatten(mx::slice(sdiff, {0, 0}, {1, 3}));
+    auto AO = mx::negative(A);
+
+    auto AB = mx::subtract(B, A), AC = mx::subtract(C, A), AD = mx::subtract(D, A);
+    auto ABC = mx::flatten(mx::linalg::cross(mx::reshape(AB, {1,3}), mx::reshape(AC, {1,3})));
+    auto ACD = mx::flatten(mx::linalg::cross(mx::reshape(AC, {1,3}), mx::reshape(AD, {1,3})));
+    auto ADB = mx::flatten(mx::linalg::cross(mx::reshape(AD, {1,3}), mx::reshape(AB, {1,3})));
+
+    auto abc_test = mx::greater(mx::sum(mx::multiply(ABC, AO)), mx::array(0.0f));
+    auto acd_test = mx::greater(mx::sum(mx::multiply(ACD, AO)), mx::array(0.0f));
+    auto adb_test = mx::greater(mx::sum(mx::multiply(ADB, AO)), mx::array(0.0f));
+
+    auto any_outside = mx::logical_or(abc_test, mx::logical_or(acd_test, adb_test));
+
+    // If outside ABC face: keep {C, B, A} as triangle
+    auto sdiff_abc = mx::concatenate({mx::reshape(C, {1,3}), mx::reshape(B, {1,3}),
+                                       mx::reshape(A, {1,3}), mx::slice(sdiff, {3,0}, {4,3})}, 0);
+    // If outside ACD face: keep {D, C, A}
+    auto sdiff_acd = mx::concatenate({mx::reshape(D, {1,3}), mx::reshape(C, {1,3}),
+                                       mx::reshape(A, {1,3}), mx::slice(sdiff, {3,0}, {4,3})}, 0);
+    // If outside ADB face: keep {B, D, A}
+    auto sdiff_adb = mx::concatenate({mx::reshape(B, {1,3}), mx::reshape(D, {1,3}),
+                                       mx::reshape(A, {1,3}), mx::slice(sdiff, {3,0}, {4,3})}, 0);
+
+    auto new_sdiff = mx::where(abc_test, sdiff_abc,
+                      mx::where(acd_test, sdiff_acd, sdiff_adb));
+    auto new_dir = mx::where(abc_test, ABC, mx::where(acd_test, ACD, ADB));
+
+    // Witness points: same reordering
+    auto sa_A = mx::slice(sa, {3,0}, {4,3}); auto sb_A = mx::slice(sb, {3,0}, {4,3});
+    auto sa_B = mx::slice(sa, {2,0}, {3,3}); auto sb_B = mx::slice(sb, {2,0}, {3,3});
+    auto sa_C = mx::slice(sa, {1,0}, {2,3}); auto sb_C = mx::slice(sb, {1,0}, {2,3});
+    auto sa_D = mx::slice(sa, {0,0}, {1,3}); auto sb_D = mx::slice(sb, {0,0}, {1,3});
+
+    auto new_sa = mx::where(abc_test,
+        mx::concatenate({sa_C, sa_B, sa_A, sa_A}, 0),
+        mx::where(acd_test,
+            mx::concatenate({sa_D, sa_C, sa_A, sa_A}, 0),
+            mx::concatenate({sa_B, sa_D, sa_A, sa_A}, 0)));
+    auto new_sb = mx::where(abc_test,
+        mx::concatenate({sb_C, sb_B, sb_A, sb_A}, 0),
+        mx::where(acd_test,
+            mx::concatenate({sb_D, sb_C, sb_A, sb_A}, 0),
+            mx::concatenate({sb_B, sb_D, sb_A, sb_A}, 0)));
+
+    out_sdiff = mx::where(any_outside, new_sdiff, sdiff);
+    out_sa = mx::where(any_outside, new_sa, sa);
+    out_sb = mx::where(any_outside, new_sb, sb);
+    out_sn = mx::where(any_outside, mx::array(3), mx::array(4));
+    out_dir = mx::where(any_outside, new_dir, mx::zeros({3}));
+    out_overlap = mx::logical_not(any_outside); // if no face is outside, origin is inside
+}
+
+// Run vmap GJK: 32 fixed iterations
+static VmapGJKState vmap_gjk(const VmapConvexShape& A, const VmapConvexShape& B) {
+    auto initial_dir = mx::subtract(B.pos, A.pos);
+    auto idl = vmap_norm(initial_dir);
+    initial_dir = mx::where(mx::less(idl, mx::array(1e-12f)),
+                             mx::array({1.0f, 0.0f, 0.0f}), initial_dir);
+
+    // First support point
+    auto sa0 = vmap_support(A, initial_dir);
+    auto sb0 = vmap_support(B, mx::negative(initial_dir));
+    auto sd0 = mx::subtract(sa0, sb0);
+
+    auto sdiff = mx::concatenate({mx::reshape(sd0, {1,3}), mx::zeros({3,3})}, 0); // (4,3)
+    auto s_a = mx::concatenate({mx::reshape(sa0, {1,3}), mx::zeros({3,3})}, 0);
+    auto s_b = mx::concatenate({mx::reshape(sb0, {1,3}), mx::zeros({3,3})}, 0);
+    auto sn = mx::array(1);
+    auto dir = mx::negative(sd0);
+    auto dl = vmap_norm(dir);
+    dir = mx::where(mx::less(dl, mx::array(1e-12f)), mx::array({1.0f,0.0f,0.0f}), dir);
+    auto converged = mx::array(false);
+    auto overlap = mx::array(false);
+
+    for (int iter = 0; iter < 32; iter++) {
+        // Compute new support point
+        auto new_sa = vmap_support(A, dir);
+        auto new_sb = vmap_support(B, mx::negative(dir));
+        auto new_sd = mx::subtract(new_sa, new_sb);
+
+        // Check progress: if new point doesn't pass origin, no overlap
+        auto progress = mx::sum(mx::multiply(new_sd, dir));
+        auto no_progress = mx::less(progress, mx::array(0.0f));
+
+        // Add point to simplex
+        // Place new point at index sn (0-based)
+        auto new_sdiff = sdiff, new_s_a = s_a, new_s_b = s_b;
+        for (int i = 0; i < 4; i++) {
+            auto is_target = mx::equal(sn, mx::array(i));
+            auto old_sd_row = mx::flatten(mx::slice(sdiff, {i,0}, {i+1,3}));
+            auto old_sa_row = mx::flatten(mx::slice(s_a, {i,0}, {i+1,3}));
+            auto old_sb_row = mx::flatten(mx::slice(s_b, {i,0}, {i+1,3}));
+            auto rep_sd = mx::where(is_target, new_sd, old_sd_row);
+            auto rep_sa = mx::where(is_target, new_sa, old_sa_row);
+            auto rep_sb = mx::where(is_target, new_sb, old_sb_row);
+            if (i == 0) {
+                new_sdiff = mx::concatenate({mx::reshape(rep_sd, {1,3}), mx::slice(new_sdiff, {1,0}, {4,3})}, 0);
+                new_s_a = mx::concatenate({mx::reshape(rep_sa, {1,3}), mx::slice(new_s_a, {1,0}, {4,3})}, 0);
+                new_s_b = mx::concatenate({mx::reshape(rep_sb, {1,3}), mx::slice(new_s_b, {1,0}, {4,3})}, 0);
+            } else if (i == 3) {
+                new_sdiff = mx::concatenate({mx::slice(new_sdiff, {0,0}, {3,3}), mx::reshape(rep_sd, {1,3})}, 0);
+                new_s_a = mx::concatenate({mx::slice(new_s_a, {0,0}, {3,3}), mx::reshape(rep_sa, {1,3})}, 0);
+                new_s_b = mx::concatenate({mx::slice(new_s_b, {0,0}, {3,3}), mx::reshape(rep_sb, {1,3})}, 0);
+            } else {
+                new_sdiff = mx::concatenate({mx::slice(new_sdiff, {0,0}, {i,3}), mx::reshape(rep_sd, {1,3}),
+                                              mx::slice(new_sdiff, {i+1,0}, {4,3})}, 0);
+                new_s_a = mx::concatenate({mx::slice(new_s_a, {0,0}, {i,3}), mx::reshape(rep_sa, {1,3}),
+                                            mx::slice(new_s_a, {i+1,0}, {4,3})}, 0);
+                new_s_b = mx::concatenate({mx::slice(new_s_b, {0,0}, {i,3}), mx::reshape(rep_sb, {1,3}),
+                                            mx::slice(new_s_b, {i+1,0}, {4,3})}, 0);
+            }
+        }
+        auto new_sn = mx::add(sn, mx::array(1));
+
+        // Compute all three update cases
+        auto z4x3 = mx::zeros({4,3}); auto z0 = mx::array(0); auto z3 = mx::zeros({3}); auto zb = mx::array(false);
+        mx::array upd_sdiff2=z4x3, upd_sa2=z4x3, upd_sb2=z4x3, upd_sn2=z0, upd_dir2=z3, upd_ovl2=zb;
+        gjk_update_line(new_sdiff, new_s_a, new_s_b, upd_sdiff2, upd_sa2, upd_sb2, upd_sn2, upd_dir2, upd_ovl2);
+
+        mx::array upd_sdiff3=z4x3, upd_sa3=z4x3, upd_sb3=z4x3, upd_sn3=z0, upd_dir3=z3, upd_ovl3=zb;
+        gjk_update_triangle(new_sdiff, new_s_a, new_s_b, upd_sdiff3, upd_sa3, upd_sb3, upd_sn3, upd_dir3, upd_ovl3);
+
+        mx::array upd_sdiff4=z4x3, upd_sa4=z4x3, upd_sb4=z4x3, upd_sn4=z0, upd_dir4=z3, upd_ovl4=zb;
+        gjk_update_tetrahedron(new_sdiff, new_s_a, new_s_b, upd_sdiff4, upd_sa4, upd_sb4, upd_sn4, upd_dir4, upd_ovl4);
+
+        // Select based on new_sn (2=line, 3=triangle, 4=tetrahedron)
+        auto is2 = mx::equal(new_sn, mx::array(2));
+        auto is3 = mx::equal(new_sn, mx::array(3));
+        // is4 = default (new_sn >= 4)
+
+        auto sel_sdiff = mx::where(is2, upd_sdiff2, mx::where(is3, upd_sdiff3, upd_sdiff4));
+        auto sel_sa = mx::where(is2, upd_sa2, mx::where(is3, upd_sa3, upd_sa4));
+        auto sel_sb = mx::where(is2, upd_sb2, mx::where(is3, upd_sb3, upd_sb4));
+        auto sel_sn = mx::where(is2, upd_sn2, mx::where(is3, upd_sn3, upd_sn4));
+        auto sel_dir = mx::where(is2, upd_dir2, mx::where(is3, upd_dir3, upd_dir4));
+        auto sel_ovl = mx::where(is2, upd_ovl2, mx::where(is3, upd_ovl3, upd_ovl4));
+
+        // If no progress: converge with no overlap
+        auto new_converged = mx::logical_or(converged, no_progress);
+        auto new_overlap = mx::logical_or(overlap, sel_ovl);
+        new_converged = mx::logical_or(new_converged, new_overlap);
+
+        // Mask: if already converged, keep old state
+        sdiff = mx::where(converged, sdiff, sel_sdiff);
+        s_a = mx::where(converged, s_a, sel_sa);
+        s_b = mx::where(converged, s_b, sel_sb);
+        sn = mx::where(converged, sn, sel_sn);
+        dir = mx::where(converged, dir, sel_dir);
+        auto dir_l = vmap_norm(dir);
+        dir = mx::where(mx::less(dir_l, mx::array(1e-12f)), mx::array({1.0f,0.0f,0.0f}), dir);
+        overlap = new_overlap;
+        converged = new_converged;
+    }
+
+    return {sdiff, s_a, s_b, sn, dir, converged, overlap};
+}
+
+// ── Support-based penetration depth (replaces EPA) ──────────────────────────
+// Sample ~20 directions, find minimum support width for penetration depth.
+
+static VmapCollResult vmap_gjk_depth(
+    const VmapConvexShape& A, const VmapConvexShape& B,
+    const VmapGJKState& state)
+{
+    // Sample directions: 6 axis-aligned + 8 diagonal + 4 from simplex face normals = 18
+    std::vector<std::array<float,3>> sample_dirs = {
+        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},
+        {0.577f,0.577f,0.577f},{-0.577f,0.577f,0.577f},
+        {0.577f,-0.577f,0.577f},{0.577f,0.577f,-0.577f},
+        {-0.577f,-0.577f,0.577f},{-0.577f,0.577f,-0.577f},
+        {0.577f,-0.577f,-0.577f},{-0.577f,-0.577f,-0.577f}
+    };
+
+    mx::array best_depth = mx::array(1e10f);
+    mx::array best_normal = mx::array({0.0f, 0.0f, 1.0f});
+    mx::array best_pa = A.pos;
+    mx::array best_pb = B.pos;
+
+    for (auto& sd : sample_dirs) {
+        auto d = mx::array({sd[0], sd[1], sd[2]});
+        auto pa = vmap_support(A, d);
+        auto pb = vmap_support(B, mx::negative(d));
+        auto width = mx::sum(mx::multiply(mx::subtract(pa, pb), d));
+        auto is_better = mx::less(width, best_depth);
+        best_depth = mx::where(is_better, width, best_depth);
+        best_normal = mx::where(is_better, d, best_normal);
+        best_pa = mx::where(is_better, pa, best_pa);
+        best_pb = mx::where(is_better, pb, best_pb);
+    }
+
+    // Also try simplex face normals (more accurate for actual penetration)
+    auto A0 = mx::flatten(mx::slice(state.sdiff, {0,0}, {1,3}));
+    auto A1 = mx::flatten(mx::slice(state.sdiff, {1,0}, {2,3}));
+    auto A2 = mx::flatten(mx::slice(state.sdiff, {2,0}, {3,3}));
+    auto A3 = mx::flatten(mx::slice(state.sdiff, {3,0}, {4,3}));
+
+    std::vector<std::pair<mx::array,mx::array>> face_pairs = {
+        {mx::subtract(A1, A0), mx::subtract(A2, A0)},
+        {mx::subtract(A2, A0), mx::subtract(A3, A0)},
+        {mx::subtract(A3, A0), mx::subtract(A1, A0)},
+        {mx::subtract(A2, A1), mx::subtract(A3, A1)}
+    };
+
+    for (auto& [e1, e2] : face_pairs) {
+        auto fn = mx::flatten(mx::linalg::cross(mx::reshape(e1, {1,3}), mx::reshape(e2, {1,3})));
+        auto fnl = vmap_norm(fn);
+        fn = mx::where(mx::less(fnl, mx::array(1e-8f)), mx::array({0.0f,0.0f,1.0f}),
+                        mx::divide(fn, mx::maximum(fnl, mx::array(1e-8f))));
+        // Try both orientations
+        for (int sign = -1; sign <= 1; sign += 2) {
+            auto d = (sign > 0) ? fn : mx::negative(fn);
+            auto pa = vmap_support(A, d);
+            auto pb = vmap_support(B, mx::negative(d));
+            auto width = mx::sum(mx::multiply(mx::subtract(pa, pb), d));
+            auto is_better = mx::less(width, best_depth);
+            best_depth = mx::where(is_better, width, best_depth);
+            best_normal = mx::where(is_better, d, best_normal);
+            best_pa = mx::where(is_better, pa, best_pa);
+            best_pb = mx::where(is_better, pb, best_pb);
+        }
+    }
+
+    auto contact_pos = mx::multiply(mx::add(best_pa, best_pb), mx::array(0.5f));
+    auto dist = mx::negative(mx::maximum(best_depth, mx::array(0.0f)));
+    return {mx::reshape(dist, {}), contact_pos, vmap_make_frame(best_normal)};
+}
+
+// ── Full vmap GJK collision: handles any convex pair ────────────────────────
+
+static VmapCollResult vmap_gjk_collision(const VmapConvexShape& A, const VmapConvexShape& B) {
+    auto state = vmap_gjk(A, B);
+
+    // For overlapping case: use support-based depth estimation
+    auto overlap_result = vmap_gjk_depth(A, B, state);
+
+    // For non-overlapping case: use GJK distance
+    // Closest point on simplex to origin (use last 2 points as line approximation)
+    auto p0 = mx::flatten(mx::slice(state.sdiff, {0,0}, {1,3}));
+    auto p1 = mx::flatten(mx::slice(state.sdiff, {1,0}, {2,3}));
+    auto seg = mx::subtract(p1, p0);
+    auto seg_sq = mx::sum(mx::multiply(seg, seg));
+    auto t = mx::negative(mx::sum(mx::multiply(p0, seg)));
+    t = mx::divide(t, mx::maximum(seg_sq, mx::array(1e-12f)));
+    t = mx::clip(t, mx::array(0.0f), mx::array(1.0f));
+    auto closest = mx::add(p0, mx::multiply(seg, t));
+    auto gap_dist = vmap_norm(closest);
+
+    // Witness points
+    auto wa0 = mx::flatten(mx::slice(state.sa, {0,0}, {1,3}));
+    auto wa1 = mx::flatten(mx::slice(state.sa, {1,0}, {2,3}));
+    auto wb0 = mx::flatten(mx::slice(state.sb, {0,0}, {1,3}));
+    auto wb1 = mx::flatten(mx::slice(state.sb, {1,0}, {2,3}));
+    auto wit_a = mx::add(wa0, mx::multiply(mx::subtract(wa1, wa0), t));
+    auto wit_b = mx::add(wb0, mx::multiply(mx::subtract(wb1, wb0), t));
+    auto sep_dir = mx::subtract(wit_a, wit_b);
+    auto sep_norm = vmap_normalize(sep_dir);
+    auto gap_pos = mx::multiply(mx::add(wit_a, wit_b), mx::array(0.5f));
+    VmapCollResult gap_result = {mx::reshape(gap_dist, {}), gap_pos, vmap_make_frame(sep_norm)};
+
+    // Select based on overlap flag
+    auto dist = mx::where(state.overlap, overlap_result.dist, gap_result.dist);
+    auto pos = mx::where(state.overlap, overlap_result.pos, gap_result.pos);
+    auto frame = mx::where(state.overlap, overlap_result.frame, gap_result.frame);
+    return {dist, pos, frame};
+}
+
+// ── Analytic vmap plane-mesh (vertex projection, no GJK needed) ─────────────
+
+static VmapCollResult vmap_plane_mesh_proper(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& mpos, const mx::array& mmat,
+    const mx::array& mesh_verts) // (nv, 3) pre-baked constant
+{
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto Rc = mx::reshape(mmat, {3,3});
+    // Transform ALL vertices to world: verts @ R^T + pos
+    auto world_verts = mx::add(
+        mx::matmul(mesh_verts, mx::transpose(Rc)),
+        mx::reshape(mpos, {1, 3})); // (nv, 3)
+    // Distance of each vertex to plane
+    auto dists = mx::matmul(
+        mx::subtract(world_verts, mx::reshape(ppos, {1, 3})),
+        mx::reshape(normal, {3, 1})); // (nv, 1)
+    // Deepest vertex
+    auto best_idx = mx::argmin(mx::flatten(dists));
+    auto best_vert = mx::flatten(mx::take(world_verts, mx::reshape(best_idx, {1}), 0)); // (3,)
+    auto dist = mx::reshape(mx::take(mx::flatten(dists), mx::reshape(best_idx, {1})), {}); // scalar
+    auto pos = mx::subtract(best_vert, mx::multiply(normal, dist));
+    return {dist, pos, vmap_make_frame(normal)};
 }
 
 // ── Vmap-compatible collision (top level) ────────────────────────────────────
@@ -673,18 +1194,25 @@ Data vmap_collision(const Model& m, Data d) {
             result = vmap_capsule_cylinder(p1, m1, cp.size1[0], cp.size1[1],
                                            p2, m2, cp.size2[0], cp.size2[1]);
         } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::MESH) {
-            // Approximate mesh radius from size[0] (MuJoCo stores bounding sphere info)
-            float mesh_r = std::max({cp.size2[0], cp.size2[1], cp.size2[2]});
-            if (mesh_r < 0.001f) mesh_r = 0.05f;
-            result = vmap_plane_mesh(p1, m1, p2, m2, mesh_r);
+            if (cp.mesh_verts2.size() > 0) {
+                result = vmap_plane_mesh_proper(p1, m1, p2, m2, cp.mesh_verts2);
+            } else {
+                result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+            }
         } else if (t2 == (int)GeomType::MESH || t1 == (int)GeomType::MESH) {
-            float s1 = (t1 == (int)GeomType::MESH) ?
-                std::max({cp.size1[0], cp.size1[1], cp.size1[2]}) : cp.size1[0];
-            float s2 = (t2 == (int)GeomType::MESH) ?
-                std::max({cp.size2[0], cp.size2[1], cp.size2[2]}) : cp.size2[0];
-            if (s1 < 0.001f) s1 = 0.05f;
-            if (s2 < 0.001f) s2 = 0.05f;
-            result = vmap_convex_mesh(p1, m1, s1, p2, m2, s2);
+            VmapConvexShape shapeA;
+            shapeA.kind = geom_type_to_kind(t1);
+            shapeA.pos = p1; shapeA.mat = m1;
+            shapeA.size[0] = cp.size1[0]; shapeA.size[1] = cp.size1[1]; shapeA.size[2] = cp.size1[2];
+            shapeA.verts = cp.mesh_verts1;
+
+            VmapConvexShape shapeB;
+            shapeB.kind = geom_type_to_kind(t2);
+            shapeB.pos = p2; shapeB.mat = m2;
+            shapeB.size[0] = cp.size2[0]; shapeB.size[1] = cp.size2[1]; shapeB.size[2] = cp.size2[2];
+            shapeB.verts = cp.mesh_verts2;
+
+            result = vmap_gjk_collision(shapeA, shapeB);
         } else {
             result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
         }

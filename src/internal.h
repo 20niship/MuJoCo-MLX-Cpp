@@ -247,6 +247,8 @@ struct Model {
             float size1[3], size2[3];
             int condim;
             int dataid1 = -1, dataid2 = -1; // mesh id for mesh geoms, -1 otherwise
+            mx::array mesh_verts1{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
+            mx::array mesh_verts2{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
         };
         std::vector<CollisionPair> collision_pairs;
         int max_ncon = 0;  // = collision_pairs.size()
