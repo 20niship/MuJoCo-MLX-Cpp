@@ -303,7 +303,31 @@ struct Model {
             float margin;
         };
         std::vector<LimitInfo> limits;
-        int max_nl = 0;  // = limits.size()
+
+        // Tendon limit plan
+        struct TendonLimitInfo {
+            int tendon_idx;
+            float range_low, range_high;
+            float solref[2];
+            float solimp[5];
+            float margin;
+            float invweight;
+            std::vector<float> tenJ_row;  // (nv,) precomputed tendon Jacobian row
+        };
+        std::vector<TendonLimitInfo> tendon_limits;
+
+        // Tendon friction plan
+        struct TendonFrictionInfo {
+            int tendon_idx;
+            float frictionloss;
+            float solref[2];
+            float solimp[5];
+            float invweight;
+            std::vector<float> tenJ_row;  // (nv,) precomputed tendon Jacobian row
+        };
+        std::vector<TendonFrictionInfo> tendon_frictions;
+
+        int max_nl = 0;  // = limits.size() + tendon_limits.size()
         int max_nefc = 0; // = max_nl + max_ncon (fixed constraint budget)
 
         // DOF info: precomputed for vectorized cdof
@@ -337,6 +361,17 @@ struct Model {
         mx::array act_moment_const{mx::array(0.0f)};
         mx::array act_qpos_idxs{mx::array(0.0f)};
         mx::array act_gear{mx::array(0.0f)};
+
+        // Activation dynamics cache (vmap-compatible, precomputed at model load)
+        mx::array act_is_stateful{mx::array(0.0f)};   // (nu,) float: 1.0 if actuator has activation state
+        mx::array act_adr_safe{mx::array(0.0f)};       // (nu,) int: max(actadr, 0) for safe gather
+        mx::array act_tau{mx::array(0.0f)};             // (nu,) float: dynprm[0] clamped to MIN_TAU
+        mx::array act_is_filter{mx::array(0.0f)};       // (nu,) float: 1.0 if FILTER or FILTEREXACT
+        mx::array act_is_integrator{mx::array(0.0f)};   // (nu,) float: 1.0 if INTEGRATOR
+        mx::array act_is_filterexact{mx::array(0.0f)};  // (nu,) float: 1.0 if FILTEREXACT
+        mx::array act_is_limited{mx::array(0.0f)};      // (nu,) float: 1.0 if activation limited
+        mx::array act_range_lo{mx::array(0.0f)};         // (nu,) float: actrange lower
+        mx::array act_range_hi{mx::array(0.0f)};         // (nu,) float: actrange upper
 
         // Precomputed passive force arrays
         mx::array passive_stiffness{mx::array(0.0f)};

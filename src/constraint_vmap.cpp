@@ -1711,6 +1711,33 @@ Data vmap_make_constraint(const Model& m, Data d) {
         }
     }
 
+    // ── Tendon friction loss ──
+    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS)) {
+        for (auto& tfi : c.tendon_frictions) {
+            auto J = mx::array(tfi.tenJ_row.data(), mx::Shape{m.nv}, mx::float32);
+
+            float pos_val = 0.0f;
+            mx::array pos(pos_val);
+            mx::array k(0.0f), b(0.0f), imp(0.0f);
+            vmap_kbi(tfi.solref[0], tfi.solref[1], m.opt.timestep, refsafe,
+                     tfi.solimp[0], tfi.solimp[1], tfi.solimp[2], tfi.solimp[3], tfi.solimp[4],
+                     pos, k, b, imp);
+
+            auto r = mx::maximum(mx::multiply(mx::array(tfi.invweight),
+                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
+
+            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
+                                      mx::multiply(mx::multiply(k, imp), pos));
+
+            J_rows.push_back(J);
+            D_vals.push_back(mx::reshape(mx::divide(mx::array(1.0f), r), mx::Shape{1}));
+            aref_vals.push_back(mx::reshape(aref, mx::Shape{1}));
+            floss_vals.push_back(mx::array({tfi.frictionloss}));
+            nf++;
+        }
+    }
+
     // ── Joint limits (fixed-size: always iterate all limits, mask inactive) ──
     if (!(m.opt.disableflags & DisableBit::LIMIT)) {
         for (auto& li : c.limits) {
@@ -1736,6 +1763,44 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 invw = m.dof_invweight0.data<float>()[li.dof_adr];
             }
             auto r = mx::maximum(mx::multiply(mx::array(invw),
+                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
+
+            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
+                                      mx::multiply(mx::multiply(k, imp), pos));
+
+            auto active = mx::less(pos, mx::array(0.0f));
+            auto d_val = mx::where(active, mx::divide(mx::array(1.0f), r), mx::array(0.0f));
+            auto aref_val = mx::where(active, aref, mx::array(0.0f));
+
+            J_rows.push_back(J);
+            D_vals.push_back(mx::flatten(d_val));
+            aref_vals.push_back(mx::flatten(aref_val));
+            floss_vals.push_back(mx::array({0.0f}));
+            nl++;
+        }
+    }
+
+    // ── Tendon limits ──
+    if (!(m.opt.disableflags & DisableBit::LIMIT) && d.ten_length.size() > 0) {
+        for (auto& tli : c.tendon_limits) {
+            int t = tli.tendon_idx;
+            auto ten_len = mx::flatten(mx::slice(d.ten_length, mx::Shape{t}, mx::Shape{t + 1}));
+            auto dist_min = mx::subtract(ten_len, mx::array(tli.range_low));
+            auto dist_max = mx::subtract(mx::array(tli.range_high), ten_len);
+            auto pos = mx::subtract(mx::minimum(dist_min, dist_max), mx::array(tli.margin));
+            auto sign = mx::where(mx::less(dist_min, dist_max), mx::array(1.0f), mx::array(-1.0f));
+
+            // J = sign * ten_J[t, :]
+            auto J_base = mx::array(tli.tenJ_row.data(), mx::Shape{m.nv}, mx::float32);
+            auto J = mx::multiply(J_base, sign);
+
+            mx::array k(0.0f), b(0.0f), imp(0.0f);
+            vmap_kbi(tli.solref[0], tli.solref[1], m.opt.timestep, refsafe,
+                     tli.solimp[0], tli.solimp[1], tli.solimp[2], tli.solimp[3], tli.solimp[4],
+                     pos, k, b, imp);
+
+            auto r = mx::maximum(mx::multiply(mx::array(tli.invweight),
                 mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
 
             auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));

@@ -599,7 +599,7 @@ See [Tendon System](#tendon-system) above.
 
 ### Phase 6: Actuator Dynamics
 
-- **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete (scalar path only). Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless.
+- **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete (scalar + vmap). Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless. Vmap path uses vectorized scatter-matmul for act_dot.
 - **6.3 MUSCLE**: **Deferred**. Biomechanical muscle model with piece-wise linear dynamics. Rarely used in standard RL models.
 
 ### Phase 7: Advanced Integrators
@@ -616,15 +616,15 @@ Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched)
 | Feature | Scalar | Vmap | Notes |
 |---------|--------|------|-------|
 | Euler integration | Yes | Yes (Metal kernel) | |
-| RK4 integration | Yes | No | Metal kernel is Euler-only |
-| Activation dynamics (act_dot) | Yes | No | vmap_fwd_actuation uses ctrl directly |
-| Tendon passive forces | Yes | No | vmap_passive has joint springs + DOF damping only |
-| Gravity compensation | Yes | No | vmap_passive omits gravcomp |
-| Tendon limit constraints | Yes | No | Only in scalar constraint.cpp |
-| Tendon friction loss | Yes | No | Only in scalar constraint.cpp |
+| RK4 integration | Yes | No | Metal kernel is Euler-only; deferred |
+| Activation dynamics (act_dot) | Yes | Yes | Vectorized via scatter-matmul |
+| Tendon passive forces | Yes | Yes | Vectorized via ten_J^T @ force |
+| Gravity compensation | Yes | No | Requires vmap-compatible Jacobian; deferred |
+| Tendon limit constraints | Yes | Yes | Precomputed tenJ_row in cache |
+| Tendon friction loss | Yes | Yes | Precomputed tenJ_row in cache |
 | mesh-* collision | GJK/EPA (64 iter) | GJK + depth est. (32 iter) | Both use proper mesh support |
 
-These gaps affect the batched pipeline: features implemented only in the scalar path work correctly for single-environment simulation but are missing from the high-throughput batched path. This is acceptable for common RL models (which rarely use tendon limits, tendon friction, or activation dynamics), but should be addressed before using the batched pipeline with models that require these features.
+Remaining gaps: **RK4** in batched (needs Metal kernel rewrite or multi-forward-pass) and **gravity compensation** in vmap (needs vmap-compatible body Jacobian computation). Both are deferred since they affect few RL models.
 
 ---
 

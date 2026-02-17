@@ -186,9 +186,9 @@ All features validated against MuJoCo C reference implementation. **230 tests ac
 - **Tendon limits** -- constraint rows for tendon length bounds, qacc diff ~1e-3
 - **Tendon friction loss** -- friction constraints through tendons, exact match
 - **Spatial tendons (wrapping geometry)** -- DEFERRED: MJX supports it but requires ~400 lines of geodesic path computation around spheres/cylinders; most RL models use fixed tendons only
-- Fixed tendons + passive forces: both scalar and vmap. Tendon limits/friction + transmission: scalar path only (not yet in vmap)
+- Fixed tendons + passive forces + limits + friction: both scalar and vmap. Transmission: scalar path
 
-### Phase 6: Actuator Dynamics (scalar path only)
+### Phase 6: Actuator Dynamics (scalar + vmap)
 - **FILTER dynamics** -- first-order low-pass `da/dt = (ctrl - act) / tau`, Euler integration
 - **FILTEREXACT dynamics** -- exact exponential integration of the same ODE
 - **INTEGRATOR dynamics** -- pure integration `da/dt = ctrl`

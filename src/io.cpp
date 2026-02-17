@@ -971,7 +971,99 @@ void Model::init_cache() const {
             cache.limits.push_back(li);
         }
     }
-    cache.max_nl = (int)cache.limits.size();
+    // Tendon limit + friction plans (for vmap)
+    if (ntendon > 0) {
+        // Precompute constant tendon Jacobians for fixed tendons
+        // ten_J[t, dof] = wrap_prm for JOINT wraps
+        std::vector<std::vector<float>> tenJ_rows(ntendon, std::vector<float>(nv, 0.0f));
+        if (nwrap > 0) {
+            mx::eval(wrap_type); mx::eval(wrap_objid); mx::eval(wrap_prm);
+            mx::eval(tendon_adr); mx::eval(tendon_num);
+            auto wt = wrap_type.data<int>();
+            auto wid = wrap_objid.data<int>();
+            auto wp = wrap_prm.data<float>();
+            auto tadr = tendon_adr.data<int>();
+            auto tnum = tendon_num.data<int>();
+            mx::eval(jnt_dofadr);
+            auto jda = jnt_dofadr.data<int>();
+
+            for (int t = 0; t < ntendon; t++) {
+                int a = tadr[t], n = tnum[t];
+                for (int w = a; w < a + n; w++) {
+                    if (wt[w] == 1) { // mjWRAP_JOINT
+                        int ji = wid[w];
+                        if (ji >= 0 && ji < njnt) {
+                            int da = jda[ji];
+                            tenJ_rows[t][da] = wp[w];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (tendon_limited.size() > 0) {
+            mx::eval(tendon_limited); mx::eval(tendon_range);
+            auto tlim = tendon_limited.data<int>();
+            auto trange = tendon_range.data<float>();
+            float* tmargin = nullptr;
+            if (tendon_margin.size() > 0) { mx::eval(tendon_margin); tmargin = const_cast<float*>(tendon_margin.data<float>()); }
+            float* tsolref_l = nullptr;
+            if (tendon_solref_lim.size() > 0) { mx::eval(tendon_solref_lim); tsolref_l = const_cast<float*>(tendon_solref_lim.data<float>()); }
+            float* tsolimp_l = nullptr;
+            if (tendon_solimp_lim.size() > 0) { mx::eval(tendon_solimp_lim); tsolimp_l = const_cast<float*>(tendon_solimp_lim.data<float>()); }
+            float* tinvw = nullptr;
+            if (tendon_invweight0.size() > 0) { mx::eval(tendon_invweight0); tinvw = const_cast<float*>(tendon_invweight0.data<float>()); }
+
+            for (int t = 0; t < ntendon; t++) {
+                if (!tlim[t]) continue;
+                ModelCache::TendonLimitInfo tli;
+                tli.tendon_idx = t;
+                tli.range_low = trange[t * 2];
+                tli.range_high = trange[t * 2 + 1];
+                tli.solref[0] = tsolref_l ? tsolref_l[t * 2] : 0.02f;
+                tli.solref[1] = tsolref_l ? tsolref_l[t * 2 + 1] : 1.0f;
+                tli.solimp[0] = tsolimp_l ? tsolimp_l[t*5] : 0.9f;
+                tli.solimp[1] = tsolimp_l ? tsolimp_l[t*5+1] : 0.95f;
+                tli.solimp[2] = tsolimp_l ? tsolimp_l[t*5+2] : 0.001f;
+                tli.solimp[3] = tsolimp_l ? tsolimp_l[t*5+3] : 0.5f;
+                tli.solimp[4] = tsolimp_l ? tsolimp_l[t*5+4] : 2.0f;
+                tli.margin = tmargin ? tmargin[t] : 0.0f;
+                tli.invweight = tinvw ? tinvw[t] : 1.0f;
+                tli.tenJ_row = tenJ_rows[t];
+                cache.tendon_limits.push_back(tli);
+            }
+        }
+
+        if (tendon_frictionloss.size() > 0) {
+            mx::eval(tendon_frictionloss);
+            auto tfl = tendon_frictionloss.data<float>();
+            float* tsolref_f = nullptr;
+            if (tendon_solref_fri.size() > 0) { mx::eval(tendon_solref_fri); tsolref_f = const_cast<float*>(tendon_solref_fri.data<float>()); }
+            float* tsolimp_f = nullptr;
+            if (tendon_solimp_fri.size() > 0) { mx::eval(tendon_solimp_fri); tsolimp_f = const_cast<float*>(tendon_solimp_fri.data<float>()); }
+            float* tinvw = nullptr;
+            if (tendon_invweight0.size() > 0) { mx::eval(tendon_invweight0); tinvw = const_cast<float*>(tendon_invweight0.data<float>()); }
+
+            for (int t = 0; t < ntendon; t++) {
+                if (tfl[t] <= 0.0f) continue;
+                ModelCache::TendonFrictionInfo tfi;
+                tfi.tendon_idx = t;
+                tfi.frictionloss = tfl[t];
+                tfi.solref[0] = tsolref_f ? tsolref_f[t * 2] : 0.02f;
+                tfi.solref[1] = tsolref_f ? tsolref_f[t * 2 + 1] : 1.0f;
+                tfi.solimp[0] = tsolimp_f ? tsolimp_f[t*5] : 0.9f;
+                tfi.solimp[1] = tsolimp_f ? tsolimp_f[t*5+1] : 0.95f;
+                tfi.solimp[2] = tsolimp_f ? tsolimp_f[t*5+2] : 0.001f;
+                tfi.solimp[3] = tsolimp_f ? tsolimp_f[t*5+3] : 0.5f;
+                tfi.solimp[4] = tsolimp_f ? tsolimp_f[t*5+4] : 2.0f;
+                tfi.invweight = tinvw ? tinvw[t] : 1.0f;
+                tfi.tenJ_row = tenJ_rows[t];
+                cache.tendon_frictions.push_back(tfi);
+            }
+        }
+    }
+
+    cache.max_nl = (int)cache.limits.size() + (int)cache.tendon_limits.size();
     // Compute max contact constraint rows accounting for condim and multi-contact pairs:
     // plane-box: up to 4 contacts, plane-cylinder: up to 6, capsule-box: up to 2, others: 1
     // condim=1: 1 row/contact, condim=3 pyramidal: 4 rows/contact, condim=4: 6, condim=6: 10
@@ -1014,7 +1106,7 @@ void Model::init_cache() const {
             else if (eq_t[i] == 2) max_ne += 1;  // JOINT
         }
     }
-    // Count DOF friction loss rows
+    // Count DOF friction loss rows + tendon friction rows
     int max_nf = 0;
     if (nv > 0) {
         mx::eval(dof_frictionloss);
@@ -1023,6 +1115,7 @@ void Model::init_cache() const {
             if (fl[i] > 0.0f) max_nf++;
         }
     }
+    max_nf += (int)cache.tendon_frictions.size();
     cache.max_nefc = max_ne + max_nf + cache.max_nl + max_contact_rows;
 
     // ── Joint integration plan ──
@@ -1132,6 +1225,59 @@ void Model::init_cache() const {
         cache.act_moment_const = mx::array(moment_data.data(), mx::Shape{nu, nv}, mx::float32);
         cache.act_qpos_idxs = mx::array(act_qpos_idx.data(), mx::Shape{nu}, mx::int32);
         cache.act_gear = mx::array(act_gear_vals.data(), mx::Shape{nu}, mx::float32);
+    }
+
+    // ── Activation dynamics cache for vmap ──
+    if (nu > 0 && na > 0 && actuator_dyntype.size() > 0 && actuator_actadr.size() > 0) {
+        constexpr int DYN_INTEGRATOR = 1, DYN_FILTER = 2, DYN_FILTEREXACT = 3;
+        constexpr float MIN_TAU = 1e-15f;
+
+        mx::eval(actuator_dyntype); mx::eval(actuator_dynprm);
+        mx::eval(actuator_actadr); mx::eval(actuator_actnum);
+        auto dyn_ptr = actuator_dyntype.data<int>();
+        auto prm_ptr = actuator_dynprm.data<float>();
+        auto adr_ptr = actuator_actadr.data<int>();
+
+        std::vector<float> is_stateful(nu, 0.0f), tau_vals(nu, 1.0f);
+        std::vector<int> adr_safe(nu, 0);
+        std::vector<float> is_filter(nu, 0.0f), is_integrator(nu, 0.0f), is_filterexact(nu, 0.0f);
+        std::vector<float> is_limited(nu, 0.0f), range_lo(nu, -1e10f), range_hi(nu, 1e10f);
+
+        for (int i = 0; i < nu; i++) {
+            int dyn = dyn_ptr[i];
+            int aa = adr_ptr[i];
+            if (dyn != 0 && aa >= 0) {
+                is_stateful[i] = 1.0f;
+                adr_safe[i] = aa;
+                tau_vals[i] = std::max(prm_ptr[i * 10], MIN_TAU);
+                if (dyn == DYN_FILTER) is_filter[i] = 1.0f;
+                if (dyn == DYN_FILTEREXACT) { is_filter[i] = 1.0f; is_filterexact[i] = 1.0f; }
+                if (dyn == DYN_INTEGRATOR) is_integrator[i] = 1.0f;
+            }
+        }
+
+        if (actuator_actlimited.size() > 0) {
+            mx::eval(actuator_actlimited); mx::eval(actuator_actrange);
+            auto alim = actuator_actlimited.data<int>();
+            auto arange = actuator_actrange.data<float>();
+            for (int i = 0; i < nu; i++) {
+                if (alim[i]) {
+                    is_limited[i] = 1.0f;
+                    range_lo[i] = arange[i * 2];
+                    range_hi[i] = arange[i * 2 + 1];
+                }
+            }
+        }
+
+        cache.act_is_stateful = mx::array(is_stateful.data(), mx::Shape{nu}, mx::float32);
+        cache.act_adr_safe = mx::array(adr_safe.data(), mx::Shape{nu}, mx::int32);
+        cache.act_tau = mx::array(tau_vals.data(), mx::Shape{nu}, mx::float32);
+        cache.act_is_filter = mx::array(is_filter.data(), mx::Shape{nu}, mx::float32);
+        cache.act_is_integrator = mx::array(is_integrator.data(), mx::Shape{nu}, mx::float32);
+        cache.act_is_filterexact = mx::array(is_filterexact.data(), mx::Shape{nu}, mx::float32);
+        cache.act_is_limited = mx::array(is_limited.data(), mx::Shape{nu}, mx::float32);
+        cache.act_range_lo = mx::array(range_lo.data(), mx::Shape{nu}, mx::float32);
+        cache.act_range_hi = mx::array(range_hi.data(), mx::Shape{nu}, mx::float32);
     }
 
     // ── Precomputed passive force arrays ──
