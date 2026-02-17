@@ -1,0 +1,46 @@
+<!-- Stiff spring system for implicit integrator benchmarking.
+     High stiffness + moderate damping creates a system that requires
+     implicit integration for stability. Euler integration will diverge
+     at this timestep. -->
+<mujoco model="stiff_springs">
+  <option gravity="0 0 -9.81" timestep="0.005" integrator="implicitfast"/>
+
+  <worldbody>
+    <!-- Vertical chain of masses connected by stiff springs -->
+    <body name="m1" pos="0 0 2.0">
+      <joint name="j1" type="slide" axis="0 0 1" stiffness="10000" damping="20"/>
+      <geom type="sphere" size="0.08" mass="1.0" rgba="1 0 0 1"/>
+
+      <body name="m2" pos="0 0 -0.3">
+        <joint name="j2" type="slide" axis="0 0 1" stiffness="8000" damping="15"/>
+        <geom type="sphere" size="0.08" mass="0.8" rgba="0 1 0 1"/>
+
+        <body name="m3" pos="0 0 -0.3">
+          <joint name="j3" type="slide" axis="0 0 1" stiffness="6000" damping="12"/>
+          <geom type="sphere" size="0.08" mass="0.6" rgba="0 0 1 1"/>
+
+          <body name="m4" pos="0 0 -0.3">
+            <joint name="j4" type="slide" axis="0 0 1" stiffness="5000" damping="10"/>
+            <geom type="sphere" size="0.08" mass="0.5" rgba="1 1 0 1"/>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- Horizontal chain -->
+    <body name="h1" pos="0.5 0 1.0">
+      <joint name="hj1" type="slide" axis="1 0 0" stiffness="12000" damping="25"/>
+      <geom type="sphere" size="0.06" mass="0.5" rgba="0.5 0.5 0.5 1"/>
+
+      <body name="h2" pos="0.3 0 0">
+        <joint name="hj2" type="slide" axis="1 0 0" stiffness="9000" damping="18"/>
+        <geom type="sphere" size="0.06" mass="0.5" rgba="0.6 0.6 0.6 1"/>
+
+        <body name="h3" pos="0.3 0 0">
+          <joint name="hj3" type="slide" axis="1 0 0" stiffness="7000" damping="14"/>
+          <geom type="sphere" size="0.06" mass="0.5" rgba="0.7 0.7 0.7 1"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

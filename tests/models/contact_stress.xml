@@ -1,0 +1,70 @@
+<!-- Contact stress test: 50 free bodies (spheres) dropped on a plane.
+     Generates 50+ simultaneous contacts for solver stress testing.
+     Used to benchmark contact/constraint/solver throughput. -->
+<mujoco model="contact_stress">
+  <option gravity="0 0 -9.81" timestep="0.002"/>
+
+  <default>
+    <geom type="sphere" size="0.06" mass="0.3" rgba="0.4 0.6 0.8 1"/>
+  </default>
+
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 0.1" rgba="0.3 0.3 0.3 1"/>
+
+    <!-- Layer 1: z=0.5, 5x5 grid -->
+    <body name="b00" pos="-0.4 -0.4 0.5"><freejoint/><geom/></body>
+    <body name="b01" pos="-0.2 -0.4 0.5"><freejoint/><geom/></body>
+    <body name="b02" pos=" 0.0 -0.4 0.5"><freejoint/><geom/></body>
+    <body name="b03" pos=" 0.2 -0.4 0.5"><freejoint/><geom/></body>
+    <body name="b04" pos=" 0.4 -0.4 0.5"><freejoint/><geom/></body>
+    <body name="b05" pos="-0.4 -0.2 0.5"><freejoint/><geom/></body>
+    <body name="b06" pos="-0.2 -0.2 0.5"><freejoint/><geom/></body>
+    <body name="b07" pos=" 0.0 -0.2 0.5"><freejoint/><geom/></body>
+    <body name="b08" pos=" 0.2 -0.2 0.5"><freejoint/><geom/></body>
+    <body name="b09" pos=" 0.4 -0.2 0.5"><freejoint/><geom/></body>
+    <body name="b10" pos="-0.4  0.0 0.5"><freejoint/><geom/></body>
+    <body name="b11" pos="-0.2  0.0 0.5"><freejoint/><geom/></body>
+    <body name="b12" pos=" 0.0  0.0 0.5"><freejoint/><geom/></body>
+    <body name="b13" pos=" 0.2  0.0 0.5"><freejoint/><geom/></body>
+    <body name="b14" pos=" 0.4  0.0 0.5"><freejoint/><geom/></body>
+    <body name="b15" pos="-0.4  0.2 0.5"><freejoint/><geom/></body>
+    <body name="b16" pos="-0.2  0.2 0.5"><freejoint/><geom/></body>
+    <body name="b17" pos=" 0.0  0.2 0.5"><freejoint/><geom/></body>
+    <body name="b18" pos=" 0.2  0.2 0.5"><freejoint/><geom/></body>
+    <body name="b19" pos=" 0.4  0.2 0.5"><freejoint/><geom/></body>
+    <body name="b20" pos="-0.4  0.4 0.5"><freejoint/><geom/></body>
+    <body name="b21" pos="-0.2  0.4 0.5"><freejoint/><geom/></body>
+    <body name="b22" pos=" 0.0  0.4 0.5"><freejoint/><geom/></body>
+    <body name="b23" pos=" 0.2  0.4 0.5"><freejoint/><geom/></body>
+    <body name="b24" pos=" 0.4  0.4 0.5"><freejoint/><geom/></body>
+
+    <!-- Layer 2: z=0.8, 5x5 grid (offset by 0.1) -->
+    <body name="b25" pos="-0.3 -0.3 0.8"><freejoint/><geom/></body>
+    <body name="b26" pos="-0.1 -0.3 0.8"><freejoint/><geom/></body>
+    <body name="b27" pos=" 0.1 -0.3 0.8"><freejoint/><geom/></body>
+    <body name="b28" pos=" 0.3 -0.3 0.8"><freejoint/><geom/></body>
+    <body name="b29" pos="-0.3 -0.1 0.8"><freejoint/><geom/></body>
+    <body name="b30" pos="-0.1 -0.1 0.8"><freejoint/><geom/></body>
+    <body name="b31" pos=" 0.1 -0.1 0.8"><freejoint/><geom/></body>
+    <body name="b32" pos=" 0.3 -0.1 0.8"><freejoint/><geom/></body>
+    <body name="b33" pos="-0.3  0.1 0.8"><freejoint/><geom/></body>
+    <body name="b34" pos="-0.1  0.1 0.8"><freejoint/><geom/></body>
+    <body name="b35" pos=" 0.1  0.1 0.8"><freejoint/><geom/></body>
+    <body name="b36" pos=" 0.3  0.1 0.8"><freejoint/><geom/></body>
+    <body name="b37" pos="-0.3  0.3 0.8"><freejoint/><geom/></body>
+    <body name="b38" pos="-0.1  0.3 0.8"><freejoint/><geom/></body>
+    <body name="b39" pos=" 0.1  0.3 0.8"><freejoint/><geom/></body>
+    <body name="b40" pos=" 0.3  0.3 0.8"><freejoint/><geom/></body>
+
+    <!-- Layer 3: z=1.1, 3x3 grid (top of pile) -->
+    <body name="b41" pos="-0.2 -0.2 1.1"><freejoint/><geom/></body>
+    <body name="b42" pos=" 0.0 -0.2 1.1"><freejoint/><geom/></body>
+    <body name="b43" pos=" 0.2 -0.2 1.1"><freejoint/><geom/></body>
+    <body name="b44" pos="-0.2  0.0 1.1"><freejoint/><geom/></body>
+    <body name="b45" pos=" 0.0  0.0 1.1"><freejoint/><geom/></body>
+    <body name="b46" pos=" 0.2  0.0 1.1"><freejoint/><geom/></body>
+    <body name="b47" pos="-0.2  0.2 1.1"><freejoint/><geom/></body>
+    <body name="b48" pos=" 0.0  0.2 1.1"><freejoint/><geom/></body>
+    <body name="b49" pos=" 0.2  0.2 1.1"><freejoint/><geom/></body>
+  </worldbody>
+</mujoco>

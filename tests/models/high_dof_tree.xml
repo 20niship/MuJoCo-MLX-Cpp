@@ -1,0 +1,163 @@
+<!-- High-DOF humanoid tree model (~63 hinge joints, nv~69 with freejoint).
+     Approximates the Synth model's DOF count for Metal pipeline stress testing.
+     21 bodies, 3 hinge joints per body (x/y/z rotation), similar bone hierarchy. -->
+<mujoco model="high_dof_tree">
+  <option gravity="0 0 -9.81" timestep="0.002"/>
+
+  <default>
+    <geom type="capsule" rgba="0.7 0.5 0.3 1"/>
+    <joint damping="0.5" armature="0.01"/>
+    <motor gear="20"/>
+  </default>
+
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 0.1" rgba="0.3 0.3 0.3 1"/>
+
+    <!-- Root: pelvis with freejoint -->
+    <body name="pelvis" pos="0 0 1.0">
+      <freejoint name="root"/>
+      <geom size="0.1 0.12" mass="8"/>
+
+      <!-- Spine chain: 4 segments -->
+      <body name="spine1" pos="0 0 0.14">
+        <joint name="sp1_x" type="hinge" axis="1 0 0" range="-30 30"/>
+        <joint name="sp1_y" type="hinge" axis="0 1 0" range="-30 30"/>
+        <joint name="sp1_z" type="hinge" axis="0 0 1" range="-20 20"/>
+        <geom size="0.08 0.1" mass="4"/>
+
+        <body name="spine2" pos="0 0 0.12">
+          <joint name="sp2_x" type="hinge" axis="1 0 0" range="-25 25"/>
+          <joint name="sp2_y" type="hinge" axis="0 1 0" range="-25 25"/>
+          <joint name="sp2_z" type="hinge" axis="0 0 1" range="-15 15"/>
+          <geom size="0.08 0.1" mass="4"/>
+
+          <body name="chest" pos="0 0 0.12">
+            <joint name="ch_x" type="hinge" axis="1 0 0" range="-20 20"/>
+            <joint name="ch_y" type="hinge" axis="0 1 0" range="-20 20"/>
+            <joint name="ch_z" type="hinge" axis="0 0 1" range="-15 15"/>
+            <geom size="0.1 0.1" mass="6"/>
+
+            <body name="neck" pos="0 0 0.12">
+              <joint name="nk_x" type="hinge" axis="1 0 0" range="-40 40"/>
+              <joint name="nk_y" type="hinge" axis="0 1 0" range="-40 40"/>
+              <joint name="nk_z" type="hinge" axis="0 0 1" range="-30 30"/>
+              <geom type="sphere" size="0.08" mass="4"/>
+            </body>
+
+            <!-- Left arm: 3 segments -->
+            <body name="l_shoulder" pos="0.18 0 0.08">
+              <joint name="ls_x" type="hinge" axis="1 0 0" range="-90 90"/>
+              <joint name="ls_y" type="hinge" axis="0 1 0" range="-90 90"/>
+              <joint name="ls_z" type="hinge" axis="0 0 1" range="-90 90"/>
+              <geom size="0.04 0.12" mass="1.5"/>
+
+              <body name="l_elbow" pos="0 0 -0.26">
+                <joint name="le_x" type="hinge" axis="1 0 0" range="-120 5"/>
+                <joint name="le_y" type="hinge" axis="0 1 0" range="-90 90"/>
+                <joint name="le_z" type="hinge" axis="0 0 1" range="-90 90"/>
+                <geom size="0.035 0.1" mass="1.0"/>
+
+                <body name="l_hand" pos="0 0 -0.22">
+                  <joint name="lh_x" type="hinge" axis="1 0 0" range="-60 60"/>
+                  <joint name="lh_y" type="hinge" axis="0 1 0" range="-60 60"/>
+                  <joint name="lh_z" type="hinge" axis="0 0 1" range="-60 60"/>
+                  <geom size="0.025 0.04" mass="0.3"/>
+                </body>
+              </body>
+            </body>
+
+            <!-- Right arm: 3 segments -->
+            <body name="r_shoulder" pos="-0.18 0 0.08">
+              <joint name="rs_x" type="hinge" axis="1 0 0" range="-90 90"/>
+              <joint name="rs_y" type="hinge" axis="0 1 0" range="-90 90"/>
+              <joint name="rs_z" type="hinge" axis="0 0 1" range="-90 90"/>
+              <geom size="0.04 0.12" mass="1.5"/>
+
+              <body name="r_elbow" pos="0 0 -0.26">
+                <joint name="re_x" type="hinge" axis="1 0 0" range="-120 5"/>
+                <joint name="re_y" type="hinge" axis="0 1 0" range="-90 90"/>
+                <joint name="re_z" type="hinge" axis="0 0 1" range="-90 90"/>
+                <geom size="0.035 0.1" mass="1.0"/>
+
+                <body name="r_hand" pos="0 0 -0.22">
+                  <joint name="rh_x" type="hinge" axis="1 0 0" range="-60 60"/>
+                  <joint name="rh_y" type="hinge" axis="0 1 0" range="-60 60"/>
+                  <joint name="rh_z" type="hinge" axis="0 0 1" range="-60 60"/>
+                  <geom size="0.025 0.04" mass="0.3"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- Left leg: 3 segments -->
+      <body name="l_hip" pos="0.1 0 -0.14">
+        <joint name="lh2_x" type="hinge" axis="1 0 0" range="-60 120"/>
+        <joint name="lh2_y" type="hinge" axis="0 1 0" range="-45 45"/>
+        <joint name="lh2_z" type="hinge" axis="0 0 1" range="-45 45"/>
+        <geom size="0.05 0.18" mass="4"/>
+
+        <body name="l_knee" pos="0 0 -0.38">
+          <joint name="lk_x" type="hinge" axis="1 0 0" range="-5 130"/>
+          <joint name="lk_y" type="hinge" axis="0 1 0" range="-10 10"/>
+          <joint name="lk_z" type="hinge" axis="0 0 1" range="-10 10"/>
+          <geom size="0.04 0.15" mass="2.5"/>
+
+          <body name="l_ankle" pos="0 0 -0.32">
+            <joint name="la_x" type="hinge" axis="1 0 0" range="-40 40"/>
+            <joint name="la_y" type="hinge" axis="0 1 0" range="-30 30"/>
+            <joint name="la_z" type="hinge" axis="0 0 1" range="-20 20"/>
+            <geom size="0.03 0.06" mass="0.8"/>
+          </body>
+        </body>
+      </body>
+
+      <!-- Right leg: 3 segments -->
+      <body name="r_hip" pos="-0.1 0 -0.14">
+        <joint name="rh2_x" type="hinge" axis="1 0 0" range="-60 120"/>
+        <joint name="rh2_y" type="hinge" axis="0 1 0" range="-45 45"/>
+        <joint name="rh2_z" type="hinge" axis="0 0 1" range="-45 45"/>
+        <geom size="0.05 0.18" mass="4"/>
+
+        <body name="r_knee" pos="0 0 -0.38">
+          <joint name="rk_x" type="hinge" axis="1 0 0" range="-5 130"/>
+          <joint name="rk_y" type="hinge" axis="0 1 0" range="-10 10"/>
+          <joint name="rk_z" type="hinge" axis="0 0 1" range="-10 10"/>
+          <geom size="0.04 0.15" mass="2.5"/>
+
+          <body name="r_ankle" pos="0 0 -0.32">
+            <joint name="ra_x" type="hinge" axis="1 0 0" range="-40 40"/>
+            <joint name="ra_y" type="hinge" axis="0 1 0" range="-30 30"/>
+            <joint name="ra_z" type="hinge" axis="0 0 1" range="-20 20"/>
+            <geom size="0.03 0.06" mass="0.8"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Spine (12) -->
+    <motor joint="sp1_x"/><motor joint="sp1_y"/><motor joint="sp1_z"/>
+    <motor joint="sp2_x"/><motor joint="sp2_y"/><motor joint="sp2_z"/>
+    <motor joint="ch_x"/><motor joint="ch_y"/><motor joint="ch_z"/>
+    <motor joint="nk_x"/><motor joint="nk_y"/><motor joint="nk_z"/>
+    <!-- Left arm (9) -->
+    <motor joint="ls_x"/><motor joint="ls_y"/><motor joint="ls_z"/>
+    <motor joint="le_x"/><motor joint="le_y"/><motor joint="le_z"/>
+    <motor joint="lh_x"/><motor joint="lh_y"/><motor joint="lh_z"/>
+    <!-- Right arm (9) -->
+    <motor joint="rs_x"/><motor joint="rs_y"/><motor joint="rs_z"/>
+    <motor joint="re_x"/><motor joint="re_y"/><motor joint="re_z"/>
+    <motor joint="rh_x"/><motor joint="rh_y"/><motor joint="rh_z"/>
+    <!-- Left leg (9) -->
+    <motor joint="lh2_x"/><motor joint="lh2_y"/><motor joint="lh2_z"/>
+    <motor joint="lk_x"/><motor joint="lk_y"/><motor joint="lk_z"/>
+    <motor joint="la_x"/><motor joint="la_y"/><motor joint="la_z"/>
+    <!-- Right leg (9) -->
+    <motor joint="rh2_x"/><motor joint="rh2_y"/><motor joint="rh2_z"/>
+    <motor joint="rk_x"/><motor joint="rk_y"/><motor joint="rk_z"/>
+    <motor joint="ra_x"/><motor joint="ra_y"/><motor joint="ra_z"/>
+  </actuator>
+</mujoco>

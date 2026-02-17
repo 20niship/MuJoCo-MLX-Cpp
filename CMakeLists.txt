@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(MJMLX_BUILD_TESTS "Build tests" ON)
+option(MJMLX_BUILD_BENCHMARKS "Build benchmark executables" ON)
 option(MJMLX_BUILD_PYTHON "Build Python bindings via nanobind" OFF)
 option(MJMLX_BUILD_EXAMPLES "Build example programs" ON)
 
@@ -277,6 +278,7 @@ if(MJMLX_BUILD_TESTS)
 
     # Self-contained tests (no model path needed)
     add_test(NAME math_full COMMAND test_math_full)
+    set_tests_properties(math_full PROPERTIES LABELS "correctness")
 
     # Tests that optionally use a model path
     if(MJMLX_TEST_MODEL)
@@ -298,6 +300,49 @@ if(MJMLX_BUILD_TESTS)
         add_test(NAME linalg_full COMMAND test_linalg_full)
         add_test(NAME vmap_smooth COMMAND test_vmap_smooth)
     endif()
+
+    # Label all correctness tests
+    set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)
+    if(MJMLX_TEST_MODEL)
+        list(APPEND _correctness_tests batched_diag batched)
+    endif()
+    foreach(_ct ${_correctness_tests})
+        set_tests_properties(${_ct} PROPERTIES LABELS "correctness")
+    endforeach()
+endif()
+
+# ── Benchmarks ────────────────────────────────────────────────
+if(MJMLX_BUILD_BENCHMARKS AND MJMLX_BUILD_TESTS)
+    # Baseline benchmark (uses test_utils.h + bench_utils.h + test_models.h)
+    add_executable(bench_baseline tests/bench_baseline.cpp)
+    target_link_libraries(bench_baseline PRIVATE mjmlx mujoco_imported)
+    target_include_directories(bench_baseline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    # Fix MuJoCo dylib reference for benchmark executables
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET bench_baseline POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:bench_baseline>"
+            COMMENT "Fixing MuJoCo dylib for bench_baseline"
+        )
+    endif()
+
+    # Register benchmark in CTest with "benchmark" label
+    if(MJMLX_TEST_MODEL)
+        add_test(NAME bench_baseline COMMAND bench_baseline ${MJMLX_TEST_MODEL}
+            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/history.csv")
+    else()
+        add_test(NAME bench_baseline COMMAND bench_baseline ""
+            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/history.csv")
+    endif()
+    set_tests_properties(bench_baseline PROPERTIES LABELS "benchmark")
+
+    # Copy benchmark model files to build directory for easy access
+    file(COPY tests/models DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/tests)
 endif()
 
 # ── Python bindings ───────────────────────────────────────────
