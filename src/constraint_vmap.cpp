@@ -1663,6 +1663,54 @@ Data vmap_make_constraint(const Model& m, Data d) {
         }
     }
 
+    // ── DOF friction loss (MUST come after equality, before limits) ─────────
+    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS) && m.dof_frictionloss.size() > 0) {
+        mx::eval(m.dof_frictionloss);
+        mx::eval(m.dof_invweight0);
+        mx::eval(m.dof_solref);
+        mx::eval(m.dof_solimp);
+        auto fl_ptr = m.dof_frictionloss.data<float>();
+        auto iw_ptr = m.dof_invweight0.data<float>();
+        auto sr_ptr = m.dof_solref.data<float>();
+        auto si_ptr = m.dof_solimp.data<float>();
+
+        for (int i = 0; i < m.nv; i++) {
+            if (fl_ptr[i] <= 0.0f) continue;
+
+            // J = identity row for this DOF
+            std::vector<float> jr(m.nv, 0.0f);
+            jr[i] = 1.0f;
+            auto J = mx::array(jr.data(), mx::Shape{m.nv}, mx::float32);
+
+            auto pos = mx::array({0.0f});  // no positional error for friction
+            float invw = iw_ptr[i];
+            float solref0 = sr_ptr[i * 2], solref1 = sr_ptr[i * 2 + 1];
+            float si0 = si_ptr[i*5], si1 = si_ptr[i*5+1], si2 = si_ptr[i*5+2];
+            float si3 = si_ptr[i*5+3], si4 = si_ptr[i*5+4];
+
+            mx::array k(0.0f), b_val(0.0f), imp(0.0f);
+            vmap_kbi(solref0, solref1, m.opt.timestep, refsafe,
+                     si0, si1, si2, si3, si4, pos, k, b_val, imp);
+
+            auto r = mx::maximum(mx::multiply(mx::array(invw),
+                mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
+
+            // J @ qvel = qvel[i]
+            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto aref = mx::subtract(mx::negative(mx::multiply(b_val, j_dot_qvel)),
+                                      mx::multiply(mx::multiply(k, imp), pos));
+
+            // Friction constraints are always active
+            auto d_val = mx::divide(mx::array(1.0f), r);
+
+            J_rows.push_back(J);
+            D_vals.push_back(mx::flatten(d_val));
+            aref_vals.push_back(mx::flatten(aref));
+            floss_vals.push_back(mx::array({fl_ptr[i]}));
+            nf++;
+        }
+    }
+
     // ── Joint limits (fixed-size: always iterate all limits, mask inactive) ──
     if (!(m.opt.disableflags & DisableBit::LIMIT)) {
         for (auto& li : c.limits) {

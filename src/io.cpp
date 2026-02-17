@@ -175,6 +175,10 @@ static Model convert_model(mjModel* m) {
         model.dof_damping = to_mx_f(m->dof_damping, (int)m->nv);
         model.dof_invweight0 = to_mx_f(m->dof_invweight0, (int)m->nv);
         model.dof_frictionloss = to_mx_f(m->dof_frictionloss, (int)m->nv);
+        model.dof_solref = to_mx_f(m->dof_solref, (int)m->nv * 2);
+        model.dof_solref = mx::reshape(model.dof_solref, {(int)m->nv, 2});
+        model.dof_solimp = to_mx_f(m->dof_solimp, (int)m->nv * 5);
+        model.dof_solimp = mx::reshape(model.dof_solimp, {(int)m->nv, 5});
     }
 
     // Site properties
@@ -984,7 +988,16 @@ void Model::init_cache() const {
             else if (eq_t[i] == 2) max_ne += 1;  // JOINT
         }
     }
-    cache.max_nefc = max_ne + cache.max_nl + max_contact_rows;
+    // Count DOF friction loss rows
+    int max_nf = 0;
+    if (nv > 0) {
+        mx::eval(dof_frictionloss);
+        auto fl = dof_frictionloss.data<float>();
+        for (int i = 0; i < nv; i++) {
+            if (fl[i] > 0.0f) max_nf++;
+        }
+    }
+    cache.max_nefc = max_ne + max_nf + cache.max_nl + max_contact_rows;
 
     // ── Joint integration plan ──
     if (njnt > 0) {

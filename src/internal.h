@@ -160,6 +160,8 @@ struct Model {
     mx::array dof_damping{mx::array({})};
     mx::array dof_invweight0{mx::array({})};
     mx::array dof_frictionloss{mx::array({})};
+    mx::array dof_solref{mx::array({})};   // (nv, 2) solver reference params for friction loss
+    mx::array dof_solimp{mx::array({})};   // (nv, 5) solver impedance params for friction loss
 
     // Site properties
     mx::array site_bodyid{mx::array({})};

@@ -405,6 +405,44 @@ Data make_constraint(const Model& m, Data d) {
         }
     }
 
+    // ── DOF friction loss (MUST come after equality, before limits) ─────────
+    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS) && m.dof_frictionloss.size() > 0) {
+        mx::eval(m.dof_frictionloss);
+        mx::eval(m.dof_invweight0);
+        mx::eval(m.dof_solref);
+        mx::eval(m.dof_solimp);
+        auto fl_ptr = m.dof_frictionloss.data<float>();
+        auto iw_ptr = m.dof_invweight0.data<float>();
+        auto sr_ptr = m.dof_solref.data<float>();
+        auto si_ptr = m.dof_solimp.data<float>();
+
+        for (int i = 0; i < m.nv; i++) {
+            if (fl_ptr[i] <= 0.0f) continue;
+
+            // J = identity row for this DOF
+            std::vector<float> j_row(m.nv, 0.0f);
+            j_row[i] = 1.0f;
+
+            float pos = 0.0f;  // no positional error for friction
+            float invw = iw_ptr[i];
+            float solref0 = sr_ptr[i * 2], solref1 = sr_ptr[i * 2 + 1];
+            float si0 = si_ptr[i*5], si1 = si_ptr[i*5+1], si2 = si_ptr[i*5+2];
+            float si3 = si_ptr[i*5+3], si4 = si_ptr[i*5+4];
+
+            auto [k, b, imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos);
+            float r = std::max(invw * (1.0f - imp) / imp, MJMINVAL);
+
+            float jdot_qvel = qvel_ptr[i];  // J is identity row, so J @ qvel = qvel[i]
+            float aref = -b * jdot_qvel - k * imp * pos;  // pos=0, so aref = -b * qvel[i]
+
+            efc_J_rows.push_back(j_row);
+            efc_D_vals.push_back(1.0f / r);
+            efc_aref_vals.push_back(aref);
+            efc_floss_vals.push_back(fl_ptr[i]);
+            nf++;
+        }
+    }
+
     // ── Joint limits ──────────────────────────────────────────────────────
     if (!(m.opt.disableflags & DisableBit::LIMIT) && m.jnt_limited.size() > 0) {
         mx::eval(m.jnt_limited); mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr);
