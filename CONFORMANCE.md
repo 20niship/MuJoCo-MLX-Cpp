@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 2 contact friction complete — all condim 1-6 pyramidal).
+Last updated: 2026-02-11 (Phase 3.1 BOX collisions complete).
 
 ## Table of Contents
 
@@ -55,6 +55,26 @@ Key results:
 - Impedance: `R_py = 2μ²·R_normal·(1+μ²) / impratio`
 - Both scalar and vmap/batched paths implemented
 
+## Phase 3.1 Conformance (Completed 2026-02-11)
+
+BOX collision detection — unlocks models with box geoms (tables, shelves, blocks,
+Franka Panda bodies). Implements all 4 collision pair types involving boxes.
+
+| Feature | Status | Tests |
+|---------|--------|-------|
+| plane-box (multi-contact, up to 4) | Done | 6 tests in `test_collision_box.cpp` |
+| sphere-box (closest-point on OBB) | Done | Included in above |
+| capsule-box (segment-OBB approach) | Done | Included in above |
+| box-box (SAT, 15 axes) | Done | Included in above |
+
+Key results:
+- plane-box ncon/nefc matches MuJoCo C exactly (4 contacts, 16 efc rows)
+- qacc diff after 1 step: 0.000004 (near-perfect match)
+- qpos diff after 100 steps: 0.000000 (exact match)
+- Both scalar and vmap/batched paths implemented
+- Algorithms: multi-vertex face contact (plane-box), OBB closest-point (sphere-box),
+  iterative segment-OBB (capsule-box), Separating Axis Theorem with 15 axes (box-box)
+
 ---
 
 ## Scale Comparison
@@ -90,7 +110,7 @@ across 6 files to a 9x9 geom-type dispatch table with analytic, convex
 | CAPSULE | Yes | Yes | Yes |
 | ELLIPSOID | Yes | Partial (SDF) | **No** |
 | CYLINDER | Yes | Partial (SDF) | **No** |
-| BOX | Yes | Yes (as mesh) | **No** |
+| BOX | Yes | Yes (as mesh) | Yes |
 | MESH | Yes | Yes (vertex limit) | **No** |
 | SDF | Yes | Yes | **No** |
 
@@ -103,15 +123,15 @@ MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 5:
 | plane-sphere | `mjc_PlaneSphere` | Yes | Yes |
 | plane-capsule | `mjc_PlaneCapsule` | Yes | Yes |
 | plane-cylinder | `mjc_PlaneCylinder` | Yes | **No** |
-| plane-box | `mjc_PlaneBox` | Yes | **No** |
+| plane-box | `mjc_PlaneBox` | Yes | Yes (multi-contact, up to 4) |
 | plane-convex | `mjc_PlaneConvex` | Yes | **No** |
 | sphere-sphere | `mjc_SphereSphere` | Yes | Yes |
 | sphere-capsule | `mjc_SphereCapsule` | Yes | Yes |
 | sphere-cylinder | `mjc_SphereCylinder` | Yes | **No** |
-| sphere-box | `mjc_SphereBox` | Yes | **No** |
+| sphere-box | `mjc_SphereBox` | Yes | Yes |
 | capsule-capsule | `mjc_CapsuleCapsule` | Yes | Yes |
-| capsule-box | `mjc_CapsuleBox` | Yes | **No** |
-| box-box | `mjc_BoxBox` | Yes | **No** |
+| capsule-box | `mjc_CapsuleBox` | Yes | Yes |
+| box-box | `mjc_BoxBox` | Yes | Yes (SAT, single contact) |
 | convex-convex | GJK/EPA | GJK/SAT | **No** |
 | mesh-* | GJK/EPA | SAT (vertex limit) | **No** |
 | hfield-* | `mjc_ConvexHField` | Yes | **No** |
@@ -135,9 +155,10 @@ the `init_cache()` collision pair pre-filter (for the vmap path) and the scalar
 
 ### Impact
 
-Any model with BOX, CYLINDER, MESH, or HFIELD geoms will have **no collisions
-at all** on the MLX backend. The humanoid works only because `foot_contacts_only`
-filters down to capsule-plane pairs.
+Any model with CYLINDER, MESH, or HFIELD geoms will have **no collisions
+at all** on the MLX backend for those geom types. BOX collision is now supported
+(Phase 3.1). The humanoid works because `foot_contacts_only` filters down to
+capsule-plane pairs.
 
 ---
 
@@ -331,7 +352,7 @@ model load time for unsupported features:
 
 | Scenario | What happens |
 |----------|-------------|
-| Model has BOX geoms | **Warning emitted.** Geom loaded, no collisions generated. |
+| Model has BOX geoms | **Supported.** All 4 box pair types work (plane/sphere/capsule/box). |
 | Model has MESH geoms | **Warning emitted.** Same -- no collisions. |
 | Model has HFIELD/ELLIPSOID/CYLINDER geoms | **Warning emitted.** No collisions for those types. |
 | Model has TENDON/SITE transmission | **Warning emitted.** Actuator produces zero force. |
@@ -416,7 +437,7 @@ The Gymnasium Humanoid-v5 model fits perfectly in the supported subset:
 | Euler integration | Yes |
 | No equality constraints | N/A |
 | No tendons or muscles | N/A |
-| No BOX/MESH/CYLINDER geoms | N/A |
+| No MESH/CYLINDER geoms | N/A |
 
 This makes MuJoCo-MLX-Cpp a viable accelerator for the most common RL
 locomotion benchmarks (Humanoid, Ant, HalfCheetah, Walker2d, Hopper -- all
@@ -424,7 +445,7 @@ use capsule/sphere + plane geoms with simple actuators).
 
 **Models that would NOT work on the MLX backend:**
 - Shadow Hand (MESH geoms, TENDON transmission, equality constraints)
-- Franka Panda (BOX geoms, SITE transmission)
+- Franka Panda (SITE transmission, equality constraints)
 - Any manipulation task (requires friction for grasping)
 - Soft body / cloth (FLEX)
 
@@ -444,12 +465,10 @@ Ranked by impact-to-effort ratio for expanding the MLX backend:
 - **Why first:** Even with only plane/sphere/capsule, friction makes the physics
   dramatically more realistic. Humanoid training would benefit from foot grip.
 
-### Priority 2: BOX Collisions
-- **Impact:** Unlocks many robotics models (tables, shelves, blocks)
-- **Effort:** 2-4 weeks
-- **Changes:** 4 new pair functions (plane-box, sphere-box, capsule-box, box-box),
-  both scalar and vmap paths
-- **Why second:** BOX is the most common geom type after sphere/capsule.
+### Priority 2: BOX Collisions — DONE (Phase 3.1)
+- **Status:** Complete. All 4 box pair types implemented (plane-box with multi-contact,
+  sphere-box, capsule-box, box-box with SAT). Both scalar and vmap paths.
+- **Tests:** 6 tests in `test_collision_box.cpp`, qacc match within 0.000004 of MuJoCo C.
 
 ### Priority 3: Equality Constraints
 - **Impact:** Unlocks closed kinematic chains, weld joints, joint coupling
@@ -502,7 +521,7 @@ architectural answer to the conformance gap:
 1. Any model works on CPU backend (correctness guaranteed)
 2. Simple locomotion models get 3.5x speedup on MLX backend
 3. Gaps only matter for GPU-batched training on complex models
-4. Close gaps incrementally (friction first, then BOX, then equality)
+4. Close gaps incrementally (friction done, BOX done, next: CYLINDER, equality)
 
 ---
 

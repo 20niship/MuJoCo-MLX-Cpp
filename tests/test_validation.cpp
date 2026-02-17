@@ -90,7 +90,7 @@ int main() {
         TEST_END();
     }
 
-    // ── Test 3: Box geom warning ──
+    // ── Test 3: Box geom — no warning (box collision now supported in Phase 3.1) ──
     {
         static const char* BOX_XML = R"(
 <mujoco>
@@ -102,10 +102,10 @@ int main() {
   </worldbody>
 </mujoco>
 )";
-        TEST_BEGIN("box_geom_warning");
+        TEST_BEGIN("box_geom_no_warning");
         auto warnings = capture_stderr_load(BOX_XML);
         printf("    warnings: '%s'\n", warnings.c_str());
-        CHECK(warnings.find("BOX") != std::string::npos, "should warn about BOX geoms");
+        CHECK(warnings.find("BOX") == std::string::npos, "box geoms should not produce warning");
         TEST_END();
     }
 

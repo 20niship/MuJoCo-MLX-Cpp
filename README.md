@@ -87,13 +87,13 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (162 tests across 16 suites)
+# Full suite (174 tests across 18 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
 cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure
 
-# Conformance tests only (Phase 1 + Phase 2)
+# Conformance tests only (Phase 1 + Phase 2 + Phase 3)
 cd build && ctest -L correctness --output-on-failure
 ```
 
@@ -144,14 +144,21 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) — validated against MuJoCo C
 - **Per-body contact forces** (`cfrc_ext` via `rne_post_constraint`) — integrated into forward pipeline
 - **Exclude signature** collision filtering (`nexclude`, `exclude_signature`) — matches MuJoCo C encoding
-- **Model validation warnings** at load time for unsupported features (mesh, box, tendons, etc.)
+- **Model validation warnings** at load time for unsupported features (mesh, tendons, etc.)
 - **High-DOF verification** (nv=67) — perfect match with MuJoCo C, stable through 100+ steps
 
 ### Phase 2: Contact Friction
 - **Pyramidal friction (condim=3)** — 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
 - **Pyramidal friction (condim=4,6)** — torsion + rolling friction, 6/10 rows per contact, D values identical
 
-47 conformance tests across 7 test suites, all validated against MuJoCo C reference.
+### Phase 3: Box Collisions
+- **plane-box** — multi-contact (up to 4 face vertices), ncon/nefc match MuJoCo C exactly
+- **sphere-box** — closest-point on OBB, with interior fallback
+- **capsule-box** — segment-to-OBB closest approach with iterative refinement
+- **box-box** — SAT (Separating Axis Theorem) with 15 axes, support point contact generation
+- All four collision types work in both scalar and vmap (batched) pipelines
+
+53 conformance tests across 8 test suites, all validated against MuJoCo C reference.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
 

@@ -353,7 +353,7 @@ Collision filtering via `exclude_signature` is implemented in both `init_cache()
 
 ### Model Validation
 
-`validate_model()` in `io.cpp` scans the `mjModel` at load time and emits `[mjmlx WARNING]` messages to stderr for unsupported features (mesh/box/hfield/ellipsoid/cylinder geoms, tendon/site transmission, muscle actuators, equality constraints, RK4/implicit integrators, sensors). Models still load and simulate with the supported subset.
+`validate_model()` in `io.cpp` scans the `mjModel` at load time and emits `[mjmlx WARNING]` messages to stderr for unsupported features (mesh/hfield/ellipsoid/cylinder geoms, tendon/site transmission, muscle actuators, equality constraints, RK4/implicit integrators, sensors). BOX geoms are now fully supported (Phase 3.1). Models still load and simulate with the supported subset.
 
 ---
 
@@ -375,6 +375,22 @@ The impedance for pyramidal rows uses a friction-scaled formula:
 All 4 rows are simple unilateral inequalities (force >= 0), so the existing CG/Newton solver handles them without modification. The `max_nefc` computation in `io.cpp` now accounts for `2*(condim-1)` rows per friction contact pair.
 
 D values and aref match MuJoCo C within 0.001% (validated in `test_friction_condim3.cpp`).
+
+### Phase 3.1: BOX Collisions
+
+`collision.cpp` and `constraint_vmap.cpp` now handle all 4 box collision pair types:
+
+1. **plane-box** (`plane_box_multi`): Projects box vertices onto plane. Finds the face most aligned with the plane normal and returns up to 4 contacts (one per face vertex). Matches MuJoCo C's `mjc_PlaneBox` algorithm — produces identical ncon and nefc.
+
+2. **sphere-box** (`sphere_box`): Transforms sphere center to box-local coordinates, clamps to box bounds (OBB closest point), and computes penetration. Handles degenerate case (sphere center inside box) by pushing out along the axis of least penetration.
+
+3. **capsule-box** (`capsule_box`): Tests 3 sample points (endpoints + midpoint) against the box, finds closest point on box, projects back onto capsule segment, and iterates once for refinement. Approximate but stable.
+
+4. **box-box** (`box_box`): Full Separating Axis Theorem (SAT) with 15 potential axes: 3 face normals from each box + 9 edge-edge cross products. Reports the axis with minimum overlap as the contact normal. Contact point is the midpoint of the two support vertices along the separating axis.
+
+The vmap-compatible versions use pure MLX array ops (no eval/data). The vmap path generates 1 contact per pair (deepest only); the scalar path generates multi-contact for plane-box.
+
+`max_nefc` in `io.cpp` now accounts for multi-contact pairs: plane-box (4x), capsule-box (2x), box-box (8x) the per-contact constraint rows.
 
 ---
 

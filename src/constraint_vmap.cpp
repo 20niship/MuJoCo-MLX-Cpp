@@ -232,6 +232,190 @@ static VmapCollResult vmap_capsule_capsule(
     return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
 }
 
+// ── BOX collision (vmap-compatible) ──────────────────────────────────────────
+
+static VmapCollResult vmap_plane_box(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& bpos, const mx::array& bmat, const float* half)
+{
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto R = mx::reshape(bmat, {3,3});
+
+    // Compute R^T * normal (project normal into box frame)
+    auto local_n = mx::flatten(mx::matmul(mx::transpose(R), mx::reshape(normal, {3,1})));
+    // Deepest vertex: sign opposite to local_n, scaled by half-extents
+    auto halves = mx::array({half[0], half[1], half[2]});
+    auto signs = mx::negative(mx::sign(local_n));
+    auto corner_local = mx::multiply(signs, halves);
+
+    // World vertex = bpos + R * corner_local
+    auto vertex = mx::add(bpos, mx::flatten(mx::matmul(R, mx::reshape(corner_local, {3,1}))));
+
+    // Distance to plane
+    auto dist = mx::sum(mx::multiply(normal, mx::subtract(vertex, ppos)));
+    auto pos = mx::subtract(vertex, mx::multiply(normal, dist));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_sphere_box(
+    const mx::array& spos, float radius,
+    const mx::array& bpos, const mx::array& bmat, const float* half)
+{
+    auto R = mx::reshape(bmat, {3,3});
+    // Transform sphere center to box-local
+    auto diff = mx::subtract(spos, bpos);
+    auto local = mx::flatten(mx::matmul(mx::transpose(R), mx::reshape(diff, {3,1})));
+
+    // Clamp to box bounds
+    auto halves_pos = mx::array({half[0], half[1], half[2]});
+    auto halves_neg = mx::negative(halves_pos);
+    auto closest_local = mx::clip(local, halves_neg, halves_pos);
+
+    // Transform back to world
+    auto closest_world = mx::add(bpos, mx::flatten(mx::matmul(R, mx::reshape(closest_local, {3,1}))));
+
+    auto sep = mx::subtract(spos, closest_world);
+    auto d = vmap_norm(sep);
+    auto normal = mx::where(mx::less(d, mx::array(1e-8f)),
+                             mx::array({0.0f, 0.0f, 1.0f}),
+                             mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(radius));
+    return {mx::reshape(dist, {}), closest_world, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_capsule_box(
+    const mx::array& cpos, const mx::array& cmat, float r_c, float half_len,
+    const mx::array& bpos, const mx::array& bmat, const float* half)
+{
+    auto R = mx::reshape(bmat, {3,3});
+    auto RT = mx::transpose(R);
+    auto halves_pos = mx::array({half[0], half[1], half[2]});
+    auto halves_neg = mx::negative(halves_pos);
+
+    // Capsule axis (z-column of capsule rotation matrix)
+    auto cap_axis = mx::flatten(mx::slice(mx::reshape(cmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto e0 = mx::subtract(cpos, mx::multiply(cap_axis, mx::array(half_len)));
+    auto e1 = mx::add(cpos, mx::multiply(cap_axis, mx::array(half_len)));
+
+    // Test endpoints and midpoint against box, pick closest
+    auto test_pt = [&](const mx::array& pt) -> std::pair<mx::array, mx::array> {
+        auto diff = mx::subtract(pt, bpos);
+        auto loc = mx::flatten(mx::matmul(RT, mx::reshape(diff, {3,1})));
+        auto cl = mx::clip(loc, halves_neg, halves_pos);
+        auto cw = mx::add(bpos, mx::flatten(mx::matmul(R, mx::reshape(cl, {3,1}))));
+        return {pt, cw}; // segment point, box point
+    };
+
+    // For vmap: test midpoint (most common closest), then refine with segment projection
+    auto diff_mid = mx::subtract(cpos, bpos);
+    auto loc_mid = mx::flatten(mx::matmul(RT, mx::reshape(diff_mid, {3,1})));
+    auto cl_mid = mx::clip(loc_mid, halves_neg, halves_pos);
+    auto bpt_mid = mx::add(bpos, mx::flatten(mx::matmul(R, mx::reshape(cl_mid, {3,1}))));
+
+    // Project box point onto capsule segment
+    auto seg = mx::subtract(e1, e0);
+    auto t_num = mx::sum(mx::multiply(mx::subtract(bpt_mid, e0), seg));
+    auto seg_sq = mx::sum(mx::multiply(seg, seg));
+    auto param = mx::clip(mx::divide(t_num, mx::maximum(seg_sq, mx::array(1e-8f))),
+                           mx::array(0.0f), mx::array(1.0f));
+    auto seg_pt = mx::add(e0, mx::multiply(seg, param));
+
+    // Closest on box to refined segment point
+    auto diff2 = mx::subtract(seg_pt, bpos);
+    auto loc2 = mx::flatten(mx::matmul(RT, mx::reshape(diff2, {3,1})));
+    auto cl2 = mx::clip(loc2, halves_neg, halves_pos);
+    auto bpt2 = mx::add(bpos, mx::flatten(mx::matmul(R, mx::reshape(cl2, {3,1}))));
+
+    auto sep = mx::subtract(seg_pt, bpt2);
+    auto d = vmap_norm(sep);
+    auto normal = mx::where(mx::less(d, mx::array(1e-8f)),
+                             mx::array({0.0f, 0.0f, 1.0f}),
+                             mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(r_c));
+    return {mx::reshape(dist, {}), bpt2, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_box_box(
+    const mx::array& pos1, const mx::array& mat1, const float* h1,
+    const mx::array& pos2, const mx::array& mat2, const float* h2)
+{
+    auto R1 = mx::reshape(mat1, {3,3});
+    auto R2 = mx::reshape(mat2, {3,3});
+    auto T = mx::subtract(pos2, pos1);
+
+    auto halves1 = mx::array({h1[0], h1[1], h1[2]});
+    auto halves2 = mx::array({h2[0], h2[1], h2[2]});
+
+    // SAT: test 6 face normals (3+3), skip edge cross products for vmap simplicity
+    // For each axis, compute overlap = r1_proj + r2_proj - |T.axis|
+    // The axis with minimum positive overlap is the contact normal
+
+    auto best_overlap = mx::array(1e10f);
+    auto best_normal = mx::array({0.0f, 0.0f, 1.0f});
+
+    auto test_face_axis = [&](const mx::array& axis, int sign_mode) {
+        // Project both boxes onto axis
+        auto r1_proj = mx::array(0.0f);
+        auto r2_proj = mx::array(0.0f);
+        for (int j = 0; j < 3; j++) {
+            auto col1 = mx::flatten(mx::slice(R1, mx::Shape{0,j}, mx::Shape{3,j+1}));
+            auto d1 = mx::abs(mx::sum(mx::multiply(col1, axis)));
+            r1_proj = mx::add(r1_proj, mx::multiply(mx::array(h1[j]), d1));
+
+            auto col2 = mx::flatten(mx::slice(R2, mx::Shape{0,j}, mx::Shape{3,j+1}));
+            auto d2 = mx::abs(mx::sum(mx::multiply(col2, axis)));
+            r2_proj = mx::add(r2_proj, mx::multiply(mx::array(h2[j]), d2));
+        }
+        auto T_proj = mx::sum(mx::multiply(T, axis));
+        auto d_proj = mx::abs(T_proj);
+        auto overlap = mx::subtract(mx::add(r1_proj, r2_proj), d_proj);
+
+        // Choose sign so axis points from box1 to box2
+        auto signed_axis = mx::where(mx::greater_equal(T_proj, mx::array(0.0f)),
+                                      axis, mx::negative(axis));
+        auto is_better = mx::less(overlap, best_overlap);
+        auto is_valid = mx::greater(overlap, mx::array(0.0f));
+        auto use_this = mx::logical_and(is_better, is_valid);
+        best_overlap = mx::where(use_this, overlap, best_overlap);
+        best_normal = mx::where(use_this, signed_axis, best_normal);
+    };
+
+    // Test 3 face normals from box1
+    for (int j = 0; j < 3; j++) {
+        auto col = mx::flatten(mx::slice(R1, mx::Shape{0,j}, mx::Shape{3,j+1}));
+        test_face_axis(col, 0);
+    }
+    // Test 3 face normals from box2
+    for (int j = 0; j < 3; j++) {
+        auto col = mx::flatten(mx::slice(R2, mx::Shape{0,j}, mx::Shape{3,j+1}));
+        test_face_axis(col, 1);
+    }
+
+    // Contact point: midpoint of support points
+    auto support1 = pos1;
+    auto support2 = pos2;
+    for (int j = 0; j < 3; j++) {
+        auto col1 = mx::flatten(mx::slice(R1, mx::Shape{0,j}, mx::Shape{3,j+1}));
+        auto d = mx::sum(mx::multiply(col1, best_normal));
+        auto s = mx::where(mx::less(d, mx::array(0.0f)), mx::array(h1[j]), mx::array(-h1[j]));
+        support1 = mx::add(support1, mx::multiply(col1, s));
+
+        auto col2 = mx::flatten(mx::slice(R2, mx::Shape{0,j}, mx::Shape{3,j+1}));
+        d = mx::sum(mx::multiply(col2, best_normal));
+        s = mx::where(mx::greater(d, mx::array(0.0f)), mx::array(h2[j]), mx::array(-h2[j]));
+        support2 = mx::add(support2, mx::multiply(col2, s));
+    }
+
+    auto contact_pos = mx::multiply(mx::add(support1, support2), mx::array(0.5f));
+    auto dist = mx::negative(best_overlap);
+
+    // If no overlap (separating), set dist to 1.0 (no contact)
+    auto no_contact = mx::greater(best_overlap, mx::array(1e9f));
+    dist = mx::where(no_contact, mx::array(1.0f), dist);
+
+    return {mx::reshape(dist, {}), contact_pos, vmap_make_frame(best_normal)};
+}
+
 // ── Vmap-compatible collision (top level) ────────────────────────────────────
 
 Data vmap_collision(const Model& m, Data d) {
@@ -276,6 +460,14 @@ Data vmap_collision(const Model& m, Data d) {
         } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::CAPSULE) {
             result = vmap_capsule_capsule(p1, m1, cp.size1[0], cp.size1[1],
                                           p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::BOX) {
+            result = vmap_plane_box(p1, m1, p2, m2, cp.size2);
+        } else if (t1 == (int)GeomType::SPHERE && t2 == (int)GeomType::BOX) {
+            result = vmap_sphere_box(p1, cp.size1[0], p2, m2, cp.size2);
+        } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::BOX) {
+            result = vmap_capsule_box(p1, m1, cp.size1[0], cp.size1[1], p2, m2, cp.size2);
+        } else if (t1 == (int)GeomType::BOX && t2 == (int)GeomType::BOX) {
+            result = vmap_box_box(p1, m1, cp.size1, p2, m2, cp.size2);
         } else {
             result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
         }

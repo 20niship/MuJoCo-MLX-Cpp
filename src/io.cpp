@@ -264,8 +264,7 @@ static void validate_model(const mjModel* m) {
     }
     if (has_mesh)
         fprintf(stderr, "[mjmlx WARNING] Model has MESH geoms -- collision not supported, bodies will pass through.\n");
-    if (has_box)
-        fprintf(stderr, "[mjmlx WARNING] Model has BOX geoms -- collision not supported, bodies will pass through.\n");
+    // BOX geom collision is now supported (Phase 3.1)
     if (has_hfield)
         fprintf(stderr, "[mjmlx WARNING] Model has HFIELD geoms -- collision not supported.\n");
     if (has_ellipsoid)
@@ -852,11 +851,20 @@ void Model::init_cache() const {
         }
     }
     cache.max_nl = (int)cache.limits.size();
-    // Compute max contact constraint rows accounting for condim:
-    // condim=1: 1 row (frictionless), condim=3 pyramidal: 4 rows, condim=4: 6, condim=6: 10
+    // Compute max contact constraint rows accounting for condim and multi-contact pairs:
+    // plane-box: up to 4 contacts, capsule-box: up to 2 contacts, others: 1 contact
+    // condim=1: 1 row/contact, condim=3 pyramidal: 4 rows/contact, condim=4: 6, condim=6: 10
     int max_contact_rows = 0;
     for (auto& cp : cache.collision_pairs) {
-        max_contact_rows += (cp.condim <= 1) ? 1 : 2 * (cp.condim - 1);
+        int rows_per_contact = (cp.condim <= 1) ? 1 : 2 * (cp.condim - 1);
+        int max_contacts = 1;
+        if (cp.type1 == (int)GeomType::PLANE && cp.type2 == (int)GeomType::BOX)
+            max_contacts = 4;
+        else if (cp.type1 == (int)GeomType::CAPSULE && cp.type2 == (int)GeomType::BOX)
+            max_contacts = 2;
+        else if (cp.type1 == (int)GeomType::BOX && cp.type2 == (int)GeomType::BOX)
+            max_contacts = 8;
+        max_contact_rows += max_contacts * rows_per_contact;
     }
     cache.max_nefc = cache.max_nl + max_contact_rows;
 

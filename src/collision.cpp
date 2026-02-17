@@ -125,6 +125,409 @@ static CollisionResult sphere_capsule(
     return {mx::flatten(dist), pos, make_frame(normal)};
 }
 
+// ── BOX collision helpers ─────────────────────────────────────
+
+// Transform a world-space point into box-local coordinates
+static void world_to_box_local(const float* Rp, const float* bp,
+                                float wx, float wy, float wz,
+                                float& lx, float& ly, float& lz) {
+    float dx = wx - bp[0], dy = wy - bp[1], dz = wz - bp[2];
+    // local = R^T * (world - box_pos), R stored row-major: Rp[i*3+j] = R[i][j]
+    lx = Rp[0]*dx + Rp[3]*dy + Rp[6]*dz;
+    ly = Rp[1]*dx + Rp[4]*dy + Rp[7]*dz;
+    lz = Rp[2]*dx + Rp[5]*dy + Rp[8]*dz;
+}
+
+// Transform box-local coordinates to world-space
+static void box_local_to_world(const float* Rp, const float* bp,
+                                float lx, float ly, float lz,
+                                float& wx, float& wy, float& wz) {
+    // world = box_pos + R * local
+    wx = bp[0] + Rp[0]*lx + Rp[1]*ly + Rp[2]*lz;
+    wy = bp[1] + Rp[3]*lx + Rp[4]*ly + Rp[5]*lz;
+    wz = bp[2] + Rp[6]*lx + Rp[7]*ly + Rp[8]*lz;
+}
+
+// Closest point on an axis-aligned box (in local coords) to a local point
+static void closest_on_aabb(float lx, float ly, float lz,
+                             float hx, float hy, float hz,
+                             float& cx, float& cy, float& cz) {
+    cx = std::max(-hx, std::min(hx, lx));
+    cy = std::max(-hy, std::min(hy, ly));
+    cz = std::max(-hz, std::min(hz, lz));
+}
+
+// plane_box_multi: returns up to 4 contacts (vertices of the closest face)
+// Matches MuJoCo C's mjc_PlaneBox algorithm.
+static int plane_box_multi(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& box_pos, const mx::array& box_mat, const mx::array& box_size,
+    float margin, int g1, int g2, int condim,
+    std::vector<mx::array>& c_dist, std::vector<mx::array>& c_pos,
+    std::vector<mx::array>& c_frame, std::vector<mx::array>& c_geom,
+    std::vector<int>& c_dim)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+    auto frame = make_frame(normal);
+
+    mx::eval(box_size); mx::eval(box_pos); mx::eval(box_mat);
+    mx::eval(normal); mx::eval(plane_pos);
+    float hx = box_size.data<float>()[0];
+    float hy = box_size.data<float>()[1];
+    float hz = box_size.data<float>()[2];
+
+    auto np = normal.data<float>();
+    auto Rp = box_mat.data<float>();
+    auto bp = box_pos.data<float>();
+    auto pp = plane_pos.data<float>();
+
+    // Project plane normal into box-local frame: local_n = R^T * normal
+    float local_n[3];
+    for (int j = 0; j < 3; j++)
+        local_n[j] = Rp[0*3+j]*np[0] + Rp[1*3+j]*np[1] + Rp[2*3+j]*np[2];
+
+    // Find the face axis most aligned with the plane normal
+    int best_axis = 0;
+    float best_dot = std::abs(local_n[0]);
+    for (int i = 1; i < 3; i++) {
+        float d = std::abs(local_n[i]);
+        if (d > best_dot) { best_dot = d; best_axis = i; }
+    }
+
+    float halves[3] = {hx, hy, hz};
+    // Sign: face center on the side opposite to the normal
+    float face_sign = (local_n[best_axis] < 0) ? 1.0f : -1.0f;
+
+    // Generate 4 vertices of the closest face
+    int ax1 = (best_axis + 1) % 3;
+    int ax2 = (best_axis + 2) % 3;
+
+    int ncon_added = 0;
+    for (int s1 = -1; s1 <= 1; s1 += 2) {
+        for (int s2 = -1; s2 <= 1; s2 += 2) {
+            float corner_local[3] = {0, 0, 0};
+            corner_local[best_axis] = face_sign * halves[best_axis];
+            corner_local[ax1] = s1 * halves[ax1];
+            corner_local[ax2] = s2 * halves[ax2];
+
+            float wx, wy, wz;
+            box_local_to_world(Rp, bp, corner_local[0], corner_local[1], corner_local[2],
+                               wx, wy, wz);
+
+            float dist_val = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+
+            if (dist_val < margin) {
+                auto vertex = mx::array({wx, wy, wz});
+                auto contact_pos = mx::subtract(vertex, mx::multiply(normal, mx::array(dist_val)));
+                c_dist.push_back(mx::array(dist_val));
+                c_pos.push_back(contact_pos);
+                c_frame.push_back(frame);
+                c_geom.push_back(mx::array({g1, g2}, mx::int32));
+                c_dim.push_back(condim);
+                ncon_added++;
+            }
+        }
+    }
+
+    return ncon_added;
+}
+
+// Single-contact plane_box (for fallback / vmap dispatch compatibility)
+static CollisionResult plane_box(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& box_pos, const mx::array& box_mat, const mx::array& box_size)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+
+    mx::eval(box_size); mx::eval(box_pos); mx::eval(box_mat);
+    mx::eval(normal); mx::eval(plane_pos);
+
+    auto np = normal.data<float>();
+    auto Rp = box_mat.data<float>();
+    auto bp = box_pos.data<float>();
+    auto pp = plane_pos.data<float>();
+    float halves[3] = {box_size.data<float>()[0], box_size.data<float>()[1], box_size.data<float>()[2]};
+
+    float local_n[3];
+    for (int j = 0; j < 3; j++)
+        local_n[j] = Rp[0*3+j]*np[0] + Rp[1*3+j]*np[1] + Rp[2*3+j]*np[2];
+
+    float corner_local[3];
+    for (int j = 0; j < 3; j++)
+        corner_local[j] = (local_n[j] < 0 ? 1.0f : -1.0f) * halves[j];
+
+    float wx, wy, wz;
+    box_local_to_world(Rp, bp, corner_local[0], corner_local[1], corner_local[2],
+                       wx, wy, wz);
+
+    float dist_val = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+    auto dist = mx::array(dist_val);
+    auto vertex_world = mx::array({wx, wy, wz});
+    auto pos = mx::subtract(vertex_world, mx::multiply(normal, dist));
+    return {dist, pos, make_frame(normal)};
+}
+
+static CollisionResult sphere_box(
+    const mx::array& sphere_pos, const mx::array& sphere_size,
+    const mx::array& box_pos, const mx::array& box_mat, const mx::array& box_size)
+{
+    mx::eval(sphere_size); mx::eval(sphere_pos);
+    mx::eval(box_pos); mx::eval(box_mat); mx::eval(box_size);
+    float r = sphere_size.data<float>()[0];
+    auto sp = sphere_pos.data<float>();
+    auto bp = box_pos.data<float>();
+    auto Rp = box_mat.data<float>();
+    float hx = box_size.data<float>()[0];
+    float hy = box_size.data<float>()[1];
+    float hz = box_size.data<float>()[2];
+
+    // Transform sphere center to box-local coordinates
+    float lx, ly, lz;
+    world_to_box_local(Rp, bp, sp[0], sp[1], sp[2], lx, ly, lz);
+
+    // Closest point on box (local coords)
+    float cx, cy, cz;
+    closest_on_aabb(lx, ly, lz, hx, hy, hz, cx, cy, cz);
+
+    // Transform closest point back to world
+    float wx, wy, wz;
+    box_local_to_world(Rp, bp, cx, cy, cz, wx, wy, wz);
+
+    // Direction from closest point to sphere center
+    float fx = sp[0] - wx, fy = sp[1] - wy, fz = sp[2] - wz;
+    float d = std::sqrt(fx*fx + fy*fy + fz*fz);
+
+    float nx, ny, nz;
+    if (d < MJMINVAL) {
+        // Sphere center is on or inside box surface — push out along
+        // the axis of least penetration
+        float pen[3] = {hx - std::abs(lx), hy - std::abs(ly), hz - std::abs(lz)};
+        int best = 0;
+        for (int i = 1; i < 3; i++)
+            if (pen[i] < pen[best]) best = i;
+        float sign = (best == 0 ? lx : best == 1 ? ly : lz) >= 0 ? 1.0f : -1.0f;
+        // Normal is box face normal in world coords (column of R)
+        nx = Rp[0*3+best] * sign;
+        ny = Rp[1*3+best] * sign;
+        nz = Rp[2*3+best] * sign;
+        d = pen[best] + r;
+    } else {
+        nx = fx/d; ny = fy/d; nz = fz/d;
+    }
+
+    float dist_val = d - r;
+    auto dist = mx::array(dist_val);
+    auto normal_arr = mx::array({nx, ny, nz});
+    auto pos_arr = mx::array({wx, wy, wz});
+    return {dist, pos_arr, make_frame(normal_arr)};
+}
+
+static CollisionResult capsule_box(
+    const mx::array& cap_pos, const mx::array& cap_mat, const mx::array& cap_size,
+    const mx::array& box_pos, const mx::array& box_mat, const mx::array& box_size)
+{
+    mx::eval(cap_size); mx::eval(cap_pos); mx::eval(cap_mat);
+    mx::eval(box_pos); mx::eval(box_mat); mx::eval(box_size);
+    float r_c = cap_size.data<float>()[0];
+    float half_len = cap_size.data<float>()[1];
+    auto cp = cap_pos.data<float>();
+    auto cm = cap_mat.data<float>();
+    auto bp = box_pos.data<float>();
+    auto Rp = box_mat.data<float>();
+    float hx = box_size.data<float>()[0];
+    float hy = box_size.data<float>()[1];
+    float hz = box_size.data<float>()[2];
+
+    // Capsule axis: z-column of capsule rotation matrix
+    float ax = cm[2], ay = cm[5], az = cm[8];
+
+    // Capsule endpoints
+    float e0[3] = {cp[0] - ax*half_len, cp[1] - ay*half_len, cp[2] - az*half_len};
+    float e1[3] = {cp[0] + ax*half_len, cp[1] + ay*half_len, cp[2] + az*half_len};
+
+    // Test both endpoints + midpoint, find closest to box
+    float best_dist_sq = 1e20f;
+    float best_seg[3], best_box[3];
+
+    float test_pts[3][3] = {
+        {e0[0], e0[1], e0[2]},
+        {e1[0], e1[1], e1[2]},
+        {cp[0], cp[1], cp[2]}
+    };
+
+    for (int ti = 0; ti < 3; ti++) {
+        float lx, ly, lz;
+        world_to_box_local(Rp, bp, test_pts[ti][0], test_pts[ti][1], test_pts[ti][2],
+                           lx, ly, lz);
+        float cx, cy, cz;
+        closest_on_aabb(lx, ly, lz, hx, hy, hz, cx, cy, cz);
+        float wx, wy, wz;
+        box_local_to_world(Rp, bp, cx, cy, cz, wx, wy, wz);
+
+        // Now find closest point on capsule segment to this box point
+        // Project box point onto capsule line: t = dot(box_pt - e0, axis) / |axis|^2
+        float dx = wx - e0[0], dy = wy - e0[1], dz = wz - e0[2];
+        float seg_x = e1[0]-e0[0], seg_y = e1[1]-e0[1], seg_z = e1[2]-e0[2];
+        float seg_sq = seg_x*seg_x + seg_y*seg_y + seg_z*seg_z;
+        float t = (seg_sq > MJMINVAL) ? (dx*seg_x + dy*seg_y + dz*seg_z) / seg_sq : 0.0f;
+        t = std::max(0.0f, std::min(1.0f, t));
+        float sx = e0[0] + t*seg_x, sy = e0[1] + t*seg_y, sz = e0[2] + t*seg_z;
+
+        // Get new closest on box to this refined segment point
+        float lx2, ly2, lz2;
+        world_to_box_local(Rp, bp, sx, sy, sz, lx2, ly2, lz2);
+        float cx2, cy2, cz2;
+        closest_on_aabb(lx2, ly2, lz2, hx, hy, hz, cx2, cy2, cz2);
+        float wx2, wy2, wz2;
+        box_local_to_world(Rp, bp, cx2, cy2, cz2, wx2, wy2, wz2);
+
+        float fx = sx - wx2, fy = sy - wy2, fz = sz - wz2;
+        float dsq = fx*fx + fy*fy + fz*fz;
+        if (dsq < best_dist_sq) {
+            best_dist_sq = dsq;
+            best_seg[0] = sx; best_seg[1] = sy; best_seg[2] = sz;
+            best_box[0] = wx2; best_box[1] = wy2; best_box[2] = wz2;
+        }
+    }
+
+    float fx = best_seg[0] - best_box[0];
+    float fy = best_seg[1] - best_box[1];
+    float fz = best_seg[2] - best_box[2];
+    float d = std::sqrt(fx*fx + fy*fy + fz*fz);
+    float nx, ny, nz;
+    if (d < MJMINVAL) {
+        nx = 0; ny = 0; nz = 1;
+    } else {
+        nx = fx/d; ny = fy/d; nz = fz/d;
+    }
+
+    float dist_val = d - r_c;
+    auto dist = mx::array(dist_val);
+    auto normal_arr = mx::array({nx, ny, nz});
+    auto pos_arr = mx::array({best_box[0], best_box[1], best_box[2]});
+    return {dist, pos_arr, make_frame(normal_arr)};
+}
+
+static CollisionResult box_box(
+    const mx::array& pos1, const mx::array& mat1, const mx::array& size1,
+    const mx::array& pos2, const mx::array& mat2, const mx::array& size2)
+{
+    mx::eval(pos1); mx::eval(mat1); mx::eval(size1);
+    mx::eval(pos2); mx::eval(mat2); mx::eval(size2);
+    auto p1 = pos1.data<float>(); auto R1 = mat1.data<float>(); auto s1 = size1.data<float>();
+    auto p2 = pos2.data<float>(); auto R2 = mat2.data<float>(); auto s2 = size2.data<float>();
+
+    float h1[3] = {s1[0], s1[1], s1[2]};
+    float h2[3] = {s2[0], s2[1], s2[2]};
+
+    // Center difference
+    float T[3] = {p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2]};
+
+    // SAT: 15 potential separating axes
+    // Axes: R1 columns (3), R2 columns (3), cross products (9)
+    float best_overlap = 1e10f;
+    float best_axis[3] = {0, 0, 1};
+
+    auto get_col = [](const float* R, int j, float* out) {
+        out[0] = R[0*3+j]; out[1] = R[1*3+j]; out[2] = R[2*3+j];
+    };
+
+    auto dot3 = [](const float* a, const float* b) {
+        return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    };
+
+    auto test_axis = [&](float ax, float ay, float az) -> bool {
+        float len = std::sqrt(ax*ax + ay*ay + az*az);
+        if (len < 1e-8f) return true; // degenerate axis, skip
+        ax /= len; ay /= len; az /= len;
+
+        // Project box1 half-extents onto axis
+        float r1_proj = 0;
+        for (int j = 0; j < 3; j++) {
+            float col[3]; get_col(R1, j, col);
+            r1_proj += h1[j] * std::abs(dot3(col, (float[]){ax, ay, az}));
+        }
+        // Project box2 half-extents onto axis
+        float r2_proj = 0;
+        for (int j = 0; j < 3; j++) {
+            float col[3]; get_col(R2, j, col);
+            r2_proj += h2[j] * std::abs(dot3(col, (float[]){ax, ay, az}));
+        }
+        // Distance between centers projected onto axis
+        float d_proj = std::abs(T[0]*ax + T[1]*ay + T[2]*az);
+        float overlap = r1_proj + r2_proj - d_proj;
+        if (overlap < 0) return false; // separating axis found
+        if (overlap < best_overlap) {
+            best_overlap = overlap;
+            // Choose sign so axis points from box1 to box2
+            float sign = (T[0]*ax + T[1]*ay + T[2]*az >= 0) ? 1.0f : -1.0f;
+            best_axis[0] = ax * sign;
+            best_axis[1] = ay * sign;
+            best_axis[2] = az * sign;
+        }
+        return true;
+    };
+
+    bool colliding = true;
+
+    // Test 3 face normals of box1
+    for (int j = 0; j < 3 && colliding; j++) {
+        float col[3]; get_col(R1, j, col);
+        colliding = test_axis(col[0], col[1], col[2]);
+    }
+    // Test 3 face normals of box2
+    for (int j = 0; j < 3 && colliding; j++) {
+        float col[3]; get_col(R2, j, col);
+        colliding = test_axis(col[0], col[1], col[2]);
+    }
+    // Test 9 edge-edge cross products
+    for (int i = 0; i < 3 && colliding; i++) {
+        float a[3]; get_col(R1, i, a);
+        for (int j = 0; j < 3 && colliding; j++) {
+            float b[3]; get_col(R2, j, b);
+            float cx = a[1]*b[2] - a[2]*b[1];
+            float cy = a[2]*b[0] - a[0]*b[2];
+            float cz = a[0]*b[1] - a[1]*b[0];
+            colliding = test_axis(cx, cy, cz);
+        }
+    }
+
+    if (!colliding) {
+        return {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+    }
+
+    // Contact point: midpoint between the two closest support points
+    // along the separating axis
+    float support1[3] = {p1[0], p1[1], p1[2]};
+    float support2[3] = {p2[0], p2[1], p2[2]};
+    for (int j = 0; j < 3; j++) {
+        float col1[3]; get_col(R1, j, col1);
+        float d = dot3(col1, best_axis);
+        float sign = (d < 0) ? 1.0f : -1.0f;
+        support1[0] += sign * h1[j] * col1[0];
+        support1[1] += sign * h1[j] * col1[1];
+        support1[2] += sign * h1[j] * col1[2];
+
+        float col2[3]; get_col(R2, j, col2);
+        d = dot3(col2, best_axis);
+        sign = (d > 0) ? 1.0f : -1.0f;
+        support2[0] += sign * h2[j] * col2[0];
+        support2[1] += sign * h2[j] * col2[1];
+        support2[2] += sign * h2[j] * col2[2];
+    }
+
+    float contact_pos[3] = {
+        0.5f * (support1[0] + support2[0]),
+        0.5f * (support1[1] + support2[1]),
+        0.5f * (support1[2] + support2[2])
+    };
+
+    auto dist = mx::array(-best_overlap);
+    auto normal_arr = mx::array({best_axis[0], best_axis[1], best_axis[2]});
+    auto pos_arr = mx::array({contact_pos[0], contact_pos[1], contact_pos[2]});
+    return {dist, pos_arr, make_frame(normal_arr)};
+}
+
 static CollisionResult capsule_capsule(
     const mx::array& pos1, const mx::array& mat1, const mx::array& size1,
     const mx::array& pos2, const mx::array& mat2, const mx::array& size2)
@@ -241,6 +644,28 @@ Data collision(const Model& m, Data d) {
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CAPSULE)) {
                 result = capsule_capsule(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                // Multi-contact: up to 4 contacts from plane-box
+                float margin = gmargin[g1_] + gmargin[g2_];
+                int condim = 3;
+                if (m.geom_condim.size() > 0) {
+                    mx::eval(m.geom_condim);
+                    auto cdp = m.geom_condim.data<int>();
+                    condim = std::max(cdp[g1_], cdp[g2_]);
+                }
+                plane_box_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                                margin, g1_, g2_, condim,
+                                c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = sphere_box(gpos1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = capsule_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::BOX) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = box_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
             }
 
             if (!handled) continue;
@@ -310,6 +735,31 @@ Data collision(const Model& m, Data d) {
                 handled = true;
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CAPSULE)) {
                 result = capsule_capsule(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                // Multi-contact plane-box for explicit pairs
+                float margin_pb = gmargin[g1_] + gmargin[g2_];
+                if (m.pair_margin.size() > 0) {
+                    mx::eval(m.pair_margin);
+                    margin_pb = m.pair_margin.data<float>()[pi];
+                }
+                int condim_pb = 3;
+                if (m.pair_dim.size() > 0) {
+                    mx::eval(m.pair_dim);
+                    condim_pb = m.pair_dim.data<int>()[pi];
+                }
+                plane_box_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                                margin_pb, g1_, g2_, condim_pb,
+                                c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = sphere_box(gpos1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = capsule_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::BOX) && t2_ == static_cast<int>(GeomType::BOX)) {
+                result = box_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
             }
 
