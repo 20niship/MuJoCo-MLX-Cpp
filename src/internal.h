@@ -182,6 +182,10 @@ struct Model {
     mx::array actuator_ctrlrange{mx::array({})};
     mx::array actuator_forcelimited{mx::array({})};
     mx::array actuator_forcerange{mx::array({})};
+    mx::array actuator_actadr{mx::array({})};      // (nu,) int: first activation address (-1 = stateless)
+    mx::array actuator_actnum{mx::array({})};      // (nu,) int: number of activation variables
+    mx::array actuator_actlimited{mx::array({})};  // (nu,) byte: has activation limits
+    mx::array actuator_actrange{mx::array({})};    // (nu, 2) float: activation limits
 
     // Tendon properties
     mx::array tendon_adr{mx::array({})};        // (ntendon,) int: start index in wrap arrays

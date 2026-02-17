@@ -204,6 +204,10 @@ static Model convert_model(mjModel* m) {
         model.actuator_ctrlrange = to_mx_f2(m->actuator_ctrlrange, (int)m->nu, 2);
         model.actuator_forcelimited = to_mx_byte(m->actuator_forcelimited, (int)m->nu);
         model.actuator_forcerange = to_mx_f2(m->actuator_forcerange, (int)m->nu, 2);
+        model.actuator_actadr = to_mx_i(m->actuator_actadr, (int)m->nu);
+        model.actuator_actnum = to_mx_i(m->actuator_actnum, (int)m->nu);
+        model.actuator_actlimited = to_mx_byte(m->actuator_actlimited, (int)m->nu);
+        model.actuator_actrange = to_mx_f2(m->actuator_actrange, (int)m->nu, 2);
     }
 
     // Tendon properties
@@ -329,23 +333,15 @@ static void validate_model(const mjModel* m) {
 
     // Check for unsupported actuator types
     bool has_tendon_trn = false, has_muscle = false, has_site_trn = false;
-    bool has_filter_dyn = false, has_integrator_dyn = false;
     for (int i = 0; i < m->nu; i++) {
         if (m->actuator_trntype[i] == mjTRN_TENDON) has_tendon_trn = true;
         if (m->actuator_trntype[i] == mjTRN_SITE) has_site_trn = true;
         if (m->actuator_gaintype[i] == mjGAIN_MUSCLE) has_muscle = true;
-        if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT ||
-            m->actuator_dyntype[i] == mjDYN_FILTER) has_filter_dyn = true;
-        if (m->actuator_dyntype[i] == mjDYN_INTEGRATOR) has_integrator_dyn = true;
     }
     if (has_site_trn && m->nsite == 0)
         fprintf(stderr, "[mjmlx WARNING] Model has SITE transmission but no sites -- actuator will produce zero force.\n");
     if (has_muscle)
         fprintf(stderr, "[mjmlx WARNING] Model has MUSCLE actuators -- act_dot not computed, activation stays at zero.\n");
-    if (has_filter_dyn)
-        fprintf(stderr, "[mjmlx WARNING] Model has FILTER actuator dynamics -- not implemented, dynamics ignored.\n");
-    if (has_integrator_dyn)
-        fprintf(stderr, "[mjmlx WARNING] Model has INTEGRATOR actuator dynamics -- not implemented, dynamics ignored.\n");
 
     // Check for spatial tendons (wrapping geometry types other than JOINT)
     if (m->nwrap > 0) {

@@ -69,20 +69,68 @@ static Data fwd_actuation(const Model& m, Data d) {
     }
   }
 
-  // Compute actuator force (simplified: FIXED gain with AFFINE bias)
+  // Activation dynamics: compute act_dot and determine ctrl_act
+  constexpr int DYN_NONE = 0, DYN_INTEGRATOR = 1, DYN_FILTER = 2, DYN_FILTEREXACT = 3;
+  constexpr float MIN_TAU = 1e-15f;
+
+  mx::eval(ctrl);
+  auto ctrl_ptr = ctrl.data<float>();
+  std::vector<float> ctrl_act_data(m.nu, 0.0f);
+  std::vector<float> act_dot_data(m.na, 0.0f);
+
+  if (m.na > 0 && m.actuator_dyntype.size() > 0 && m.actuator_actadr.size() > 0) {
+      mx::eval(m.actuator_dyntype); mx::eval(m.actuator_dynprm);
+      mx::eval(m.actuator_actadr); mx::eval(m.actuator_actnum);
+      mx::eval(d.act);
+
+      auto dyntype_ptr = m.actuator_dyntype.data<int>();
+      auto dynprm_ptr = m.actuator_dynprm.data<float>();
+      auto actadr_ptr = m.actuator_actadr.data<int>();
+      auto actnum_ptr = m.actuator_actnum.data<int>();
+      float* act_ptr = (d.act.size() > 0) ? const_cast<float*>(d.act.data<float>()) : nullptr;
+
+      for (int i = 0; i < m.nu; i++) {
+          int dyn = dyntype_ptr[i];
+          int aa = actadr_ptr[i];
+          float u = ctrl_ptr[i];
+
+          if (dyn == DYN_NONE || aa < 0) {
+              ctrl_act_data[i] = u;
+          } else {
+              int anum = actnum_ptr[i];
+              float a = (act_ptr && aa >= 0 && aa + anum - 1 < m.na) ? act_ptr[aa + anum - 1] : 0.0f;
+              ctrl_act_data[i] = a;
+
+              if (dyn == DYN_INTEGRATOR) {
+                  act_dot_data[aa] = u;
+              } else if (dyn == DYN_FILTER || dyn == DYN_FILTEREXACT) {
+                  float tau = std::max(dynprm_ptr[i * 10], MIN_TAU);
+                  act_dot_data[aa] = (u - a) / tau;
+              }
+          }
+      }
+  } else {
+      for (int i = 0; i < m.nu; i++) ctrl_act_data[i] = ctrl_ptr[i];
+  }
+  if (m.na > 0)
+      d.act_dot = mx::array(act_dot_data.data(), {m.na}, mx::float32);
+  else
+      d.act_dot = mx::zeros({0});
+
+  // Compute actuator force
   mx::eval(m.actuator_gaintype); mx::eval(m.actuator_gainprm);
   mx::eval(m.actuator_biastype); mx::eval(m.actuator_biasprm);
   auto gaintype_ptr = m.actuator_gaintype.data<int>();
   auto biastype_ptr = m.actuator_biastype.data<int>();
+  auto gp = m.actuator_gainprm.data<float>();
+  auto bp = m.actuator_biasprm.data<float>();
 
   std::vector<float> force_data(m.nu, 0.0f);
-  mx::eval(ctrl); mx::eval(d.actuator_length);
-  auto ctrl_ptr = ctrl.data<float>();
+  mx::eval(d.actuator_length);
+  auto len_ptr = d.actuator_length.data<float>();
 
   for (int i = 0; i < m.nu; i++) {
     float gain = 0.0f;
-    mx::eval(m.actuator_gainprm);
-    auto gp = m.actuator_gainprm.data<float>();
     if (gaintype_ptr[i] == static_cast<int>(GainType::FIXED)) {
       gain = gp[i * 10];
     } else {
@@ -91,14 +139,10 @@ static Data fwd_actuation(const Model& m, Data d) {
 
     float bias = 0.0f;
     if (biastype_ptr[i] == static_cast<int>(BiasType::AFFINE)) {
-      mx::eval(m.actuator_biasprm);
-      auto bp = m.actuator_biasprm.data<float>();
-      mx::eval(d.actuator_length);
-      auto len_ptr = d.actuator_length.data<float>();
       bias = bp[i * 10] + bp[i * 10 + 1] * len_ptr[i];
     }
 
-    force_data[i] = gain * ctrl_ptr[i] + bias;
+    force_data[i] = gain * ctrl_act_data[i] + bias;
   }
 
   // Clamp force
@@ -181,6 +225,62 @@ static Data integrate_euler(const Model& m, Data d) {
   d.qpos = mx::concatenate(parts, 0);
   d.qvel = new_qvel;
   d.qacc_warmstart = d.qacc;
+
+  // Integrate activation state: act += act_dot * dt
+  if (m.na > 0 && d.act.size() > 0 && d.act_dot.size() > 0) {
+      constexpr int DYN_FILTEREXACT = 3;
+      mx::eval(m.actuator_dyntype); mx::eval(m.actuator_dynprm);
+      mx::eval(m.actuator_actadr); mx::eval(m.actuator_actnum);
+      mx::eval(d.act); mx::eval(d.act_dot);
+
+      auto dyntype_ptr = m.actuator_dyntype.data<int>();
+      auto dynprm_ptr = m.actuator_dynprm.data<float>();
+      auto actadr_ptr = m.actuator_actadr.data<int>();
+      auto actnum_ptr = m.actuator_actnum.data<int>();
+      auto act_ptr = d.act.data<float>();
+      auto adot_ptr = d.act_dot.data<float>();
+
+      std::vector<float> new_act(m.na);
+      for (int i = 0; i < m.na; i++) new_act[i] = act_ptr[i];
+
+      for (int i = 0; i < m.nu; i++) {
+          int aa = actadr_ptr[i];
+          if (aa < 0 || aa >= m.na) continue;
+          int anum = actnum_ptr[i];
+          for (int k = 0; k < anum; k++) {
+              int idx = aa + k;
+              if (idx >= m.na) break;
+              if (dyntype_ptr[i] == DYN_FILTEREXACT) {
+                  float tau = std::max(dynprm_ptr[i * 10], 1e-15f);
+                  new_act[idx] = act_ptr[idx] + adot_ptr[idx] * tau * (1.0f - std::exp(-dt / tau));
+              } else {
+                  new_act[idx] = act_ptr[idx] + adot_ptr[idx] * dt;
+              }
+          }
+      }
+
+      // Clamp activation
+      if (m.actuator_actlimited.size() > 0) {
+          mx::eval(m.actuator_actlimited); mx::eval(m.actuator_actrange);
+          auto alim = m.actuator_actlimited.data<int>();
+          auto arange = m.actuator_actrange.data<float>();
+          for (int i = 0; i < m.nu; i++) {
+              int aa = actadr_ptr[i];
+              if (aa < 0) continue;
+              if (alim[i]) {
+                  int anum = actnum_ptr[i];
+                  for (int k = 0; k < anum; k++) {
+                      int idx = aa + k;
+                      if (idx >= m.na) break;
+                      new_act[idx] = std::max(arange[i * 2], std::min(arange[i * 2 + 1], new_act[idx]));
+                  }
+              }
+          }
+      }
+
+      d.act = mx::array(new_act.data(), {m.na}, mx::float32);
+  }
+
   return d;
 }
 
