@@ -333,9 +333,17 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Phase 3.3: MESH collision tests (GJK/EPA)
+    add_executable(test_collision_mesh tests/test_collision_mesh.cpp)
+    target_link_libraries(test_collision_mesh PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_collision_mesh PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder)
+        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -383,7 +391,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME friction_condim46 COMMAND test_friction_condim46)
     add_test(NAME collision_box COMMAND test_collision_box)
     add_test(NAME collision_cylinder COMMAND test_collision_cylinder)
-    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder PROPERTIES LABELS "correctness")
+    add_test(NAME collision_mesh COMMAND test_collision_mesh)
+    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh PROPERTIES LABELS "correctness")
 
     # Label all correctness tests
     set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)

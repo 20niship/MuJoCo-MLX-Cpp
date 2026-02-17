@@ -83,10 +83,10 @@ int main() {
   </worldbody>
 </mujoco>
 )";
-        TEST_BEGIN("mesh_geom_warning");
+        TEST_BEGIN("mesh_geom_no_warning");
         auto warnings = capture_stderr_load(MESH_XML);
         printf("    warnings: '%s'\n", warnings.c_str());
-        CHECK(warnings.find("MESH") != std::string::npos, "should warn about MESH geoms");
+        CHECK(warnings.find("MESH") == std::string::npos, "should NOT warn about MESH geoms (now supported)");
         TEST_END();
     }
 

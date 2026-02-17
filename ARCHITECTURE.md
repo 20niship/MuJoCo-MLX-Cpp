@@ -406,6 +406,40 @@ Helper function `closest_on_cylinder_local` computes the closest point on a cyli
 
 The vmap-compatible versions (`vmap_plane_cylinder`, `vmap_sphere_cylinder`, `vmap_capsule_cylinder`) use pure MLX array ops with no eval/data calls. The vmap plane-cylinder path returns 1 contact (deepest rim point); the scalar path returns multi-contact.
 
+### Phase 3.3: MESH/GJK/EPA Convex Collisions
+
+The most complex collision subsystem. Handles any pair involving MESH geoms using the standard GJK/EPA algorithm pair.
+
+**Mesh Data Loading** (`io.cpp`):
+- `geom_dataid`: maps each geom to its mesh index (-1 for non-mesh)
+- `mesh_vertadr`, `mesh_vertnum`: per-mesh vertex address and count
+- `mesh_vert`: all mesh vertices in a single (total_verts, 3) array
+- `CollisionPair` extended with `dataid1`/`dataid2` fields
+
+**Support Functions** (`collision.cpp`):
+Each geom type has a `support(direction)` function returning the furthest surface point in a given direction:
+- **Sphere**: center + radius × normalize(dir)
+- **Capsule**: best endpoint + radius × normalize(dir)
+- **Box**: sign(dir·axis_i) × halfsize_i for each axis
+- **Cylinder**: best face tip + R × perpendicular component
+- **Mesh**: argmax(vertices · direction), transformed to world space
+
+**GJK** (64-iteration bound):
+Iterative Minkowski-difference origin search using evolving simplex (point → line → triangle → tetrahedron). Tracks witness points (a, b) on both shapes for each simplex vertex.
+
+**EPA** (64-iteration bound, 128 vertices, 256 faces):
+Given a GJK tetrahedron containing the origin, expands the convex polytope toward the origin by:
+1. Finding the closest face to the origin
+2. Adding a new support point in that face's normal direction
+3. Removing visible faces, collecting horizon edges, rebuilding
+4. Computing barycentric witness points on convergence
+
+**Plane-Mesh** (`plane_mesh_multi`):
+Special-cased for performance — tests ALL mesh vertices against the plane and returns contacts for every penetrating vertex. This matches MuJoCo C's convex-plane behavior.
+
+**Vmap Path**:
+Uses sphere approximation for mesh geoms in the batched pipeline (mesh center + bounding radius). Full GJK/EPA is scalar-only due to variable iteration requirements. This is acceptable for batched training.
+
 ---
 
 ## Known Issues and Future Work

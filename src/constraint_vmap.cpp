@@ -580,6 +580,39 @@ static VmapCollResult vmap_capsule_cylinder(
     return {mx::reshape(dist, {}), bpt2, vmap_make_frame(norm)};
 }
 
+// ── MESH collision (vmap-compatible) ─────────────────────────────────────────
+// For vmap: uses the mesh center as a sphere approximation for simplicity.
+// The scalar path (collision.cpp) uses full GJK/EPA for accuracy.
+// This is adequate for batched training where exact mesh collision conformance
+// is less critical than stability.
+
+static VmapCollResult vmap_plane_mesh(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& mpos, const mx::array& mmat, float mesh_radius)
+{
+    // Treat mesh as a sphere centered at its position with approximate radius
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto diff = mx::subtract(mpos, ppos);
+    auto dist = mx::subtract(mx::sum(mx::multiply(normal, diff)), mx::array(mesh_radius));
+    auto pos = mx::subtract(mpos, mx::multiply(normal, mx::add(dist, mx::array(mesh_radius))));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_convex_mesh(
+    const mx::array& pos1, const mx::array& mat1, float size1_0,
+    const mx::array& pos2, const mx::array& mat2, float mesh_radius)
+{
+    // Simplified: treat both as spheres at their centers
+    auto sep = mx::subtract(pos1, pos2);
+    auto d = vmap_norm(sep);
+    auto norm = mx::where(mx::less(d, mx::array(1e-8f)),
+                           mx::array({0.0f, 0.0f, 1.0f}),
+                           mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::add(mx::array(size1_0), mx::array(mesh_radius)));
+    auto contact = mx::add(pos2, mx::multiply(norm, mx::array(mesh_radius)));
+    return {mx::reshape(dist, {}), contact, vmap_make_frame(norm)};
+}
+
 // ── Vmap-compatible collision (top level) ────────────────────────────────────
 
 Data vmap_collision(const Model& m, Data d) {
@@ -639,6 +672,19 @@ Data vmap_collision(const Model& m, Data d) {
         } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::CYLINDER) {
             result = vmap_capsule_cylinder(p1, m1, cp.size1[0], cp.size1[1],
                                            p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::MESH) {
+            // Approximate mesh radius from size[0] (MuJoCo stores bounding sphere info)
+            float mesh_r = std::max({cp.size2[0], cp.size2[1], cp.size2[2]});
+            if (mesh_r < 0.001f) mesh_r = 0.05f;
+            result = vmap_plane_mesh(p1, m1, p2, m2, mesh_r);
+        } else if (t2 == (int)GeomType::MESH || t1 == (int)GeomType::MESH) {
+            float s1 = (t1 == (int)GeomType::MESH) ?
+                std::max({cp.size1[0], cp.size1[1], cp.size1[2]}) : cp.size1[0];
+            float s2 = (t2 == (int)GeomType::MESH) ?
+                std::max({cp.size2[0], cp.size2[1], cp.size2[2]}) : cp.size2[0];
+            if (s1 < 0.001f) s1 = 0.05f;
+            if (s2 < 0.001f) s2 = 0.05f;
+            result = vmap_convex_mesh(p1, m1, s1, p2, m2, s2);
         } else {
             result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
         }

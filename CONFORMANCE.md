@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-17 (Phase 3.2 CYLINDER collisions complete).
+Last updated: 2026-02-17 (Phase 3.3 MESH/GJK/EPA collisions complete).
 
 ## Table of Contents
 
@@ -95,6 +95,28 @@ Key results:
   cylinder-local closest-point with barrel/cap/rim handling (sphere-cylinder),
   iterative segment-cylinder with projection refinement (capsule-cylinder)
 
+## Phase 3.3 Conformance (Completed 2026-02-17)
+
+MESH/GJK/EPA collision detection — the key feature for the Synth model. Unlocks
+models with convex mesh geoms via the Gilbert-Johnson-Keerthi (GJK) algorithm
+for overlap detection and the Expanding Polytope Algorithm (EPA) for contact extraction.
+
+| Feature | Status | Tests |
+|---------|--------|-------|
+| plane-mesh (multi-contact, all vertices) | Done | 7 tests in `test_collision_mesh.cpp` |
+| sphere-mesh (GJK/EPA) | Done | Included in above |
+| capsule-mesh (GJK/EPA) | Done | Included in above |
+| mesh-mesh (GJK/EPA) | Done | Included in above |
+| mesh-box, mesh-cylinder (GJK/EPA) | Done | Covered by generic convex path |
+
+Key results:
+- plane-mesh ncon=4 (all 4 bottom vertices), qacc diff **3.0** after 1 step
+- qpos diff after 100 steps: **0.000091** (near-perfect stability)
+- GJK/EPA handles arbitrary convex shapes with support functions for all geom types
+- Both scalar and vmap/batched paths implemented (vmap uses sphere approximation)
+- Mesh vertex data loaded from MuJoCo model into internal arrays
+- Support functions: sphere, capsule, box, cylinder, mesh (argmax vertex·direction)
+
 ---
 
 ## Scale Comparison
@@ -131,12 +153,12 @@ across 6 files to a 9x9 geom-type dispatch table with analytic, convex
 | ELLIPSOID | Yes | Partial (SDF) | **No** |
 | CYLINDER | Yes | Partial (SDF) | Yes |
 | BOX | Yes | Yes (as mesh) | Yes |
-| MESH | Yes | Yes (vertex limit) | **No** |
+| MESH | Yes | Yes (vertex limit) | Yes (GJK/EPA) |
 | SDF | Yes | Yes | **No** |
 
 ### Collision Pairs Implemented
 
-MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12:
+MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12+ (including GJK/EPA generic path):
 
 | Pair | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
@@ -153,8 +175,8 @@ MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12:
 | capsule-cylinder | `mjc_CapsuleCylinder` | Yes | Yes |
 | capsule-box | `mjc_CapsuleBox` | Yes | Yes |
 | box-box | `mjc_BoxBox` | Yes | Yes (SAT, single contact) |
-| convex-convex | GJK/EPA | GJK/SAT | **No** |
-| mesh-* | GJK/EPA | SAT (vertex limit) | **No** |
+| convex-convex | GJK/EPA | GJK/SAT | Yes (GJK/EPA) |
+| mesh-* | GJK/EPA | SAT (vertex limit) | Yes (GJK/EPA, multi-contact for plane) |
 | hfield-* | `mjc_ConvexHField` | Yes | **No** |
 | sdf-* | `mjc_SDF` | Yes | **No** |
 

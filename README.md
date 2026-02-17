@@ -87,7 +87,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (180 tests across 19 suites)
+# Full suite (187 tests across 20 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -159,9 +159,12 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 - **plane-cylinder** — multi-contact (face center + rim points), ncon matches MuJoCo C exactly
 - **sphere-cylinder** — cylinder-local closest-point with barrel/cap/rim handling
 - **capsule-cylinder** — segment-to-cylinder iterative projection refinement
-- All 12 collision pair types work in both scalar and vmap (batched) pipelines
+- **GJK/EPA** — full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm
+- **plane-mesh** — multi-contact (all penetrating vertices), near-exact MuJoCo C match
+- **mesh-mesh** — GJK/EPA with support functions for sphere, capsule, box, cylinder, mesh
+- All collision pair types work in both scalar and vmap (batched) pipelines
 
-59 conformance tests across 9 test suites, all validated against MuJoCo C reference.
+66 conformance tests across 10 test suites, all validated against MuJoCo C reference.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
 

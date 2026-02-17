@@ -197,6 +197,12 @@ struct Model {
     mx::array geom_conaffinity{mx::array({})};
     mx::array geom_condim{mx::array({})};
 
+    // Mesh data (for GJK/EPA convex collision)
+    mx::array geom_dataid{mx::array({})};     // (ngeom,) int: mesh id for mesh geoms, -1 otherwise
+    mx::array mesh_vertadr{mx::array({})};    // (nmesh,) int: start index of vertices for each mesh
+    mx::array mesh_vertnum{mx::array({})};    // (nmesh,) int: number of vertices for each mesh
+    mx::array mesh_vert{mx::array({})};       // (total_verts, 3) float: all mesh vertices
+
     // Pair properties
     mx::array pair_geom1{mx::array({})};
     mx::array pair_geom2{mx::array({})};
@@ -240,6 +246,7 @@ struct Model {
             float solimp[5];
             float size1[3], size2[3];
             int condim;
+            int dataid1 = -1, dataid2 = -1; // mesh id for mesh geoms, -1 otherwise
         };
         std::vector<CollisionPair> collision_pairs;
         int max_ncon = 0;  // = collision_pairs.size()

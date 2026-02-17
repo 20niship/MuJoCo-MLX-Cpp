@@ -820,6 +820,627 @@ static CollisionResult capsule_cylinder(
             make_frame(mx::array({nx, ny, nz}))};
 }
 
+// ── GJK/EPA convex collision ──────────────────────────────────
+// Used for any pair involving MESH geoms (and as fallback for other convex pairs).
+
+struct Vec3 { float x, y, z; };
+static Vec3 v3sub(Vec3 a, Vec3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
+static Vec3 v3add(Vec3 a, Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
+static Vec3 v3scale(Vec3 a, float s) { return {a.x*s, a.y*s, a.z*s}; }
+static float v3dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static Vec3 v3cross(Vec3 a, Vec3 b) {
+    return {a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
+}
+static float v3len(Vec3 a) { return std::sqrt(a.x*a.x + a.y*a.y + a.z*a.z); }
+static Vec3 v3neg(Vec3 a) { return {-a.x, -a.y, -a.z}; }
+static Vec3 v3norm(Vec3 a) {
+    float l = v3len(a);
+    return l > 1e-12f ? v3scale(a, 1.0f/l) : Vec3{0,0,1};
+}
+
+// Support function: furthest point on convex geom in a given direction (world space)
+struct ConvexGeom {
+    int type;
+    float pos[3];
+    float mat[9]; // 3x3 rotation, row-major
+    float size[3];
+    // For mesh: vertex data
+    const float* verts = nullptr;
+    int nverts = 0;
+};
+
+static Vec3 support(const ConvexGeom& g, Vec3 dir) {
+    Vec3 center = {g.pos[0], g.pos[1], g.pos[2]};
+
+    switch (g.type) {
+    case (int)GeomType::SPHERE: {
+        float r = g.size[0];
+        Vec3 nd = v3norm(dir);
+        return v3add(center, v3scale(nd, r));
+    }
+    case (int)GeomType::CAPSULE: {
+        float r = g.size[0];
+        float h = g.size[1];
+        // Axis = z-column of rotation matrix
+        Vec3 axis = {g.mat[2], g.mat[5], g.mat[8]};
+        // Pick the endpoint most aligned with dir
+        float d = v3dot(axis, dir);
+        Vec3 endpoint = v3add(center, v3scale(axis, d >= 0 ? h : -h));
+        Vec3 nd = v3norm(dir);
+        return v3add(endpoint, v3scale(nd, r));
+    }
+    case (int)GeomType::BOX: {
+        float hx = g.size[0], hy = g.size[1], hz = g.size[2];
+        Vec3 xc = {g.mat[0], g.mat[3], g.mat[6]}; // x-column
+        Vec3 yc = {g.mat[1], g.mat[4], g.mat[7]}; // y-column
+        Vec3 zc = {g.mat[2], g.mat[5], g.mat[8]}; // z-column
+        float sx = (v3dot(xc, dir) >= 0) ? hx : -hx;
+        float sy = (v3dot(yc, dir) >= 0) ? hy : -hy;
+        float sz = (v3dot(zc, dir) >= 0) ? hz : -hz;
+        return {center.x + sx*xc.x + sy*yc.x + sz*zc.x,
+                center.y + sx*xc.y + sy*yc.y + sz*zc.y,
+                center.z + sx*xc.z + sy*yc.z + sz*zc.z};
+    }
+    case (int)GeomType::CYLINDER: {
+        float R = g.size[0], H = g.size[1];
+        Vec3 axis = {g.mat[2], g.mat[5], g.mat[8]}; // z-column
+        // Along axis: pick the sign that aligns with dir
+        float da = v3dot(axis, dir);
+        Vec3 tip = v3add(center, v3scale(axis, da >= 0 ? H : -H));
+        // Perpendicular to axis in dir direction
+        float proj = v3dot(dir, axis);
+        Vec3 perp = {dir.x - proj*axis.x, dir.y - proj*axis.y, dir.z - proj*axis.z};
+        float pl = v3len(perp);
+        if (pl > 1e-12f) {
+            return v3add(tip, v3scale(perp, R / pl));
+        }
+        return tip;
+    }
+    case (int)GeomType::MESH: {
+        // Find vertex with maximum dot product with dir
+        float best_dot = -1e20f;
+        int best_i = 0;
+        for (int i = 0; i < g.nverts; i++) {
+            float d = g.verts[i*3]*dir.x + g.verts[i*3+1]*dir.y + g.verts[i*3+2]*dir.z;
+            if (d > best_dot) { best_dot = d; best_i = i; }
+        }
+        // Mesh vertices are in local frame; transform to world
+        float lx = g.verts[best_i*3], ly = g.verts[best_i*3+1], lz = g.verts[best_i*3+2];
+        float wx = center.x + g.mat[0]*lx + g.mat[1]*ly + g.mat[2]*lz;
+        float wy = center.y + g.mat[3]*lx + g.mat[4]*ly + g.mat[5]*lz;
+        float wz = center.z + g.mat[6]*lx + g.mat[7]*ly + g.mat[8]*lz;
+        return {wx, wy, wz};
+    }
+    default:
+        return center;
+    }
+}
+
+// GJK: Minkowski difference support
+struct MinkowskiPoint {
+    Vec3 diff; // A - B in Minkowski space
+    Vec3 a;    // support point on A
+    Vec3 b;    // support point on B
+};
+
+static MinkowskiPoint mink_support(const ConvexGeom& A, const ConvexGeom& B, Vec3 dir) {
+    Vec3 sa = support(A, dir);
+    Vec3 sb = support(B, v3neg(dir));
+    return {v3sub(sa, sb), sa, sb};
+}
+
+// GJK: update simplex toward origin. Returns true if origin is contained.
+struct GJKSimplex {
+    MinkowskiPoint pts[4];
+    int n = 0;
+    Vec3 dir;
+};
+
+static bool gjk_line(GJKSimplex& s) {
+    Vec3 A = s.pts[1].diff, B = s.pts[0].diff;
+    Vec3 AB = v3sub(B, A);
+    Vec3 AO = v3neg(A);
+    if (v3dot(AB, AO) > 0) {
+        s.dir = v3cross(v3cross(AB, AO), AB);
+        if (v3len(s.dir) < 1e-12f) s.dir = v3cross(AB, {1,0,0});
+        if (v3len(s.dir) < 1e-12f) s.dir = v3cross(AB, {0,1,0});
+    } else {
+        s.pts[0] = s.pts[1];
+        s.n = 1;
+        s.dir = AO;
+    }
+    return false;
+}
+
+static bool gjk_triangle(GJKSimplex& s) {
+    Vec3 A = s.pts[2].diff, B = s.pts[1].diff, C = s.pts[0].diff;
+    Vec3 AB = v3sub(B, A), AC = v3sub(C, A), AO = v3neg(A);
+    Vec3 ABC = v3cross(AB, AC);
+
+    Vec3 ABperp = v3cross(AB, ABC);
+    Vec3 ACperp = v3cross(ABC, AC);
+
+    if (v3dot(ACperp, AO) > 0) {
+        if (v3dot(AC, AO) > 0) {
+            s.pts[0] = s.pts[0]; // C stays
+            s.pts[1] = s.pts[2]; // A
+            s.n = 2;
+            s.dir = v3cross(v3cross(AC, AO), AC);
+        } else {
+            s.pts[0] = s.pts[1]; s.pts[1] = s.pts[2]; s.n = 2;
+            return gjk_line(s);
+        }
+    } else if (v3dot(ABperp, AO) > 0) {
+        s.pts[0] = s.pts[1]; s.pts[1] = s.pts[2]; s.n = 2;
+        return gjk_line(s);
+    } else {
+        if (v3dot(ABC, AO) > 0) {
+            s.dir = ABC;
+        } else {
+            // Flip winding
+            MinkowskiPoint tmp = s.pts[0]; s.pts[0] = s.pts[1]; s.pts[1] = tmp;
+            s.dir = v3neg(ABC);
+        }
+    }
+    return false;
+}
+
+static bool gjk_tetrahedron(GJKSimplex& s) {
+    Vec3 A = s.pts[3].diff, B = s.pts[2].diff, C = s.pts[1].diff, D = s.pts[0].diff;
+    Vec3 AB = v3sub(B, A), AC = v3sub(C, A), AD = v3sub(D, A), AO = v3neg(A);
+
+    Vec3 ABC = v3cross(AB, AC);
+    Vec3 ACD = v3cross(AC, AD);
+    Vec3 ADB = v3cross(AD, AB);
+
+    if (v3dot(ABC, AO) > 0) {
+        s.pts[0] = s.pts[1]; s.pts[1] = s.pts[2]; s.pts[2] = s.pts[3]; s.n = 3;
+        return gjk_triangle(s);
+    }
+    if (v3dot(ACD, AO) > 0) {
+        s.pts[1] = s.pts[0]; s.pts[0] = s.pts[1];
+        s.pts[0] = s.pts[0]; s.pts[1] = s.pts[2]; s.pts[2] = s.pts[3]; s.n = 3;
+        // Reorder: keep A, C, D
+        s.pts[0] = {D.x ? s.pts[0] : s.pts[0]}; // keep D
+        // Simpler: rebuild
+        MinkowskiPoint pA = s.pts[3], pC = s.pts[1], pD = s.pts[0];
+        s.pts[0] = pD; s.pts[1] = pC; s.pts[2] = pA; s.n = 3;
+        return gjk_triangle(s);
+    }
+    if (v3dot(ADB, AO) > 0) {
+        MinkowskiPoint pA = s.pts[3], pD = s.pts[0], pB = s.pts[2];
+        s.pts[0] = pB; s.pts[1] = pD; s.pts[2] = pA; s.n = 3;
+        return gjk_triangle(s);
+    }
+    // Origin is inside tetrahedron
+    return true;
+}
+
+// Run GJK. Returns true if shapes overlap. simplex is the final GJK simplex.
+static bool gjk(const ConvexGeom& A, const ConvexGeom& B, GJKSimplex& simplex) {
+    Vec3 initial_dir = v3sub(Vec3{B.pos[0], B.pos[1], B.pos[2]},
+                              Vec3{A.pos[0], A.pos[1], A.pos[2]});
+    if (v3len(initial_dir) < 1e-12f) initial_dir = {1, 0, 0};
+
+    simplex.pts[0] = mink_support(A, B, initial_dir);
+    simplex.n = 1;
+
+    simplex.dir = v3neg(simplex.pts[0].diff);
+    if (v3len(simplex.dir) < 1e-12f) return true; // origin at support = overlap
+
+    for (int iter = 0; iter < 64; iter++) {
+        MinkowskiPoint p = mink_support(A, B, simplex.dir);
+        if (v3dot(p.diff, simplex.dir) < 0) {
+            return false; // no overlap
+        }
+        simplex.pts[simplex.n++] = p;
+
+        bool contains_origin = false;
+        switch (simplex.n) {
+        case 2: contains_origin = gjk_line(simplex); break;
+        case 3: contains_origin = gjk_triangle(simplex); break;
+        case 4: contains_origin = gjk_tetrahedron(simplex); break;
+        }
+        if (contains_origin) return true;
+    }
+    return false;
+}
+
+// EPA: Expanding Polytope Algorithm
+// Given a GJK simplex containing the origin, find the closest face and expand.
+struct EPAFace {
+    int a, b, c;
+    Vec3 normal;
+    float dist;
+};
+
+struct EPAResult {
+    Vec3 normal;
+    float depth;
+    Vec3 point_a; // witness on shape A
+    Vec3 point_b; // witness on shape B
+};
+
+static EPAResult epa(const ConvexGeom& A, const ConvexGeom& B, GJKSimplex& simplex) {
+    static constexpr int MAX_VERTS = 128;
+    static constexpr int MAX_FACES = 256;
+    static constexpr int MAX_ITER = 64;
+
+    MinkowskiPoint verts[MAX_VERTS];
+    int nverts = 0;
+
+    // Initialize with tetrahedron from GJK simplex
+    if (simplex.n < 4) {
+        // Need a full tetrahedron. Expand simplex.
+        // Add support points in cardinal directions to build a tetrahedron
+        Vec3 dirs[6] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        while (simplex.n < 4) {
+            for (auto& d : dirs) {
+                auto p = mink_support(A, B, d);
+                bool dup = false;
+                for (int i = 0; i < simplex.n; i++) {
+                    Vec3 diff = v3sub(p.diff, simplex.pts[i].diff);
+                    if (v3len(diff) < 1e-8f) { dup = true; break; }
+                }
+                if (!dup) {
+                    simplex.pts[simplex.n++] = p;
+                    if (simplex.n >= 4) break;
+                }
+            }
+            if (simplex.n < 4) {
+                // Degenerate case: shapes barely touching
+                Vec3 n = v3norm(v3sub(Vec3{A.pos[0],A.pos[1],A.pos[2]},
+                                       Vec3{B.pos[0],B.pos[1],B.pos[2]}));
+                return {n, 0.0f, {A.pos[0],A.pos[1],A.pos[2]}, {B.pos[0],B.pos[1],B.pos[2]}};
+            }
+        }
+    }
+
+    for (int i = 0; i < 4; i++) verts[nverts++] = simplex.pts[i];
+
+    // Build initial faces (tetrahedron = 4 faces)
+    EPAFace faces[MAX_FACES];
+    int nfaces = 0;
+
+    auto add_face = [&](int a, int b, int c) {
+        if (nfaces >= MAX_FACES) return;
+        Vec3 AB = v3sub(verts[b].diff, verts[a].diff);
+        Vec3 AC = v3sub(verts[c].diff, verts[a].diff);
+        Vec3 n = v3cross(AB, AC);
+        float nl = v3len(n);
+        if (nl < 1e-12f) return;
+        n = v3scale(n, 1.0f/nl);
+        float d = v3dot(n, verts[a].diff);
+        if (d < 0) { n = v3neg(n); d = -d; std::swap(b, c); }
+        faces[nfaces++] = {a, b, c, n, d};
+    };
+
+    add_face(0,1,2); add_face(0,2,3); add_face(0,3,1); add_face(1,3,2);
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        if (nfaces == 0) break;
+
+        // Find closest face to origin
+        int best_f = 0;
+        float best_dist = faces[0].dist;
+        for (int i = 1; i < nfaces; i++) {
+            if (faces[i].dist < best_dist) { best_dist = faces[i].dist; best_f = i; }
+        }
+
+        EPAFace& closest = faces[best_f];
+        Vec3 search_dir = closest.normal;
+
+        // Get new support point
+        auto p = mink_support(A, B, search_dir);
+        float proj = v3dot(p.diff, search_dir);
+
+        if (proj - best_dist < 1e-4f || nverts >= MAX_VERTS) {
+            // Converged: compute witness points via barycentric coords on closest face
+            Vec3 a = verts[closest.a].diff;
+            Vec3 b = verts[closest.b].diff;
+            Vec3 c = verts[closest.c].diff;
+
+            // Project origin onto face plane, then barycentric
+            Vec3 v0 = v3sub(b, a), v1 = v3sub(c, a), v2 = v3neg(a); // 0 - a
+            float d00 = v3dot(v0, v0), d01 = v3dot(v0, v1), d11 = v3dot(v1, v1);
+            float d20 = v3dot(v2, v0), d21 = v3dot(v2, v1);
+            float denom = d00*d11 - d01*d01;
+            float u = (denom > 1e-12f) ? (d11*d20 - d01*d21) / denom : 1.0f/3;
+            float v = (denom > 1e-12f) ? (d00*d21 - d01*d20) / denom : 1.0f/3;
+            float w = 1.0f - u - v;
+            u = std::max(0.0f, u); v = std::max(0.0f, v); w = std::max(0.0f, w);
+            float sum = u + v + w;
+            if (sum > 1e-8f) { u /= sum; v /= sum; w /= sum; }
+
+            Vec3 pa = v3add(v3add(v3scale(verts[closest.a].a, w),
+                                   v3scale(verts[closest.b].a, u)),
+                            v3scale(verts[closest.c].a, v));
+            Vec3 pb = v3add(v3add(v3scale(verts[closest.a].b, w),
+                                   v3scale(verts[closest.b].b, u)),
+                            v3scale(verts[closest.c].b, v));
+
+            return {search_dir, best_dist, pa, pb};
+        }
+
+        // Add new vertex
+        verts[nverts] = p;
+        int new_idx = nverts++;
+
+        // Remove faces visible from new point, collect horizon edges
+        struct Edge { int a, b; };
+        Edge horizon[MAX_FACES * 3];
+        int nhorizon = 0;
+
+        bool removed[MAX_FACES] = {};
+        for (int i = 0; i < nfaces; i++) {
+            Vec3 to_p = v3sub(p.diff, verts[faces[i].a].diff);
+            if (v3dot(faces[i].normal, to_p) > 0) removed[i] = true;
+        }
+
+        for (int i = 0; i < nfaces; i++) {
+            if (!removed[i]) continue;
+            int edges[3][2] = {{faces[i].a, faces[i].b},
+                               {faces[i].b, faces[i].c},
+                               {faces[i].c, faces[i].a}};
+            for (auto& e : edges) {
+                bool shared = false;
+                for (int j = 0; j < nfaces; j++) {
+                    if (j == i || !removed[j]) continue;
+                    int fe[3][2] = {{faces[j].a, faces[j].b},
+                                    {faces[j].b, faces[j].c},
+                                    {faces[j].c, faces[j].a}};
+                    for (auto& fe2 : fe) {
+                        if ((fe2[0] == e[1] && fe2[1] == e[0]) ||
+                            (fe2[0] == e[0] && fe2[1] == e[1])) {
+                            shared = true; break;
+                        }
+                    }
+                    if (shared) break;
+                }
+                if (!shared && nhorizon < MAX_FACES * 3) {
+                    horizon[nhorizon++] = {e[0], e[1]};
+                }
+            }
+        }
+
+        // Compact face array
+        int write = 0;
+        for (int i = 0; i < nfaces; i++) {
+            if (!removed[i]) faces[write++] = faces[i];
+        }
+        nfaces = write;
+
+        // Add new faces from horizon edges to new vertex
+        for (int i = 0; i < nhorizon; i++) {
+            add_face(horizon[i].a, horizon[i].b, new_idx);
+        }
+    }
+
+    // Fallback
+    Vec3 n = v3norm(v3sub(Vec3{A.pos[0],A.pos[1],A.pos[2]},
+                           Vec3{B.pos[0],B.pos[1],B.pos[2]}));
+    return {n, 0.0f, {A.pos[0],A.pos[1],A.pos[2]}, {B.pos[0],B.pos[1],B.pos[2]}};
+}
+
+// GJK closest distance (for non-overlapping shapes)
+static float gjk_distance(const GJKSimplex& simplex) {
+    switch (simplex.n) {
+    case 1: return v3len(simplex.pts[0].diff);
+    case 2: {
+        Vec3 A = simplex.pts[1].diff, B = simplex.pts[0].diff;
+        Vec3 AB = v3sub(B, A);
+        float t = -v3dot(A, AB) / std::max(v3dot(AB, AB), 1e-12f);
+        t = std::max(0.0f, std::min(1.0f, t));
+        Vec3 closest = v3add(A, v3scale(AB, t));
+        return v3len(closest);
+    }
+    case 3: {
+        // Distance from origin to triangle
+        Vec3 A = simplex.pts[2].diff, B = simplex.pts[1].diff, C = simplex.pts[0].diff;
+        Vec3 AB = v3sub(B, A), AC = v3sub(C, A);
+        Vec3 n = v3cross(AB, AC);
+        float nl = v3len(n);
+        if (nl < 1e-12f) return v3len(A);
+        return std::abs(v3dot(A, n)) / nl;
+    }
+    default: return 0.0f;
+    }
+}
+
+// Witness points for non-overlapping case
+static void gjk_witness(const GJKSimplex& simplex, Vec3& pa, Vec3& pb) {
+    switch (simplex.n) {
+    case 1:
+        pa = simplex.pts[0].a;
+        pb = simplex.pts[0].b;
+        break;
+    case 2: {
+        Vec3 A = simplex.pts[1].diff, B = simplex.pts[0].diff;
+        Vec3 AB = v3sub(B, A);
+        float t = -v3dot(A, AB) / std::max(v3dot(AB, AB), 1e-12f);
+        t = std::max(0.0f, std::min(1.0f, t));
+        pa = v3add(simplex.pts[1].a, v3scale(v3sub(simplex.pts[0].a, simplex.pts[1].a), t));
+        pb = v3add(simplex.pts[1].b, v3scale(v3sub(simplex.pts[0].b, simplex.pts[1].b), t));
+        break;
+    }
+    case 3: {
+        Vec3 A = simplex.pts[2].diff, B = simplex.pts[1].diff, C = simplex.pts[0].diff;
+        Vec3 v0 = v3sub(B, A), v1 = v3sub(C, A), v2 = v3neg(A);
+        float d00 = v3dot(v0, v0), d01 = v3dot(v0, v1), d11 = v3dot(v1, v1);
+        float d20 = v3dot(v2, v0), d21 = v3dot(v2, v1);
+        float denom = d00*d11 - d01*d01;
+        float u = (denom > 1e-12f) ? (d11*d20 - d01*d21) / denom : 1.0f/3;
+        float v = (denom > 1e-12f) ? (d00*d21 - d01*d20) / denom : 1.0f/3;
+        float w = 1.0f - u - v;
+        u = std::max(0.0f, u); v = std::max(0.0f, v); w = std::max(0.0f, w);
+        float sum = u + v + w;
+        if (sum > 1e-8f) { u /= sum; v /= sum; w /= sum; }
+        pa = v3add(v3add(v3scale(simplex.pts[2].a, w), v3scale(simplex.pts[1].a, u)),
+                    v3scale(simplex.pts[0].a, v));
+        pb = v3add(v3add(v3scale(simplex.pts[2].b, w), v3scale(simplex.pts[1].b, u)),
+                    v3scale(simplex.pts[0].b, v));
+        break;
+    }
+    default:
+        pa = {0,0,0}; pb = {0,0,0};
+    }
+}
+
+// Build ConvexGeom from collision data
+static ConvexGeom make_convex_geom(int type, const float* pos, const float* mat,
+                                    const float* size, const Model& model, int dataid) {
+    ConvexGeom g;
+    g.type = type;
+    for (int i = 0; i < 3; i++) g.pos[i] = pos[i];
+    for (int i = 0; i < 9; i++) g.mat[i] = mat[i];
+    for (int i = 0; i < 3; i++) g.size[i] = size[i];
+    g.verts = nullptr;
+    g.nverts = 0;
+
+    if (type == (int)GeomType::MESH && dataid >= 0 && model.mesh_vert.size() > 0) {
+        mx::eval(model.mesh_vertadr);
+        mx::eval(model.mesh_vertnum);
+        mx::eval(model.mesh_vert);
+        auto vadr = model.mesh_vertadr.data<int>();
+        auto vnum = model.mesh_vertnum.data<int>();
+        g.verts = model.mesh_vert.data<float>() + vadr[dataid] * 3;
+        g.nverts = vnum[dataid];
+    }
+
+    return g;
+}
+
+// Convex collision via GJK/EPA: handles any pair involving MESH geoms
+static CollisionResult convex_collision(
+    int type1, const mx::array& pos1, const mx::array& mat1, const mx::array& size1, int dataid1,
+    int type2, const mx::array& pos2, const mx::array& mat2, const mx::array& size2, int dataid2,
+    const Model& model)
+{
+    mx::eval(pos1); mx::eval(mat1); mx::eval(size1);
+    mx::eval(pos2); mx::eval(mat2); mx::eval(size2);
+
+    ConvexGeom A = make_convex_geom(type1, pos1.data<float>(), mat1.data<float>(),
+                                     size1.data<float>(), model, dataid1);
+    ConvexGeom B = make_convex_geom(type2, pos2.data<float>(), mat2.data<float>(),
+                                     size2.data<float>(), model, dataid2);
+
+    GJKSimplex simplex;
+    bool overlap = gjk(A, B, simplex);
+
+    if (overlap) {
+        EPAResult r = epa(A, B, simplex);
+        float dist = -r.depth;
+        Vec3 contact_pos = v3scale(v3add(r.point_a, r.point_b), 0.5f);
+        Vec3 normal = r.normal;
+        return {mx::array(dist),
+                mx::array({contact_pos.x, contact_pos.y, contact_pos.z}),
+                make_frame(mx::array({normal.x, normal.y, normal.z}))};
+    } else {
+        float dist = gjk_distance(simplex);
+        Vec3 pa, pb;
+        gjk_witness(simplex, pa, pb);
+        Vec3 sep = v3sub(pa, pb);
+        Vec3 normal = v3norm(sep);
+        Vec3 contact_pos = v3scale(v3add(pa, pb), 0.5f);
+        return {mx::array(dist),
+                mx::array({contact_pos.x, contact_pos.y, contact_pos.z}),
+                make_frame(mx::array({normal.x, normal.y, normal.z}))};
+    }
+}
+
+// plane_mesh_multi: returns contacts for all mesh vertices penetrating the plane.
+// Matches MuJoCo C's convex-plane contact generation.
+static int plane_mesh_multi(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& mesh_pos, const mx::array& mesh_mat, const mx::array& mesh_size,
+    int dataid, const Model& model, float margin, int g1, int g2, int condim,
+    std::vector<mx::array>& c_dist, std::vector<mx::array>& c_pos,
+    std::vector<mx::array>& c_frame, std::vector<mx::array>& c_geom,
+    std::vector<int>& c_dim)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+    auto frame = make_frame(normal);
+    mx::eval(normal); mx::eval(plane_pos);
+    mx::eval(mesh_pos); mx::eval(mesh_mat);
+
+    if (dataid < 0 || model.mesh_vert.size() == 0) return 0;
+
+    mx::eval(model.mesh_vertadr); mx::eval(model.mesh_vertnum); mx::eval(model.mesh_vert);
+    auto vadr = model.mesh_vertadr.data<int>();
+    auto vnum = model.mesh_vertnum.data<int>();
+    const float* verts = model.mesh_vert.data<float>() + vadr[dataid] * 3;
+    int nv = vnum[dataid];
+
+    auto np = normal.data<float>();
+    auto pp = plane_pos.data<float>();
+    auto mp = mesh_pos.data<float>();
+    auto mm = mesh_mat.data<float>();
+
+    int ncon_added = 0;
+    for (int i = 0; i < nv; i++) {
+        float lx = verts[i*3], ly = verts[i*3+1], lz = verts[i*3+2];
+        float wx = mp[0] + mm[0]*lx + mm[1]*ly + mm[2]*lz;
+        float wy = mp[1] + mm[3]*lx + mm[4]*ly + mm[5]*lz;
+        float wz = mp[2] + mm[6]*lx + mm[7]*ly + mm[8]*lz;
+        float d = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+        if (d < margin) {
+            c_dist.push_back(mx::array(d));
+            auto vertex = mx::array({wx, wy, wz});
+            c_pos.push_back(mx::subtract(vertex, mx::multiply(normal, mx::array(d))));
+            c_frame.push_back(frame);
+            c_geom.push_back(mx::array({g1, g2}, mx::int32));
+            c_dim.push_back(condim);
+            ncon_added++;
+        }
+    }
+    return ncon_added;
+}
+
+// Single-contact plane_mesh (for vmap fallback)
+static CollisionResult plane_mesh_single(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& mesh_pos, const mx::array& mesh_mat, const mx::array& mesh_size,
+    int dataid, const Model& model)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+    mx::eval(normal); mx::eval(plane_pos);
+    mx::eval(mesh_pos); mx::eval(mesh_mat);
+
+    if (dataid < 0 || model.mesh_vert.size() == 0)
+        return {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
+
+    mx::eval(model.mesh_vertadr); mx::eval(model.mesh_vertnum); mx::eval(model.mesh_vert);
+    auto vadr = model.mesh_vertadr.data<int>();
+    auto vnum = model.mesh_vertnum.data<int>();
+    const float* verts = model.mesh_vert.data<float>() + vadr[dataid] * 3;
+    int nv = vnum[dataid];
+
+    auto np = normal.data<float>();
+    auto pp = plane_pos.data<float>();
+    auto mp = mesh_pos.data<float>();
+    auto mm = mesh_mat.data<float>();
+
+    float best_dist = 1e10f;
+    float best_wx = 0, best_wy = 0, best_wz = 0;
+
+    for (int i = 0; i < nv; i++) {
+        float lx = verts[i*3], ly = verts[i*3+1], lz = verts[i*3+2];
+        float wx = mp[0] + mm[0]*lx + mm[1]*ly + mm[2]*lz;
+        float wy = mp[1] + mm[3]*lx + mm[4]*ly + mm[5]*lz;
+        float wz = mp[2] + mm[6]*lx + mm[7]*ly + mm[8]*lz;
+        float d = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+        if (d < best_dist) {
+            best_dist = d;
+            best_wx = wx; best_wy = wy; best_wz = wz;
+        }
+    }
+
+    auto dist = mx::array(best_dist);
+    auto vertex = mx::array({best_wx, best_wy, best_wz});
+    auto pos = mx::subtract(vertex, mx::multiply(normal, dist));
+    return {dist, pos, make_frame(normal)};
+}
+
 static CollisionResult capsule_capsule(
     const mx::array& pos1, const mx::array& mat1, const mx::array& size1,
     const mx::array& pos2, const mx::array& mat2, const mx::array& size2)
@@ -976,6 +1597,35 @@ Data collision(const Model& m, Data d) {
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
                 result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
+                float margin = gmargin[g1_] + gmargin[g2_];
+                int condim = 3;
+                if (m.geom_condim.size() > 0) {
+                    mx::eval(m.geom_condim);
+                    auto cdp = m.geom_condim.data<int>();
+                    condim = std::max(cdp[g1_], cdp[g2_]);
+                }
+                int dataid2 = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    dataid2 = m.geom_dataid.data<int>()[g2_];
+                }
+                plane_mesh_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                    dataid2, m, margin, g1_, g2_, condim,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
+            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)) {
+                // GJK/EPA for any pair involving MESH
+                int dataid1 = -1, dataid2 = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    auto gdid = m.geom_dataid.data<int>();
+                    dataid1 = gdid[g1_];
+                    dataid2 = gdid[g2_];
+                }
+                result = convex_collision(t1_, gpos1, gmat1, gsize1, dataid1,
+                                          t2_, gpos2, gmat2, gsize2, dataid2, m);
+                handled = true;
             }
 
             if (!handled) continue;
@@ -1091,6 +1741,37 @@ Data collision(const Model& m, Data d) {
                 handled = true;
             } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
                 result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
+                float margin_pm = gmargin[g1_] + gmargin[g2_];
+                if (m.pair_margin.size() > 0) {
+                    mx::eval(m.pair_margin);
+                    margin_pm = m.pair_margin.data<float>()[pi];
+                }
+                int condim_pm = 3;
+                if (m.pair_dim.size() > 0) {
+                    mx::eval(m.pair_dim);
+                    condim_pm = m.pair_dim.data<int>()[pi];
+                }
+                int dataid2 = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    dataid2 = m.geom_dataid.data<int>()[g2_];
+                }
+                plane_mesh_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                    dataid2, m, margin_pm, g1_, g2_, condim_pm,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
+            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)) {
+                int dataid1 = -1, dataid2 = -1;
+                if (m.geom_dataid.size() > 0) {
+                    mx::eval(m.geom_dataid);
+                    auto gdid = m.geom_dataid.data<int>();
+                    dataid1 = gdid[g1_];
+                    dataid2 = gdid[g2_];
+                }
+                result = convex_collision(t1_, gpos1, gmat1, gsize1, dataid1,
+                                          t2_, gpos2, gmat2, gsize2, dataid2, m);
                 handled = true;
             }
 

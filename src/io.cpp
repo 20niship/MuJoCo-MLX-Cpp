@@ -39,6 +39,11 @@ static mx::array to_mx_f2(const double* data, int rows, int cols) {
     return mx::array(buf.data(), {rows, cols});
 }
 
+// Helper: convert a C float array to mx::array with 2D shape (for mesh_vert etc.)
+static mx::array to_mx_f2(const float* data, int rows, int cols) {
+    return mx::array(data, {rows, cols});
+}
+
 // Helper: convert a C int array to mx::array (int32)
 static mx::array to_mx_i(const int* data, int n) {
     return mx::array(data, {n}, mx::int32);
@@ -213,6 +218,22 @@ static Model convert_model(mjModel* m) {
         model.geom_contype = to_mx_i(m->geom_contype, (int)m->ngeom);
         model.geom_conaffinity = to_mx_i(m->geom_conaffinity, (int)m->ngeom);
         model.geom_condim = to_mx_i(m->geom_condim, (int)m->ngeom);
+
+        // geom_dataid: maps geom to its mesh id (-1 for non-mesh)
+        model.geom_dataid = to_mx_i(m->geom_dataid, (int)m->ngeom);
+    }
+
+    // Mesh data (for GJK/EPA convex collision)
+    if (m->nmesh > 0) {
+        model.nmesh = (int)m->nmesh;
+        model.mesh_vertadr = to_mx_i(m->mesh_vertadr, (int)m->nmesh);
+        model.mesh_vertnum = to_mx_i(m->mesh_vertnum, (int)m->nmesh);
+        int total_verts = 0;
+        for (int i = 0; i < m->nmesh; i++)
+            total_verts += m->mesh_vertnum[i];
+        if (total_verts > 0) {
+            model.mesh_vert = to_mx_f2(m->mesh_vert, total_verts, 3);
+        }
     }
 
     // Explicit contact pairs
@@ -262,8 +283,7 @@ static void validate_model(const mjModel* m) {
             default: break;
         }
     }
-    if (has_mesh)
-        fprintf(stderr, "[mjmlx WARNING] Model has MESH geoms -- collision not supported, bodies will pass through.\n");
+    // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
     // BOX geom collision is now supported (Phase 3.1)
     if (has_hfield)
         fprintf(stderr, "[mjmlx WARNING] Model has HFIELD geoms -- collision not supported.\n");
@@ -687,6 +707,13 @@ void Model::init_cache() const {
                     cp.size1[k] = gsize_ptr[g1_ * 3 + k];
                     cp.size2[k] = gsize_ptr[g2_ * 3 + k];
                 }
+                // Mesh data ids
+                if (geom_dataid.size() > 0) {
+                    mx::eval(geom_dataid);
+                    auto gdid = geom_dataid.data<int>();
+                    cp.dataid1 = gdid[g1_];
+                    cp.dataid2 = gdid[g2_];
+                }
                 // Friction: max of both geoms
                 if (geom_friction.size() > 0) {
                     mx::eval(geom_friction);
@@ -774,6 +801,12 @@ void Model::init_cache() const {
                 for (int k = 0; k < 3; k++) {
                     cp.size1[k] = gsize_ptr[g1_ * 3 + k];
                     cp.size2[k] = gsize_ptr[g2_ * 3 + k];
+                }
+                if (geom_dataid.size() > 0) {
+                    mx::eval(geom_dataid);
+                    auto gdid = geom_dataid.data<int>();
+                    cp.dataid1 = gdid[g1_];
+                    cp.dataid2 = gdid[g2_];
                 }
                 if (has_friction) {
                     auto fp = pair_friction.data<float>();
@@ -865,6 +898,18 @@ void Model::init_cache() const {
             max_contacts = 2;
         else if (cp.type1 == (int)GeomType::BOX && cp.type2 == (int)GeomType::BOX)
             max_contacts = 8;
+        else if (cp.type1 == (int)GeomType::PLANE && cp.type2 == (int)GeomType::MESH) {
+            // plane-mesh: up to all vertices can penetrate (use dataid to get count)
+            int dataid = cp.dataid2;
+            if (dataid >= 0 && mesh_vertnum.size() > 0) {
+                mx::eval(mesh_vertnum);
+                max_contacts = mesh_vertnum.data<int>()[dataid];
+            } else {
+                max_contacts = 8; // conservative fallback
+            }
+        }
+        else if (cp.type2 == (int)GeomType::MESH || cp.type1 == (int)GeomType::MESH)
+            max_contacts = 1; // GJK/EPA returns 1 contact
         max_contact_rows += max_contacts * rows_per_contact;
     }
     cache.max_nefc = cache.max_nl + max_contact_rows;
