@@ -20,7 +20,7 @@ Humanoid benchmarks on Apple M4 Max (40-core GPU, 64 GB unified memory):
 | 4,096 | 255,362 | |
 | 8,192 | **331,207** | Peak throughput |
 
-Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal Euler`
+Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` (Euler in batched, Euler/RK4 in scalar)
 
 Validated training: **5,678 reward** on Gymnasium Humanoid-v5 (12.6x MuJoCo C baseline), 70K SPS at 8192 envs.
 
@@ -47,7 +47,8 @@ libmjmlx.dylib (GPU physics core)
     |
     +-- Tendon system
     |     Fixed (joint-based) tendons: ten_length, ten_velocity, ten_J
-    |     Tendon passive forces (spring + damping)
+    |     Tendon passive forces, limits, friction (scalar path)
+    |     TENDON + SITE actuator transmission
     |
     +-- Metal kernels
     |     Kinematics FK, fused Euler (source-generated MSL)
@@ -165,12 +166,12 @@ All features validated against MuJoCo C reference implementation. **230 tests ac
 - **plane-cylinder** -- multi-contact (face center + rim points)
 - **sphere-cylinder** -- cylinder-local closest-point with barrel/cap/rim handling
 - **capsule-cylinder** -- segment-to-cylinder iterative projection refinement
-- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm
+- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm (scalar: 64-iter GJK + 64-iter EPA; vmap: 32-iter GJK + support-based depth estimation)
 - **plane-mesh** -- multi-contact (all penetrating vertices), near-exact MuJoCo C match
-- **mesh-mesh** -- GJK/EPA with support functions for sphere, capsule, box, cylinder, mesh
+- **mesh-mesh** -- GJK/EPA with proper mesh support functions (vertex argmax), not sphere approximation
 - **plane-hfield** -- heightfield terrain collision against all geom types, grid-cell triangle tests
 - **plane-ellipsoid** -- analytic ellipsoid collision against planes, spheres, capsules
-- All collision pair types work in both scalar and vmap (batched) pipelines
+- All collision pair types work in both scalar and vmap (batched) pipelines with proper support functions
 
 ### Phase 4: Equality Constraints + DOF Friction
 - **Equality constraints (CONNECT/WELD/JOINT)** -- 12 tests, qacc diff ~0 vs MuJoCo C
@@ -185,18 +186,20 @@ All features validated against MuJoCo C reference implementation. **230 tests ac
 - **Tendon limits** -- constraint rows for tendon length bounds, qacc diff ~1e-3
 - **Tendon friction loss** -- friction constraints through tendons, exact match
 - **Spatial tendons (wrapping geometry)** -- DEFERRED: MJX supports it but requires ~400 lines of geodesic path computation around spheres/cylinders; most RL models use fixed tendons only
-- Both scalar and vmap paths
+- Fixed tendons + passive forces: both scalar and vmap. Tendon limits/friction + transmission: scalar path only (not yet in vmap)
 
-### Phase 6: Actuator Dynamics
+### Phase 6: Actuator Dynamics (scalar path only)
 - **FILTER dynamics** -- first-order low-pass `da/dt = (ctrl - act) / tau`, Euler integration
 - **FILTEREXACT dynamics** -- exact exponential integration of the same ODE
 - **INTEGRATOR dynamics** -- pure integration `da/dt = ctrl`
 - **Activation clamping** -- `actuator_actlimited` / `actuator_actrange`
 - Mixed stateless (NONE) + stateful actuators in the same model
+- **MUSCLE dynamics** -- DEFERRED (biomechanical models only)
 
-### Phase 7: Advanced Integrators
+### Phase 7: Advanced Integrators (scalar path only)
 - **RK4 (4th-order Runge-Kutta)** -- 4 forward evaluations per step, weighted average; qpos diff ~3e-8 vs MuJoCo C
 - Euler and RK4 supported; Implicit/ImplicitFast pending
+- Batched (Metal) pipeline uses Euler only
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 

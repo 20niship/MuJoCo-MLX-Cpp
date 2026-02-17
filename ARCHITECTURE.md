@@ -51,11 +51,12 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
          |
          v
 
- Phase 3: Metal Euler Kernel
- ----------------------------
+ Phase 3: Metal Integration Kernel
+ -----------------------------------
  Single GPU dispatch for ALL N environments.
  Built-in Cholesky + solve + velocity update + position integration.
- Replaces the entire integration step with one fused Metal kernel.
+ Currently Euler only; RK4 is supported in the scalar pipeline but
+ not yet in the batched Metal kernel.
 ```
 
 The pipeline is orchestrated in `batched.cpp:make_batched_step()`.
@@ -92,8 +93,8 @@ The vmap pipeline mirrors this with `vmap_*` versions of each function. All vmap
 
 **Constraint ordering** within `efc_J`:
 1. Equality constraints (`d.ne` rows)
-2. DOF friction loss (`d.nf` rows)
-3. Joint limits (`d.nl` rows)
+2. DOF friction loss + Tendon friction loss (`d.nf` rows)
+3. Joint limits + Tendon limits (`d.nl` rows)
 4. Contact constraints (remaining rows)
 
 ---
@@ -329,7 +330,9 @@ In the Polak-Ribiere beta computation, `prev_grad` must be captured **before** u
 | Equality (WELD) | `eq_type=0` | 6 | Position (3) + orientation (3) |
 | Equality (JOINT) | `eq_type=2` | 1 | Joint position error |
 | DOF friction loss | `dof_frictionloss > 0` | 1 per DOF | Identity Jacobian, K=0 |
+| Tendon friction loss | `tendon_frictionloss > 0` | 1 per tendon | `ten_J` Jacobian, K=0 |
 | Joint limit | `jnt_limited` | 1 per active limit | Upper or lower bound |
+| Tendon limit | `tendon_limited` | 1 per active limit | `ten_J` Jacobian, signed |
 | Contact (condim=1) | collision | 1 | Normal only |
 | Contact (condim=3) | collision | 4 | Pyramidal friction (2 tangent dirs) |
 | Contact (condim=4) | collision | 6 | + torsion friction |
@@ -419,8 +422,9 @@ Tendon velocity is computed as `ten_velocity = ten_J @ qvel`.
 
 Tendon computation is placed in `fwd_position` after `factor_m` and before `collision`, matching MuJoCo C's ordering. This ensures tendon data (`ten_length`, `ten_J`) is available for:
 - Tendon passive forces (in `fwd_velocity -> passive()`)
-- Tendon limit constraints (future Phase 5)
-- Tendon transmission actuators (future Phase 5.3)
+- Tendon limit constraints (in `make_constraint`)
+- Tendon friction loss constraints (in `make_constraint`)
+- Tendon transmission actuators (in `transmission`)
 
 ### Passive forces
 
@@ -437,7 +441,7 @@ The rest length uses `tendon_lengthspring` range clamping: `rest = clamp(ten_len
 
 The vmap path pre-computes the constant Jacobian from model data (safe to use `eval`/`data<>` since it's model-time, not trace-time). The `ten_length` computation uses a gather-matmul pattern: gather `qpos` at relevant indices, multiply by coefficients, then scatter-sum into tendon lengths via a pre-built one-hot matrix. This avoids CPU-side loops during vmap tracing.
 
-### Spatial tendons (not yet implemented)
+### Spatial tendons (DEFERRED)
 
 Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require computing shortest paths (~400 lines of dense geometric code in MJX). **DEFERRED**: Most RL models use fixed (joint-based) tendons only. Spatial wrapping is needed primarily for anatomical hand models. The model fields (`wrap_type` values 3-5 for SITE/SPHERE/CYLINDER) are loaded but non-JOINT wrap types emit a warning and are skipped.
 
@@ -468,12 +472,12 @@ Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require c
 | capsule-cylinder | Iterative | 1 | Yes |
 | capsule-ellipsoid | Analytic | 1 | Yes |
 | box-box | SAT (15 axes) | 1 | Yes |
-| mesh-* | GJK/EPA | 1 | Sphere approx |
+| mesh-* | GJK/EPA | 1 | GJK + depth est. |
 | hfield-* | Grid cells | Variable | 1 |
 
 ### GJK/EPA (convex collision)
 
-64-iteration GJK with evolving simplex (point -> line -> triangle -> tetrahedron), followed by 64-iteration EPA for penetration depth. The vmap path uses a fixed-iteration GJK (32 iters) with support-based depth estimation (22 directions) for GPU compatibility.
+64-iteration GJK with evolving simplex (point -> line -> triangle -> tetrahedron), followed by 64-iteration EPA for penetration depth. The vmap path uses 32-iteration GJK with support-based depth estimation (~18 sample directions: 6 axis-aligned + 8 diagonal + simplex face normals) instead of EPA, for GPU compatibility. Both scalar and vmap paths use proper mesh support functions (vertex argmax), not sphere approximation.
 
 ### Heightfield (hfield)
 
@@ -494,9 +498,9 @@ Source-generated MSL in `batched.cpp:make_kinematics_source()`. Embeds model top
 - Forward kinematics loop unrolled over joint chain
 - Stack memory: ~7 floats per body (pos, quat). Skip if `nbody * 7 * 4 > 24KB`
 
-### Euler Kernel (Phase 3)
+### Integration Kernel (Phase 3)
 
-Source-generated MSL in `batched.cpp:make_euler_source()`. Embeds Cholesky factorization and solve inline:
+Source-generated MSL in `batched.cpp:make_euler_source()`. Currently Euler-only (RK4 supported in scalar path but not Metal kernel). Embeds Cholesky factorization and solve inline:
 - Stack memory: `2*nv*nv + 4*nv + nq` floats. Limited to `nv <= 80`
 - Performs: Cholesky(M) -> solve for qacc -> velocity update -> position integration
 - For humanoid (nv=27): ~5KB stack per thread, well within limits
@@ -576,7 +580,9 @@ Key differences from Python mujoco-mlx:
 
 See [Collision System](#collision-system) above for the full collision pair matrix.
 
-Key algorithms: SAT for box-box, GJK/EPA for mesh, grid-cell for hfield, ellipsoid-to-sphere transform for ellipsoid. All pairs work in both scalar and vmap pipelines.
+Key algorithms: SAT for box-box, GJK/EPA for mesh/convex (64-iter scalar, 32-iter + depth estimation vmap), grid-cell for hfield, ellipsoid-to-sphere transform for ellipsoid. All pairs work in both scalar and vmap pipelines with proper support functions (no sphere approximation).
+
+**Not yet implemented**: cylinder-cylinder collision (uncommon in RL models).
 
 ### Phase 4: Equality Constraints + DOF Friction
 
@@ -591,15 +597,34 @@ See [Tendon System](#tendon-system) above.
 - **5.4 Tendon friction loss**: Complete. Friction constraints through tendons using `ten_J` as Jacobian, same `compute_kbi` as DOF friction.
 - **5.5 Tendon limits**: Complete. Limit constraints on tendon length, using `tendon_limited`/`tendon_range`/`tendon_margin` with `ten_J` Jacobian.
 
-### Phase 7: Advanced Integrators
-
-- **7.1 RK4**: Complete. Classic 4th-order Runge-Kutta with 4 forward evaluations per step. Weighted-average qacc for velocity update and weighted-average qvel for position update. Refactored `integrate_pos()` and `integrate_act()` as shared helpers used by both Euler and RK4.
-- **7.2 ImplicitFast**: Not yet implemented.
-
 ### Phase 6: Actuator Dynamics
 
-- **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete. Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless.
-- **6.3 MUSCLE**: Not yet implemented.
+- **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete (scalar path only). Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless.
+- **6.3 MUSCLE**: **Deferred**. Biomechanical muscle model with piece-wise linear dynamics. Rarely used in standard RL models.
+
+### Phase 7: Advanced Integrators
+
+- **7.1 RK4**: Complete (scalar path only). Classic 4th-order Runge-Kutta with 4 forward evaluations per step. Weighted-average qacc for velocity update and weighted-average qvel for position update. Refactored `integrate_pos()` and `integrate_act()` as shared helpers used by both Euler and RK4.
+- **7.2 ImplicitFast**: Not yet implemented. Requires velocity derivative computation.
+
+---
+
+## Scalar vs Vmap Feature Parity
+
+Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched) paths. The scalar path is the reference implementation; the vmap path lags in these areas:
+
+| Feature | Scalar | Vmap | Notes |
+|---------|--------|------|-------|
+| Euler integration | Yes | Yes (Metal kernel) | |
+| RK4 integration | Yes | No | Metal kernel is Euler-only |
+| Activation dynamics (act_dot) | Yes | No | vmap_fwd_actuation uses ctrl directly |
+| Tendon passive forces | Yes | No | vmap_passive has joint springs + DOF damping only |
+| Gravity compensation | Yes | No | vmap_passive omits gravcomp |
+| Tendon limit constraints | Yes | No | Only in scalar constraint.cpp |
+| Tendon friction loss | Yes | No | Only in scalar constraint.cpp |
+| mesh-* collision | GJK/EPA (64 iter) | GJK + depth est. (32 iter) | Both use proper mesh support |
+
+These gaps affect the batched pipeline: features implemented only in the scalar path work correctly for single-environment simulation but are missing from the high-throughput batched path. This is acceptable for common RL models (which rarely use tendon limits, tendon friction, or activation dynamics), but should be addressed before using the batched pipeline with models that require these features.
 
 ---
 
@@ -617,7 +642,7 @@ See [Tendon System](#tendon-system) above.
 
 5. **Spatial tendons**: Wrapping geometry (sphere/cylinder) for tendon paths is **deferred** (Phase 5.2). MJX supports it but it requires ~400 lines of geodesic computation; most RL models don't need it.
 
-6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics not yet implemented (Phase 6.3).
+6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics **deferred** (Phase 6.3). Biomechanical models only.
 
 7. **ImplicitFast integrator**: Not yet implemented (Phase 7.2). Requires velocity derivative computation.
 
