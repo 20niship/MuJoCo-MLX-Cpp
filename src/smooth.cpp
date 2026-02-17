@@ -657,6 +657,7 @@ Data transmission(const Model& m, Data d) {
     auto jnt_type_ptr = m.jnt_type.data<int>();
     auto jnt_dofadr_ptr = m.jnt_dofadr.data<int>();
     auto jnt_qposadr_ptr = m.jnt_qposadr.data<int>();
+    auto gear_ptr = m.actuator_gear.data<float>();
 
     std::vector<mx::array> lengths;
     for (int i = 0; i < m.nu; i++) lengths.push_back(mx::array({0.0f}));
@@ -665,37 +666,129 @@ Data transmission(const Model& m, Data d) {
     mx::eval(m.actuator_trnid);
     auto trnid_ptr = m.actuator_trnid.data<int>();
 
+    // Transmission type constants (matching MuJoCo C mjtTrn)
+    constexpr int TRN_JOINT = 0;
+    constexpr int TRN_JOINTINPARENT = 1;
+    constexpr int TRN_SLIDERCRANK = 2;
+    constexpr int TRN_TENDON = 3;
+    constexpr int TRN_SITE = 4;
+
+    // Pre-eval tendon data if any tendon transmission exists
+    bool has_tendon_trn = false, has_site_trn = false;
+    for (int i = 0; i < m.nu; i++) {
+        if (trntype_ptr[i] == TRN_TENDON) has_tendon_trn = true;
+        if (trntype_ptr[i] == TRN_SITE) has_site_trn = true;
+    }
+    if (has_tendon_trn && m.ntendon > 0) {
+        mx::eval(d.ten_length); mx::eval(d.ten_J);
+    }
+    if (has_site_trn && m.nsite > 0) {
+        mx::eval(m.site_bodyid); mx::eval(d.site_xpos); mx::eval(d.site_xmat);
+    }
+
     for (int i = 0; i < m.nu; i++) {
         int trntype = trntype_ptr[i];
 
-        if (trntype == 0) {  // JOINT transmission
-            int jnt_id = trnid_ptr[i * 2];  // trnid is (njnt, 2)
+        if (trntype == TRN_JOINT || trntype == TRN_JOINTINPARENT) {
+            int jnt_id = trnid_ptr[i * 2];
             int jt = jnt_type_ptr[jnt_id];
             int da = jnt_dofadr_ptr[jnt_id];
 
             if (jt == static_cast<int>(JointType::FREE)) {
                 lengths[i] = mx::array({0.0f});
-                mx::eval(m.actuator_gear);
-                auto gear = m.actuator_gear.data<float>();
                 for (int k = 0; k < 6; k++) {
-                    moment_data[i * m.nv + da + k] = gear[i * 6 + k];
+                    moment_data[i * m.nv + da + k] = gear_ptr[i * 6 + k];
                 }
             } else if (jt == static_cast<int>(JointType::BALL)) {
                 lengths[i] = mx::array({0.0f});
-                mx::eval(m.actuator_gear);
-                auto gear = m.actuator_gear.data<float>();
                 for (int k = 0; k < 3; k++) {
-                    moment_data[i * m.nv + da + k] = gear[i * 6 + k];
+                    moment_data[i * m.nv + da + k] = gear_ptr[i * 6 + k];
                 }
             } else {
                 // HINGE or SLIDE
                 int qa = jnt_qposadr_ptr[jnt_id];
-                mx::eval(m.actuator_gear);
-                auto gear = m.actuator_gear.data<float>();
-                float g0 = gear[i * 6];
+                float g0 = gear_ptr[i * 6];
                 auto qp = mx::slice(d.qpos, {qa}, {qa + 1});
                 lengths[i] = mx::multiply(qp, mx::array(g0));
                 moment_data[i * m.nv + da] = g0;
+            }
+        } else if (trntype == TRN_TENDON) {
+            int ten_id = trnid_ptr[i * 2];
+            float g0 = gear_ptr[i * 6];
+
+            if (m.ntendon > 0 && ten_id >= 0 && ten_id < m.ntendon) {
+                // actuator_length = gear[0] * ten_length[ten_id]
+                float tlen = d.ten_length.data<float>()[ten_id];
+                lengths[i] = mx::array({g0 * tlen});
+
+                // actuator_moment[i, :] = gear[0] * ten_J[ten_id, :]
+                auto tenJ_ptr = d.ten_J.data<float>();
+                for (int j = 0; j < m.nv; j++) {
+                    moment_data[i * m.nv + j] = g0 * tenJ_ptr[ten_id * m.nv + j];
+                }
+            }
+        } else if (trntype == TRN_SITE) {
+            int site_id = trnid_ptr[i * 2];
+            int refsite_id = trnid_ptr[i * 2 + 1];
+
+            if (m.nsite > 0 && site_id >= 0 && site_id < m.nsite) {
+                auto sbid = m.site_bodyid.data<int>();
+                int body_id = sbid[site_id];
+
+                // Site position in world frame
+                auto sxpos = d.site_xpos.data<float>();
+                auto sxmat = d.site_xmat.data<float>();
+                auto site_pos = mx::array(&sxpos[site_id * 3], {3}, mx::float32);
+
+                // Compute translational + rotational Jacobian at site
+                auto [jacp, jacr] = jac(m, d, site_pos, body_id);
+
+                // Frame rotation matrix (3x3) for the site
+                // For SITE transmission, the gear is in the site frame
+                auto frame_mat = mx::reshape(
+                    mx::array(&sxmat[site_id * 9], {9}, mx::float32), {3, 3});
+
+                // If refsite exists, compute differential Jacobian
+                if (refsite_id >= 0 && refsite_id < m.nsite) {
+                    int ref_body_id = sbid[refsite_id];
+                    auto ref_pos = mx::array(&sxpos[refsite_id * 3], {3}, mx::float32);
+                    auto [jacrefp, jacrefr] = jac(m, d, ref_pos, ref_body_id);
+                    jacp = mx::subtract(jacp, jacrefp);
+                    jacr = mx::subtract(jacr, jacrefr);
+                    frame_mat = mx::reshape(
+                        mx::array(&sxmat[refsite_id * 9], {9}, mx::float32), {3, 3});
+
+                    // Length = dot([vecp, vecr], gear) where vecp is in refsite frame
+                    auto ref_mat_t = mx::transpose(frame_mat);
+                    auto vecp = mx::flatten(mx::matmul(ref_mat_t,
+                        mx::reshape(mx::subtract(site_pos, ref_pos), {3, 1})));
+                    // For simplicity, compute length as dot(vecp, gear[:3]) only
+                    mx::eval(vecp);
+                    auto vecp_ptr = vecp.data<float>();
+                    float len = 0.0f;
+                    for (int k = 0; k < 3; k++)
+                        len += vecp_ptr[k] * gear_ptr[i * 6 + k];
+                    lengths[i] = mx::array({len});
+                }
+
+                // Full Jacobian (nv, 6) = [jacp, jacr]
+                // jacp is (nv, 3), jacr is (nv, 3)
+                auto full_jac = mx::concatenate({jacp, jacr}, 1);  // (nv, 6)
+
+                // Wrench in world frame: [frame_mat @ gear[:3], frame_mat @ gear[3:]]
+                auto gear_pos = mx::array(&gear_ptr[i * 6], {3}, mx::float32);
+                auto gear_rot = mx::array(&gear_ptr[i * 6 + 3], {3}, mx::float32);
+                auto wrench_pos = mx::flatten(mx::matmul(frame_mat, mx::reshape(gear_pos, {3, 1})));
+                auto wrench_rot = mx::flatten(mx::matmul(frame_mat, mx::reshape(gear_rot, {3, 1})));
+                auto wrench = mx::concatenate({wrench_pos, wrench_rot}, 0);  // (6,)
+
+                // moment = full_jac @ wrench  =>  (nv, 6) @ (6, 1) -> (nv, 1) -> (nv,)
+                auto moment = mx::flatten(mx::matmul(full_jac, mx::reshape(wrench, {6, 1})));
+                mx::eval(moment);
+                auto moment_ptr = moment.data<float>();
+                for (int j = 0; j < m.nv; j++) {
+                    moment_data[i * m.nv + j] = moment_ptr[j];
+                }
             }
         } else {
             lengths[i] = mx::array({0.0f});

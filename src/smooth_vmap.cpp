@@ -497,12 +497,38 @@ Data vmap_transmission(const Model& m, Data d) {
     if (m.nu == 0) return d;
     const auto& c = m.cache;
 
-    // Precomputed moment matrix (constant)
+    // Precomputed moment matrix (constant for JOINT and TENDON transmission)
     d.actuator_moment = c.act_moment_const;
 
-    // Vectorized length: qpos[qa_indices] * gear
+    // Vectorized length: qpos[qa_indices] * gear for JOINT transmission
     auto qpos_gathered = mx::take(d.qpos, c.act_qpos_idxs, 0);  // (nu,)
     d.actuator_length = mx::multiply(qpos_gathered, c.act_gear);
+
+    // For TENDON transmission actuators, override length with ten_length * gear
+    // This is done by checking which actuators have tendon transmission
+    // and overriding their length using precomputed masks
+    if (m.ntendon > 0) {
+        mx::eval(m.actuator_trntype); mx::eval(m.actuator_trnid);
+        auto trn_ptr = m.actuator_trntype.data<int>();
+        auto trnid_ptr = m.actuator_trnid.data<int>();
+        auto gear_ptr = c.act_gear.data<float>();
+
+        for (int i = 0; i < m.nu; i++) {
+            if (trn_ptr[i] == 3) {  // TENDON (mjTRN_TENDON=3)
+                int ten_id = trnid_ptr[i * 2];
+                if (ten_id >= 0 && ten_id < m.ntendon) {
+                    // Override length for this actuator
+                    auto tlen = mx::slice(d.ten_length, {ten_id}, {ten_id + 1});
+                    auto alen = mx::multiply(tlen, mx::array(gear_ptr[i]));
+
+                    // Replace in actuator_length via scatter
+                    auto before = mx::slice(d.actuator_length, {0}, {i});
+                    auto after = mx::slice(d.actuator_length, {i + 1}, {m.nu});
+                    d.actuator_length = mx::concatenate({before, alen, after}, 0);
+                }
+            }
+        }
+    }
 
     return d;
 }

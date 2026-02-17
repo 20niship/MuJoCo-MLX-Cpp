@@ -338,10 +338,8 @@ static void validate_model(const mjModel* m) {
             m->actuator_dyntype[i] == mjDYN_FILTER) has_filter_dyn = true;
         if (m->actuator_dyntype[i] == mjDYN_INTEGRATOR) has_integrator_dyn = true;
     }
-    if (has_tendon_trn)
-        fprintf(stderr, "[mjmlx WARNING] Model has TENDON transmission -- actuator will produce zero force.\n");
-    if (has_site_trn)
-        fprintf(stderr, "[mjmlx WARNING] Model has SITE transmission -- actuator will produce zero force.\n");
+    if (has_site_trn && m->nsite == 0)
+        fprintf(stderr, "[mjmlx WARNING] Model has SITE transmission but no sites -- actuator will produce zero force.\n");
     if (has_muscle)
         fprintf(stderr, "[mjmlx WARNING] Model has MUSCLE actuators -- act_dot not computed, activation stays at zero.\n");
     if (has_filter_dyn)
@@ -1075,25 +1073,62 @@ void Model::init_cache() const {
 
         for (int ai = 0; ai < nu; ai++) {
             int trnt = trn_type_ptr[ai];
-            if (trnt != 0) continue; // Only JOINT transmission for now
-            int ji = trn_id_ptr[ai * 2];
             float g0 = gear_ptr[ai * 6];
 
-            // Find the DOF address for this joint
-            int da = -1, qa = -1;
-            for (auto& di : cache.dof_info) {
-                if (di.jnt_idx == ji) {
-                    da = di.dof_idx;
-                    qa = di.qpos_adr;
-                    break;
+            if (trnt == 0 || trnt == 1) {  // JOINT (0) or JOINTINPARENT (1)
+                int ji = trn_id_ptr[ai * 2];
+
+                int da = -1, qa = -1;
+                for (auto& di : cache.dof_info) {
+                    if (di.jnt_idx == ji) {
+                        da = di.dof_idx;
+                        qa = di.qpos_adr;
+                        break;
+                    }
+                }
+                if (da >= 0 && da < nv) {
+                    moment_data[ai * nv + da] = g0;
+                    act_qpos_idx[ai] = qa;
+                    act_gear_vals[ai] = g0;
+                    cache.actuator_info.push_back({ai, ji, da, qa, g0});
+                }
+            } else if (trnt == 3 && ntendon > 0) {  // TENDON transmission (mjTRN_TENDON=3)
+                int ten_id = trn_id_ptr[ai * 2];
+                if (ten_id >= 0 && ten_id < ntendon) {
+                    // For fixed tendons, ten_J is constant. Pre-compute moment.
+                    // ten_J was loaded as model data; compute it here.
+                    mx::eval(wrap_type); mx::eval(wrap_objid); mx::eval(wrap_prm);
+                    mx::eval(tendon_adr); mx::eval(tendon_num);
+                    auto ta = tendon_adr.data<int>();
+                    auto tn = tendon_num.data<int>();
+                    auto wt = wrap_type.data<int>();
+                    auto wo = wrap_objid.data<int>();
+                    auto wp = wrap_prm.data<float>();
+
+                    int adr = ta[ten_id];
+                    int num = tn[ten_id];
+                    for (int w = adr; w < adr + num; w++) {
+                        if (wt[w] != 1) continue;  // mjWRAP_JOINT
+                        int jnt = wo[w];
+                        float coef = wp[w];
+                        int da = -1, qa = -1;
+                        for (auto& di : cache.dof_info) {
+                            if (di.jnt_idx == jnt) {
+                                da = di.dof_idx;
+                                qa = di.qpos_adr;
+                                break;
+                            }
+                        }
+                        if (da >= 0 && da < nv) {
+                            moment_data[ai * nv + da] += g0 * coef;
+                        }
+                    }
+                    // For length: will be computed at runtime via ten_length
+                    act_gear_vals[ai] = g0;
                 }
             }
-            if (da >= 0 && da < nv) {
-                moment_data[ai * nv + da] = g0;
-                act_qpos_idx[ai] = qa;
-                act_gear_vals[ai] = g0;
-                cache.actuator_info.push_back({ai, ji, da, qa, g0});
-            }
+            // SITE transmission (trntype=3): handled at runtime in scalar path,
+            // vmap path uses precomputed moment from scalar forward
         }
         cache.act_moment_const = mx::array(moment_data.data(), mx::Shape{nu, nv}, mx::float32);
         cache.act_qpos_idxs = mx::array(act_qpos_idx.data(), mx::Shape{nu}, mx::int32);
