@@ -159,10 +159,10 @@ int main() {
   </equality>
 </mujoco>
 )";
-        TEST_BEGIN("equality_constraint_warning");
+        TEST_BEGIN("equality_constraint_no_warning");
         auto warnings = capture_stderr_load(EQ_XML);
         printf("    warnings: '%s'\n", warnings.c_str());
-        CHECK(warnings.find("equality") != std::string::npos, "should warn about equality constraints");
+        CHECK(warnings.find("equality") == std::string::npos, "equality constraints now supported, no warning expected");
         TEST_END();
     }
 

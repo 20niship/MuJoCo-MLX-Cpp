@@ -329,10 +329,6 @@ static void validate_model(const mjModel* m) {
     if (m->ntendon > 0)
         fprintf(stderr, "[mjmlx WARNING] Model has %lld tendons -- not supported, ignored.\n", (long long)m->ntendon);
 
-    // Check for equality constraints
-    if (m->neq > 0)
-        fprintf(stderr, "[mjmlx WARNING] Model has %lld equality constraints -- not enforced in MLX backend.\n", (long long)m->neq);
-
     // Check integrator type
     if (m->opt.integrator == mjINT_RK4)
         fprintf(stderr, "[mjmlx WARNING] Model uses RK4 integrator -- only Euler supported, using Euler.\n");
@@ -977,7 +973,18 @@ void Model::init_cache() const {
             max_contacts = 50; // MuJoCo C limit per hfield pair (mjMAXCONPAIR)
         max_contact_rows += max_contacts * rows_per_contact;
     }
-    cache.max_nefc = cache.max_nl + max_contact_rows;
+    // Count equality constraint rows
+    int max_ne = 0;
+    if (neq > 0) {
+        mx::eval(eq_type);
+        auto eq_t = eq_type.data<int>();
+        for (int i = 0; i < neq; i++) {
+            if (eq_t[i] == 0) max_ne += 3;      // CONNECT
+            else if (eq_t[i] == 1) max_ne += 6;  // WELD
+            else if (eq_t[i] == 2) max_ne += 1;  // JOINT
+        }
+    }
+    cache.max_nefc = max_ne + cache.max_nl + max_contact_rows;
 
     // ── Joint integration plan ──
     if (njnt > 0) {

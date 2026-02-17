@@ -91,6 +91,320 @@ Data make_constraint(const Model& m, Data d) {
     mx::eval(d.qvel);
     auto qvel_ptr = d.qvel.data<float>();
 
+    // ── Equality constraints (MUST be first — solver treats first ne rows as always-active) ──
+    if (!(m.opt.disableflags & DisableBit::EQUALITY) && m.neq > 0) {
+        mx::eval(m.eq_type); mx::eval(m.eq_obj1id); mx::eval(m.eq_obj2id);
+        mx::eval(m.eq_data); mx::eval(m.eq_solref); mx::eval(m.eq_solimp);
+        mx::eval(d.xpos); mx::eval(d.xmat); mx::eval(d.xquat);
+        mx::eval(m.qpos0); mx::eval(d.qpos);
+
+        auto eq_types = m.eq_type.data<int>();
+        auto eq_obj1 = m.eq_obj1id.data<int>();
+        auto eq_obj2 = m.eq_obj2id.data<int>();
+        auto eq_dat = m.eq_data.data<float>();
+        auto eq_sr = m.eq_solref.data<float>();
+        auto eq_si = m.eq_solimp.data<float>();
+        auto xpos_ptr = d.xpos.data<float>();
+        auto xmat_ptr = d.xmat.data<float>();
+        auto qpos0_ptr = m.qpos0.data<float>();
+        auto qpos_ptr = d.qpos.data<float>();
+
+        for (int e = 0; e < m.neq; e++) {
+            int etype = eq_types[e];
+            int id1 = eq_obj1[e];
+            int id2 = eq_obj2[e];
+            float solref0 = eq_sr[e * 2], solref1 = eq_sr[e * 2 + 1];
+            float si0 = eq_si[e*5], si1 = eq_si[e*5+1], si2 = eq_si[e*5+2];
+            float si3 = eq_si[e*5+3], si4 = eq_si[e*5+4];
+
+            if (etype == 0) {
+                // ── CONNECT: 3 translational rows ──
+                int body1 = id1, body2 = id2;
+                float anchor1[3] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2] };
+                float anchor2[3] = { eq_dat[e*11+3], eq_dat[e*11+4], eq_dat[e*11+5] };
+
+                // pos1 = xpos[body1] + xmat[body1] @ anchor1
+                const float* xp1 = xpos_ptr + body1 * 3;
+                const float* xm1 = xmat_ptr + body1 * 9;
+                float pos1[3], pos2[3];
+                for (int i = 0; i < 3; i++) {
+                    pos1[i] = xp1[i];
+                    for (int j = 0; j < 3; j++)
+                        pos1[i] += xm1[i * 3 + j] * anchor1[j];
+                }
+
+                const float* xp2 = xpos_ptr + body2 * 3;
+                const float* xm2 = xmat_ptr + body2 * 9;
+                for (int i = 0; i < 3; i++) {
+                    pos2[i] = xp2[i];
+                    for (int j = 0; j < 3; j++)
+                        pos2[i] += xm2[i * 3 + j] * anchor2[j];
+                }
+
+                // error = pos1 - pos2
+                float err[3] = { pos1[0]-pos2[0], pos1[1]-pos2[1], pos1[2]-pos2[2] };
+
+                // Jacobians
+                auto p1_arr = mx::array(pos1, {3});
+                auto p2_arr = mx::array(pos2, {3});
+                auto [jacp1, jacr1] = jac(m, d, p1_arr, body1);
+                auto [jacp2, jacr2] = jac(m, d, p2_arr, body2);
+
+                mx::eval(jacp1); mx::eval(jacp2);
+                auto jp1 = jacp1.data<float>(); // (nv, 3)
+                auto jp2 = jacp2.data<float>();
+
+                float invw = 0.0f;
+                if (m.body_invweight0.size() > 0) {
+                    mx::eval(m.body_invweight0);
+                    auto iw = m.body_invweight0.data<float>();
+                    invw = iw[body1 * 2] + iw[body2 * 2];
+                }
+
+                float pos_norm = std::sqrt(err[0]*err[0] + err[1]*err[1] + err[2]*err[2]);
+
+                for (int axis = 0; axis < 3; axis++) {
+                    std::vector<float> j_row(m.nv, 0.0f);
+                    for (int i = 0; i < m.nv; i++)
+                        j_row[i] = jp1[i * 3 + axis] - jp2[i * 3 + axis];
+
+                    float pos = err[axis];
+                    auto [k, b, imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos_norm);
+                    float r = std::max(invw * (1.0f - imp) / imp, MJMINVAL);
+
+                    float jdot_qvel = 0.0f;
+                    for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+                    float aref = -b * jdot_qvel - k * imp * pos;
+
+                    efc_J_rows.push_back(j_row);
+                    efc_D_vals.push_back(1.0f / r);
+                    efc_aref_vals.push_back(aref);
+                    efc_floss_vals.push_back(0.0f);
+                    ne++;
+                }
+
+            } else if (etype == 1) {
+                // ── WELD: 3 translational + 3 rotational rows ──
+                int body1 = id1, body2 = id2;
+                // data[0:3] = anchor on body2, data[3:6] = anchor on body1 (swapped vs connect in MJX)
+                float anc_body2[3] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2] };
+                float anc_body1[3] = { eq_dat[e*11+3], eq_dat[e*11+4], eq_dat[e*11+5] };
+                float relquat[4] = { eq_dat[e*11+6], eq_dat[e*11+7], eq_dat[e*11+8], eq_dat[e*11+9] };
+                float torquescale = eq_dat[e*11+10];
+
+                // Position: pos1 = xpos[body1] + xmat[body1] @ anc_body1
+                const float* xp1 = xpos_ptr + body1 * 3;
+                const float* xm1 = xmat_ptr + body1 * 9;
+                float pos1[3], pos2[3];
+                for (int i = 0; i < 3; i++) {
+                    pos1[i] = xp1[i];
+                    for (int j = 0; j < 3; j++)
+                        pos1[i] += xm1[i * 3 + j] * anc_body1[j];
+                }
+
+                const float* xp2 = xpos_ptr + body2 * 3;
+                const float* xm2 = xmat_ptr + body2 * 9;
+                for (int i = 0; i < 3; i++) {
+                    pos2[i] = xp2[i];
+                    for (int j = 0; j < 3; j++)
+                        pos2[i] += xm2[i * 3 + j] * anc_body2[j];
+                }
+
+                float cpos[3] = { pos1[0]-pos2[0], pos1[1]-pos2[1], pos1[2]-pos2[2] };
+
+                // Jacobians for position
+                auto p1_arr = mx::array(pos1, {3});
+                auto p2_arr = mx::array(pos2, {3});
+                auto [jacp1, jacr1] = jac(m, d, p1_arr, body1);
+                auto [jacp2, jacr2] = jac(m, d, p2_arr, body2);
+
+                mx::eval(jacp1); mx::eval(jacp2); mx::eval(jacr1); mx::eval(jacr2);
+                auto jp1 = jacp1.data<float>();
+                auto jp2 = jacp2.data<float>();
+                auto jr1 = jacr1.data<float>();
+                auto jr2 = jacr2.data<float>();
+
+                float invw_t = 0.0f, invw_r = 0.0f;
+                if (m.body_invweight0.size() > 0) {
+                    mx::eval(m.body_invweight0);
+                    auto iw = m.body_invweight0.data<float>();
+                    invw_t = iw[body1 * 2] + iw[body2 * 2];
+                    invw_r = iw[body1 * 2 + 1] + iw[body2 * 2 + 1];
+                }
+
+                // Rotation error: conj(q2) * q1 * relquat
+                mx::eval(d.xquat);
+                auto xquat_ptr = d.xquat.data<float>();
+                const float* q1 = xquat_ptr + body1 * 4;
+                const float* q2 = xquat_ptr + body2 * 4;
+
+                // quat = q1 * relquat
+                float quat_prod[4];
+                quat_prod[0] = q1[0]*relquat[0] - q1[1]*relquat[1] - q1[2]*relquat[2] - q1[3]*relquat[3];
+                quat_prod[1] = q1[0]*relquat[1] + q1[1]*relquat[0] + q1[2]*relquat[3] - q1[3]*relquat[2];
+                quat_prod[2] = q1[0]*relquat[2] - q1[1]*relquat[3] + q1[2]*relquat[0] + q1[3]*relquat[1];
+                quat_prod[3] = q1[0]*relquat[3] + q1[1]*relquat[2] - q1[2]*relquat[1] + q1[3]*relquat[0];
+
+                // q2_inv = conj(q2)
+                float q2_inv[4] = { q2[0], -q2[1], -q2[2], -q2[3] };
+
+                // q_err = q2_inv * quat_prod
+                float q_err[4];
+                q_err[0] = q2_inv[0]*quat_prod[0] - q2_inv[1]*quat_prod[1] - q2_inv[2]*quat_prod[2] - q2_inv[3]*quat_prod[3];
+                q_err[1] = q2_inv[0]*quat_prod[1] + q2_inv[1]*quat_prod[0] + q2_inv[2]*quat_prod[3] - q2_inv[3]*quat_prod[2];
+                q_err[2] = q2_inv[0]*quat_prod[2] - q2_inv[1]*quat_prod[3] + q2_inv[2]*quat_prod[0] + q2_inv[3]*quat_prod[1];
+                q_err[3] = q2_inv[0]*quat_prod[3] + q2_inv[1]*quat_prod[2] - q2_inv[2]*quat_prod[1] + q2_inv[3]*quat_prod[0];
+
+                // Rotation error = axis part of q_err, scaled by torquescale
+                float crot[3] = { q_err[1] * torquescale, q_err[2] * torquescale, q_err[3] * torquescale };
+
+                // Combined error for pos_imp
+                float all_err[6] = { cpos[0], cpos[1], cpos[2], crot[0], crot[1], crot[2] };
+                float pos_norm = 0.0f;
+                for (int i = 0; i < 6; i++) pos_norm += all_err[i] * all_err[i];
+                pos_norm = std::sqrt(pos_norm);
+
+                auto [k, b, imp] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos_norm);
+
+                // Rotational Jacobian correction: 0.5 * conj(q2) * (jacr1-jacr2) * q1 * relquat
+                // For each DOF i, transform the rotation Jacobian column:
+                //   j_corr[i] = 0.5 * quat_mul(quat_mul_axis(q2_inv, jr_diff[:,i]), quat_prod)[1:4]
+                // This is the quaternion correction for the weld rotational constraint.
+                // For simplicity, we compute the corrected Jacobian per DOF.
+                std::vector<float> jacr_corr(m.nv * 3, 0.0f);
+                for (int i = 0; i < m.nv; i++) {
+                    float jrd[3] = {
+                        (jr1[i*3+0] - jr2[i*3+0]) * torquescale,
+                        (jr1[i*3+1] - jr2[i*3+1]) * torquescale,
+                        (jr1[i*3+2] - jr2[i*3+2]) * torquescale
+                    };
+                    // quat_mul_axis(q2_inv, jrd): treat jrd as pure quaternion (0, jrd)
+                    // q2_inv * (0, jrd) = (-q2_inv[1:]*jrd, q2_inv[0]*jrd + cross(q2_inv[1:], jrd))
+                    float qm[4];
+                    qm[0] = -(q2_inv[1]*jrd[0] + q2_inv[2]*jrd[1] + q2_inv[3]*jrd[2]);
+                    qm[1] =  q2_inv[0]*jrd[0] + q2_inv[2]*jrd[2] - q2_inv[3]*jrd[1];
+                    qm[2] =  q2_inv[0]*jrd[1] + q2_inv[3]*jrd[0] - q2_inv[1]*jrd[2];
+                    qm[3] =  q2_inv[0]*jrd[2] + q2_inv[1]*jrd[1] - q2_inv[2]*jrd[0];
+
+                    // result = qm * quat_prod (extract imaginary part, scale by 0.5)
+                    float res[4];
+                    res[0] = qm[0]*quat_prod[0] - qm[1]*quat_prod[1] - qm[2]*quat_prod[2] - qm[3]*quat_prod[3];
+                    res[1] = qm[0]*quat_prod[1] + qm[1]*quat_prod[0] + qm[2]*quat_prod[3] - qm[3]*quat_prod[2];
+                    res[2] = qm[0]*quat_prod[2] - qm[1]*quat_prod[3] + qm[2]*quat_prod[0] + qm[3]*quat_prod[1];
+                    res[3] = qm[0]*quat_prod[3] + qm[1]*quat_prod[2] - qm[2]*quat_prod[1] + qm[3]*quat_prod[0];
+
+                    jacr_corr[i*3+0] = 0.5f * res[1];
+                    jacr_corr[i*3+1] = 0.5f * res[2];
+                    jacr_corr[i*3+2] = 0.5f * res[3];
+                }
+
+                // 3 positional rows
+                for (int axis = 0; axis < 3; axis++) {
+                    std::vector<float> j_row(m.nv, 0.0f);
+                    for (int i = 0; i < m.nv; i++)
+                        j_row[i] = jp1[i * 3 + axis] - jp2[i * 3 + axis];
+
+                    float pos = cpos[axis];
+                    float r = std::max(invw_t * (1.0f - imp) / imp, MJMINVAL);
+
+                    float jdot_qvel = 0.0f;
+                    for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+                    float aref = -b * jdot_qvel - k * imp * pos;
+
+                    efc_J_rows.push_back(j_row);
+                    efc_D_vals.push_back(1.0f / r);
+                    efc_aref_vals.push_back(aref);
+                    efc_floss_vals.push_back(0.0f);
+                    ne++;
+                }
+
+                // 3 rotational rows
+                for (int axis = 0; axis < 3; axis++) {
+                    std::vector<float> j_row(m.nv, 0.0f);
+                    for (int i = 0; i < m.nv; i++)
+                        j_row[i] = jacr_corr[i * 3 + axis];
+
+                    float pos = crot[axis];
+                    float r = std::max(invw_r * (1.0f - imp) / imp, MJMINVAL);
+
+                    float jdot_qvel = 0.0f;
+                    for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+                    float aref = -b * jdot_qvel - k * imp * pos;
+
+                    efc_J_rows.push_back(j_row);
+                    efc_D_vals.push_back(1.0f / r);
+                    efc_aref_vals.push_back(aref);
+                    efc_floss_vals.push_back(0.0f);
+                    ne++;
+                }
+
+            } else if (etype == 2) {
+                // ── JOINT: 1 row, polynomial coupling ──
+                int jnt1 = id1, jnt2 = id2;
+
+                mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+                auto jqpa = m.jnt_qposadr.data<int>();
+                auto jda = m.jnt_dofadr.data<int>();
+
+                int qa1 = jqpa[jnt1], da1 = jda[jnt1];
+                float qpos1 = qpos_ptr[qa1];
+                float ref1 = qpos0_ptr[qa1];
+
+                float poly[5] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2],
+                                   eq_dat[e*11+3], eq_dat[e*11+4] };
+
+                float dif = 0.0f;
+                int da2 = -1;
+                if (jnt2 >= 0) {
+                    int qa2 = jqpa[jnt2];
+                    da2 = jda[jnt2];
+                    float ref2 = qpos0_ptr[qa2];
+                    dif = qpos_ptr[qa2] - ref2;
+                }
+
+                // poly_val = poly[0] + poly[1]*dif + poly[2]*dif^2 + poly[3]*dif^3 + poly[4]*dif^4
+                float dif_pow[5] = { 1.0f, dif, dif*dif, dif*dif*dif, dif*dif*dif*dif };
+                float poly_val = 0.0f;
+                for (int i = 0; i < 5; i++) poly_val += poly[i] * dif_pow[i];
+
+                // Error: (qpos1 - ref1) - poly(dif)
+                float pos = (qpos1 - ref1) - poly_val;
+
+                // Derivative: poly[1] + 2*poly[2]*dif + 3*poly[3]*dif^2 + 4*poly[4]*dif^3
+                float deriv = 0.0f;
+                if (jnt2 >= 0) {
+                    deriv = poly[1] + 2.0f*poly[2]*dif + 3.0f*poly[3]*dif*dif + 4.0f*poly[4]*dif*dif*dif;
+                }
+
+                // Jacobian: 1 at dof1, -deriv at dof2
+                std::vector<float> j_row(m.nv, 0.0f);
+                j_row[da1] = 1.0f;
+                if (da2 >= 0) j_row[da2] = -deriv;
+
+                float invw = 0.0f;
+                if (m.dof_invweight0.size() > 0) {
+                    mx::eval(m.dof_invweight0);
+                    invw = m.dof_invweight0.data<float>()[da1];
+                    if (da2 >= 0) invw += m.dof_invweight0.data<float>()[da2];
+                }
+
+                auto [k_val, b_val, imp_val] = compute_kbi(m, solref0, solref1, si0, si1, si2, si3, si4, pos);
+                float r = std::max(invw * (1.0f - imp_val) / imp_val, MJMINVAL);
+
+                float jdot_qvel = 0.0f;
+                for (int i = 0; i < m.nv; i++) jdot_qvel += j_row[i] * qvel_ptr[i];
+                float aref = -b_val * jdot_qvel - k_val * imp_val * pos;
+
+                efc_J_rows.push_back(j_row);
+                efc_D_vals.push_back(1.0f / r);
+                efc_aref_vals.push_back(aref);
+                efc_floss_vals.push_back(0.0f);
+                ne++;
+            }
+            // Types 3 (TENDON) and above are not yet supported
+        }
+    }
+
     // ── Joint limits ──────────────────────────────────────────────────────
     if (!(m.opt.disableflags & DisableBit::LIMIT) && m.jnt_limited.size() > 0) {
         mx::eval(m.jnt_limited); mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr);
