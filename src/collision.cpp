@@ -199,6 +199,20 @@ Data collision(const Model& m, Data d) {
                 if (w1 != 0 && w2 != 0 && (w1 == w2p || w2 == w1p)) continue;
             }
 
+            // Check exclude_signature: skip excluded body pairs
+            if (m.nexclude > 0 && m.exclude_signature.size() > 0) {
+                mx::eval(m.exclude_signature);
+                auto ex_ptr = m.exclude_signature.data<int>();
+                int bmin = std::min(b1, b2);
+                int bmax = std::max(b1, b2);
+                int sig = (bmin << 16) | bmax;
+                bool excluded = false;
+                for (int ei = 0; ei < m.nexclude; ei++) {
+                    if (ex_ptr[ei] == sig) { excluded = true; break; }
+                }
+                if (excluded) continue;
+            }
+
             // Dispatch collision
             auto gpos1 = row(d.geom_xpos, g1_);
             auto gpos2 = row(d.geom_xpos, g2_);

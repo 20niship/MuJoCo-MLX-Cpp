@@ -107,7 +107,7 @@ struct Model {
     int nq = 0, nv = 0, nu = 0, na = 0;
     int nbody = 0, njnt = 0, ngeom = 0, nsite = 0;
     int ncam = 0, nmesh = 0, nmocap = 0, ntendon = 0;
-    int neq = 0, ncon = 0, ngravcomp = 0, npair = 0;
+    int neq = 0, ncon = 0, ngravcomp = 0, npair = 0, nexclude = 0;
 
     Option opt;
     Statistic stat;

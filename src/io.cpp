@@ -237,9 +237,11 @@ static Model convert_model(mjModel* m) {
         model.eq_solimp = to_mx_f2(m->eq_solimp, (int)m->neq, 5);
     }
 
-    // Eval all arrays to materialize them
-    // (MLX is lazy -- this ensures everything is in GPU memory)
-    // We skip this for now since model arrays are typically small
+    // Exclude body pairs
+    model.nexclude = m->nexclude;
+    if (m->nexclude > 0) {
+        model.exclude_signature = to_mx_i(m->exclude_signature, (int)m->nexclude);
+    }
 
     return model;
 }
@@ -550,6 +552,16 @@ void Model::init_cache() const {
         cache.make_m_mask = mx::array(mask_data.data(), {nv, nv}, mx::float32);
     }
 
+    // ── Build exclude set for fast lookup ──
+    std::set<int> exclude_set;
+    if (nexclude > 0 && exclude_signature.size() > 0) {
+        mx::eval(exclude_signature);
+        auto ex_ptr = exclude_signature.data<int>();
+        for (int i = 0; i < nexclude; i++) {
+            exclude_set.insert(ex_ptr[i]);
+        }
+    }
+
     // ── Collision pairs (pre-computed from model topology) ──
     if (ngeom > 0) {
         mx::eval(geom_type); mx::eval(geom_bodyid);
@@ -581,6 +593,15 @@ void Model::init_cache() const {
                     int w1p = (w1 > 0) ? bwid_ptr[parent_ptr[w1]] : 0;
                     int w2p = (w2 > 0) ? bwid_ptr[parent_ptr[w2]] : 0;
                     if (w1 != 0 && w2 != 0 && (w1 == w2p || w2 == w1p)) continue;
+                }
+
+                // Check exclude_signature: skip excluded body pairs
+                // MuJoCo C signature format: (min(b1,b2) << 16) | max(b1,b2)
+                if (!exclude_set.empty()) {
+                    int bmin = std::min(b1, b2);
+                    int bmax = std::max(b1, b2);
+                    int sig = (bmin << 16) | bmax;
+                    if (exclude_set.count(sig)) continue;
                 }
 
                 ModelCache::CollisionPair cp;
