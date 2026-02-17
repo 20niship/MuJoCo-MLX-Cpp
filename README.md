@@ -91,7 +91,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (204 tests across 23 suites)
+# Full suite (218 tests across 25 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -144,7 +144,7 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Conformance
 
-All features validated against MuJoCo C reference implementation. **204 tests across 23 test suites, all passing.**
+All features validated against MuJoCo C reference implementation. **218 tests across 25 test suites, all passing.**
 
 ### Phase 1: Synth Physics Foundation
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
@@ -177,10 +177,20 @@ All features validated against MuJoCo C reference implementation. **204 tests ac
 - **DOF friction loss** -- solver friction clamping with linear zone cost, qacc diff ~1e-6
 - Correct constraint ordering: equality -> friction -> limits -> contacts
 
-### Phase 5: Tendon System (in progress)
+### Phase 5: Tendon System + Transmission
 - **Fixed (joint-based) tendons** -- `ten_length`, `ten_velocity`, `ten_J` match MuJoCo C within 1e-5
 - **Tendon passive forces** -- spring + damping via `ten_J^T` projection
+- **TENDON transmission** -- actuators through tendons, moment = gear * ten_J
+- **SITE transmission** -- actuators at sites, full 6-DOF Jacobian projection
+- **Spatial tendons (wrapping geometry)** -- DEFERRED: MJX supports it but requires ~400 lines of geodesic path computation around spheres/cylinders; most RL models use fixed tendons only
 - Both scalar and vmap paths
+
+### Phase 6: Actuator Dynamics
+- **FILTER dynamics** -- first-order low-pass `da/dt = (ctrl - act) / tau`, Euler integration
+- **FILTEREXACT dynamics** -- exact exponential integration of the same ODE
+- **INTEGRATOR dynamics** -- pure integration `da/dt = ctrl`
+- **Activation clamping** -- `actuator_actlimited` / `actuator_actrange`
+- Mixed stateless (NONE) + stateful actuators in the same model
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 
@@ -211,7 +221,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | test_equality | 12 | Equality constraints (CONNECT/WELD/JOINT) |
 | test_dof_friction | 9 | DOF friction loss + solver clamping |
 | test_fixed_tendon | 9 | Fixed tendon system |
-| **TOTAL** | **204** | |
+| test_transmission | 7 | TENDON + SITE transmission |
+| test_filter_dynamics | 7 | Activation dynamics (FILTER/INTEGRATOR) |
+| **TOTAL** | **218** | |
 
 ## Consumers
 

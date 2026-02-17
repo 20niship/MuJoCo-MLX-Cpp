@@ -42,10 +42,10 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
  -----------------------------------------
  Pure MLX array operations, traced by vmap across N environments.
  COM position, CRB mass matrix, Cholesky factorization,
- tendon computation,
- collision detection, constraint generation, solver,
- transmission, COM velocity, passive forces, RNE,
- actuation, acceleration, rne_post_constraint (cfrc_ext).
+ tendon computation, collision detection, constraint generation,
+ solver, transmission, COM velocity, passive forces, RNE,
+ actuation (incl. activation dynamics), acceleration,
+ rne_post_constraint (cfrc_ext).
  mx::compile fuses the computation graph into fewer GPU dispatches.
 
          |
@@ -439,7 +439,7 @@ The vmap path pre-computes the constant Jacobian from model data (safe to use `e
 
 ### Spatial tendons (not yet implemented)
 
-Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require computing shortest paths. These will be added in Phase 5.2. The model fields (`wrap_type` values 3-5 for SITE/SPHERE/CYLINDER) are loaded but currently emit a warning.
+Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require computing shortest paths (~400 lines of dense geometric code in MJX). **DEFERRED**: Most RL models use fixed (joint-based) tendons only. Spatial wrapping is needed primarily for anatomical hand models. The model fields (`wrap_type` values 3-5 for SITE/SPHERE/CYLINDER) are loaded but non-JOINT wrap types emit a warning and are skipped.
 
 ---
 
@@ -582,9 +582,17 @@ Key algorithms: SAT for box-box, GJK/EPA for mesh, grid-cell for hfield, ellipso
 
 See [Constraint Construction](#constraint-construction) and [DOF Friction Loss](#dof-friction-loss) above.
 
-### Phase 5: Tendon System (in progress)
+### Phase 5: Tendon System + Transmission
 
-See [Tendon System](#tendon-system) above. Phase 5.1 (fixed tendons) complete. Phase 5.2 (spatial tendons) and 5.3 (SITE/TENDON transmission) pending.
+See [Tendon System](#tendon-system) above.
+- **5.1 Fixed tendons**: Complete. `ten_length`, `ten_velocity`, `ten_J`, passive spring/damping forces.
+- **5.2 Spatial tendons**: **Deferred**. MJX supports wrapping geometry (sphere/cylinder) but requires ~400 lines of geodesic path code. Most RL models use fixed tendons only.
+- **5.3 TENDON + SITE transmission**: Complete. TENDON transmission (`moment = gear * ten_J`), SITE transmission (full 6-DOF Jacobian at site, gear wrench projection). Both scalar and vmap paths.
+
+### Phase 6: Actuator Dynamics
+
+- **6.1 FILTER + FILTEREXACT + INTEGRATOR**: Complete. Activation state `act` with `act_dot` computation, Euler and exact exponential integration, activation clamping. Force uses `act` for stateful actuators, `ctrl` for stateless.
+- **6.3 MUSCLE**: Not yet implemented.
 
 ---
 
@@ -600,14 +608,12 @@ See [Tendon System](#tendon-system) above. Phase 5.1 (fixed tendons) complete. P
 
 4. **Memory**: Each environment uses ~50KB of state. At 8192 envs, total GPU memory is ~400MB.
 
-5. **Spatial tendons**: Wrapping geometry (sphere/cylinder) for tendon paths is not yet implemented (Phase 5.2).
+5. **Spatial tendons**: Wrapping geometry (sphere/cylinder) for tendon paths is **deferred** (Phase 5.2). MJX supports it but it requires ~400 lines of geodesic computation; most RL models don't need it.
 
-6. **Tendon/SITE transmission**: Actuators with tendon or site transmission types produce zero force (Phase 5.3).
+6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics not yet implemented (Phase 6.3).
 
-7. **Advanced actuator dynamics**: FILTER, INTEGRATOR, MUSCLE dynamics types not yet implemented (Phase 6).
+7. **Advanced integrators**: RK4 and ImplicitFast not yet implemented (Phase 7).
 
-8. **Advanced integrators**: RK4 and ImplicitFast not yet implemented (Phase 7).
+8. **Sensors**: Not yet implemented (Phase 8).
 
-9. **Sensors**: Not yet implemented (Phase 8).
-
-10. **Differentiable physics**: `grad(step)` for empowerment/model-based RL is planned (Phase 9) and is the most important milestone for Project Sentience.
+9. **Differentiable physics**: `grad(step)` for empowerment/model-based RL is planned (Phase 9) and is the most important milestone for Project Sentience.
