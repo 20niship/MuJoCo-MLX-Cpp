@@ -416,6 +416,170 @@ static VmapCollResult vmap_box_box(
     return {mx::reshape(dist, {}), contact_pos, vmap_make_frame(best_normal)};
 }
 
+// ── CYLINDER collision (vmap-compatible) ────────────────────────────────────
+
+static VmapCollResult vmap_plane_cylinder(
+    const mx::array& ppos, const mx::array& pmat,
+    const mx::array& cpos, const mx::array& cmat, float R, float H)
+{
+    auto normal = mx::flatten(mx::slice(mx::reshape(pmat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto Rc = mx::reshape(cmat, {3,3});
+    // Cylinder axis = z-column of rotation matrix
+    auto axis = mx::flatten(mx::slice(Rc, mx::Shape{0,2}, mx::Shape{3,3}));
+
+    // Rim centers: cpos ± H * axis
+    auto rc0 = mx::subtract(cpos, mx::multiply(axis, mx::array(H)));
+    auto rc1 = mx::add(cpos, mx::multiply(axis, mx::array(H)));
+
+    // Perpendicular component of normal to cylinder axis
+    auto ndota = mx::sum(mx::multiply(normal, axis));
+    auto perp = mx::subtract(normal, mx::multiply(axis, ndota));
+    auto perp_len = vmap_norm(perp);
+    auto perp_dir = mx::divide(perp, mx::maximum(perp_len, mx::array(1e-8f)));
+    // Offset direction on rim (towards plane = anti-perp)
+    auto rim_offset = mx::multiply(mx::negative(perp_dir), mx::array(R));
+
+    // When perp is near-zero (normal || axis), offset is zero (face center)
+    auto is_parallel = mx::less(perp_len, mx::array(1e-6f));
+    rim_offset = mx::where(is_parallel, mx::zeros({3}), rim_offset);
+
+    auto pt0 = mx::add(rc0, rim_offset);
+    auto pt1 = mx::add(rc1, rim_offset);
+
+    auto d0 = mx::sum(mx::multiply(normal, mx::subtract(pt0, ppos)));
+    auto d1 = mx::sum(mx::multiply(normal, mx::subtract(pt1, ppos)));
+
+    auto use_0 = mx::less(d0, d1);
+    auto dist = mx::where(use_0, d0, d1);
+    auto vertex = mx::where(use_0, pt0, pt1);
+    auto pos = mx::subtract(vertex, mx::multiply(normal, dist));
+    return {mx::reshape(dist, {}), pos, vmap_make_frame(normal)};
+}
+
+static VmapCollResult vmap_sphere_cylinder(
+    const mx::array& spos, float radius,
+    const mx::array& cpos, const mx::array& cmat, float R, float H)
+{
+    auto Rc = mx::reshape(cmat, {3,3});
+    auto RT = mx::transpose(Rc);
+
+    // Transform sphere center to cylinder local
+    auto diff = mx::subtract(spos, cpos);
+    auto local = mx::flatten(mx::matmul(RT, mx::reshape(diff, {3,1})));
+    auto lx = mx::slice(local, {0}, {1});
+    auto ly = mx::slice(local, {1}, {2});
+    auto lz = mx::slice(local, {2}, {3});
+
+    auto rho = mx::sqrt(mx::maximum(mx::add(mx::multiply(lx,lx), mx::multiply(ly,ly)), mx::array(1e-16f)));
+    auto clamped_z = mx::clip(lz, mx::array(-H), mx::array(H));
+
+    // Closest on barrel: scale xy to R, clamp z
+    auto scale = mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f)));
+    auto barrel_x = mx::multiply(lx, mx::minimum(scale, mx::array(1.0f)));
+    auto barrel_y = mx::multiply(ly, mx::minimum(scale, mx::array(1.0f)));
+
+    // If beside barrel (rho > R, |z| <= H)
+    auto on_barrel = mx::logical_and(mx::greater(rho, mx::array(R)),
+                                      mx::less_equal(mx::abs(lz), mx::array(H)));
+    // If above/below cap (rho <= R, |z| > H)
+    auto on_cap = mx::logical_and(mx::less_equal(rho, mx::array(R)),
+                                   mx::greater(mx::abs(lz), mx::array(H)));
+    // Diagonal: rim
+    auto on_rim = mx::logical_and(mx::greater(rho, mx::array(R)),
+                                   mx::greater(mx::abs(lz), mx::array(H)));
+
+    auto cx_barrel = mx::multiply(lx, scale);
+    auto cy_barrel = mx::multiply(ly, scale);
+    auto cz_barrel = clamped_z;
+
+    auto cx_cap = lx;
+    auto cy_cap = ly;
+    auto cz_cap = mx::where(mx::greater(lz, mx::array(0.0f)), mx::array(H), mx::array(-H));
+
+    auto cx_rim = mx::multiply(lx, mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f))));
+    auto cy_rim = mx::multiply(ly, mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f))));
+    auto cz_rim = cz_cap;
+
+    // Default to barrel, override with cap, then rim
+    auto cx = mx::where(on_barrel, cx_barrel, mx::where(on_cap, cx_cap, cx_rim));
+    auto cy = mx::where(on_barrel, cy_barrel, mx::where(on_cap, cy_cap, cy_rim));
+    auto cz = mx::where(on_barrel, cz_barrel, mx::where(on_cap, cz_cap, cz_rim));
+
+    auto closest_local = mx::concatenate({cx, cy, cz}, 0);
+    auto closest_world = mx::add(cpos, mx::flatten(mx::matmul(Rc, mx::reshape(closest_local, {3,1}))));
+
+    auto sep = mx::subtract(spos, closest_world);
+    auto d = vmap_norm(sep);
+    auto norm = mx::where(mx::less(d, mx::array(1e-8f)),
+                           mx::array({0.0f, 0.0f, 1.0f}),
+                           mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(radius));
+    return {mx::reshape(dist, {}), closest_world, vmap_make_frame(norm)};
+}
+
+static VmapCollResult vmap_capsule_cylinder(
+    const mx::array& cap_pos, const mx::array& cap_mat, float r_c, float half_len,
+    const mx::array& cpos, const mx::array& cmat, float R, float H)
+{
+    auto Rc = mx::reshape(cmat, {3,3});
+    auto RT = mx::transpose(Rc);
+
+    auto cap_axis = mx::flatten(mx::slice(mx::reshape(cap_mat, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+    auto e0 = mx::subtract(cap_pos, mx::multiply(cap_axis, mx::array(half_len)));
+    auto e1 = mx::add(cap_pos, mx::multiply(cap_axis, mx::array(half_len)));
+
+    // Use midpoint approach: project midpoint to cylinder, project back to segment, refine
+    auto diff_mid = mx::subtract(cap_pos, cpos);
+    auto loc_mid = mx::flatten(mx::matmul(RT, mx::reshape(diff_mid, {3,1})));
+
+    auto lx = mx::slice(loc_mid, {0}, {1});
+    auto ly = mx::slice(loc_mid, {1}, {2});
+    auto lz = mx::slice(loc_mid, {2}, {3});
+    auto rho = mx::sqrt(mx::maximum(mx::add(mx::multiply(lx,lx), mx::multiply(ly,ly)), mx::array(1e-16f)));
+
+    // Simplified: closest on barrel/cap
+    auto scale = mx::minimum(mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f))), mx::array(1.0f));
+    auto is_outside = mx::greater(rho, mx::array(R));
+    auto cx = mx::where(is_outside, mx::multiply(lx, mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f)))), lx);
+    auto cy = mx::where(is_outside, mx::multiply(ly, mx::divide(mx::array(R), mx::maximum(rho, mx::array(1e-8f)))), ly);
+    auto cz = mx::clip(lz, mx::array(-H), mx::array(H));
+
+    auto cl_local = mx::concatenate({cx, cy, cz}, 0);
+    auto bpt = mx::add(cpos, mx::flatten(mx::matmul(Rc, mx::reshape(cl_local, {3,1}))));
+
+    // Project cylinder point onto capsule segment
+    auto seg = mx::subtract(e1, e0);
+    auto t_num = mx::sum(mx::multiply(mx::subtract(bpt, e0), seg));
+    auto seg_sq = mx::sum(mx::multiply(seg, seg));
+    auto param = mx::clip(mx::divide(t_num, mx::maximum(seg_sq, mx::array(1e-8f))),
+                           mx::array(0.0f), mx::array(1.0f));
+    auto seg_pt = mx::add(e0, mx::multiply(seg, param));
+
+    // Refine: closest on cylinder to refined segment point
+    auto diff2 = mx::subtract(seg_pt, cpos);
+    auto loc2 = mx::flatten(mx::matmul(RT, mx::reshape(diff2, {3,1})));
+    auto lx2 = mx::slice(loc2, {0}, {1});
+    auto ly2 = mx::slice(loc2, {1}, {2});
+    auto lz2 = mx::slice(loc2, {2}, {3});
+    auto rho2 = mx::sqrt(mx::maximum(mx::add(mx::multiply(lx2,lx2), mx::multiply(ly2,ly2)), mx::array(1e-16f)));
+
+    auto is_outside2 = mx::greater(rho2, mx::array(R));
+    auto cx2 = mx::where(is_outside2, mx::multiply(lx2, mx::divide(mx::array(R), mx::maximum(rho2, mx::array(1e-8f)))), lx2);
+    auto cy2 = mx::where(is_outside2, mx::multiply(ly2, mx::divide(mx::array(R), mx::maximum(rho2, mx::array(1e-8f)))), ly2);
+    auto cz2 = mx::clip(lz2, mx::array(-H), mx::array(H));
+
+    auto cl2 = mx::concatenate({cx2, cy2, cz2}, 0);
+    auto bpt2 = mx::add(cpos, mx::flatten(mx::matmul(Rc, mx::reshape(cl2, {3,1}))));
+
+    auto sep = mx::subtract(seg_pt, bpt2);
+    auto d = vmap_norm(sep);
+    auto norm = mx::where(mx::less(d, mx::array(1e-8f)),
+                           mx::array({0.0f, 0.0f, 1.0f}),
+                           mx::divide(sep, mx::maximum(d, mx::array(1e-8f))));
+    auto dist = mx::subtract(d, mx::array(r_c));
+    return {mx::reshape(dist, {}), bpt2, vmap_make_frame(norm)};
+}
+
 // ── Vmap-compatible collision (top level) ────────────────────────────────────
 
 Data vmap_collision(const Model& m, Data d) {
@@ -468,6 +632,13 @@ Data vmap_collision(const Model& m, Data d) {
             result = vmap_capsule_box(p1, m1, cp.size1[0], cp.size1[1], p2, m2, cp.size2);
         } else if (t1 == (int)GeomType::BOX && t2 == (int)GeomType::BOX) {
             result = vmap_box_box(p1, m1, cp.size1, p2, m2, cp.size2);
+        } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::CYLINDER) {
+            result = vmap_plane_cylinder(p1, m1, p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::SPHERE && t2 == (int)GeomType::CYLINDER) {
+            result = vmap_sphere_cylinder(p1, cp.size1[0], p2, m2, cp.size2[0], cp.size2[1]);
+        } else if (t1 == (int)GeomType::CAPSULE && t2 == (int)GeomType::CYLINDER) {
+            result = vmap_capsule_cylinder(p1, m1, cp.size1[0], cp.size1[1],
+                                           p2, m2, cp.size2[0], cp.size2[1]);
         } else {
             result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
         }

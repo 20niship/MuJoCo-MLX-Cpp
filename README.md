@@ -87,7 +87,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (174 tests across 18 suites)
+# Full suite (180 tests across 19 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
@@ -151,14 +151,17 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 - **Pyramidal friction (condim=3)** — 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
 - **Pyramidal friction (condim=4,6)** — torsion + rolling friction, 6/10 rows per contact, D values identical
 
-### Phase 3: Box Collisions
+### Phase 3: Collision Geometry
 - **plane-box** — multi-contact (up to 4 face vertices), ncon/nefc match MuJoCo C exactly
 - **sphere-box** — closest-point on OBB, with interior fallback
 - **capsule-box** — segment-to-OBB closest approach with iterative refinement
 - **box-box** — SAT (Separating Axis Theorem) with 15 axes, support point contact generation
-- All four collision types work in both scalar and vmap (batched) pipelines
+- **plane-cylinder** — multi-contact (face center + rim points), ncon matches MuJoCo C exactly
+- **sphere-cylinder** — cylinder-local closest-point with barrel/cap/rim handling
+- **capsule-cylinder** — segment-to-cylinder iterative projection refinement
+- All 12 collision pair types work in both scalar and vmap (batched) pipelines
 
-53 conformance tests across 8 test suites, all validated against MuJoCo C reference.
+59 conformance tests across 9 test suites, all validated against MuJoCo C reference.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
 

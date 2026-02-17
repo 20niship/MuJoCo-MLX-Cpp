@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 3.1 BOX collisions complete).
+Last updated: 2026-02-17 (Phase 3.2 CYLINDER collisions complete).
 
 ## Table of Contents
 
@@ -75,6 +75,26 @@ Key results:
 - Algorithms: multi-vertex face contact (plane-box), OBB closest-point (sphere-box),
   iterative segment-OBB (capsule-box), Separating Axis Theorem with 15 axes (box-box)
 
+## Phase 3.2 Conformance (Completed 2026-02-17)
+
+CYLINDER collision detection — unlocks models with cylinder geoms (robot links,
+pipes, legs). Implements 3 collision pair types involving cylinders.
+
+| Feature | Status | Tests |
+|---------|--------|-------|
+| plane-cylinder (multi-contact, up to 3) | Done | 6 tests in `test_collision_cylinder.cpp` |
+| sphere-cylinder (closest-point on cylinder surface) | Done | Included in above |
+| capsule-cylinder (segment-cylinder approach) | Done | Included in above |
+
+Key results:
+- plane-cylinder ncon/nefc matches MuJoCo C exactly (3 upright, 2 side)
+- Side-lying qacc diff after 1 step: 0.000005 (near-perfect match)
+- qpos diff after 100 steps: 0.000160 (excellent stability)
+- Both scalar and vmap/batched paths implemented
+- Algorithms: multi-contact face center + rim points (plane-cylinder),
+  cylinder-local closest-point with barrel/cap/rim handling (sphere-cylinder),
+  iterative segment-cylinder with projection refinement (capsule-cylinder)
+
 ---
 
 ## Scale Comparison
@@ -109,27 +129,28 @@ across 6 files to a 9x9 geom-type dispatch table with analytic, convex
 | SPHERE | Yes | Yes | Yes |
 | CAPSULE | Yes | Yes | Yes |
 | ELLIPSOID | Yes | Partial (SDF) | **No** |
-| CYLINDER | Yes | Partial (SDF) | **No** |
+| CYLINDER | Yes | Partial (SDF) | Yes |
 | BOX | Yes | Yes (as mesh) | Yes |
 | MESH | Yes | Yes (vertex limit) | **No** |
 | SDF | Yes | Yes | **No** |
 
 ### Collision Pairs Implemented
 
-MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 5:
+MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12:
 
 | Pair | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
 | plane-sphere | `mjc_PlaneSphere` | Yes | Yes |
 | plane-capsule | `mjc_PlaneCapsule` | Yes | Yes |
-| plane-cylinder | `mjc_PlaneCylinder` | Yes | **No** |
+| plane-cylinder | `mjc_PlaneCylinder` | Yes | Yes (multi-contact, up to 3) |
 | plane-box | `mjc_PlaneBox` | Yes | Yes (multi-contact, up to 4) |
 | plane-convex | `mjc_PlaneConvex` | Yes | **No** |
 | sphere-sphere | `mjc_SphereSphere` | Yes | Yes |
 | sphere-capsule | `mjc_SphereCapsule` | Yes | Yes |
-| sphere-cylinder | `mjc_SphereCylinder` | Yes | **No** |
+| sphere-cylinder | `mjc_SphereCylinder` | Yes | Yes |
 | sphere-box | `mjc_SphereBox` | Yes | Yes |
 | capsule-capsule | `mjc_CapsuleCapsule` | Yes | Yes |
+| capsule-cylinder | `mjc_CapsuleCylinder` | Yes | Yes |
 | capsule-box | `mjc_CapsuleBox` | Yes | Yes |
 | box-box | `mjc_BoxBox` | Yes | Yes (SAT, single contact) |
 | convex-convex | GJK/EPA | GJK/SAT | **No** |

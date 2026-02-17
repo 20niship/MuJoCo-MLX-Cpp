@@ -390,7 +390,21 @@ D values and aref match MuJoCo C within 0.001% (validated in `test_friction_cond
 
 The vmap-compatible versions use pure MLX array ops (no eval/data). The vmap path generates 1 contact per pair (deepest only); the scalar path generates multi-contact for plane-box.
 
-`max_nefc` in `io.cpp` now accounts for multi-contact pairs: plane-box (4x), capsule-box (2x), box-box (8x) the per-contact constraint rows.
+`max_nefc` in `io.cpp` now accounts for multi-contact pairs: plane-box (4x), plane-cylinder (6x), capsule-box (2x), box-box (8x) the per-contact constraint rows.
+
+### Phase 3.2: CYLINDER Collisions
+
+`collision.cpp` and `constraint_vmap.cpp` now handle 3 cylinder collision pair types:
+
+1. **plane-cylinder** (`plane_cylinder_multi`): For each of the 2 face caps, computes face center + rim points (along the plane-perpendicular direction). In the degenerate case (axis parallel to normal), generates 2 orthogonal rim points + center per face. Returns up to 6 candidate contacts, filtered by margin. Matches MuJoCo C ncon exactly (3 upright, 2 side).
+
+2. **sphere-cylinder** (`sphere_cylinder`): Transforms sphere center to cylinder-local coordinates. Cylinder surface decomposed into barrel (curved), top cap, bottom cap, and rim edges. Closest-point logic handles 4 regions: beside barrel, above/below cap, diagonal (rim), and interior (push out to nearest surface).
+
+3. **capsule-cylinder** (`capsule_cylinder`): Tests 3 sample points (endpoints + midpoint) on the capsule segment against the cylinder. For each, transforms to cylinder-local, finds closest surface point, projects back to capsule segment, and refines. Picks the pair with minimum separation.
+
+Helper function `closest_on_cylinder_local` computes the closest point on a cylinder surface (barrel + caps) to an arbitrary point in cylinder-local coordinates, handling all 4 geometric regions including the interior case.
+
+The vmap-compatible versions (`vmap_plane_cylinder`, `vmap_sphere_cylinder`, `vmap_capsule_cylinder`) use pure MLX array ops with no eval/data calls. The vmap plane-cylinder path returns 1 contact (deepest rim point); the scalar path returns multi-contact.
 
 ---
 

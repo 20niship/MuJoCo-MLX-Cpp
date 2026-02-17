@@ -269,8 +269,7 @@ static void validate_model(const mjModel* m) {
         fprintf(stderr, "[mjmlx WARNING] Model has HFIELD geoms -- collision not supported.\n");
     if (has_ellipsoid)
         fprintf(stderr, "[mjmlx WARNING] Model has ELLIPSOID geoms -- collision not supported.\n");
-    if (has_cylinder)
-        fprintf(stderr, "[mjmlx WARNING] Model has CYLINDER geoms -- collision not supported.\n");
+    // CYLINDER geom collision is now supported (Phase 3.2)
 
     // Check for unsupported actuator types
     bool has_tendon_trn = false, has_muscle = false, has_site_trn = false;
@@ -852,7 +851,7 @@ void Model::init_cache() const {
     }
     cache.max_nl = (int)cache.limits.size();
     // Compute max contact constraint rows accounting for condim and multi-contact pairs:
-    // plane-box: up to 4 contacts, capsule-box: up to 2 contacts, others: 1 contact
+    // plane-box: up to 4 contacts, plane-cylinder: up to 6, capsule-box: up to 2, others: 1
     // condim=1: 1 row/contact, condim=3 pyramidal: 4 rows/contact, condim=4: 6, condim=6: 10
     int max_contact_rows = 0;
     for (auto& cp : cache.collision_pairs) {
@@ -860,6 +859,8 @@ void Model::init_cache() const {
         int max_contacts = 1;
         if (cp.type1 == (int)GeomType::PLANE && cp.type2 == (int)GeomType::BOX)
             max_contacts = 4;
+        else if (cp.type1 == (int)GeomType::PLANE && cp.type2 == (int)GeomType::CYLINDER)
+            max_contacts = 6; // 2 faces × (center + 2 rim points)
         else if (cp.type1 == (int)GeomType::CAPSULE && cp.type2 == (int)GeomType::BOX)
             max_contacts = 2;
         else if (cp.type1 == (int)GeomType::BOX && cp.type2 == (int)GeomType::BOX)

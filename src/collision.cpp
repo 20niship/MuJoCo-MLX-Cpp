@@ -528,6 +528,298 @@ static CollisionResult box_box(
     return {dist, pos_arr, make_frame(normal_arr)};
 }
 
+// ── CYLINDER collision functions ──────────────────────────────
+
+// Closest point on a cylinder surface to an external point, all in cylinder-local coords.
+// Cylinder: radius R, half-length H, axis = local z. Surface = barrel + two caps.
+static void closest_on_cylinder_local(float px, float py, float pz,
+                                       float R, float H,
+                                       float& cx, float& cy, float& cz) {
+    float rho = std::sqrt(px*px + py*py);
+    float clamped_z = std::max(-H, std::min(H, pz));
+
+    if (rho <= R && std::abs(pz) <= H) {
+        // Point is INSIDE cylinder — push out to nearest surface
+        float d_barrel = R - rho;
+        float d_top = H - pz;
+        float d_bot = pz + H;
+        float d_min = std::min({d_barrel, d_top, d_bot});
+        if (d_min == d_barrel && rho > MJMINVAL) {
+            cx = px * R / rho; cy = py * R / rho; cz = pz;
+        } else if (d_min == d_top) {
+            cx = px; cy = py; cz = H;
+        } else {
+            cx = px; cy = py; cz = -H;
+        }
+    } else if (rho <= R) {
+        // Above/below cap
+        cx = px; cy = py; cz = (pz > 0) ? H : -H;
+    } else if (std::abs(pz) <= H) {
+        // Beside barrel
+        cx = px * R / rho; cy = py * R / rho; cz = pz;
+    } else {
+        // Diagonal: closest to rim
+        cx = (rho > MJMINVAL) ? px * R / rho : R;
+        cy = (rho > MJMINVAL) ? py * R / rho : 0.0f;
+        cz = (pz > 0) ? H : -H;
+    }
+}
+
+// plane_cylinder_multi: returns up to 3 contacts per face (2 rim points + center)
+// for a total of up to 6 candidate contacts. Matches MuJoCo C's mjc_PlaneCylinder.
+static int plane_cylinder_multi(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& cyl_pos, const mx::array& cyl_mat, const mx::array& cyl_size,
+    float margin, int g1, int g2, int condim,
+    std::vector<mx::array>& c_dist, std::vector<mx::array>& c_pos,
+    std::vector<mx::array>& c_frame, std::vector<mx::array>& c_geom,
+    std::vector<int>& c_dim)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+    auto frame = make_frame(normal);
+
+    mx::eval(cyl_size); mx::eval(cyl_pos); mx::eval(cyl_mat);
+    mx::eval(normal); mx::eval(plane_pos);
+    float R = cyl_size.data<float>()[0];
+    float H = cyl_size.data<float>()[1];
+
+    auto np = normal.data<float>();
+    auto Rp = cyl_mat.data<float>();
+    auto cp = cyl_pos.data<float>();
+    auto pp = plane_pos.data<float>();
+
+    // Cylinder axis = z-column of rotation matrix
+    float ax = Rp[2], ay = Rp[5], az = Rp[8];
+
+    // Component of normal perpendicular to cylinder axis
+    float ndota = np[0]*ax + np[1]*ay + np[2]*az;
+    float perp[3] = {np[0] - ndota*ax, np[1] - ndota*ay, np[2] - ndota*az};
+    float perp_len = std::sqrt(perp[0]*perp[0] + perp[1]*perp[1] + perp[2]*perp[2]);
+
+    // Normalized perpendicular direction on the face plane
+    float px = 0, py = 0, pz = 0;
+    // Second orthogonal direction on face plane
+    float qx = 0, qy = 0, qz = 0;
+    if (perp_len > 1e-6f) {
+        px = perp[0] / perp_len; py = perp[1] / perp_len; pz = perp[2] / perp_len;
+        // q = axis × p (orthogonal to both axis and perp, lies in the face plane)
+        qx = ay*pz - az*py; qy = az*px - ax*pz; qz = ax*py - ay*px;
+    } else {
+        // Normal parallel to axis — pick arbitrary face directions
+        // Use x-column and y-column of rotation matrix
+        px = Rp[0]; py = Rp[3]; pz = Rp[6];
+        qx = Rp[1]; qy = Rp[4]; qz = Rp[7];
+    }
+
+    auto add_contact = [&](float wx, float wy, float wz) -> bool {
+        float d = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+        if (d < margin) {
+            c_dist.push_back(mx::array(d));
+            auto vertex = mx::array({wx, wy, wz});
+            c_pos.push_back(mx::subtract(vertex, mx::multiply(normal, mx::array(d))));
+            c_frame.push_back(frame);
+            c_geom.push_back(mx::array({g1, g2}, mx::int32));
+            c_dim.push_back(condim);
+            return true;
+        }
+        return false;
+    };
+
+    int ncon_added = 0;
+    for (int s = 0; s < 2; s++) {
+        float sign = (s == 0) ? -1.0f : 1.0f;
+        float fcx = cp[0] + sign * H * ax;
+        float fcy = cp[1] + sign * H * ay;
+        float fcz = cp[2] + sign * H * az;
+
+        // Face center
+        if (add_contact(fcx, fcy, fcz)) ncon_added++;
+
+        // Rim point along -perp direction (closest to plane)
+        if (add_contact(fcx - R*px, fcy - R*py, fcz - R*pz)) ncon_added++;
+
+        // Rim point along +perp direction (for degenerate/upright case: second diameter point)
+        if (perp_len < 1e-6f) {
+            // Normal || axis: add a second rim point in orthogonal direction
+            if (add_contact(fcx + R*qx, fcy + R*qy, fcz + R*qz)) ncon_added++;
+        }
+    }
+
+    return ncon_added;
+}
+
+// Single-contact plane_cylinder (for vmap dispatch)
+static CollisionResult plane_cylinder(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& cyl_pos, const mx::array& cyl_mat, const mx::array& cyl_size)
+{
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+
+    mx::eval(cyl_size); mx::eval(cyl_pos); mx::eval(cyl_mat);
+    mx::eval(normal); mx::eval(plane_pos);
+    float R = cyl_size.data<float>()[0];
+    float H = cyl_size.data<float>()[1];
+
+    auto np = normal.data<float>();
+    auto Rp = cyl_mat.data<float>();
+    auto cp = cyl_pos.data<float>();
+    auto pp = plane_pos.data<float>();
+
+    float ax = Rp[2], ay = Rp[5], az = Rp[8];
+    float ndota = np[0]*ax + np[1]*ay + np[2]*az;
+    float perp[3] = {np[0] - ndota*ax, np[1] - ndota*ay, np[2] - ndota*az};
+    float perp_len = std::sqrt(perp[0]*perp[0] + perp[1]*perp[1] + perp[2]*perp[2]);
+
+    float best_dist = 1e10f;
+    float best_wx = 0, best_wy = 0, best_wz = 0;
+
+    for (int s = 0; s < 2; s++) {
+        float sign = (s == 0) ? -1.0f : 1.0f;
+        float fcx = cp[0] + sign * H * ax;
+        float fcy = cp[1] + sign * H * ay;
+        float fcz = cp[2] + sign * H * az;
+
+        float wx, wy, wz;
+        if (perp_len > MJMINVAL) {
+            wx = fcx - R * perp[0] / perp_len;
+            wy = fcy - R * perp[1] / perp_len;
+            wz = fcz - R * perp[2] / perp_len;
+        } else {
+            wx = fcx; wy = fcy; wz = fcz;
+        }
+
+        float d = np[0]*(wx-pp[0]) + np[1]*(wy-pp[1]) + np[2]*(wz-pp[2]);
+        if (d < best_dist) {
+            best_dist = d;
+            best_wx = wx; best_wy = wy; best_wz = wz;
+        }
+    }
+
+    auto dist = mx::array(best_dist);
+    auto vertex = mx::array({best_wx, best_wy, best_wz});
+    auto pos = mx::subtract(vertex, mx::multiply(normal, dist));
+    return {dist, pos, make_frame(normal)};
+}
+
+static CollisionResult sphere_cylinder(
+    const mx::array& sphere_pos, const mx::array& sphere_size,
+    const mx::array& cyl_pos, const mx::array& cyl_mat, const mx::array& cyl_size)
+{
+    mx::eval(sphere_size); mx::eval(sphere_pos);
+    mx::eval(cyl_pos); mx::eval(cyl_mat); mx::eval(cyl_size);
+    float r = sphere_size.data<float>()[0];
+    float R = cyl_size.data<float>()[0];
+    float H = cyl_size.data<float>()[1];
+    auto sp = sphere_pos.data<float>();
+    auto cyp = cyl_pos.data<float>();
+    auto Rp = cyl_mat.data<float>();
+
+    // Transform sphere center to cylinder-local coords
+    float lx, ly, lz;
+    world_to_box_local(Rp, cyp, sp[0], sp[1], sp[2], lx, ly, lz);
+
+    // Closest point on cylinder surface
+    float cx, cy, cz;
+    closest_on_cylinder_local(lx, ly, lz, R, H, cx, cy, cz);
+
+    // Transform back to world
+    float wx, wy, wz;
+    box_local_to_world(Rp, cyp, cx, cy, cz, wx, wy, wz);
+
+    float fx = sp[0] - wx, fy = sp[1] - wy, fz = sp[2] - wz;
+    float d = std::sqrt(fx*fx + fy*fy + fz*fz);
+    float nx, ny, nz;
+    if (d < MJMINVAL) {
+        nx = 0; ny = 0; nz = 1;
+    } else {
+        nx = fx/d; ny = fy/d; nz = fz/d;
+    }
+
+    float dist_val = d - r;
+    return {mx::array(dist_val), mx::array({wx, wy, wz}), make_frame(mx::array({nx, ny, nz}))};
+}
+
+static CollisionResult capsule_cylinder(
+    const mx::array& cap_pos, const mx::array& cap_mat, const mx::array& cap_size,
+    const mx::array& cyl_pos, const mx::array& cyl_mat, const mx::array& cyl_size)
+{
+    mx::eval(cap_size); mx::eval(cap_pos); mx::eval(cap_mat);
+    mx::eval(cyl_pos); mx::eval(cyl_mat); mx::eval(cyl_size);
+    float r_c = cap_size.data<float>()[0];
+    float half_len = cap_size.data<float>()[1];
+    float R = cyl_size.data<float>()[0];
+    float H = cyl_size.data<float>()[1];
+    auto cap_p = cap_pos.data<float>();
+    auto cm = cap_mat.data<float>();
+    auto cyp = cyl_pos.data<float>();
+    auto Rp = cyl_mat.data<float>();
+
+    // Capsule axis (z-column of capsule mat)
+    float cax = cm[2], cay = cm[5], caz = cm[8];
+    float e0[3] = {cap_p[0] - cax*half_len, cap_p[1] - cay*half_len, cap_p[2] - caz*half_len};
+    float e1[3] = {cap_p[0] + cax*half_len, cap_p[1] + cay*half_len, cap_p[2] + caz*half_len};
+
+    // Test endpoints + midpoint against cylinder
+    float best_dist_sq = 1e20f;
+    float best_seg[3], best_cyl[3];
+
+    float test_pts[3][3] = {
+        {e0[0], e0[1], e0[2]},
+        {e1[0], e1[1], e1[2]},
+        {cap_p[0], cap_p[1], cap_p[2]}
+    };
+
+    for (int ti = 0; ti < 3; ti++) {
+        // Transform to cylinder local
+        float lx, ly, lz;
+        world_to_box_local(Rp, cyp, test_pts[ti][0], test_pts[ti][1], test_pts[ti][2],
+                           lx, ly, lz);
+        float cx, cy, cz;
+        closest_on_cylinder_local(lx, ly, lz, R, H, cx, cy, cz);
+        float wx, wy, wz;
+        box_local_to_world(Rp, cyp, cx, cy, cz, wx, wy, wz);
+
+        // Project cylinder point back onto capsule segment
+        float dx = wx - e0[0], dy = wy - e0[1], dz = wz - e0[2];
+        float seg_x = e1[0]-e0[0], seg_y = e1[1]-e0[1], seg_z = e1[2]-e0[2];
+        float seg_sq = seg_x*seg_x + seg_y*seg_y + seg_z*seg_z;
+        float t = (seg_sq > MJMINVAL) ? (dx*seg_x + dy*seg_y + dz*seg_z) / seg_sq : 0.0f;
+        t = std::max(0.0f, std::min(1.0f, t));
+        float sx = e0[0] + t*seg_x, sy = e0[1] + t*seg_y, sz = e0[2] + t*seg_z;
+
+        // Get refined closest on cylinder
+        float lx2, ly2, lz2;
+        world_to_box_local(Rp, cyp, sx, sy, sz, lx2, ly2, lz2);
+        float cx2, cy2, cz2;
+        closest_on_cylinder_local(lx2, ly2, lz2, R, H, cx2, cy2, cz2);
+        float wx2, wy2, wz2;
+        box_local_to_world(Rp, cyp, cx2, cy2, cz2, wx2, wy2, wz2);
+
+        float fx = sx - wx2, fy = sy - wy2, fz = sz - wz2;
+        float dsq = fx*fx + fy*fy + fz*fz;
+        if (dsq < best_dist_sq) {
+            best_dist_sq = dsq;
+            best_seg[0] = sx; best_seg[1] = sy; best_seg[2] = sz;
+            best_cyl[0] = wx2; best_cyl[1] = wy2; best_cyl[2] = wz2;
+        }
+    }
+
+    float fx = best_seg[0] - best_cyl[0];
+    float fy = best_seg[1] - best_cyl[1];
+    float fz = best_seg[2] - best_cyl[2];
+    float d = std::sqrt(fx*fx + fy*fy + fz*fz);
+    float nx, ny, nz;
+    if (d < MJMINVAL) {
+        nx = 0; ny = 0; nz = 1;
+    } else {
+        nx = fx/d; ny = fy/d; nz = fz/d;
+    }
+
+    float dist_val = d - r_c;
+    return {mx::array(dist_val), mx::array({best_cyl[0], best_cyl[1], best_cyl[2]}),
+            make_frame(mx::array({nx, ny, nz}))};
+}
+
 static CollisionResult capsule_capsule(
     const mx::array& pos1, const mx::array& mat1, const mx::array& size1,
     const mx::array& pos2, const mx::array& mat2, const mx::array& size2)
@@ -666,6 +958,24 @@ Data collision(const Model& m, Data d) {
             } else if (t1_ == static_cast<int>(GeomType::BOX) && t2_ == static_cast<int>(GeomType::BOX)) {
                 result = box_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                float margin = gmargin[g1_] + gmargin[g2_];
+                int condim = 3;
+                if (m.geom_condim.size() > 0) {
+                    mx::eval(m.geom_condim);
+                    auto cdp = m.geom_condim.data<int>();
+                    condim = std::max(cdp[g1_], cdp[g2_]);
+                }
+                plane_cylinder_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                    margin, g1_, g2_, condim,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue; // already pushed contacts
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                result = sphere_cylinder(gpos1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
             }
 
             if (!handled) continue;
@@ -760,6 +1070,27 @@ Data collision(const Model& m, Data d) {
                 handled = true;
             } else if (t1_ == static_cast<int>(GeomType::BOX) && t2_ == static_cast<int>(GeomType::BOX)) {
                 result = box_box(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                float margin_pc = gmargin[g1_] + gmargin[g2_];
+                if (m.pair_margin.size() > 0) {
+                    mx::eval(m.pair_margin);
+                    margin_pc = m.pair_margin.data<float>()[pi];
+                }
+                int condim_pc = 3;
+                if (m.pair_dim.size() > 0) {
+                    mx::eval(m.pair_dim);
+                    condim_pc = m.pair_dim.data<int>()[pi];
+                }
+                plane_cylinder_multi(gpos1, gmat1, gpos2, gmat2, gsize2,
+                    margin_pc, g1_, g2_, condim_pc,
+                    c_dist, c_pos, c_frame, c_geom, c_dim);
+                continue;
+            } else if (t1_ == static_cast<int>(GeomType::SPHERE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                result = sphere_cylinder(gpos1, gsize1, gpos2, gmat2, gsize2);
+                handled = true;
+            } else if (t1_ == static_cast<int>(GeomType::CAPSULE) && t2_ == static_cast<int>(GeomType::CYLINDER)) {
+                result = capsule_cylinder(gpos1, gmat1, gsize1, gpos2, gmat2, gsize2);
                 handled = true;
             }
 
