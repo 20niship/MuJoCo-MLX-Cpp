@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 2a).
+Last updated: 2026-02-11 (Phase 1 conformance complete).
 
 ## Table of Contents
 
@@ -18,6 +18,24 @@ Last updated: 2026-02-11 (Phase 2a).
 - [Gap Closure Priority](#gap-closure-priority)
 - [Dual-Backend Mitigation](#dual-backend-mitigation)
 - [Appendix: Full Feature Matrix](#appendix-full-feature-matrix)
+
+---
+
+## Phase 1 Conformance (Completed 2026-02-11)
+
+Phase 1 closed the highest-priority gaps for ProjectSentience Synth training:
+
+| Phase | Feature | Status | Tests |
+|-------|---------|--------|-------|
+| 1.1 | Gravity compensation (`qfrc_gravcomp`) | Done | 7 tests in `test_gravcomp.cpp` |
+| 1.2 | Per-body contact forces (`cfrc_ext`) | Done | 6 tests in `test_cfrc_ext.cpp` |
+| 1.3 | Exclude signature collision filtering | Done | 6 tests in `test_exclude.cpp` |
+| 1.4 | Model validation warnings at load time | Done | 8 tests in `test_validation.cpp` |
+| 1.5 | High-DOF (nv=67) verification | Done | 6 tests in `test_high_dof.cpp` |
+
+All tests validate against MuJoCo C reference. The high-DOF model (nv=67,
+nu=61, nbody=25) matches MuJoCo C perfectly after 5 steps and remains stable
+through 100 steps with random controls.
 
 ---
 
@@ -88,6 +106,14 @@ MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 5:
 | MuJoCo C | ~9,000 lines (6 files: primitive, box, convex, GJK, SDF, driver) |
 | MJX | ~2,100 lines (4 files: primitive, convex, SDF, driver) |
 | MuJoCo-MLX-Cpp | ~840 lines (collision.cpp + constraint_vmap.cpp collision parts) |
+
+### Exclude Signature (Phase 1.3)
+
+`exclude_signature` is now fully implemented. The `nexclude` count and
+`exclude_signature` array are loaded from the MuJoCo model and applied in both
+the `init_cache()` collision pair pre-filter (for the vmap path) and the scalar
+`collision()` narrowphase loop. Signature encoding matches MuJoCo C:
+`(min_body_id << 16) | max_body_id`.
 
 ### Impact
 
@@ -251,7 +277,7 @@ MuJoCo-MLX-Cpp's solver supports:
 | **Sleep/wake** (775 lines) | Full | N/A | **None** |
 | **Constraint islands** (642 lines) | Full | N/A | **None** |
 | **Flex/deformable** (in passive.c + core_util.c) | Full | **None** | **None** |
-| **Gravity compensation** | `body_gravcomp` | Yes | **Allocated, never filled** |
+| **Gravity compensation** | `body_gravcomp` | Yes | **Yes (Phase 1.1)** — `qfrc_gravcomp` computed and added to `qfrc_passive` |
 | **Visualization** (4,955 lines) | Full | N/A | **None** (physics only) |
 | **Plugins** | Full | **None** | **None** |
 
@@ -270,25 +296,29 @@ This is one area with **full parity**.
 
 ---
 
-## Silent Failure Modes
+## Silent Failure Modes (Mitigated — Phase 1.4)
 
 MJX validates models at load time and raises errors or warnings for unsupported
-features. MuJoCo-MLX-Cpp **does not** -- it silently produces wrong physics:
+features. As of Phase 1.4, MuJoCo-MLX-Cpp now **emits warnings to stderr** at
+model load time for unsupported features:
 
 | Scenario | What happens |
 |----------|-------------|
-| Model has BOX geoms | Geom loaded, no collisions generated. Bodies pass through each other. |
-| Model has MESH geoms | Same -- no collisions. |
-| Model has TENDON transmission | Actuator `trntype != 0` skipped in io.cpp. Actuator produces zero force. |
-| Model has MUSCLE dynamics | `act_dot` never computed. Actuator activation stays at zero. |
-| Model has equality constraints | `eq_*` arrays loaded but never used. Constraints not enforced. |
-| Model has contact condim=3 | Condim value ignored. Only normal constraint generated. No friction. |
-| Model uses RK4 integrator | `opt.integrator` loaded but integration is always Euler. |
-| Model uses implicit integrator | Same -- always Euler. |
+| Model has BOX geoms | **Warning emitted.** Geom loaded, no collisions generated. |
+| Model has MESH geoms | **Warning emitted.** Same -- no collisions. |
+| Model has HFIELD/ELLIPSOID/CYLINDER geoms | **Warning emitted.** No collisions for those types. |
+| Model has TENDON/SITE transmission | **Warning emitted.** Actuator produces zero force. |
+| Model has MUSCLE dynamics | **Warning emitted.** `act_dot` never computed. |
+| Model has equality constraints | **Warning emitted.** Constraints not enforced. |
+| Model uses RK4 integrator | **Warning emitted.** Integration is always Euler. |
+| Model uses implicit integrator | **Warning emitted.** Integration is always Euler. |
+| Model has sensors | **Warning emitted.** Sensors not computed. |
 
-**Recommendation:** Add model validation at load time (in `mjmlx_load_model` and
-`mjb_load_model`) that warns when a model uses unsupported features on the MLX
-backend. The CPU backend (via `libmjb`) handles everything correctly.
+The `validate_model()` function in `io.cpp` scans the `mjModel` at load time
+and prints `[mjmlx WARNING]` messages for each unsupported feature detected.
+Models still load and simulate (with the supported subset), but the user is
+informed about what won't work. The CPU backend (via `libmjb`) handles
+everything correctly.
 
 ---
 
@@ -463,11 +493,12 @@ architectural answer to the conformance gap:
 | Constraints | `mj_makeConstraint` | `make_constraint()` | Limits + normal contact only |
 | Transmission | `mj_transmission` | `transmission()` | JOINT only |
 | COM velocity | `mj_comVel` | `com_vel()` | Full parity |
-| Passive forces | `mj_passive` | `passive()` | Spring + damper (no gravcomp) |
+| Passive forces | `mj_passive` | `passive()` | Spring + damper + **gravcomp (Phase 1.1)** |
 | RNE | `mj_rne` | `rne()` | Full parity |
 | Actuation | `mj_fwdActuation` | `fwd_actuation()` | FIXED + AFFINE gain only |
 | Acceleration | `mj_fwdAcceleration` | `fwd_acceleration()` | Full parity |
 | Solve | `mj_fwdConstraint` | `solve()` | CG + Newton (no PGS) |
+| Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | **Yes (Phase 1.2)** — computes `cfrc_ext` |
 | Euler | `mj_Euler` | `integrate_euler()` | Full parity + Metal kernel |
 | RK4 | `mj_RungeKutta` | -- | Not implemented |
 | Implicit | `mj_implicit` | -- | Not implemented |

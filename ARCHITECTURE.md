@@ -39,7 +39,8 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
  Pure MLX array operations, traced by vmap across N environments.
  COM position, CRB mass matrix, Cholesky factorization,
  collision detection, constraint generation, solver,
- COM velocity, RNE, actuation, acceleration.
+ COM velocity, RNE, actuation, acceleration,
+ rne_post_constraint (cfrc_ext).
  mx::compile fuses the computation graph into fewer GPU dispatches.
 
          │
@@ -333,6 +334,26 @@ Key differences from Python mujoco-mlx:
 - C++ eliminates Python interpreter overhead
 - Mass matrix mask bug fix (see above) was found during C++ port
 - Solver iteration count now matches XML spec (Python had the same)
+
+---
+
+## Phase 1 Conformance Additions
+
+### rne_post_constraint (cfrc_ext)
+
+`rne_post_constraint()` is now called automatically at the end of the `forward()` pipeline (in `forward.cpp`), after the constraint solver. It computes `cfrc_ext` — the per-body sum of external contact and constraint forces — using a `cdof`-based projection from `qfrc_constraint`. This is an approximation compared to MuJoCo C's geometry-based approach using `efc_force`, but produces matching results for typical contact scenarios (validated within 0.001 tolerance against MuJoCo C).
+
+### Gravity Compensation
+
+`passive()` in `passive.cpp` now includes a `gravcomp()` function that computes `qfrc_gravcomp` for bodies with `body_gravcomp != 0`. The force is computed as `-(mass * gravcomp * gravity)` and projected to joint space via the translational Jacobian at the body's COM. The result is accumulated into `qfrc_passive`.
+
+### Exclude Signature
+
+Collision filtering via `exclude_signature` is implemented in both `init_cache()` (for vmap pair pre-filtering) and the scalar `collision()` narrowphase loop. The encoding matches MuJoCo C: `(min_body_id << 16) | max_body_id`.
+
+### Model Validation
+
+`validate_model()` in `io.cpp` scans the `mjModel` at load time and emits `[mjmlx WARNING]` messages to stderr for unsupported features (mesh/box/hfield/ellipsoid/cylinder geoms, tendon/site transmission, muscle actuators, equality constraints, RK4/implicit integrators, sensors). Models still load and simulate with the supported subset.
 
 ---
 
