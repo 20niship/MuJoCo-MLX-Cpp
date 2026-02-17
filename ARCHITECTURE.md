@@ -357,6 +357,27 @@ Collision filtering via `exclude_signature` is implemented in both `init_cache()
 
 ---
 
+## Phase 2 Conformance Additions
+
+### Pyramidal Friction (condim=3)
+
+`constraint.cpp` and `constraint_vmap.cpp` now generate pyramidal friction constraint rows when `condim >= 3` and `cone == PYRAMIDAL` (the default). For condim=3, each contact produces 4 constraint rows — two opposing pyramid edges per tangent direction:
+
+```
+J_edge[2k]   = J_normal + μ[k] * J_tangent[k]
+J_edge[2k+1] = J_normal - μ[k] * J_tangent[k]    for k = 0, 1
+```
+
+The impedance for pyramidal rows uses a friction-scaled formula:
+- `invw_py = invw * (1 + μ²)` — diagonal approximation correction
+- `R_py = 2μ² * invw_py * (1-imp)/imp / impratio` — pyramidal R
+
+All 4 rows are simple unilateral inequalities (force >= 0), so the existing CG/Newton solver handles them without modification. The `max_nefc` computation in `io.cpp` now accounts for `2*(condim-1)` rows per friction contact pair.
+
+D values and aref match MuJoCo C within 0.001% (validated in `test_friction_condim3.cpp`).
+
+---
+
 ## Known Issues and Future Work
 
 1. **Graph size**: The computation graph (~6,200 nodes) is large. Reducing it would speed up both compilation and execution. Main targets:

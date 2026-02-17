@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 1 conformance complete).
+Last updated: 2026-02-11 (Phase 2.1 pyramidal friction condim=3 complete).
 
 ## Table of Contents
 
@@ -36,6 +36,23 @@ Phase 1 closed the highest-priority gaps for ProjectSentience Synth training:
 All tests validate against MuJoCo C reference. The high-DOF model (nv=67,
 nu=61, nbody=25) matches MuJoCo C perfectly after 5 steps and remains stable
 through 100 steps with random controls.
+
+## Phase 2.1 Conformance (Completed 2026-02-11)
+
+Pyramidal friction (condim=3) — the single largest physics fidelity improvement
+for contact simulation. Each friction contact now generates 4 pyramidal constraint
+rows instead of 1 frictionless normal row.
+
+| Feature | Status | Tests |
+|---------|--------|-------|
+| Pyramidal friction condim=3 | Done | 7 tests in `test_friction_condim3.cpp` |
+
+Key results:
+- D values match MuJoCo C within 0.001%
+- qfrc_constraint difference = 0.000025 (near-perfect float32 accuracy)
+- Pyramidal row formula: `J_edge = J_normal ± μ * J_tangent` (4 rows per contact)
+- Impedance: `R_py = 2μ²·R_normal·(1+μ²) / impratio`
+- Both scalar and vmap/batched paths implemented
 
 ---
 
@@ -139,17 +156,26 @@ filters down to capsule-plane pairs.
 | Tendon limits | Yes | Yes | **No** |
 | DOF friction loss | Yes | Yes | **No** |
 | Tendon friction loss | Yes | Yes | **No** |
-| Contact: frictionless (condim=1) | Yes | Yes | Yes (this is all we do) |
-| Contact: pyramidal friction | Yes | Yes | **No** |
+| Contact: frictionless (condim=1) | Yes | Yes | Yes |
+| Contact: pyramidal friction (condim=3) | Yes | Yes | **Yes (Phase 2.1)** |
+| Contact: pyramidal friction (condim=4,6) | Yes | Yes | **No** |
 | Contact: elliptic friction | Yes | Yes | **No** |
 
 ### Contact Dimension (condim)
 
-MuJoCo C generates 1-5 constraint rows per contact depending on `condim`:
-- condim=1: 1 row (normal only)
-- condim=3: 3 rows (normal + 2 friction)
-- condim=4: 4 rows (normal + 2 friction + torsion)
-- condim=6: 6 rows (normal + 2 friction + torsion + 2 rolling)
+MuJoCo C generates 1-10 constraint rows per contact depending on `condim` and cone type:
+
+Pyramidal cone (2*(condim-1) rows):
+- condim=1: 1 row (normal only, frictionless)
+- condim=3: 4 rows (2 tangent directions × 2 pyramid edges) — **Implemented (Phase 2.1)**
+- condim=4: 6 rows (3 directions × 2 edges)
+- condim=6: 10 rows (5 directions × 2 edges)
+
+Elliptic cone (condim rows):
+- condim=1: 1 row
+- condim=3: 3 rows (normal + 2 tangent)
+- condim=4: 4 rows
+- condim=6: 6 rows
 
 MuJoCo-MLX-Cpp generates **1 row per contact (normal only)**, regardless of
 the model's `condim` setting. This means objects cannot grip, resist sliding,

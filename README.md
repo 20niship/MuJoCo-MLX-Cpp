@@ -87,13 +87,13 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (148 tests across 14 suites)
+# Full suite (155 tests across 15 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
 cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure
 
-# Phase 1 conformance tests only
+# Conformance tests only (Phase 1 + Phase 2)
 cd build && ctest -L correctness --output-on-failure
 ```
 
@@ -138,17 +138,19 @@ const float* qpos = mjmlx_get_qpos(data, &n);  // zero-copy unified memory
 
 See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
-## Conformance (Phase 1)
+## Conformance
 
-Phase 1 conformance features added for ProjectSentience Synth model support:
-
+### Phase 1: Synth Physics Foundation
 - **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) — validated against MuJoCo C
 - **Per-body contact forces** (`cfrc_ext` via `rne_post_constraint`) — integrated into forward pipeline
 - **Exclude signature** collision filtering (`nexclude`, `exclude_signature`) — matches MuJoCo C encoding
 - **Model validation warnings** at load time for unsupported features (mesh, box, tendons, etc.)
 - **High-DOF verification** (nv=67) — perfect match with MuJoCo C, stable through 100+ steps
 
-33 conformance tests across 5 test suites, all validated against MuJoCo C reference.
+### Phase 2: Contact Friction
+- **Pyramidal friction (condim=3)** — 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
+
+40 conformance tests across 6 test suites, all validated against MuJoCo C reference.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
 
