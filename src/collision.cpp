@@ -35,8 +35,11 @@ static mx::array mat_col(const mx::array& mats, int i, int col) {
 static mx::array make_frame(const mx::array& normal) {
     auto n = normalize(normal);
     auto [b, c] = orthogonals(n);
-    // Stack as (3, 3): [n; b; c]
-    return mx::stack({n, b, c});
+    // Ensure all are exactly (3,) before stacking to (3,3)
+    auto n3 = mx::reshape(n, {3});
+    auto b3 = mx::reshape(b, {3});
+    auto c3 = mx::reshape(c, {3});
+    return mx::stack({n3, b3, c3});
 }
 
 struct CollisionResult {
@@ -55,6 +58,42 @@ static CollisionResult plane_sphere(
     auto pos = mx::subtract(sphere_pos,
                              mx::multiply(normal, mx::add(dist, mx::slice(sphere_size, {0}, {1}))));
     return {mx::flatten(dist), pos, make_frame(normal)};
+}
+
+static CollisionResult plane_ellipsoid(
+    const mx::array& plane_pos, const mx::array& plane_mat,
+    const mx::array& ell_pos, const mx::array& ell_mat, const mx::array& ell_size)
+{
+    // Plane normal is the z-column of plane_mat
+    auto normal = mat_col(mx::reshape(plane_mat, {1, 3, 3}), 0, 2);
+    mx::eval(normal); mx::eval(ell_pos); mx::eval(ell_mat); mx::eval(ell_size);
+    auto np = normal.data<float>();
+    auto ep = ell_pos.data<float>();
+    auto em = ell_mat.data<float>();
+    auto es = ell_size.data<float>();
+
+    // Find deepest point on ellipsoid surface along -normal direction
+    float neg_n[3] = {-np[0], -np[1], -np[2]};
+    // R^T * (-normal) → local direction
+    float ldx = em[0]*neg_n[0] + em[3]*neg_n[1] + em[6]*neg_n[2];
+    float ldy = em[1]*neg_n[0] + em[4]*neg_n[1] + em[7]*neg_n[2];
+    float ldz = em[2]*neg_n[0] + em[5]*neg_n[1] + em[8]*neg_n[2];
+    float a = es[0], b = es[1], c = es[2];
+    float sx = a*a*ldx, sy = b*b*ldy, sz = c*c*ldz;
+    float slen = std::sqrt(sx*sx/(a*a) + sy*sy/(b*b) + sz*sz/(c*c));
+    if (slen < 1e-12f) slen = 1e-12f;
+    float lx = sx/slen, ly = sy/slen, lz = sz/slen;
+    // World position of deepest point
+    float wx = ep[0] + em[0]*lx + em[1]*ly + em[2]*lz;
+    float wy = ep[1] + em[3]*lx + em[4]*ly + em[5]*lz;
+    float wz = ep[2] + em[6]*lx + em[7]*ly + em[8]*lz;
+
+    mx::eval(plane_pos);
+    auto pp = plane_pos.data<float>();
+    // Distance = dot(deepest_point - plane_pos, normal)
+    float dist_val = (wx-pp[0])*np[0] + (wy-pp[1])*np[1] + (wz-pp[2])*np[2];
+    auto pos = mx::array({wx, wy, wz});
+    return {mx::array(dist_val), pos, make_frame(normal)};
 }
 
 static CollisionResult plane_capsule(
@@ -896,6 +935,24 @@ static Vec3 support(const ConvexGeom& g, Vec3 dir) {
         }
         return tip;
     }
+    case (int)GeomType::ELLIPSOID: {
+        float a = g.size[0], b = g.size[1], c = g.size[2];
+        // R^T * dir (transform direction to local frame)
+        float ld_x = g.mat[0]*dir.x + g.mat[3]*dir.y + g.mat[6]*dir.z;
+        float ld_y = g.mat[1]*dir.x + g.mat[4]*dir.y + g.mat[7]*dir.z;
+        float ld_z = g.mat[2]*dir.x + g.mat[5]*dir.y + g.mat[8]*dir.z;
+        // Scale by semi-axes: s = diag(a,b,c)^2 * local_dir
+        float sx = a*a*ld_x, sy = b*b*ld_y, sz = c*c*ld_z;
+        float slen = std::sqrt(sx*sx/(a*a) + sy*sy/(b*b) + sz*sz/(c*c));
+        if (slen < 1e-12f) slen = 1e-12f;
+        // Local support point = diag(a,b,c)^2 * local_dir / |diag(a,b,c) * local_dir|
+        float lx = sx / slen, ly = sy / slen, lz = sz / slen;
+        // Transform to world
+        float wx = center.x + g.mat[0]*lx + g.mat[1]*ly + g.mat[2]*lz;
+        float wy = center.y + g.mat[3]*lx + g.mat[4]*ly + g.mat[5]*lz;
+        float wz = center.z + g.mat[6]*lx + g.mat[7]*ly + g.mat[8]*lz;
+        return {wx, wy, wz};
+    }
     case (int)GeomType::MESH: {
         // Find vertex with maximum dot product with dir
         float best_dot = -1e20f;
@@ -1451,7 +1508,8 @@ static float geom_rbound(int type, const float* size) {
     case (int)GeomType::SPHERE:   return size[0];
     case (int)GeomType::CAPSULE:  return size[0] + size[1];
     case (int)GeomType::BOX:      return std::sqrt(size[0]*size[0] + size[1]*size[1] + size[2]*size[2]);
-    case (int)GeomType::CYLINDER: return std::sqrt(size[0]*size[0] + size[1]*size[1]);
+    case (int)GeomType::CYLINDER:  return std::sqrt(size[0]*size[0] + size[1]*size[1]);
+    case (int)GeomType::ELLIPSOID: return std::max({size[0], size[1], size[2]});
     case (int)GeomType::MESH:     return std::max({size[0], size[1], size[2]});
     default:                      return 0.1f;
     }
@@ -1760,6 +1818,9 @@ Data collision(const Model& m, Data d) {
                     hf_margin, hf_g, other_g, hf_condim,
                     c_dist, c_pos, c_frame, c_geom, c_dim);
                 continue;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::ELLIPSOID)) {
+                result = plane_ellipsoid(gpos1, gmat1, gpos2, gmat2, gsize2);
+                handled = true;
             } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
                 float margin = gmargin[g1_] + gmargin[g2_];
                 int condim = 3;
@@ -1777,8 +1838,9 @@ Data collision(const Model& m, Data d) {
                     dataid2, m, margin, g1_, g2_, condim,
                     c_dist, c_pos, c_frame, c_geom, c_dim);
                 continue;
-            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)) {
-                // GJK/EPA for any pair involving MESH
+            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)
+                    || t2_ == static_cast<int>(GeomType::ELLIPSOID) || t1_ == static_cast<int>(GeomType::ELLIPSOID)) {
+                // GJK/EPA for any pair involving MESH or ELLIPSOID
                 int dataid1 = -1, dataid2 = -1;
                 if (m.geom_dataid.size() > 0) {
                     mx::eval(m.geom_dataid);
@@ -1803,9 +1865,9 @@ Data collision(const Model& m, Data d) {
                     condim = std::max(cdp[g1_], cdp[g2_]);
                 }
 
-                c_dist.push_back(result.dist);
-                c_pos.push_back(result.pos);
-                c_frame.push_back(result.frame);
+                c_dist.push_back(mx::reshape(result.dist, {}));
+                c_pos.push_back(mx::reshape(result.pos, {3}));
+                c_frame.push_back(mx::reshape(result.frame, {3, 3}));
                 c_geom.push_back(mx::array({g1_, g2_}, mx::int32));
                 c_dim.push_back(condim);
             }
@@ -1937,6 +1999,9 @@ Data collision(const Model& m, Data d) {
                     hf_margin, hf_g, other_g, hf_condim,
                     c_dist, c_pos, c_frame, c_geom, c_dim);
                 continue;
+            } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::ELLIPSOID)) {
+                result = plane_ellipsoid(gpos1, gmat1, gpos2, gmat2, gsize2);
+                handled = true;
             } else if (t1_ == static_cast<int>(GeomType::PLANE) && t2_ == static_cast<int>(GeomType::MESH)) {
                 float margin_pm = gmargin[g1_] + gmargin[g2_];
                 if (m.pair_margin.size() > 0) {
@@ -1957,7 +2022,8 @@ Data collision(const Model& m, Data d) {
                     dataid2, m, margin_pm, g1_, g2_, condim_pm,
                     c_dist, c_pos, c_frame, c_geom, c_dim);
                 continue;
-            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)) {
+            } else if (t2_ == static_cast<int>(GeomType::MESH) || t1_ == static_cast<int>(GeomType::MESH)
+                    || t2_ == static_cast<int>(GeomType::ELLIPSOID) || t1_ == static_cast<int>(GeomType::ELLIPSOID)) {
                 int dataid1 = -1, dataid2 = -1;
                 if (m.geom_dataid.size() > 0) {
                     mx::eval(m.geom_dataid);
@@ -1987,9 +2053,9 @@ Data collision(const Model& m, Data d) {
                     condim = m.pair_dim.data<int>()[pi];
                 }
 
-                c_dist.push_back(result.dist);
-                c_pos.push_back(result.pos);
-                c_frame.push_back(result.frame);
+                c_dist.push_back(mx::reshape(result.dist, {}));
+                c_pos.push_back(mx::reshape(result.pos, {3}));
+                c_frame.push_back(mx::reshape(result.frame, {3, 3}));
                 c_geom.push_back(mx::array({g1_, g2_}, mx::int32));
                 c_dim.push_back(condim);
             }

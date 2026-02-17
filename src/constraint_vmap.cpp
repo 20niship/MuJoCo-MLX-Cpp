@@ -636,6 +636,35 @@ static mx::array vmap_support_cylinder(
     return mx::add(tip, offset);
 }
 
+static mx::array vmap_support_ellipsoid(
+    const mx::array& pos, const mx::array& mat, const float* size, const mx::array& dir)
+{
+    auto Rc = mx::reshape(mat, {3,3});
+    auto RT = mx::transpose(Rc);
+    // local_dir = R^T * dir
+    auto ld = mx::flatten(mx::matmul(RT, mx::reshape(dir, {3,1})));
+    auto ldx = mx::reshape(mx::take(ld, mx::array({0})), {});
+    auto ldy = mx::reshape(mx::take(ld, mx::array({1})), {});
+    auto ldz = mx::reshape(mx::take(ld, mx::array({2})), {});
+    float a = size[0], b = size[1], c = size[2];
+    // s = diag(a^2, b^2, c^2) * local_dir
+    auto sx = mx::multiply(ldx, mx::array(a*a));
+    auto sy = mx::multiply(ldy, mx::array(b*b));
+    auto sz = mx::multiply(ldz, mx::array(c*c));
+    // slen = |diag(a,b,c) * local_dir|
+    auto slen = mx::sqrt(mx::maximum(
+        mx::add(mx::add(mx::multiply(sx, mx::divide(sx, mx::array(a*a))),
+                         mx::multiply(sy, mx::divide(sy, mx::array(b*b)))),
+                mx::multiply(sz, mx::divide(sz, mx::array(c*c)))),
+        mx::array(1e-16f)));
+    // local_point = s / slen
+    auto lp = mx::concatenate({mx::reshape(mx::divide(sx, slen), {1}),
+                               mx::reshape(mx::divide(sy, slen), {1}),
+                               mx::reshape(mx::divide(sz, slen), {1})});
+    // world = pos + R * local_point
+    return mx::add(pos, mx::flatten(mx::matmul(Rc, mx::reshape(lp, {3,1}))));
+}
+
 static mx::array vmap_support_mesh(
     const mx::array& verts, const mx::array& pos, const mx::array& mat,
     const mx::array& dir)
@@ -651,7 +680,7 @@ static mx::array vmap_support_mesh(
 
 // ── Generic support function dispatcher ─────────────────────────────────────
 
-enum VmapGeomKind { VGK_SPHERE=0, VGK_CAPSULE, VGK_BOX, VGK_CYLINDER, VGK_MESH };
+enum VmapGeomKind { VGK_SPHERE=0, VGK_CAPSULE, VGK_BOX, VGK_CYLINDER, VGK_ELLIPSOID, VGK_MESH };
 
 struct VmapConvexShape {
     VmapGeomKind kind;
@@ -666,8 +695,9 @@ static mx::array vmap_support(const VmapConvexShape& g, const mx::array& dir) {
     case VGK_SPHERE:   return vmap_support_sphere(g.pos, g.size[0], dir);
     case VGK_CAPSULE:  return vmap_support_capsule(g.pos, g.mat, g.size[0], g.size[1], dir);
     case VGK_BOX:      return vmap_support_box(g.pos, g.mat, g.size, dir);
-    case VGK_CYLINDER: return vmap_support_cylinder(g.pos, g.mat, g.size[0], g.size[1], dir);
-    case VGK_MESH:     return vmap_support_mesh(g.verts, g.pos, g.mat, dir);
+    case VGK_CYLINDER:  return vmap_support_cylinder(g.pos, g.mat, g.size[0], g.size[1], dir);
+    case VGK_ELLIPSOID: return vmap_support_ellipsoid(g.pos, g.mat, g.size, dir);
+    case VGK_MESH:      return vmap_support_mesh(g.verts, g.pos, g.mat, dir);
     default:           return g.pos;
     }
 }
@@ -677,9 +707,10 @@ static VmapGeomKind geom_type_to_kind(int t) {
     case (int)GeomType::SPHERE:   return VGK_SPHERE;
     case (int)GeomType::CAPSULE:  return VGK_CAPSULE;
     case (int)GeomType::BOX:      return VGK_BOX;
-    case (int)GeomType::CYLINDER: return VGK_CYLINDER;
-    case (int)GeomType::MESH:     return VGK_MESH;
-    default:                      return VGK_SPHERE;
+    case (int)GeomType::CYLINDER:  return VGK_CYLINDER;
+    case (int)GeomType::ELLIPSOID: return VGK_ELLIPSOID;
+    case (int)GeomType::MESH:      return VGK_MESH;
+    default:                       return VGK_SPHERE;
     }
 }
 
@@ -1307,13 +1338,21 @@ Data vmap_collision(const Model& m, Data d) {
             } else {
                 result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
             }
+        } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::ELLIPSOID) {
+            // Analytic plane-ellipsoid: support point on ellipsoid in -normal direction
+            auto normal = mx::flatten(mx::slice(mx::reshape(m1, {3,3}), mx::Shape{0,2}, mx::Shape{3,3}));
+            auto neg_n = mx::negative(normal);
+            auto deep_pt = vmap_support_ellipsoid(p2, m2, cp.size2, neg_n);
+            auto dist = mx::sum(mx::multiply(normal, mx::subtract(deep_pt, p1)));
+            result = {mx::reshape(dist, {}), deep_pt, vmap_make_frame(normal)};
         } else if (t1 == (int)GeomType::PLANE && t2 == (int)GeomType::MESH) {
             if (cp.mesh_verts2.size() > 0) {
                 result = vmap_plane_mesh_proper(p1, m1, p2, m2, cp.mesh_verts2);
             } else {
                 result = {mx::array(1.0f), mx::zeros({3}), mx::eye(3)};
             }
-        } else if (t2 == (int)GeomType::MESH || t1 == (int)GeomType::MESH) {
+        } else if (t2 == (int)GeomType::MESH || t1 == (int)GeomType::MESH
+                || t2 == (int)GeomType::ELLIPSOID || t1 == (int)GeomType::ELLIPSOID) {
             VmapConvexShape shapeA;
             shapeA.kind = geom_type_to_kind(t1);
             shapeA.pos = p1; shapeA.mat = m1;

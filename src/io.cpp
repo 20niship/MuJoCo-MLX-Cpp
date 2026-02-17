@@ -300,8 +300,7 @@ static void validate_model(const mjModel* m) {
     // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
     // BOX geom collision is now supported (Phase 3.1)
     // HFIELD geom collision is now supported (Phase 3.4)
-    if (has_ellipsoid)
-        fprintf(stderr, "[mjmlx WARNING] Model has ELLIPSOID geoms -- collision not supported.\n");
+    // ELLIPSOID geom collision is now supported via GJK/EPA (Phase 3.5)
     // CYLINDER geom collision is now supported (Phase 3.2)
 
     // Check for unsupported actuator types
