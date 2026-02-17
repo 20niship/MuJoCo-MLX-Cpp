@@ -5,6 +5,7 @@ Comprehensive design document for MuJoCo-MLX-Cpp. This documents key architectur
 ## Table of Contents
 
 - [High-Level Pipeline](#high-level-pipeline)
+- [Forward Pipeline Detail](#forward-pipeline-detail)
 - [Why Metal + Vmap Hybrid](#why-metal--vmap-hybrid)
 - [Computation Graph Rules](#computation-graph-rules)
 - [Key Data Structures](#key-data-structures)
@@ -13,6 +14,9 @@ Comprehensive design document for MuJoCo-MLX-Cpp. This documents key architectur
 - [Mass Matrix Construction](#mass-matrix-construction)
 - [Constraint Solver](#constraint-solver)
 - [Constraint Construction](#constraint-construction)
+- [DOF Friction Loss](#dof-friction-loss)
+- [Tendon System](#tendon-system)
+- [Collision System](#collision-system)
 - [Metal Kernels](#metal-kernels)
 - [Performance Characteristics](#performance-characteristics)
 - [Comparison with Python mujoco-mlx and MJX](#comparison-with-python-mujoco-mlx-and-mjx)
@@ -26,34 +30,71 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
 
 ```
  Phase 1: Metal Kinematics Kernel
- ─────────────────────────────────
+ ---------------------------------
  Single GPU dispatch for ALL N environments.
  qpos -> xpos, xquat, xmat, xipos, ximat, xanchor, xaxis, geom_xpos, geom_xmat
  Replaces ~130 separate MLX dispatches with one fused Metal kernel.
 
-         │
-         ▼
+         |
+         v
 
  Phase 2: compile(vmap(forward_dynamics))
- ─────────────────────────────────────────
+ -----------------------------------------
  Pure MLX array operations, traced by vmap across N environments.
  COM position, CRB mass matrix, Cholesky factorization,
+ tendon computation,
  collision detection, constraint generation, solver,
- COM velocity, RNE, actuation, acceleration,
- rne_post_constraint (cfrc_ext).
+ transmission, COM velocity, passive forces, RNE,
+ actuation, acceleration, rne_post_constraint (cfrc_ext).
  mx::compile fuses the computation graph into fewer GPU dispatches.
 
-         │
-         ▼
+         |
+         v
 
  Phase 3: Metal Euler Kernel
- ────────────────────────────
+ ----------------------------
  Single GPU dispatch for ALL N environments.
  Built-in Cholesky + solve + velocity update + position integration.
  Replaces the entire integration step with one fused Metal kernel.
 ```
 
 The pipeline is orchestrated in `batched.cpp:make_batched_step()`.
+
+---
+
+## Forward Pipeline Detail
+
+The scalar `forward()` pipeline calls sub-stages in this order:
+
+```
+fwd_position:
+  kinematics -> com_pos -> crb -> factor_m -> tendon -> collision -> make_constraint -> transmission
+
+fwd_velocity:
+  actuator_velocity -> com_vel -> passive (incl. tendon spring/damping) -> rne
+
+fwd_actuation:
+  actuator force computation
+
+fwd_acceleration:
+  qfrc_smooth = qfrc_passive - qfrc_bias + qfrc_actuator + qfrc_applied
+  qacc_smooth = M^{-1} * qfrc_smooth
+
+constraint solve:
+  if nefc > 0: solve(m, d)     [CG or Newton]
+  else: qacc = qacc_smooth
+
+post-constraint:
+  rne_post_constraint -> cfrc_ext
+```
+
+The vmap pipeline mirrors this with `vmap_*` versions of each function. All vmap functions use pure MLX array ops (no eval, no data<>).
+
+**Constraint ordering** within `efc_J`:
+1. Equality constraints (`d.ne` rows)
+2. DOF friction loss (`d.nf` rows)
+3. Joint limits (`d.nl` rows)
+4. Contact constraints (remaining rows)
 
 ---
 
@@ -83,7 +124,7 @@ Our advantage over MJX: custom Metal kernels for the two hottest phases (kinemat
 4. **Use `mx::where()` for conditional logic** -- Branch-free selection on GPU.
 5. **Fixed output shapes** -- vmap requires uniform shapes across the batch dimension.
 
-Functions that follow these rules: `vmap_com_pos`, `vmap_crb`, `vmap_factor_m`, `vmap_com_vel`, `vmap_rne`, `vmap_collision`, `vmap_make_constraint`, `vmap_solve`, `vmap_transmission`, `vmap_passive`, `vmap_fwd_actuation`, `vmap_fwd_acceleration`.
+Functions that follow these rules: `vmap_com_pos`, `vmap_crb`, `vmap_factor_m`, `vmap_com_vel`, `vmap_rne`, `vmap_collision`, `vmap_make_constraint`, `vmap_solve`, `vmap_transmission`, `vmap_tendon`, `vmap_passive`, `vmap_fwd_actuation`, `vmap_fwd_acceleration`.
 
 **Model constants** (topology arrays, scatter matrices, masks) are accessed inside vmap functions but are never mutated. They are precomputed in `ModelCache` during `init_cache()` using `eval()` + `data<>()`, which is safe because `init_cache()` runs at model load time, not inside vmap.
 
@@ -95,8 +136,11 @@ Functions that follow these rules: `vmap_com_pos`, `vmap_crb`, `vmap_factor_m`, 
 
 Loaded from MuJoCo XML via `io.cpp`. Contains all model parameters as `mx::array`:
 - Joint/body/geom topology (parentid, bodyid, types)
-- Physical properties (mass, inertia, damping, stiffness)
+- Physical properties (mass, inertia, damping, stiffness, frictionloss)
 - Actuator configuration (gear, bias, limits)
+- Tendon properties (adr, num, stiffness, damping, wrap objects)
+- Equality constraint properties (type, obj1id, obj2id, data, solref, solimp)
+- DOF solver parameters (dof_solref, dof_solimp for friction loss)
 - Solver options (solver type, iterations, timestep)
 
 ### ModelCache
@@ -105,17 +149,20 @@ Precomputed at load time by `init_cache()`. Contains:
 - **Tree topology**: `tree_levels` (bodies grouped by depth), `body_dofs` (DOF indices per body), `body_parentid_vec` (C++ vector for fast indexing)
 - **Scatter matrices**: For level-parallel backward accumulation in `vmap_com_pos` and `vmap_crb`
 - **Mass matrix mask**: Lower-triangular DOF ancestor mask (`make_m_mask`)
-- **Collision pairs**: Pre-filtered geometry pairs for broadphase
+- **Collision pairs**: Pre-filtered geometry pairs for broadphase (includes hfield, ellipsoid, mesh data)
 - **Joint plans**: Integration plans (simple/free/ball joints), actuator moment matrices
 - **CDoF plan**: Precomputed indices for vectorized cdof computation
 - **Body DOF masks**: For Jacobian computation in constraints
+- **max_nefc**: Pre-computed maximum constraint rows (equality + friction + limits + contacts)
 
 ### Data
 
 Per-environment state. In batched mode, vmap adds a leading batch dimension:
 - **State**: qpos, qvel, qacc, ctrl, act
 - **Derived**: xpos, xquat, xmat (from kinematics), cinert, cvel, cdof, cdof_dot (from smooth dynamics), qfrc_bias, qfrc_smooth, qfrc_constraint (from RNE/solver)
-- **Constraint**: efc_J, efc_D, efc_aref, contact info
+- **Tendon**: ten_length, ten_velocity, ten_J (from tendon computation)
+- **Constraint**: efc_J, efc_D, efc_aref, efc_force, efc_frictionloss, contact info
+- **Counts**: nefc, ne (equality), nf (friction), nl (limits), ncon (contacts)
 
 ---
 
@@ -222,7 +269,7 @@ The Python reference `_get_mass_matrix_mask` in `support.py` is also strictly lo
 
 ## Constraint Solver
 
-**File:** `solver_vmap.cpp`
+**Files:** `solver.cpp` (scalar), `solver_vmap.cpp` (vmap/GPU)
 
 ### Newton vs CG
 
@@ -248,6 +295,22 @@ Instead of binary/backtracking search (which needs conditional branches, incompa
 
 All 5 costs are computed in one batched operation and the minimum is selected via `mx::argmin`. Branch-free and fully vectorizable.
 
+### Friction force clamping (linear zone)
+
+DOF friction loss constraints use a special "linear zone" cost function. When `|Jaref| >= R * frictionloss`, the constraint enters the linear zone:
+
+- The constraint is removed from the quadratic active set (`active_mask = 0`)
+- The force is clamped to `+/-frictionloss`
+- The cost becomes linear (not quadratic)
+
+**This is critical for the `alpha_n` calculation.** The Newton step denominator must only include quadratic terms, while the numerator must include both quadratic and linear derivatives:
+
+```
+alpha_n = -(linear_gauss + linear_con + linear_floss) / max(2 * (quad_gauss + quad_con), eps)
+```
+
+If `linear_floss` (the derivative of the linear friction cost) is omitted, the solver diverges because `alpha_n` collapses when friction rows dominate. Both `solver.cpp` and `solver_vmap.cpp` implement this via `apply_friction_clamp` / `vmap_friction_clamp` helper functions.
+
 ### prev_grad correctness (CG)
 
 In the Polak-Ribiere beta computation, `prev_grad` must be captured **before** updating `grad`. An earlier bug used the already-updated gradient in the denominator, causing CG to diverge.
@@ -256,15 +319,169 @@ In the Polak-Ribiere beta computation, `prev_grad` must be captured **before** u
 
 ## Constraint Construction
 
-**File:** `constraint_vmap.cpp`
+**Files:** `constraint.cpp` (scalar), `constraint_vmap.cpp` (vmap/GPU)
+
+### Constraint types supported
+
+| Type | Source | Rows per instance | Notes |
+|------|--------|-------------------|-------|
+| Equality (CONNECT) | `eq_type=1` | 3 | Positional error in 3D |
+| Equality (WELD) | `eq_type=0` | 6 | Position (3) + orientation (3) |
+| Equality (JOINT) | `eq_type=2` | 1 | Joint position error |
+| DOF friction loss | `dof_frictionloss > 0` | 1 per DOF | Identity Jacobian, K=0 |
+| Joint limit | `jnt_limited` | 1 per active limit | Upper or lower bound |
+| Contact (condim=1) | collision | 1 | Normal only |
+| Contact (condim=3) | collision | 4 | Pyramidal friction (2 tangent dirs) |
+| Contact (condim=4) | collision | 6 | + torsion friction |
+| Contact (condim=6) | collision | 10 | + rolling friction |
 
 ### Fixed-size outputs
 
 All pre-computed collision pairs are always evaluated, even when not in contact. Inactive constraints get `D=0`, which makes them no-ops in the solver. This ensures uniform output shapes across environments, which is required for vmap.
 
+### KBI (Stiffness, Damping, Impedance) computation
+
+Constraint parameters are computed from `solref` (reference) and `solimp` (impedance):
+- **K** (stiffness): `1 / (max(solref[0], eps) * h)^2` (set to 0 for friction loss)
+- **B** (damping): `2 / (max(solref[0], eps) * h)` (scaled by solref[1])
+- **Imp** (impedance): interpolated from solimp range using positional error
+
 ### Degenerate normal fallback
 
 `vmap_make_frame` computes tangent frames from contact normals using cross products. When the normal is near-parallel to `[0,0,1]` (cross product magnitude < 1e-6), it falls back to `[0,1,0]` as the reference axis. This uses `mx::where` for branch-free execution.
+
+---
+
+## DOF Friction Loss
+
+**Files:** `constraint.cpp`, `constraint_vmap.cpp`, `solver.cpp`, `solver_vmap.cpp`
+
+DOF friction loss is a joint-level friction mechanism where each DOF with `frictionloss > 0` generates a constraint row. The constraint applies a force opposing velocity, bounded by `+/-frictionloss`.
+
+### Constraint generation
+
+- **Jacobian**: Identity row `e_i` (1 at DOF index, 0 elsewhere)
+- **Position**: Always 0 (no positional error for friction)
+- **Stiffness (K)**: Explicitly set to 0 (matching MuJoCo C `engine_core_constraint.c`)
+- **Damping (B)**: Computed from `dof_solref` / `dof_solimp`
+- **aref**: `-B * qvel[i]`
+
+### Solver integration
+
+The friction clamping logic is the most intricate part:
+
+1. **Linear zone detection**: If `|Jaref| >= R * frictionloss`, the row enters the linear zone
+2. **Active set update**: Linear zone rows are removed from the quadratic active set
+3. **Force clamping**: Force is saturated at `+/-frictionloss` (sign determined by Jaref direction)
+4. **Cost**: Quadratic cost for quadratic rows + linear cost for friction rows in the linear zone
+5. **Line search**: `alpha_n` numerator includes `linear_floss` derivative term
+
+This is re-evaluated at every solver iteration since `Jaref` changes as the solution evolves.
+
+---
+
+## Tendon System
+
+**Files:** `smooth.cpp` (`tendon()`), `smooth_vmap.cpp` (`vmap_tendon()`), `passive.cpp` (`tendon_passive()`)
+
+### Fixed (joint-based) tendons
+
+Fixed tendons compute a linear combination of joint values:
+
+```
+ten_length[i] = sum(wrap_prm[j] * qpos[jnt_qposadr[wrap_objid[j]]])
+```
+
+where the sum is over all wrap objects of type `mjWRAP_JOINT` in tendon `i`.
+
+The tendon Jacobian is sparse and constant (does not depend on state):
+
+```
+ten_J[tendon_id, jnt_dofadr[wrap_objid[j]]] = wrap_prm[j]
+```
+
+Tendon velocity is computed as `ten_velocity = ten_J @ qvel`.
+
+### Model fields
+
+| Field | Shape | Description |
+|-------|-------|-------------|
+| `tendon_adr` | (ntendon,) | Start index in wrap arrays |
+| `tendon_num` | (ntendon,) | Number of wrap objects per tendon |
+| `tendon_stiffness` | (ntendon,) | Spring stiffness |
+| `tendon_damping` | (ntendon,) | Damping coefficient |
+| `tendon_lengthspring` | (ntendon, 2) | Spring rest length range |
+| `wrap_type` | (nwrap,) | Wrap object type (1 = JOINT) |
+| `wrap_objid` | (nwrap,) | Joint index |
+| `wrap_prm` | (nwrap,) | Coefficient / moment arm |
+
+### Pipeline position
+
+Tendon computation is placed in `fwd_position` after `factor_m` and before `collision`, matching MuJoCo C's ordering. This ensures tendon data (`ten_length`, `ten_J`) is available for:
+- Tendon passive forces (in `fwd_velocity -> passive()`)
+- Tendon limit constraints (future Phase 5)
+- Tendon transmission actuators (future Phase 5.3)
+
+### Passive forces
+
+Tendon spring and damping forces are computed in `passive.cpp`:
+
+```
+force[t] = -stiffness * (ten_length - rest_length) - damping * ten_velocity
+qfrc_passive += ten_J^T * force
+```
+
+The rest length uses `tendon_lengthspring` range clamping: `rest = clamp(ten_length, lo, hi)`.
+
+### Vmap compatibility
+
+The vmap path pre-computes the constant Jacobian from model data (safe to use `eval`/`data<>` since it's model-time, not trace-time). The `ten_length` computation uses a gather-matmul pattern: gather `qpos` at relevant indices, multiply by coefficients, then scatter-sum into tendon lengths via a pre-built one-hot matrix. This avoids CPU-side loops during vmap tracing.
+
+### Spatial tendons (not yet implemented)
+
+Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require computing shortest paths. These will be added in Phase 5.2. The model fields (`wrap_type` values 3-5 for SITE/SPHERE/CYLINDER) are loaded but currently emit a warning.
+
+---
+
+## Collision System
+
+**Files:** `collision.cpp` (scalar), `constraint_vmap.cpp` (vmap)
+
+### Supported collision pairs
+
+| Pair | Algorithm | Multi-contact | Vmap |
+|------|-----------|---------------|------|
+| plane-sphere | Analytic | 1 | Yes |
+| plane-capsule | Analytic | 1 | Yes |
+| plane-box | Face projection | Up to 4 | Yes (1) |
+| plane-cylinder | Rim + center | Up to 6 | Yes (1) |
+| plane-mesh | All vertices | Variable | Yes (1) |
+| plane-hfield | Grid triangles | Variable | Yes (1) |
+| plane-ellipsoid | Analytic | 1 | Yes |
+| sphere-sphere | Analytic | 1 | Yes |
+| sphere-capsule | Segment closest | 1 | Yes |
+| sphere-box | OBB closest | 1 | Yes |
+| sphere-cylinder | Region-based | 1 | Yes |
+| sphere-ellipsoid | Analytic | 1 | Yes |
+| capsule-capsule | Segment-segment | 1 | Yes |
+| capsule-box | Iterative | 1 | Yes |
+| capsule-cylinder | Iterative | 1 | Yes |
+| capsule-ellipsoid | Analytic | 1 | Yes |
+| box-box | SAT (15 axes) | 1 | Yes |
+| mesh-* | GJK/EPA | 1 | Sphere approx |
+| hfield-* | Grid cells | Variable | 1 |
+
+### GJK/EPA (convex collision)
+
+64-iteration GJK with evolving simplex (point -> line -> triangle -> tetrahedron), followed by 64-iteration EPA for penetration depth. The vmap path uses a fixed-iteration GJK (32 iters) with support-based depth estimation (22 directions) for GPU compatibility.
+
+### Heightfield (hfield)
+
+Grid-cell based collision: identifies the grid cell containing the query point, tests against both triangles of the cell, returns the deepest penetrating contact. Supports all geom types against hfield.
+
+### Ellipsoid
+
+Analytic collision using the ellipsoid-to-sphere transform: scale the world so the ellipsoid becomes a unit sphere, compute the contact in that space, then transform back. Supports plane-ellipsoid, sphere-ellipsoid, and capsule-ellipsoid.
 
 ---
 
@@ -337,108 +554,37 @@ Key differences from Python mujoco-mlx:
 
 ---
 
-## Phase 1 Conformance Additions
+## Conformance Phases
 
-### rne_post_constraint (cfrc_ext)
+### Phase 1: Synth Physics Foundation
 
-`rne_post_constraint()` is now called automatically at the end of the `forward()` pipeline (in `forward.cpp`), after the constraint solver. It computes `cfrc_ext` — the per-body sum of external contact and constraint forces — using a `cdof`-based projection from `qfrc_constraint`. This is an approximation compared to MuJoCo C's geometry-based approach using `efc_force`, but produces matching results for typical contact scenarios (validated within 0.001 tolerance against MuJoCo C).
+**rne_post_constraint (cfrc_ext)**: Called automatically at the end of `forward()`, after the constraint solver. Computes `cfrc_ext` using a `cdof`-based projection from `qfrc_constraint`. This is an approximation compared to MuJoCo C's geometry-based approach using `efc_force`, but produces matching results for typical contact scenarios (validated within 0.001 tolerance).
 
-### Gravity Compensation
+**Gravity Compensation**: `passive()` includes `gravcomp()` for bodies with `body_gravcomp != 0`. Force `-(mass * gravcomp * gravity)` projected to joint space via translational Jacobian at body COM.
 
-`passive()` in `passive.cpp` now includes a `gravcomp()` function that computes `qfrc_gravcomp` for bodies with `body_gravcomp != 0`. The force is computed as `-(mass * gravcomp * gravity)` and projected to joint space via the translational Jacobian at the body's COM. The result is accumulated into `qfrc_passive`.
+**Exclude Signature**: Collision filtering via `exclude_signature` in both `init_cache()` (vmap pair pre-filtering) and scalar `collision()` narrowphase. Encoding: `(min_body_id << 16) | max_body_id`.
 
-### Exclude Signature
+**Model Validation**: `validate_model()` scans `mjModel` at load time and emits warnings for unsupported features.
 
-Collision filtering via `exclude_signature` is implemented in both `init_cache()` (for vmap pair pre-filtering) and the scalar `collision()` narrowphase loop. The encoding matches MuJoCo C: `(min_body_id << 16) | max_body_id`.
+### Phase 2: Contact Friction
 
-### Model Validation
+**Pyramidal Friction (condim=3)**: 4 constraint rows per contact (opposing pyramid edges per tangent direction). Friction-scaled impedance: `invw_py = invw * (1 + mu^2)`, `R_py = 2*mu^2 * invw_py * (1-imp)/imp / impratio`.
 
-`validate_model()` in `io.cpp` scans the `mjModel` at load time and emits `[mjmlx WARNING]` messages to stderr for unsupported features (mesh/hfield/ellipsoid/cylinder geoms, tendon/site transmission, muscle actuators, equality constraints, RK4/implicit integrators, sensors). BOX geoms are now fully supported (Phase 3.1). Models still load and simulate with the supported subset.
+**Pyramidal Friction (condim=4,6)**: Torsion (condim=4, +2 rows) and rolling (condim=6, +4 more rows) friction using 3rd/4th/5th geom_friction parameters.
 
----
+### Phase 3: Collision Geometry
 
-## Phase 2 Conformance Additions
+See [Collision System](#collision-system) above for the full collision pair matrix.
 
-### Pyramidal Friction (condim=3)
+Key algorithms: SAT for box-box, GJK/EPA for mesh, grid-cell for hfield, ellipsoid-to-sphere transform for ellipsoid. All pairs work in both scalar and vmap pipelines.
 
-`constraint.cpp` and `constraint_vmap.cpp` now generate pyramidal friction constraint rows when `condim >= 3` and `cone == PYRAMIDAL` (the default). For condim=3, each contact produces 4 constraint rows — two opposing pyramid edges per tangent direction:
+### Phase 4: Equality Constraints + DOF Friction
 
-```
-J_edge[2k]   = J_normal + μ[k] * J_tangent[k]
-J_edge[2k+1] = J_normal - μ[k] * J_tangent[k]    for k = 0, 1
-```
+See [Constraint Construction](#constraint-construction) and [DOF Friction Loss](#dof-friction-loss) above.
 
-The impedance for pyramidal rows uses a friction-scaled formula:
-- `invw_py = invw * (1 + μ²)` — diagonal approximation correction
-- `R_py = 2μ² * invw_py * (1-imp)/imp / impratio` — pyramidal R
+### Phase 5: Tendon System (in progress)
 
-All 4 rows are simple unilateral inequalities (force >= 0), so the existing CG/Newton solver handles them without modification. The `max_nefc` computation in `io.cpp` now accounts for `2*(condim-1)` rows per friction contact pair.
-
-D values and aref match MuJoCo C within 0.001% (validated in `test_friction_condim3.cpp`).
-
-### Phase 3.1: BOX Collisions
-
-`collision.cpp` and `constraint_vmap.cpp` now handle all 4 box collision pair types:
-
-1. **plane-box** (`plane_box_multi`): Projects box vertices onto plane. Finds the face most aligned with the plane normal and returns up to 4 contacts (one per face vertex). Matches MuJoCo C's `mjc_PlaneBox` algorithm — produces identical ncon and nefc.
-
-2. **sphere-box** (`sphere_box`): Transforms sphere center to box-local coordinates, clamps to box bounds (OBB closest point), and computes penetration. Handles degenerate case (sphere center inside box) by pushing out along the axis of least penetration.
-
-3. **capsule-box** (`capsule_box`): Tests 3 sample points (endpoints + midpoint) against the box, finds closest point on box, projects back onto capsule segment, and iterates once for refinement. Approximate but stable.
-
-4. **box-box** (`box_box`): Full Separating Axis Theorem (SAT) with 15 potential axes: 3 face normals from each box + 9 edge-edge cross products. Reports the axis with minimum overlap as the contact normal. Contact point is the midpoint of the two support vertices along the separating axis.
-
-The vmap-compatible versions use pure MLX array ops (no eval/data). The vmap path generates 1 contact per pair (deepest only); the scalar path generates multi-contact for plane-box.
-
-`max_nefc` in `io.cpp` now accounts for multi-contact pairs: plane-box (4x), plane-cylinder (6x), capsule-box (2x), box-box (8x) the per-contact constraint rows.
-
-### Phase 3.2: CYLINDER Collisions
-
-`collision.cpp` and `constraint_vmap.cpp` now handle 3 cylinder collision pair types:
-
-1. **plane-cylinder** (`plane_cylinder_multi`): For each of the 2 face caps, computes face center + rim points (along the plane-perpendicular direction). In the degenerate case (axis parallel to normal), generates 2 orthogonal rim points + center per face. Returns up to 6 candidate contacts, filtered by margin. Matches MuJoCo C ncon exactly (3 upright, 2 side).
-
-2. **sphere-cylinder** (`sphere_cylinder`): Transforms sphere center to cylinder-local coordinates. Cylinder surface decomposed into barrel (curved), top cap, bottom cap, and rim edges. Closest-point logic handles 4 regions: beside barrel, above/below cap, diagonal (rim), and interior (push out to nearest surface).
-
-3. **capsule-cylinder** (`capsule_cylinder`): Tests 3 sample points (endpoints + midpoint) on the capsule segment against the cylinder. For each, transforms to cylinder-local, finds closest surface point, projects back to capsule segment, and refines. Picks the pair with minimum separation.
-
-Helper function `closest_on_cylinder_local` computes the closest point on a cylinder surface (barrel + caps) to an arbitrary point in cylinder-local coordinates, handling all 4 geometric regions including the interior case.
-
-The vmap-compatible versions (`vmap_plane_cylinder`, `vmap_sphere_cylinder`, `vmap_capsule_cylinder`) use pure MLX array ops with no eval/data calls. The vmap plane-cylinder path returns 1 contact (deepest rim point); the scalar path returns multi-contact.
-
-### Phase 3.3: MESH/GJK/EPA Convex Collisions
-
-The most complex collision subsystem. Handles any pair involving MESH geoms using the standard GJK/EPA algorithm pair.
-
-**Mesh Data Loading** (`io.cpp`):
-- `geom_dataid`: maps each geom to its mesh index (-1 for non-mesh)
-- `mesh_vertadr`, `mesh_vertnum`: per-mesh vertex address and count
-- `mesh_vert`: all mesh vertices in a single (total_verts, 3) array
-- `CollisionPair` extended with `dataid1`/`dataid2` fields
-
-**Support Functions** (`collision.cpp`):
-Each geom type has a `support(direction)` function returning the furthest surface point in a given direction:
-- **Sphere**: center + radius × normalize(dir)
-- **Capsule**: best endpoint + radius × normalize(dir)
-- **Box**: sign(dir·axis_i) × halfsize_i for each axis
-- **Cylinder**: best face tip + R × perpendicular component
-- **Mesh**: argmax(vertices · direction), transformed to world space
-
-**GJK** (64-iteration bound):
-Iterative Minkowski-difference origin search using evolving simplex (point → line → triangle → tetrahedron). Tracks witness points (a, b) on both shapes for each simplex vertex.
-
-**EPA** (64-iteration bound, 128 vertices, 256 faces):
-Given a GJK tetrahedron containing the origin, expands the convex polytope toward the origin by:
-1. Finding the closest face to the origin
-2. Adding a new support point in that face's normal direction
-3. Removing visible faces, collecting horizon edges, rebuilding
-4. Computing barycentric witness points on convergence
-
-**Plane-Mesh** (`plane_mesh_multi`):
-Special-cased for performance — tests ALL mesh vertices against the plane and returns contacts for every penetrating vertex. This matches MuJoCo C's convex-plane behavior.
-
-**Vmap Path**:
-Uses sphere approximation for mesh geoms in the batched pipeline (mesh center + bounding radius). Full GJK/EPA is scalar-only due to variable iteration requirements. This is acceptable for batched training.
+See [Tendon System](#tendon-system) above. Phase 5.1 (fixed tendons) complete. Phase 5.2 (spatial tendons) and 5.3 (SITE/TENDON transmission) pending.
 
 ---
 
@@ -453,3 +599,15 @@ Uses sphere approximation for mesh geoms in the batched pipeline (mesh center + 
 3. **Small batch sizes**: Below 1024 envs, GPU utilization is low and per-step overhead dominates.
 
 4. **Memory**: Each environment uses ~50KB of state. At 8192 envs, total GPU memory is ~400MB.
+
+5. **Spatial tendons**: Wrapping geometry (sphere/cylinder) for tendon paths is not yet implemented (Phase 5.2).
+
+6. **Tendon/SITE transmission**: Actuators with tendon or site transmission types produce zero force (Phase 5.3).
+
+7. **Advanced actuator dynamics**: FILTER, INTEGRATOR, MUSCLE dynamics types not yet implemented (Phase 6).
+
+8. **Advanced integrators**: RK4 and ImplicitFast not yet implemented (Phase 7).
+
+9. **Sensors**: Not yet implemented (Phase 8).
+
+10. **Differentiable physics**: `grad(step)` for empowerment/model-based RL is planned (Phase 9) and is the most important milestone for Project Sentience.

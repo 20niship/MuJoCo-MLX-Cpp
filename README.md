@@ -4,8 +4,8 @@ GPU-accelerated MuJoCo physics on Apple Silicon via [MLX](https://github.com/ml-
 
 Two C++ shared libraries:
 
-- **`libmjmlx.dylib`** — MuJoCo physics pipeline reimplemented on Metal GPU using MLX C++
-- **`libmjb.dylib`** — Unified dual-backend C API that dispatches to either MuJoCo C (CPU) or MuJoCo-MLX (GPU)
+- **`libmjmlx.dylib`** -- MuJoCo physics pipeline reimplemented on Metal GPU using MLX C++
+- **`libmjb.dylib`** -- Unified dual-backend C API that dispatches to either MuJoCo C (CPU) or MuJoCo-MLX (GPU)
 
 Designed for consumption from Python (via nanobind), Unity/C# (via P/Invoke), or any language with C FFI.
 
@@ -44,6 +44,10 @@ libmjmlx.dylib (GPU physics core)
     +-- Physics pipeline (C++ / MLX)
     |     io, math, smooth, collision, constraint, solver, forward,
     |     passive, support, scan
+    |
+    +-- Tendon system
+    |     Fixed (joint-based) tendons: ten_length, ten_velocity, ten_J
+    |     Tendon passive forces (spring + damping)
     |
     +-- Metal kernels
     |     Kinematics FK, fused Euler (source-generated MSL)
@@ -87,13 +91,13 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 ### Running tests
 
 ```bash
-# Full suite (187 tests across 20 suites)
+# Full suite (204 tests across 23 suites)
 ./run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
 cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure
 
-# Conformance tests only (Phase 1 + Phase 2 + Phase 3)
+# Conformance tests only
 cd build && ctest -L correctness --output-on-failure
 ```
 
@@ -140,38 +144,79 @@ See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
 
 ## Conformance
 
+All features validated against MuJoCo C reference implementation. **204 tests across 23 test suites, all passing.**
+
 ### Phase 1: Synth Physics Foundation
-- **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) — validated against MuJoCo C
-- **Per-body contact forces** (`cfrc_ext` via `rne_post_constraint`) — integrated into forward pipeline
-- **Exclude signature** collision filtering (`nexclude`, `exclude_signature`) — matches MuJoCo C encoding
-- **Model validation warnings** at load time for unsupported features (mesh, tendons, etc.)
-- **High-DOF verification** (nv=67) — perfect match with MuJoCo C, stable through 100+ steps
+- **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
+- **Per-body contact forces** (`cfrc_ext` via `rne_post_constraint`) -- integrated into forward pipeline
+- **Exclude signature** collision filtering (`nexclude`, `exclude_signature`) -- matches MuJoCo C encoding
+- **Model validation warnings** at load time for unsupported features
+- **High-DOF verification** (nv=67) -- perfect match with MuJoCo C, stable through 100+ steps
 
 ### Phase 2: Contact Friction
-- **Pyramidal friction (condim=3)** — 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
-- **Pyramidal friction (condim=4,6)** — torsion + rolling friction, 6/10 rows per contact, D values identical
+- **Pyramidal friction (condim=3)** -- 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
+- **Pyramidal friction (condim=4,6)** -- torsion + rolling friction, 6/10 rows per contact, D values identical
 
 ### Phase 3: Collision Geometry
-- **plane-box** — multi-contact (up to 4 face vertices), ncon/nefc match MuJoCo C exactly
-- **sphere-box** — closest-point on OBB, with interior fallback
-- **capsule-box** — segment-to-OBB closest approach with iterative refinement
-- **box-box** — SAT (Separating Axis Theorem) with 15 axes, support point contact generation
-- **plane-cylinder** — multi-contact (face center + rim points), ncon matches MuJoCo C exactly
-- **sphere-cylinder** — cylinder-local closest-point with barrel/cap/rim handling
-- **capsule-cylinder** — segment-to-cylinder iterative projection refinement
-- **GJK/EPA** — full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm
-- **plane-mesh** — multi-contact (all penetrating vertices), near-exact MuJoCo C match
-- **mesh-mesh** — GJK/EPA with support functions for sphere, capsule, box, cylinder, mesh
+- **plane-box** -- multi-contact (up to 4 face vertices), ncon/nefc match MuJoCo C exactly
+- **sphere-box** -- closest-point on OBB, with interior fallback
+- **capsule-box** -- segment-to-OBB closest approach with iterative refinement
+- **box-box** -- SAT (15 axes) with support point contact generation
+- **plane-cylinder** -- multi-contact (face center + rim points)
+- **sphere-cylinder** -- cylinder-local closest-point with barrel/cap/rim handling
+- **capsule-cylinder** -- segment-to-cylinder iterative projection refinement
+- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm
+- **plane-mesh** -- multi-contact (all penetrating vertices), near-exact MuJoCo C match
+- **mesh-mesh** -- GJK/EPA with support functions for sphere, capsule, box, cylinder, mesh
+- **plane-hfield** -- heightfield terrain collision against all geom types, grid-cell triangle tests
+- **plane-ellipsoid** -- analytic ellipsoid collision against planes, spheres, capsules
 - All collision pair types work in both scalar and vmap (batched) pipelines
 
-66 conformance tests across 10 test suites, all validated against MuJoCo C reference.
+### Phase 4: Equality Constraints + DOF Friction
+- **Equality constraints (CONNECT/WELD/JOINT)** -- 12 tests, qacc diff ~0 vs MuJoCo C
+- **DOF friction loss** -- solver friction clamping with linear zone cost, qacc diff ~1e-6
+- Correct constraint ordering: equality -> friction -> limits -> contacts
 
-See [CONFORMANCE.md](CONFORMANCE.md) for the full gap analysis and feature matrix.
+### Phase 5: Tendon System (in progress)
+- **Fixed (joint-based) tendons** -- `ten_length`, `ten_velocity`, `ten_J` match MuJoCo C within 1e-5
+- **Tendon passive forces** -- spring + damping via `ten_J^T` projection
+- Both scalar and vmap paths
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
+
+## Test Suite Summary
+
+| Suite | Tests | What it validates |
+|-------|-------|-------------------|
+| test_io_full | 9 | Model loading, array shapes, initial state |
+| test_forward_full | 7 | Forward dynamics pipeline, step correctness |
+| test_physics_full | 20 | Physics accuracy vs MuJoCo C |
+| test_solver_full | 11 | Constraint solver (Newton + CG) |
+| test_collision_full | 7 | Core collision detection |
+| test_math_full | 17 | Math utilities (quaternion, rotation, etc.) |
+| test_linalg_full | 11 | Linear algebra (Cholesky, solve, etc.) |
+| test_vmap_smooth | 12 | Vmap-compatible smooth dynamics |
+| test_gravcomp | 7 | Gravity compensation |
+| test_cfrc_ext | 6 | Contact force computation |
+| test_exclude | 6 | Collision exclusion filtering |
+| test_validation | 8 | Model validation warnings |
+| test_high_dof | 6 | High-DOF models (67 DOF) |
+| test_friction_condim3 | 7 | Pyramidal friction (condim=3) |
+| test_friction_condim46 | 7 | Torsion/rolling friction (condim=4,6) |
+| test_collision_box | 6 | Box collision pairs |
+| test_collision_cylinder | 6 | Cylinder collision pairs |
+| test_collision_mesh | 7 | Mesh/GJK/EPA collisions |
+| test_collision_hfield | 7 | Heightfield terrain collisions |
+| test_collision_ellipsoid | 7 | Ellipsoid collisions |
+| test_equality | 12 | Equality constraints (CONNECT/WELD/JOINT) |
+| test_dof_friction | 9 | DOF friction loss + solver clamping |
+| test_fixed_tendon | 9 | Fixed tendon system |
+| **TOTAL** | **204** | |
 
 ## Consumers
 
-- **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) — uses nanobind extension from this repo
-- **MuJoCo-MLX-Unity** (C#, planned) — ships `libmjb.dylib` + P/Invoke bindings
+- **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) -- uses nanobind extension from this repo
+- **MuJoCo-MLX-Unity** (C#, planned) -- ships `libmjb.dylib` + P/Invoke bindings
 
 ## License
 
