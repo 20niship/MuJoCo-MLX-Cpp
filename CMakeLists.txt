@@ -547,7 +547,7 @@ if(MJMLX_BUILD_PYTHON)
         NB_DOMAIN mlx
         python/bindings.cpp
     )
-    target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported)
+    target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported mujoco_imported)
     target_include_directories(_mjmlx_native PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -20,8 +20,8 @@ nanobind_add_module(_mjmlx_native
     python/bindings.cpp
 )
 
-# Link against our core library + MLX
-target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported)
+# Link against our core library + MLX + MuJoCo (for headers)
+target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported mujoco_imported)
 target_include_directories(_mjmlx_native PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/include
