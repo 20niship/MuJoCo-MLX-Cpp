@@ -45,6 +45,7 @@ MJB_API MjbBackendType mjb_backend_type(const MjbBackend* backend);
 
 MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path);
 MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only);
+MJB_API MjbModel* mjb_load_model_from_string(MjbBackend* b, const char* xml_string);
 MJB_API void mjb_free_model(MjbModel* model);
 
 // ============================================================
@@ -56,6 +57,22 @@ MJB_API float mjb_model_opt_timestep(const MjbModel* model);
 MJB_API void mjb_model_set_opt_timestep(MjbModel* model, float dt);
 MJB_API float mjb_model_body_mass(const MjbModel* model, int body_id);
 MJB_API int mjb_name2id(const MjbModel* model, int obj_type, const char* name);
+MJB_API const char* mjb_id2name(const MjbModel* model, int obj_type, int id);
+MJB_API int mjb_model_jnt_qposadr(const MjbModel* model, int jnt_id);
+MJB_API int mjb_model_jnt_dofadr(const MjbModel* model, int jnt_id);
+MJB_API int mjb_model_jnt_type(const MjbModel* model, int jnt_id);
+MJB_API int mjb_model_nconmax(const MjbModel* model);
+MJB_API int mjb_model_geom_type(const MjbModel* model, int geom_id);
+
+// Per-element model accessors (sensors, mocap, tendons, equality, hfield)
+MJB_API int mjb_model_sensor_adr(const MjbModel* model, int sensor_id);
+MJB_API int mjb_model_body_mocapid(const MjbModel* model, int body_id);
+MJB_API float mjb_model_tendon_width(const MjbModel* model, int tendon_id);
+MJB_API int mjb_model_hfield_adr(const MjbModel* model, int hfield_id);
+
+// Bulk model array accessors
+MJB_API const float* mjb_model_eq_data(const MjbModel* model, int* n_out);
+MJB_API const float* mjb_model_hfield_data(const MjbModel* model, int* n_out);
 
 // ============================================================
 // Data lifecycle
@@ -74,6 +91,7 @@ MJB_API void mjb_forward(MjbModel* model, MjbData* data);
 MJB_API void mjb_step1(MjbModel* model, MjbData* data);
 MJB_API void mjb_step2(MjbModel* model, MjbData* data);
 MJB_API void mjb_kinematics(MjbModel* model, MjbData* data);
+MJB_API void mjb_rne_post_constraint(MjbModel* model, MjbData* data);
 
 // ============================================================
 // State access (always float*)
@@ -94,6 +112,34 @@ MJB_API const float* mjb_get_qfrc_actuator(const MjbData* data, int* n_out);
 MJB_API const float* mjb_get_subtree_com(const MjbData* data, int* n_out);
 MJB_API const float* mjb_get_cinert(const MjbData* data, int* n_out);
 MJB_API const float* mjb_get_cfrc_ext(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_geom_xpos(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_geom_xmat(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_sensordata(const MjbData* data, int* n_out);
+
+// Additional data getters for component binding
+MJB_API const float* mjb_get_xaxis(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_site_xpos(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_site_xmat(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_actuator_length(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_actuator_velocity(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_actuator_force(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_mocap_pos(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_mocap_quat(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_ten_length(const MjbData* data, int* n_out);
+MJB_API const float* mjb_get_wrap_xpos(const MjbData* data, int* n_out);
+
+// Int data getters (tendon wrapping)
+MJB_API const int* mjb_get_ten_wrapadr(const MjbData* data, int* n_out);
+MJB_API const int* mjb_get_ten_wrapnum(const MjbData* data, int* n_out);
+MJB_API const int* mjb_get_wrap_obj(const MjbData* data, int* n_out);
+
+// Mocap setters
+MJB_API void mjb_set_mocap_pos(MjbData* data, const float* pos, int n);
+MJB_API void mjb_set_mocap_quat(MjbData* data, const float* quat, int n);
+
+// Per-geom model data (static, for component binding)
+MJB_API const float* mjb_model_geom_pos(const MjbModel* model, int* n_out);
+MJB_API const float* mjb_model_geom_quat(const MjbModel* model, int* n_out);
 
 // ============================================================
 // Batched simulation

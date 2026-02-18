@@ -74,6 +74,10 @@ MJMLX_API float mjmlx_model_body_mass(const MjmlxModel* model, int body_id);
 // Returns -1 if not found.
 MJMLX_API int mjmlx_name2id(const MjmlxModel* model, int obj_type, const char* name);
 
+// Access the underlying MuJoCo C mjModel pointer (for model field accessors).
+// Returns a const mjModel* cast to void*. Valid for the lifetime of the MjmlxModel.
+MJMLX_API const void* mjmlx_get_mj_model(const MjmlxModel* model);
+
 // ============================================================
 // Single-environment simulation
 // ============================================================

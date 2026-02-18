@@ -1595,4 +1595,9 @@ MJMLX_API int mjmlx_name2id(const MjmlxModel* model, int obj_type, const char* n
     return mj_name2id(model->mj_model, obj_type, name);
 }
 
+MJMLX_API const void* mjmlx_get_mj_model(const MjmlxModel* model) {
+    if (!model) return nullptr;
+    return static_cast<const void*>(model->mj_model);
+}
+
 } // extern "C"

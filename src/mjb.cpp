@@ -36,6 +36,8 @@ struct MjbModel {
     // MLX backend
     MjmlxModel* mlx = nullptr;
 
+    mutable std::vector<float> fbuf;  // double->float conversion buffer
+
     ~MjbModel() {
         if (mj) mj_deleteModel(mj);
         if (mlx) mjmlx_free_model(mlx);
@@ -79,7 +81,15 @@ struct MjbBatchedSim {
     }
 };
 
-// ── CPU helpers ─────────────────────────────────────────────────────────
+// ── Internal helpers ────────────────────────────────────────────────────
+
+// Get the underlying C mjModel* regardless of backend.
+// MLX models keep a copy for name/field lookups.
+static const mjModel* get_mj_model(const MjbModel* model) {
+    if (!model) return nullptr;
+    if (model->type == MJB_BACKEND_CPU) return model->mj;
+    return static_cast<const mjModel*>(mjmlx_get_mj_model(model->mlx));
+}
 
 // Convert double array to float buffer, return pointer
 static const float* d2f(const double* src, int n, std::vector<float>& buf) {
@@ -175,6 +185,35 @@ MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, i
     return m;
 }
 
+MJB_API MjbModel* mjb_load_model_from_string(MjbBackend* b, const char* xml_string) {
+    if (!b || !xml_string) return nullptr;
+    auto* m = new MjbModel();
+    m->type = b->type;
+    try {
+        if (b->type == MJB_BACKEND_CPU) {
+            char error[1000] = "";
+            mjVFS vfs;
+            mj_defaultVFS(&vfs);
+            int len = (int)strlen(xml_string);
+            mj_addBufferVFS(&vfs, "model.xml", xml_string, len);
+            m->mj = mj_loadXML("model.xml", &vfs, error, sizeof(error));
+            mj_deleteVFS(&vfs);
+            if (!m->mj) {
+                fprintf(stderr, "mjb_load_model_from_string CPU error: %s\n", error);
+                delete m;
+                return nullptr;
+            }
+        } else {
+            m->mlx = mjmlx_load_model_from_string(xml_string);
+            if (!m->mlx) { delete m; return nullptr; }
+        }
+    } catch (...) {
+        delete m;
+        return nullptr;
+    }
+    return m;
+}
+
 MJB_API void mjb_free_model(MjbModel* model) {
     delete model;
 }
@@ -183,13 +222,22 @@ MJB_API void mjb_free_model(MjbModel* model) {
 
 MJB_API MjbModelInfo mjb_model_info(const MjbModel* model) {
     if (!model) return {};
-    if (model->type == MJB_BACKEND_CPU) {
-        return {(int)model->mj->nq, (int)model->mj->nv, (int)model->mj->nu,
-                (int)model->mj->nbody, (int)model->mj->njnt, (int)model->mj->ngeom};
-    } else {
-        MjmlxModelInfo mi = mjmlx_model_info(model->mlx);
-        return {mi.nq, mi.nv, mi.nu, mi.nbody, mi.njnt, mi.ngeom};
-    }
+    const mjModel* m = get_mj_model(model);
+    if (!m) return {};
+    MjbModelInfo info = {};
+    info.nq = (int)m->nq;
+    info.nv = (int)m->nv;
+    info.nu = (int)m->nu;
+    info.nbody = (int)m->nbody;
+    info.njnt = (int)m->njnt;
+    info.ngeom = (int)m->ngeom;
+    info.nsite = (int)m->nsite;
+    info.nmocap = (int)m->nmocap;
+    info.ntendon = (int)m->ntendon;
+    info.nsensor = (int)m->nsensor;
+    info.nsensordata = (int)m->nsensordata;
+    info.neq = (int)m->neq;
+    return info;
 }
 
 MJB_API float mjb_model_opt_timestep(const MjbModel* model) {
@@ -217,6 +265,80 @@ MJB_API int mjb_name2id(const MjbModel* model, int obj_type, const char* name) {
     if (!model || !name) return -1;
     if (model->type == MJB_BACKEND_CPU) return mj_name2id(model->mj, obj_type, name);
     return mjmlx_name2id(model->mlx, obj_type, name);
+}
+
+MJB_API const char* mjb_id2name(const MjbModel* model, int obj_type, int id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m) return nullptr;
+    return mj_id2name(m, obj_type, id);
+}
+
+MJB_API int mjb_model_jnt_qposadr(const MjbModel* model, int jnt_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || jnt_id < 0 || jnt_id >= m->njnt) return -1;
+    return m->jnt_qposadr[jnt_id];
+}
+
+MJB_API int mjb_model_jnt_dofadr(const MjbModel* model, int jnt_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || jnt_id < 0 || jnt_id >= m->njnt) return -1;
+    return m->jnt_dofadr[jnt_id];
+}
+
+MJB_API int mjb_model_jnt_type(const MjbModel* model, int jnt_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || jnt_id < 0 || jnt_id >= m->njnt) return -1;
+    return m->jnt_type[jnt_id];
+}
+
+MJB_API int mjb_model_nconmax(const MjbModel* model) {
+    const mjModel* m = get_mj_model(model);
+    return m ? (int)m->nconmax : 0;
+}
+
+MJB_API int mjb_model_geom_type(const MjbModel* model, int geom_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || geom_id < 0 || geom_id >= m->ngeom) return -1;
+    return m->geom_type[geom_id];
+}
+
+MJB_API int mjb_model_sensor_adr(const MjbModel* model, int sensor_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || sensor_id < 0 || sensor_id >= m->nsensor) return -1;
+    return m->sensor_adr[sensor_id];
+}
+
+MJB_API int mjb_model_body_mocapid(const MjbModel* model, int body_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || body_id < 0 || body_id >= m->nbody) return -1;
+    return m->body_mocapid[body_id];
+}
+
+MJB_API float mjb_model_tendon_width(const MjbModel* model, int tendon_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || tendon_id < 0 || tendon_id >= m->ntendon) return 0.0f;
+    return (float)m->tendon_width[tendon_id];
+}
+
+MJB_API int mjb_model_hfield_adr(const MjbModel* model, int hfield_id) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || hfield_id < 0 || hfield_id >= m->nhfield) return -1;
+    return m->hfield_adr[hfield_id];
+}
+
+MJB_API const float* mjb_model_eq_data(const MjbModel* model, int* n_out) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || m->neq == 0) { if (n_out) *n_out = 0; return nullptr; }
+    int total = m->neq * mjNEQDATA;
+    return cpu_get(m->eq_data, total, n_out, model->fbuf);
+}
+
+MJB_API const float* mjb_model_hfield_data(const MjbModel* model, int* n_out) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || m->nhfield == 0) { if (n_out) *n_out = 0; return nullptr; }
+    int total = (int)m->nhfielddata;
+    if (n_out) *n_out = total;
+    return m->hfield_data;
 }
 
 // ── Data lifecycle ──────────────────────────────────────────────────────
@@ -284,6 +406,15 @@ MJB_API void mjb_kinematics(MjbModel* model, MjbData* data) {
     if (!model || !data) return;
     if (data->type == MJB_BACKEND_CPU) mj_kinematics(model->mj, data->mj);
     else mjmlx_kinematics(model->mlx, data->mlx);
+}
+
+MJB_API void mjb_rne_post_constraint(MjbModel* model, MjbData* data) {
+    if (!model || !data) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        mj_rnePostConstraint(model->mj, data->mj);
+    } else {
+        mjmlx_rne_post_constraint(model->mlx, data->mlx);
+    }
 }
 
 // ── State access ────────────────────────────────────────────────────────
@@ -390,6 +521,158 @@ MJB_API const float* mjb_get_cfrc_ext(const MjbData* data, int* n_out) {
     if (data->type == MJB_BACKEND_CPU)
         return cpu_get(data->mj->cfrc_ext, data->model_ref->mj->nbody * 6, n_out, data->fbuf);
     return mjmlx_get_cfrc_ext(data->mlx, n_out);
+}
+
+MJB_API const float* mjb_get_geom_xpos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->geom_xpos, data->model_ref->mj->ngeom * 3, n_out, data->fbuf);
+    // MLX: fall back to C model's data (not computed by MLX)
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_geom_xmat(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->geom_xmat, data->model_ref->mj->ngeom * 9, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_sensordata(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->sensordata, data->model_ref->mj->nsensordata, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_model_geom_pos(const MjbModel* model, int* n_out) {
+    const mjModel* m = get_mj_model(model);
+    if (!m) { if (n_out) *n_out = 0; return nullptr; }
+    return cpu_get(m->geom_pos, m->ngeom * 3, n_out, model->fbuf);
+}
+
+MJB_API const float* mjb_model_geom_quat(const MjbModel* model, int* n_out) {
+    const mjModel* m = get_mj_model(model);
+    if (!m) { if (n_out) *n_out = 0; return nullptr; }
+    return cpu_get(m->geom_quat, m->ngeom * 4, n_out, model->fbuf);
+}
+
+// ── Additional data getters for component binding ───────────────────────
+
+MJB_API const float* mjb_get_xaxis(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->xaxis, data->model_ref->mj->njnt * 3, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_site_xpos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->site_xpos, data->model_ref->mj->nsite * 3, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_site_xmat(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->site_xmat, data->model_ref->mj->nsite * 9, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_actuator_length(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->actuator_length, data->model_ref->mj->nu, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_actuator_velocity(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->actuator_velocity, data->model_ref->mj->nu, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_actuator_force(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->actuator_force, data->model_ref->mj->nu, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_mocap_pos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->mocap_pos, data->model_ref->mj->nmocap * 3, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_mocap_quat(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->mocap_quat, data->model_ref->mj->nmocap * 4, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_ten_length(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->ten_length, data->model_ref->mj->ntendon, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API const float* mjb_get_wrap_xpos(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU) {
+        int nwrap = (int)data->model_ref->mj->nwrap;
+        return cpu_get(data->mj->wrap_xpos, nwrap * 6, n_out, data->fbuf);
+    }
+    return nullptr;
+}
+
+MJB_API const int* mjb_get_ten_wrapadr(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU) {
+        int nt = (int)data->model_ref->mj->ntendon;
+        if (n_out) *n_out = nt;
+        return data->mj->ten_wrapadr;
+    }
+    return nullptr;
+}
+
+MJB_API const int* mjb_get_ten_wrapnum(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU) {
+        int nt = (int)data->model_ref->mj->ntendon;
+        if (n_out) *n_out = nt;
+        return data->mj->ten_wrapnum;
+    }
+    return nullptr;
+}
+
+MJB_API const int* mjb_get_wrap_obj(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU) {
+        int nwrap = (int)data->model_ref->mj->nwrap;
+        if (n_out) *n_out = nwrap;
+        return data->mj->wrap_obj;
+    }
+    return nullptr;
+}
+
+MJB_API void mjb_set_mocap_pos(MjbData* data, const float* pos, int n) {
+    if (!data || !pos || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        for (int i = 0; i < n; i++) data->mj->mocap_pos[i] = pos[i];
+    }
+}
+
+MJB_API void mjb_set_mocap_quat(MjbData* data, const float* quat, int n) {
+    if (!data || !quat || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        for (int i = 0; i < n; i++) data->mj->mocap_quat[i] = quat[i];
+    }
 }
 
 // ── Batched simulation ──────────────────────────────────────────────────

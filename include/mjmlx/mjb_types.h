@@ -44,12 +44,18 @@ typedef struct MjbBatchedSim MjbBatchedSim;
 
 // Model dimensions
 typedef struct {
-    int nq;       // generalized coordinates
-    int nv;       // degrees of freedom
-    int nu;       // actuators
-    int nbody;    // bodies
-    int njnt;     // joints
-    int ngeom;    // geoms
+    int nq;           // generalized coordinates
+    int nv;           // degrees of freedom
+    int nu;           // actuators
+    int nbody;        // bodies
+    int njnt;         // joints
+    int ngeom;        // geoms
+    int nsite;        // sites
+    int nmocap;       // mocap bodies
+    int ntendon;      // tendons
+    int nsensor;      // sensors
+    int nsensordata;  // sensor data values
+    int neq;          // equality constraints
 } MjbModelInfo;
 
 // Batched simulation config
