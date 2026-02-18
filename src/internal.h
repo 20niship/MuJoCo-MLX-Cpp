@@ -373,6 +373,19 @@ struct Model {
         mx::array act_range_lo{mx::array(0.0f)};         // (nu,) float: actrange lower
         mx::array act_range_hi{mx::array(0.0f)};         // (nu,) float: actrange upper
 
+        // Tendon cache (for zero-eval vmap tendon computation)
+        mx::array ten_J_const{mx::array(0.0f)};        // (ntendon, nv) constant Jacobian
+        mx::array ten_qpos_idxs{mx::array(0.0f)};      // (nwrap_joints,) int: qpos indices
+        mx::array ten_qpos_coefs{mx::array(0.0f)};     // (nwrap_joints,) float: coefficients
+        mx::array ten_scatter_mat{mx::array(0.0f)};    // (nwrap_joints, ntendon) one-hot scatter
+        bool ten_has_wraps = false;
+
+        // Tendon-actuator cache (for zero-eval vmap transmission)
+        bool ten_has_tendon_actuator = false;
+        mx::array ten_act_is_tendon{mx::array(0.0f)};      // (nu,) float: 1.0 if tendon transmission
+        mx::array ten_act_tendon_idx{mx::array(0.0f)};     // (nu,) int: tendon index (0 for non-tendon)
+        mx::array ten_act_tendon_gear{mx::array(0.0f)};    // (nu,) float: gear for tendon actuators
+
         // Precomputed passive force arrays
         mx::array passive_stiffness{mx::array(0.0f)};
         mx::array passive_qpos_idxs{mx::array(0.0f)};  

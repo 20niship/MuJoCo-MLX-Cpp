@@ -407,6 +407,8 @@ Data vmap_rne(const Model& m, Data d) {
 }
 
 // ── Vmap-compatible tendon ────────────────────────────────────────────────────
+// Zero eval(), zero data<>(), zero CPU loops -- all model constants precomputed
+// in ModelCache at load time by init_cache().
 
 Data vmap_tendon(const Model& m, Data d) {
     if (m.ntendon == 0) {
@@ -416,118 +418,44 @@ Data vmap_tendon(const Model& m, Data d) {
         return d;
     }
 
-    // Pre-compute the tendon Jacobian as a constant matrix (for fixed tendons).
-    // For each wrap object of type JOINT: ten_J[tendon_id, jnt_dofadr[wrap_objid]] = wrap_prm
-    // This is the same as scalar path since the Jacobian is constant.
-    mx::eval(m.tendon_adr); mx::eval(m.tendon_num);
-    mx::eval(m.wrap_type); mx::eval(m.wrap_objid); mx::eval(m.wrap_prm);
-    mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+    const auto& c = m.cache;
+    d.ten_J = c.ten_J_const;
 
-    auto ten_adr = m.tendon_adr.data<int>();
-    auto ten_num = m.tendon_num.data<int>();
-    auto wtype = m.wrap_type.data<int>();
-    auto wobjid = m.wrap_objid.data<int>();
-    auto wprm = m.wrap_prm.data<float>();
-    auto jqpa = m.jnt_qposadr.data<int>();
-    auto jda = m.jnt_dofadr.data<int>();
-
-    // Build constant Jacobian (same for all envs, fixed tendon coefficients)
-    std::vector<float> ten_j(m.ntendon * m.nv, 0.0f);
-    std::vector<int> qpos_indices;
-    std::vector<float> qpos_coefs;
-    std::vector<int> tendon_ids;
-
-    for (int t = 0; t < m.ntendon; t++) {
-        int adr = ten_adr[t];
-        int num = ten_num[t];
-        for (int w = adr; w < adr + num; w++) {
-            if (wtype[w] != 1) continue;  // mjWRAP_JOINT
-            int jnt = wobjid[w];
-            float coef = wprm[w];
-            int da = jda[jnt];
-            ten_j[t * m.nv + da] += coef;
-            qpos_indices.push_back(jqpa[jnt]);
-            qpos_coefs.push_back(coef);
-            tendon_ids.push_back(t);
-        }
-    }
-
-    d.ten_J = mx::array(ten_j.data(), {m.ntendon, m.nv}, mx::float32);
-
-    // ten_length = ten_J @ qpos (but only for scalar qpos entries that map to DOFs)
-    // For fixed tendons with HINGE/SLIDE joints, we use: length = sum(coef * qpos[qa])
-    // We do this via ten_J @ qpos_subset, but since qpos may have quaternions (nq != nv),
-    // we compute it via gathering and dotting.
-    // Actually, simplest vmap-compatible: just gather and sum.
-    // Build ten_length from qpos using the gathered indices.
-    if (!qpos_indices.empty()) {
-        auto idx = mx::array(qpos_indices.data(), {(int)qpos_indices.size()}, mx::int32);
-        auto coefs = mx::array(qpos_coefs.data(), {(int)qpos_coefs.size()}, mx::float32);
-        auto tids = mx::array(tendon_ids.data(), {(int)tendon_ids.size()}, mx::int32);
-
-        // Gather qpos values at the relevant indices
-        auto qvals = mx::take(d.qpos, idx);
-        auto products = mx::multiply(coefs, qvals);
-
-        // Scatter-add into ten_length using segment_sum equivalent
-        // Use mx::zeros + scatter_add (via index_put)
-        // Since MLX doesn't have segment_sum directly, use a loop or scatter
-        auto ten_length = mx::zeros({m.ntendon});
-        // For vmap compatibility, build a one-hot and matmul
-        std::vector<float> scatter_mat(qpos_indices.size() * m.ntendon, 0.0f);
-        for (size_t i = 0; i < tendon_ids.size(); i++) {
-            scatter_mat[i * m.ntendon + tendon_ids[i]] = 1.0f;
-        }
-        auto smat = mx::array(scatter_mat.data(),
-            {(int)qpos_indices.size(), m.ntendon}, mx::float32);
-        d.ten_length = mx::flatten(mx::matmul(mx::reshape(products, {1, (int)qpos_indices.size()}), smat));
+    if (c.ten_has_wraps) {
+        auto qvals = mx::take(d.qpos, c.ten_qpos_idxs, 0);
+        auto products = mx::multiply(c.ten_qpos_coefs, qvals);
+        int nw = (int)c.ten_qpos_coefs.shape(0);
+        d.ten_length = mx::flatten(mx::matmul(
+            mx::reshape(products, {1, nw}), c.ten_scatter_mat));
     } else {
         d.ten_length = mx::zeros({m.ntendon});
     }
 
-    // ten_velocity = ten_J @ qvel
-    d.ten_velocity = mx::flatten(mx::matmul(d.ten_J, mx::reshape(d.qvel, {m.nv, 1})));
+    d.ten_velocity = mx::flatten(mx::matmul(
+        d.ten_J, mx::reshape(d.qvel, {m.nv, 1})));
 
     return d;
 }
 
 // ── Vmap-compatible transmission ─────────────────────────────────────────────
+// Zero eval(), zero data<>(), zero per-actuator loops -- tendon override uses
+// vectorized mx::where with precomputed masks from ModelCache.
 
 Data vmap_transmission(const Model& m, Data d) {
     if (m.nu == 0) return d;
     const auto& c = m.cache;
 
-    // Precomputed moment matrix (constant for JOINT and TENDON transmission)
     d.actuator_moment = c.act_moment_const;
 
-    // Vectorized length: qpos[qa_indices] * gear for JOINT transmission
     auto qpos_gathered = mx::take(d.qpos, c.act_qpos_idxs, 0);  // (nu,)
     d.actuator_length = mx::multiply(qpos_gathered, c.act_gear);
 
-    // For TENDON transmission actuators, override length with ten_length * gear
-    // This is done by checking which actuators have tendon transmission
-    // and overriding their length using precomputed masks
-    if (m.ntendon > 0) {
-        mx::eval(m.actuator_trntype); mx::eval(m.actuator_trnid);
-        auto trn_ptr = m.actuator_trntype.data<int>();
-        auto trnid_ptr = m.actuator_trnid.data<int>();
-        auto gear_ptr = c.act_gear.data<float>();
-
-        for (int i = 0; i < m.nu; i++) {
-            if (trn_ptr[i] == 3) {  // TENDON (mjTRN_TENDON=3)
-                int ten_id = trnid_ptr[i * 2];
-                if (ten_id >= 0 && ten_id < m.ntendon) {
-                    // Override length for this actuator
-                    auto tlen = mx::slice(d.ten_length, {ten_id}, {ten_id + 1});
-                    auto alen = mx::multiply(tlen, mx::array(gear_ptr[i]));
-
-                    // Replace in actuator_length via scatter
-                    auto before = mx::slice(d.actuator_length, {0}, {i});
-                    auto after = mx::slice(d.actuator_length, {i + 1}, {m.nu});
-                    d.actuator_length = mx::concatenate({before, alen, after}, 0);
-                }
-            }
-        }
+    if (m.ntendon > 0 && c.ten_has_tendon_actuator) {
+        auto ten_lengths = mx::take(d.ten_length, c.ten_act_tendon_idx, 0);
+        auto ten_act_length = mx::multiply(ten_lengths, c.ten_act_tendon_gear);
+        d.actuator_length = mx::where(
+            mx::greater(c.ten_act_is_tendon, mx::array(0.5f)),
+            ten_act_length, d.actuator_length);
     }
 
     return d;

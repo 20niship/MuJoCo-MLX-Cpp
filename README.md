@@ -11,18 +11,27 @@ Designed for consumption from Python (via nanobind), Unity/C# (via P/Invoke), or
 
 ## Performance
 
-Humanoid benchmarks on Apple M4 Max (40-core GPU, 64 GB unified memory):
+Humanoid stepping throughput on Apple M4 Max (40-core GPU, 64 GB unified memory):
 
 | Envs | Steps/sec | Notes |
 |------|-----------|-------|
 | 256 | 15,027 | |
 | 1,024 | 68,753 | |
 | 4,096 | 255,362 | |
-| 8,192 | **331,207** | Peak throughput |
+| 8,192 | **331,207** | Peak throughput (pure stepping) |
 
-Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` (Euler in batched, Euler/RK4 in scalar)
+Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` (Euler in batched, Euler/RK4/ImplicitFast in scalar)
 
-Validated training: **5,678 reward** on Gymnasium Humanoid-v5 (12.6x MuJoCo C baseline), 70K SPS at 8192 envs.
+### Training benchmarks (Gymnasium Humanoid-v5, 8192 envs, 32M steps)
+
+| Backend state | Best AvgR | Avg SPS | Wall time | Notes |
+|---------------|-----------|---------|-----------|-------|
+| Phase 1e (pre-conformance) | 5,678 | 70K | 454s | Tendons silently ignored; unrealistic leg dynamics |
+| **Full conformance** | **1,102** | **71K** | **451s** | Hip-knee tendon coupling active; physically correct |
+
+The Phase 1e result was inflated by missing tendon constraints -- the gymnasium humanoid XML has 2 fixed tendons coupling hip and knee joints, which were not implemented in the vmap path at Phase 1e. With tendons active, the humanoid must learn a more realistic gait. The conformance result (1,102) is still 2.4x the MuJoCo C baseline (451 @ 8M steps). Reward was still climbing at 32M steps.
+
+SPS parity maintained via zero-eval tendon caching: all model constants (Jacobian, scatter matrix, actuator masks) precomputed at load time, eliminating CPU-GPU sync from the vmap path.
 
 ## Architecture
 
@@ -109,7 +118,7 @@ The `mjb_*` API lets you pick a backend at creation time:
 ```c
 #include <mjmlx/mjb.h>
 
-// GPU physics (Metal, float32, 70K+ SPS)
+// GPU physics (Metal, float32, 56K+ SPS training)
 MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);
 MjbModel* model = mjb_load_model(gpu, "humanoid.xml");
 MjbData* data = mjb_make_data(model);

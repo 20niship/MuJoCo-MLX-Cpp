@@ -999,6 +999,50 @@ void Model::init_cache() const {
             }
         }
 
+        // ── Tendon vmap cache: precomputed for zero-eval vmap_tendon ──
+        {
+            std::vector<float> ten_j_flat(ntendon * nv, 0.0f);
+            for (int t = 0; t < ntendon; t++)
+                for (int d = 0; d < nv; d++)
+                    ten_j_flat[t * nv + d] = tenJ_rows[t][d];
+            cache.ten_J_const = mx::array(ten_j_flat.data(), {ntendon, nv}, mx::float32);
+
+            std::vector<int> qpos_indices;
+            std::vector<float> qpos_coefs;
+            std::vector<int> tendon_ids;
+
+            if (nwrap > 0) {
+                auto wt = wrap_type.data<int>();
+                auto wid = wrap_objid.data<int>();
+                auto wp = wrap_prm.data<float>();
+                auto tadr = tendon_adr.data<int>();
+                auto tnum = tendon_num.data<int>();
+                auto jqpa = jnt_qposadr.data<int>();
+
+                for (int t = 0; t < ntendon; t++) {
+                    int a = tadr[t], n = tnum[t];
+                    for (int w = a; w < a + n; w++) {
+                        if (wt[w] != 1) continue;  // mjWRAP_JOINT
+                        int jnt = wid[w];
+                        qpos_indices.push_back(jqpa[jnt]);
+                        qpos_coefs.push_back(wp[w]);
+                        tendon_ids.push_back(t);
+                    }
+                }
+            }
+
+            cache.ten_has_wraps = !qpos_indices.empty();
+            if (!qpos_indices.empty()) {
+                int nw = (int)qpos_indices.size();
+                cache.ten_qpos_idxs = mx::array(qpos_indices.data(), {nw}, mx::int32);
+                cache.ten_qpos_coefs = mx::array(qpos_coefs.data(), {nw}, mx::float32);
+                std::vector<float> smat(nw * ntendon, 0.0f);
+                for (int i = 0; i < nw; i++)
+                    smat[i * ntendon + tendon_ids[i]] = 1.0f;
+                cache.ten_scatter_mat = mx::array(smat.data(), {nw, ntendon}, mx::float32);
+            }
+        }
+
         if (tendon_limited.size() > 0) {
             mx::eval(tendon_limited); mx::eval(tendon_range);
             auto tlim = tendon_limited.data<int>();
@@ -1223,6 +1267,33 @@ void Model::init_cache() const {
         cache.act_moment_const = mx::array(moment_data.data(), mx::Shape{nu, nv}, mx::float32);
         cache.act_qpos_idxs = mx::array(act_qpos_idx.data(), mx::Shape{nu}, mx::int32);
         cache.act_gear = mx::array(act_gear_vals.data(), mx::Shape{nu}, mx::float32);
+
+        // ── Tendon-actuator cache for zero-eval vmap transmission ──
+        if (ntendon > 0) {
+            std::vector<float> is_tendon(nu, 0.0f);
+            std::vector<int> tendon_idx(nu, 0);
+            std::vector<float> tendon_gear(nu, 0.0f);
+            bool has_any = false;
+
+            for (int ai = 0; ai < nu; ai++) {
+                if (trn_type_ptr[ai] == 3) {  // mjTRN_TENDON
+                    int tid = trn_id_ptr[ai * 2];
+                    if (tid >= 0 && tid < ntendon) {
+                        is_tendon[ai] = 1.0f;
+                        tendon_idx[ai] = tid;
+                        tendon_gear[ai] = gear_ptr[ai * 6];
+                        has_any = true;
+                    }
+                }
+            }
+
+            cache.ten_has_tendon_actuator = has_any;
+            if (has_any) {
+                cache.ten_act_is_tendon = mx::array(is_tendon.data(), {nu}, mx::float32);
+                cache.ten_act_tendon_idx = mx::array(tendon_idx.data(), {nu}, mx::int32);
+                cache.ten_act_tendon_gear = mx::array(tendon_gear.data(), {nu}, mx::float32);
+            }
+        }
     }
 
     // ── Activation dynamics cache for vmap ──
