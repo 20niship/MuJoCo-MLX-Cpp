@@ -1,7 +1,7 @@
 # MuJoCo Conformance Analysis
 
 Deep comparison of MuJoCo-MLX-Cpp against MuJoCo C and Google's MJX (JAX).
-Last updated: 2026-02-11 (Phase 7.2 ImplicitFast complete, all remaining phases deferred).
+Last updated: 2026-02-18 (Phase 7.2 ImplicitFast complete, zero-eval vmap optimization, all remaining phases deferred).
 
 ## Table of Contents
 
@@ -113,7 +113,8 @@ Key results:
 - plane-mesh ncon=4 (all 4 bottom vertices), qacc diff **3.0** after 1 step
 - qpos diff after 100 steps: **0.000091** (near-perfect stability)
 - GJK/EPA handles arbitrary convex shapes with support functions for all geom types
-- Both scalar and vmap/batched paths implemented (vmap uses sphere approximation)
+- Both scalar and vmap/batched paths implemented with proper mesh support functions (vertex argmax), not sphere approximation
+- Scalar: 64-iter GJK + 64-iter EPA. Vmap: 32-iter GJK + support-based depth estimation (~18 sample directions)
 - Mesh vertex data loaded from MuJoCo model into internal arrays
 - Support functions: sphere, capsule, box, cylinder, mesh (argmax vertex·direction)
 
@@ -125,14 +126,14 @@ Key results:
 |----------|----------|-------------|------------|-----------------|
 | MuJoCo C engine | C | ~47,700 | 80 (.c + .h) | 100% (reference) |
 | MJX (Google) | Python/JAX | ~11,500 (core) | 21 | ~80% |
-| MuJoCo-MLX-Cpp | C++ | ~7,562 | 22 (.cpp + .h) | ~25-30% |
+| MuJoCo-MLX-Cpp | C++ | ~12,450 | 18 (.cpp + .h) | ~65-70% |
 
-MuJoCo-MLX-Cpp reimplements roughly 16% of MuJoCo C by code volume. The feature
-gap is wider than the code gap because the missing features (collision geometry,
-constraint friction, tendons, muscles) are among the most complex subsystems.
+MuJoCo-MLX-Cpp reimplements roughly 26% of MuJoCo C by code volume but covers
+~65-70% of the features used in typical RL training. The remaining gaps are
+mostly niche subsystems (sensors, inverse dynamics, SDF, deformable bodies).
 
-MJX has 50% more core code and covers ~3x more features. Both MJX and
-MuJoCo-MLX-Cpp are targeted subsets, not full reimplementations.
+MJX has comparable core code volume. Both MJX and MuJoCo-MLX-Cpp are targeted
+subsets optimized for GPU-batched RL training, not full reimplementations.
 
 ---
 
@@ -147,38 +148,43 @@ across 6 files to a 9x9 geom-type dispatch table with analytic, convex
 | Geom Type | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |-----------|----------|-----|----------------|
 | PLANE | Yes | Yes | Yes |
-| HFIELD | Yes | Yes | **No** |
+| HFIELD | Yes | Yes | Yes (Phase 3.4) |
 | SPHERE | Yes | Yes | Yes |
 | CAPSULE | Yes | Yes | Yes |
-| ELLIPSOID | Yes | Partial (SDF) | **No** |
-| CYLINDER | Yes | Partial (SDF) | Yes |
-| BOX | Yes | Yes (as mesh) | Yes |
-| MESH | Yes | Yes (vertex limit) | Yes (GJK/EPA) |
-| SDF | Yes | Yes | **No** |
+| ELLIPSOID | Yes | Partial (SDF) | Yes (Phase 3.5) |
+| CYLINDER | Yes | Partial (SDF) | Yes (Phase 3.2) |
+| BOX | Yes | Yes (as mesh) | Yes (Phase 3.1) |
+| MESH | Yes | Yes (vertex limit) | Yes (GJK/EPA, Phase 3.3) |
+| SDF | Yes | Yes | **No** (DEFERRED) |
 
 ### Collision Pairs Implemented
 
-MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12+ (including GJK/EPA generic path):
+MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 20+ (including GJK/EPA generic path):
 
 | Pair | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
 | plane-sphere | `mjc_PlaneSphere` | Yes | Yes |
 | plane-capsule | `mjc_PlaneCapsule` | Yes | Yes |
-| plane-cylinder | `mjc_PlaneCylinder` | Yes | Yes (multi-contact, up to 3) |
+| plane-cylinder | `mjc_PlaneCylinder` | Yes | Yes (multi-contact, up to 6) |
 | plane-box | `mjc_PlaneBox` | Yes | Yes (multi-contact, up to 4) |
-| plane-convex | `mjc_PlaneConvex` | Yes | **No** |
+| plane-mesh | `mjc_PlaneConvex` | Yes | Yes (multi-contact, all vertices) |
+| plane-hfield | `mjc_ConvexHField` | Yes | Yes (grid-cell triangle tests) |
+| plane-ellipsoid | analytic | Partial | Yes (analytic) |
 | sphere-sphere | `mjc_SphereSphere` | Yes | Yes |
 | sphere-capsule | `mjc_SphereCapsule` | Yes | Yes |
 | sphere-cylinder | `mjc_SphereCylinder` | Yes | Yes |
 | sphere-box | `mjc_SphereBox` | Yes | Yes |
+| sphere-ellipsoid | analytic | Partial | Yes (analytic) |
 | capsule-capsule | `mjc_CapsuleCapsule` | Yes | Yes |
 | capsule-cylinder | `mjc_CapsuleCylinder` | Yes | Yes |
 | capsule-box | `mjc_CapsuleBox` | Yes | Yes |
+| capsule-ellipsoid | analytic | Partial | Yes (analytic) |
 | box-box | `mjc_BoxBox` | Yes | Yes (SAT, single contact) |
 | convex-convex | GJK/EPA | GJK/SAT | Yes (GJK/EPA) |
-| mesh-* | GJK/EPA | SAT (vertex limit) | Yes (GJK/EPA, multi-contact for plane) |
-| hfield-* | `mjc_ConvexHField` | Yes | **No** |
-| sdf-* | `mjc_SDF` | Yes | **No** |
+| mesh-* | GJK/EPA | SAT (vertex limit) | Yes (GJK/EPA, proper mesh support) |
+| hfield-* | `mjc_ConvexHField` | Yes | Yes (grid-cell triangle tests) |
+| cylinder-cylinder | `mjc_CylinderCylinder` | Yes | **No** (uncommon in RL) |
+| sdf-* | `mjc_SDF` | Yes | **No** (DEFERRED) |
 
 ### Collision Code Volume
 
@@ -186,7 +192,7 @@ MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 12+ (including GJK/EPA gener
 |----------|---------------|
 | MuJoCo C | ~9,000 lines (6 files: primitive, box, convex, GJK, SDF, driver) |
 | MJX | ~2,100 lines (4 files: primitive, convex, SDF, driver) |
-| MuJoCo-MLX-Cpp | ~840 lines (collision.cpp + constraint_vmap.cpp collision parts) |
+| MuJoCo-MLX-Cpp | ~4,000 lines (collision.cpp + constraint_vmap.cpp collision parts) |
 
 ### Exclude Signature (Phase 1.3)
 
@@ -198,10 +204,9 @@ the `init_cache()` collision pair pre-filter (for the vmap path) and the scalar
 
 ### Impact
 
-Any model with CYLINDER, MESH, or HFIELD geoms will have **no collisions
-at all** on the MLX backend for those geom types. BOX collision is now supported
-(Phase 3.1). The humanoid works because `foot_contacts_only` filters down to
-capsule-plane pairs.
+All common geom types are now supported: PLANE, SPHERE, CAPSULE, BOX, CYLINDER,
+MESH, HFIELD, ELLIPSOID. Only SDF and cylinder-cylinder are missing. The MLX
+backend handles the full collision matrix needed for standard RL training models.
 
 ---
 
@@ -209,22 +214,22 @@ capsule-plane pairs.
 
 ### Constraint Types
 
-| Constraint Type | MuJoCo C (2,541 lines) | MJX (748 lines) | MuJoCo-MLX-Cpp (699 lines) |
-|----------------|------------------------|------------------|-----------------------------|
-| Equality: CONNECT | Yes | Yes | **No** |
-| Equality: WELD | Yes | Yes | **No** |
-| Equality: JOINT | Yes | Yes | **No** |
-| Equality: TENDON | Yes | Yes | **No** |
-| Equality: FLEX | Yes | No | **No** |
+| Constraint Type | MuJoCo C (2,541 lines) | MJX (748 lines) | MuJoCo-MLX-Cpp (2,726 lines) |
+|----------------|------------------------|------------------|------------------------------|
+| Equality: CONNECT | Yes | Yes | Yes (Phase 4) |
+| Equality: WELD | Yes | Yes | Yes (Phase 4) |
+| Equality: JOINT | Yes | Yes | Yes (Phase 4) |
+| Equality: TENDON | Yes | Yes | **No** (DEFERRED) |
+| Equality: FLEX | Yes | No | **No** (DEFERRED) |
 | Equality: DISTANCE | Yes (unsupported) | No | **No** |
 | Joint limits (HINGE/SLIDE) | Yes | Yes | Yes |
-| Tendon limits | Yes | Yes | **No** |
-| DOF friction loss | Yes | Yes | **No** |
-| Tendon friction loss | Yes | Yes | **No** |
+| Tendon limits | Yes | Yes | Yes (Phase 5.5) |
+| DOF friction loss | Yes | Yes | Yes (Phase 4) |
+| Tendon friction loss | Yes | Yes | Yes (Phase 5.4) |
 | Contact: frictionless (condim=1) | Yes | Yes | Yes |
-| Contact: pyramidal friction (condim=3) | Yes | Yes | **Yes (Phase 2.1)** |
-| Contact: pyramidal friction (condim=4,6) | Yes | Yes | **Yes (Phase 2.2)** |
-| Contact: elliptic friction | Yes | Yes | **No** |
+| Contact: pyramidal friction (condim=3) | Yes | Yes | Yes (Phase 2.1) |
+| Contact: pyramidal friction (condim=4,6) | Yes | Yes | Yes (Phase 2.2) |
+| Contact: elliptic friction | Yes | Yes | **No** (DEFERRED) |
 
 ### Contact Dimension (condim)
 
@@ -232,26 +237,19 @@ MuJoCo C generates 1-10 constraint rows per contact depending on `condim` and co
 
 Pyramidal cone (2*(condim-1) rows):
 - condim=1: 1 row (normal only, frictionless)
-- condim=3: 4 rows (2 tangent directions × 2 pyramid edges) — **Implemented (Phase 2.1)**
-- condim=4: 6 rows (3 directions × 2 edges)
-- condim=6: 10 rows (5 directions × 2 edges)
+- condim=3: 4 rows (2 tangent directions × 2 pyramid edges) -- Phase 2.1
+- condim=4: 6 rows (3 directions × 2 edges) -- Phase 2.2
+- condim=6: 10 rows (5 directions × 2 edges) -- Phase 2.2
 
-Elliptic cone (condim rows):
-- condim=1: 1 row
-- condim=3: 3 rows (normal + 2 tangent)
-- condim=4: 4 rows
-- condim=6: 6 rows
+All pyramidal friction condim values are fully implemented in both scalar and
+vmap paths.
 
-MuJoCo-MLX-Cpp generates **1 row per contact (normal only)**, regardless of
-the model's `condim` setting. This means objects cannot grip, resist sliding,
-or produce torsional friction.
+### Equality Constraints (Phase 4)
 
-### Equality Constraints
-
-MuJoCo-MLX-Cpp loads `eq_type`, `eq_obj1id`, `eq_obj2id`, `eq_data`, `eq_solref`,
-`eq_solimp` from the MuJoCo model in `io.cpp`, but these arrays are **never
-used** in the constraint pipeline. Models with closed kinematic chains, fixed
-attachments, or joint coupling will produce incorrect physics.
+CONNECT, WELD, and JOINT equality constraint types are fully implemented in both
+scalar and vmap paths. Constraint data is precomputed in `ModelCache::equality_cache`
+at load time (type, body IDs, data, solref, solimp, invweight, Jacobian rows) for
+zero-eval vmap execution. TENDON equality constraints are DEFERRED.
 
 ---
 
@@ -259,24 +257,23 @@ attachments, or joint coupling will produce incorrect physics.
 
 | Integrator | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------------|----------|-----|----------------|
-| Euler (semi-implicit) | `mj_Euler` (engine_forward.c) | Yes | Yes + Metal kernel |
-| RK4 | `mj_RungeKutta` | Yes | **Declared in enum, not implemented** |
-| Implicit | `mj_implicit` (with RNE deriv) | In development | **No** |
-| ImplicitFast | `mj_implicit` (no RNE deriv) | Yes | **No** |
+| Euler (semi-implicit) | `mj_Euler` (engine_forward.c) | Yes | Yes + Metal kernel (scalar + batched) |
+| RK4 | `mj_RungeKutta` | Yes | Yes (Phase 7.1, scalar path) |
+| Implicit | `mj_implicit` (with RNE deriv) | In development | Partial (Phase 7.2, scalar path, no RNE deriv) |
+| ImplicitFast | `mj_implicit` (no RNE deriv) | Yes | Yes (Phase 7.2, scalar path) |
 
-### Note on Implicit Euler Damping
+### Scalar vs Batched
 
-MuJoCo-MLX-Cpp's Metal Euler kernel adds `dof_damping * dt` to the mass matrix
-diagonal before Cholesky factorization. This is a practical stabilization hack
-that provides some of the benefit of implicit integration for damped systems,
-but it is **not** the full implicit integrator. MuJoCo C's implicit integrator
-additionally accounts for the Jacobian of bias forces (RNE derivative).
+All 4 integrators work in the scalar path. The batched Metal pipeline uses Euler only.
+RK4 and ImplicitFast in batched mode are DEFERRED (would require either Metal kernel
+rewrites or dense Cholesky in the vmap path).
 
-### Impact
+### ImplicitFast (Phase 7.2)
 
-Euler integration is sufficient for most RL training scenarios. The implicit
-integrator matters most for stiff systems (high-gain PD controllers, tendons,
-muscle dynamics) where Euler requires very small timesteps.
+Implicit velocity integration via `deriv_smooth_vel()` computing analytical
+∂qfrc_smooth/∂qvel (joint damping + tendon damping + affine actuator velocity
+terms). Modified mass matrix M' = M - dt * qderiv, Cholesky factor and solve
+for qacc. qvel diff vs MuJoCo C: ~1e-6.
 
 ---
 
@@ -287,14 +284,15 @@ muscle dynamics) where Euler requires very small timesteps.
 | Type | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
 | JOINT | Yes | Yes | Yes |
-| JOINTINPARENT | Yes | Yes | **No** |
-| SLIDERCRANK | Yes | No | **No** |
-| TENDON | Yes | Yes | **No** |
-| SITE | Yes | Yes | **No** |
-| BODY | Yes | No | **No** |
+| JOINTINPARENT | Yes | Yes | **No** (DEFERRED) |
+| SLIDERCRANK | Yes | No | **No** (DEFERRED) |
+| TENDON | Yes | Yes | Yes (Phase 5.3) |
+| SITE | Yes | Yes | Yes (Phase 5.3) |
+| BODY | Yes | No | **No** (DEFERRED) |
 
-MuJoCo-MLX-Cpp's `io.cpp` line 814: `if (trntype != 0) continue` -- any
-non-JOINT transmission is silently skipped.
+JOINT, TENDON, and SITE transmission fully implemented in both scalar and vmap paths.
+TENDON: `moment = gear * ten_J`. SITE: full 6-DOF Jacobian at site with gear wrench
+projection.
 
 ### Gain Types
 
@@ -302,7 +300,7 @@ non-JOINT transmission is silently skipped.
 |------|----------|-----|----------------|
 | FIXED | Yes | Yes | Yes |
 | AFFINE | Yes | Yes | Yes |
-| MUSCLE | Yes | Yes | **No** |
+| MUSCLE | Yes | Yes | **No** (DEFERRED) |
 | USER | Yes | No | **No** |
 
 ### Bias Types
@@ -310,8 +308,8 @@ non-JOINT transmission is silently skipped.
 | Type | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
 | NONE | Yes | Yes | Yes |
-| AFFINE | Yes | Yes | Yes (partial -- no velocity term in scalar path) |
-| MUSCLE | Yes | Yes | **No** |
+| AFFINE | Yes | Yes | Yes |
+| MUSCLE | Yes | Yes | **No** (DEFERRED) |
 | USER | Yes | No | **No** |
 
 ### Actuator Dynamics
@@ -319,16 +317,16 @@ non-JOINT transmission is silently skipped.
 | Type | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------|----------|-----|----------------|
 | NONE | Yes | Yes | Yes (default) |
-| INTEGRATOR | Yes | Yes | **No** |
-| FILTER | Yes | Yes | **No** |
-| FILTEREXACT | Yes | Yes | **No** |
-| MUSCLE | Yes | Yes | **No** |
+| INTEGRATOR | Yes | Yes | Yes (Phase 6.1) |
+| FILTER | Yes | Yes | Yes (Phase 6.1) |
+| FILTEREXACT | Yes | Yes | Yes (Phase 6.1) |
+| MUSCLE | Yes | Yes | **No** (DEFERRED) |
 | USER | Yes | No | **No** |
 
-`act_dot` is allocated in `make_data()` but never computed. Models with
-position-controlled actuators (PD servos via FILTER dynamics) will produce
-**zero actuator activation** -- the control signal passes through with FIXED
-gain but the filter state never integrates.
+FILTER (first-order low-pass), FILTEREXACT (exact exponential), and INTEGRATOR
+(pure integration) dynamics fully implemented in both scalar and vmap paths.
+Activation clamping (`actuator_actlimited` / `actuator_actrange`) supported.
+Vmap path uses vectorized scatter-matmul for `act_dot` computation.
 
 ---
 
@@ -359,16 +357,18 @@ MuJoCo-MLX-Cpp's solver supports:
 
 | Subsystem | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |-----------|----------|-----|----------------|
-| **Sensors** (49 types, 1,542 lines) | Full | 787 lines, many types | **None** |
-| **Tendons** (wrapping, limits, forces) | Full | Yes (smooth.py) | **None** |
-| **Inverse dynamics** (298 lines) | `mj_inverse` | 110 lines | **None** |
-| **Analytical derivatives** (1,560 lines) | `mjd_transitionFD` | 73 lines (implicit) | **Stub only** |
-| **Finite-difference derivatives** (703 lines) | `mjd_inverseFD` | N/A | **None** |
-| **Ray casting** (1,486 lines) | Full | 317 lines | **None** |
-| **Sleep/wake** (775 lines) | Full | N/A | **None** |
-| **Constraint islands** (642 lines) | Full | N/A | **None** |
-| **Flex/deformable** (in passive.c + core_util.c) | Full | **None** | **None** |
-| **Gravity compensation** | `body_gravcomp` | Yes | **Yes (Phase 1.1)** — `qfrc_gravcomp` computed and added to `qfrc_passive` |
+| **Sensors** (49 types, 1,542 lines) | Full | 787 lines, many types | **None** (DEFERRED) |
+| **Fixed tendons** (length, velocity, J, passive) | Full | Yes | Yes (Phase 5.1) |
+| **Spatial tendons** (wrapping geometry) | Full | Yes | **No** (DEFERRED) |
+| **Tendon limits + friction** | Full | Yes | Yes (Phase 5.4-5.5) |
+| **Inverse dynamics** (298 lines) | `mj_inverse` | 110 lines | **None** (DEFERRED) |
+| **Analytical derivatives** (1,560 lines) | `mjd_transitionFD` | 73 lines (implicit) | Partial (`deriv_smooth_vel` for ImplicitFast) |
+| **Finite-difference derivatives** (703 lines) | `mjd_inverseFD` | N/A | **None** (DEFERRED) |
+| **Ray casting** (1,486 lines) | Full | 317 lines | **None** (DEFERRED) |
+| **Sleep/wake** (775 lines) | Full | N/A | **None** (DEFERRED) |
+| **Constraint islands** (642 lines) | Full | N/A | **None** (DEFERRED) |
+| **Flex/deformable** (in passive.c + core_util.c) | Full | **None** | **None** (DEFERRED) |
+| **Gravity compensation** | `body_gravcomp` | Yes | Yes (Phase 1.1) |
 | **Visualization** (4,955 lines) | Full | N/A | **None** (physics only) |
 | **Plugins** | Full | **None** | **None** |
 
@@ -390,26 +390,38 @@ This is one area with **full parity**.
 ## Silent Failure Modes (Mitigated — Phase 1.4)
 
 MJX validates models at load time and raises errors or warnings for unsupported
-features. As of Phase 1.4, MuJoCo-MLX-Cpp now **emits warnings to stderr** at
-model load time for unsupported features:
+features. As of Phase 1.4, MuJoCo-MLX-Cpp **emits warnings to stderr** at
+model load time for unsupported features.
+
+Most previously-warned features are now **fully supported**:
+
+| Scenario | Status |
+|----------|--------|
+| Model has BOX geoms | **Supported.** All 4 box pair types. |
+| Model has MESH geoms | **Supported.** GJK/EPA for all mesh pair types. |
+| Model has HFIELD geoms | **Supported.** Grid-cell triangle tests. |
+| Model has ELLIPSOID geoms | **Supported.** Analytic collision. |
+| Model has CYLINDER geoms | **Supported.** 3 cylinder pair types. |
+| Model has TENDON/SITE transmission | **Supported.** Full TENDON + SITE transmission. |
+| Model has equality constraints (CONNECT/WELD/JOINT) | **Supported.** |
+| Model has FILTER/FILTEREXACT/INTEGRATOR dynamics | **Supported.** |
+| Model uses RK4 integrator | **Supported (scalar path).** |
+| Model uses Implicit/ImplicitFast integrator | **Supported (scalar path).** |
+| Model has DOF friction loss | **Supported.** |
+| Model has tendon limits/friction | **Supported.** |
+
+Remaining warnings:
 
 | Scenario | What happens |
 |----------|-------------|
-| Model has BOX geoms | **Supported.** All 4 box pair types work (plane/sphere/capsule/box). |
-| Model has MESH geoms | **Warning emitted.** Same -- no collisions. |
-| Model has HFIELD/ELLIPSOID/CYLINDER geoms | **Warning emitted.** No collisions for those types. |
-| Model has TENDON/SITE transmission | **Warning emitted.** Actuator produces zero force. |
-| Model has MUSCLE dynamics | **Warning emitted.** `act_dot` never computed. |
-| Model has equality constraints | **Warning emitted.** Constraints not enforced. |
-| Model uses RK4 integrator | **Warning emitted.** Integration is always Euler. |
-| Model uses implicit integrator | **Warning emitted.** Integration is always Euler. |
+| Model has MUSCLE dynamics | **Warning emitted.** Not implemented. |
+| Model has spatial tendons | **Warning emitted.** Only fixed tendons supported. |
 | Model has sensors | **Warning emitted.** Sensors not computed. |
+| Model has TENDON equality constraints | **Warning emitted.** Not implemented. |
+| Model has SDF geoms | **Warning emitted.** Not supported. |
 
-The `validate_model()` function in `io.cpp` scans the `mjModel` at load time
-and prints `[mjmlx WARNING]` messages for each unsupported feature detected.
-Models still load and simulate (with the supported subset), but the user is
-informed about what won't work. The CPU backend (via `libmjb`) handles
-everything correctly.
+The `validate_model()` function in `io.cpp` scans the `mjModel` at load time.
+The CPU backend (via `libmjb`) handles everything correctly.
 
 ---
 
@@ -432,65 +444,65 @@ which is more resilient to field type changes.
 
 | Component | Lines | MuJoCo-version-sensitive? |
 |-----------|-------|--------------------------|
-| `io.cpp` (model conversion) | 958 | **High** -- field-by-field copy |
-| `internal.h` (Model struct) | 220 | **High** -- must mirror mjModel fields |
+| `io.cpp` (model conversion + cache) | 1,598 | **High** -- field-by-field copy + ModelCache init |
+| `internal.h` (Model/Data/Cache structs) | 698 | **High** -- must mirror mjModel fields |
 | `batched.cpp` (Metal kernels) | 915 | Medium -- physics equations in MSL strings |
-| `forward.cpp` (pipeline) | 451 | Low -- stable pipeline structure |
-| `smooth.cpp` (dynamics) | 655 | Low -- mathematical, rarely changes |
-| `collision.cpp` (detection) | 398 | Low -- analytic formulas |
+| `collision.cpp` (detection) | 2,135 | Low -- analytic formulas, GJK/EPA |
+| `constraint_vmap.cpp` (vmap constraints) | 1,878 | Medium -- zero-eval constraint pipeline |
+| `constraint.cpp` (scalar constraints) | 848 | Low -- reference implementation |
+| `smooth.cpp` (dynamics) | 803 | Low -- mathematical, rarely changes |
+| `forward.cpp` (pipeline) | 788 | Low -- stable pipeline structure |
 | `mjb.cpp` (dual backend) | 565 | **Medium** -- wraps both MuJoCo C and MLX APIs |
 
-**Total high-risk code:** ~1,180 lines (io.cpp + internal.h Model struct) that
-must track MuJoCo C's model structure across versions.
+**Total high-risk code:** ~2,296 lines (io.cpp + internal.h) that must track
+MuJoCo C's model structure across versions.
 
-### Effort to Reach MJX Parity
+### Remaining Effort to Full MJX Parity
+
+Most major features are now implemented. Remaining gaps:
 
 | Feature | Estimated Effort | Complexity |
 |---------|-----------------|------------|
-| Contact friction (pyramidal cone) | 2-3 weeks | Constraint gen + solver changes |
-| BOX collisions (4 pairs) | 2-4 weeks | Analytic geometry |
-| MESH collisions (GJK/EPA) | 4-8 weeks | Algorithm complexity |
-| Equality constraints | 2-3 weeks | Jacobian construction |
-| Actuator dynamics (filter/integrator) | 1-2 weeks | ODE integration |
+| Spatial tendons (wrapping geometry) | 3-4 weeks | Geodesic path computation |
 | Muscle model | 2-3 weeks | Muscle activation dynamics |
-| RK4 integrator | 1-2 weeks | 4-stage evaluation |
-| ImplicitFast integrator | 2-4 weeks | RNE derivative |
-| Tendon system | 3-4 weeks | Wrapping geometry |
-| HFIELD collision | 2-3 weeks | Height field sampling |
-| **Total to MJX parity** | **~4-7 months** (1 developer) | |
-
-Each feature also requires:
-- Vmap-compatible variant (for batched GPU path)
-- Metal kernel updates (kinematics/integration if affected)
-- Test suite additions (validated against MuJoCo C reference)
-- Performance regression testing
+| Sensors (~50 types) | 3-4 weeks | Large surface area, low complexity |
+| Batched RK4/ImplicitFast | 2-3 weeks | Metal kernel or vmap Cholesky |
+| **Total remaining to MJX parity** | **~3-4 months** (1 developer) | |
 
 ---
 
 ## Why It Works for Humanoid RL
 
-The Gymnasium Humanoid-v5 model fits perfectly in the supported subset:
+The Gymnasium Humanoid-v5 model uses features that are fully supported:
 
 | Feature Used | Supported? |
 |-------------|-----------|
 | HINGE joints + 1 FREE root | Yes (all 4 joint types) |
 | CAPSULE + PLANE geoms | Yes (capsule-plane pair) |
-| `foot_contacts_only` filtering | Yes (reduces to 2 contacts) |
+| Pyramidal friction (condim=3) | Yes (4 rows per contact) |
+| 2 fixed tendons (hip-knee coupling) | Yes (Phase 5) |
 | JOINT transmission, FIXED gain | Yes |
-| Euler integration | Yes |
+| Euler integration | Yes (Metal kernel, batched) |
 | No equality constraints | N/A |
-| No tendons or muscles | N/A |
 | No MESH/CYLINDER geoms | N/A |
 
-This makes MuJoCo-MLX-Cpp a viable accelerator for the most common RL
-locomotion benchmarks (Humanoid, Ant, HalfCheetah, Walker2d, Hopper -- all
-use capsule/sphere + plane geoms with simple actuators).
+Training benchmark: **73K SPS** (72,606 avg) at 8192 envs on M4 Max, with
+physically correct tendon coupling and pyramidal friction.
+
+MuJoCo-MLX-Cpp now supports a much wider range of models beyond basic locomotion:
+
+**Models that now work on MLX backend:**
+- Locomotion (Humanoid, Ant, HalfCheetah, Walker2d, Hopper)
+- Manipulation tasks with friction contact (condim=3/4/6)
+- Models with BOX, CYLINDER, MESH, HFIELD, ELLIPSOID geoms
+- Models with equality constraints (CONNECT/WELD/JOINT)
+- Models with tendon coupling and TENDON/SITE transmission
+- Models with actuator dynamics (FILTER/FILTEREXACT/INTEGRATOR)
 
 **Models that would NOT work on the MLX backend:**
-- Shadow Hand (MESH geoms, TENDON transmission, equality constraints)
-- Franka Panda (SITE transmission, equality constraints)
-- Any manipulation task (requires friction for grasping)
+- Shadow Hand (spatial tendons, MUSCLE dynamics)
 - Soft body / cloth (FLEX)
+- Models requiring sensors, SDF geoms, or spatial tendon wrapping
 
 These all work correctly on the CPU backend via `libmjb`.
 
@@ -498,49 +510,40 @@ These all work correctly on the CPU backend via `libmjb`.
 
 ## Gap Closure Priority
 
-Ranked by impact-to-effort ratio for expanding the MLX backend:
+### Completed Phases
 
-### Priority 1: Contact Friction (pyramidal cone)
-- **Impact:** Unlocks physically realistic contact for all existing geom pairs
-- **Effort:** 2-3 weeks
-- **Changes:** Constraint generation (3-5 rows per contact instead of 1), solver
-  handling of friction constraints, vmap constraint pipeline
-- **Why first:** Even with only plane/sphere/capsule, friction makes the physics
-  dramatically more realistic. Humanoid training would benefit from foot grip.
+| Phase | Feature | Status |
+|-------|---------|--------|
+| 1 | Synth Physics Foundation (gravcomp, cfrc_ext, exclude, validation, high-DOF) | **Done** |
+| 2 | Contact Friction (condim=1/3/4/6 pyramidal) | **Done** |
+| 3 | Collision Geometry (box, cylinder, mesh/GJK/EPA, hfield, ellipsoid) | **Done** |
+| 4 | Equality Constraints (CONNECT/WELD/JOINT) + DOF Friction | **Done** |
+| 5 | Tendon System (fixed tendons, passive, limits, friction, TENDON+SITE transmission) | **Done** |
+| 6 | Actuator Dynamics (FILTER/FILTEREXACT/INTEGRATOR, activation clamping) | **Done** |
+| 7 | Advanced Integrators (RK4, ImplicitFast -- scalar path) | **Done** |
 
-### Priority 2: BOX Collisions — DONE (Phase 3.1)
-- **Status:** Complete. All 4 box pair types implemented (plane-box with multi-contact,
-  sphere-box, capsule-box, box-box with SAT). Both scalar and vmap paths.
-- **Tests:** 6 tests in `test_collision_box.cpp`, qacc match within 0.000004 of MuJoCo C.
+### Remaining Gaps (all DEFERRED)
 
-### Priority 3: Equality Constraints
-- **Impact:** Unlocks closed kinematic chains, weld joints, joint coupling
-- **Effort:** 2-3 weeks
-- **Changes:** Jacobian construction for CONNECT/WELD/JOINT types, always-active
-  in solver (not inequality)
-- **Why third:** Required for many articulated robot models.
+Ranked by impact-to-effort ratio:
 
-### Priority 4: RK4 + ImplicitFast Integrators
-- **Impact:** Better stability for stiff systems
-- **Effort:** 3-6 weeks
-- **Changes:** Multi-stage evaluation (RK4), RNE derivative (ImplicitFast),
-  Metal kernel updates
-- **Why fourth:** Euler works for most RL training; stiff systems are niche.
-
-### Priority 5: Actuator Dynamics + TENDON/SITE Transmission
-- **Impact:** Unlocks PD-controlled robots, muscle models, tendon-driven hands
-- **Effort:** 4-6 weeks
-- **Changes:** ODE integration for act_dot, tendon wrapping geometry, SITE
-  Jacobians
-- **Why fifth:** Complex systems that need this are already better served by the
-  CPU backend.
+| Priority | Feature | Effort | Impact |
+|----------|---------|--------|--------|
+| D1 | Spatial tendons (wrapping geometry) | 3-4 weeks | Anatomical hand models only |
+| D2 | MUSCLE dynamics | 2-3 weeks | Biomechanical models only |
+| D3 | Sensors (~50 types) | 3-4 weeks | RL reads state directly, not sensors |
+| D4 | Batched RK4/ImplicitFast (Metal kernel) | 2-3 weeks | Euler sufficient for most RL |
+| D5 | Vmap gravity compensation | 1 week | Few models use gravcomp in batched |
+| D6 | Differentiable physics (grad(step)) | 8-12 weeks | Separate project |
+| D7 | Inverse dynamics / constraint islands / noslip / sleep | 4-6 weeks | Niche features |
+| D8 | Elliptic friction cone | 1-2 weeks | Pyramidal is default; elliptic rarely used |
+| D9 | TENDON equality constraints | 1 week | Uncommon |
 
 ---
 
 ## Dual-Backend Mitigation
 
-The `libmjb.dylib` dual-backend library (introduced in Phase 2a) is the
-architectural answer to the conformance gap:
+The `libmjb.dylib` dual-backend library is the architectural answer to the
+remaining conformance gap:
 
 ```
                    +---------+
@@ -553,18 +556,18 @@ architectural answer to the conformance gap:
     | MJB_BACKEND_CPU |     | MJB_BACKEND_MLX  |
     | (MuJoCo C)      |     | (MuJoCo-MLX)     |
     +-----------------+     +------------------+
-    | 100% features   |     | ~25-30% features |
+    | 100% features   |     | ~65-70% features |
     | double precision|     | float32          |
     | CPU threads     |     | Metal GPU        |
-    | ~20K SPS batched|     | ~70K+ SPS batched|
+    | ~20K SPS batched|     | ~73K+ SPS batched|
     +-----------------+     +------------------+
 ```
 
 **Strategy:**
 1. Any model works on CPU backend (correctness guaranteed)
-2. Simple locomotion models get 3.5x speedup on MLX backend
-3. Gaps only matter for GPU-batched training on complex models
-4. Close gaps incrementally (friction done, BOX done, next: CYLINDER, equality)
+2. Most RL models now get 3.5x speedup on MLX backend (full collision, friction, tendons, equality, dynamics)
+3. Remaining gaps (spatial tendons, muscles, sensors) affect only niche models
+4. CPU backend handles everything for those models
 
 ---
 
@@ -575,32 +578,32 @@ architectural answer to the conformance gap:
 | Stage | MuJoCo C Function | MuJoCo-MLX-Cpp | Notes |
 |-------|-------------------|----------------|-------|
 | FK kinematics | `mj_kinematics` | `kinematics()` | Full parity. Metal kernel for batched. |
-| COM position | `mj_comPos` | `com_pos()` | Full parity |
-| CRB inertia | `mj_crb` | `crb()` | Full parity |
+| COM position | `mj_comPos` | `com_pos()` | Full parity. Cached scatter matrices. |
+| CRB inertia | `mj_crb` | `crb()` | Full parity. Cached scatter matrices. |
 | Mass matrix | `mj_makeM` | `factor_m()` | Dense Cholesky (GPU) or sparse LDL |
-| Collision | `mj_collision` | `collision()` | 18+ pairs (plane/sphere/capsule/box/cylinder/mesh/hfield/ellipsoid) |
+| Tendon | `mj_tendon` | `tendon()` | Fixed tendons; spatial DEFERRED |
+| Collision | `mj_collision` | `collision()` | 20+ pairs (all 8 geom types except SDF) |
 | Constraints | `mj_makeConstraint` | `make_constraint()` | Equality + DOF friction + joint limits + tendon limits + tendon friction + contact (condim 1/3/4/6) |
 | Transmission | `mj_transmission` | `transmission()` | JOINT + TENDON + SITE |
 | COM velocity | `mj_comVel` | `com_vel()` | Full parity |
 | Passive forces | `mj_passive` | `passive()` | Spring + damper + gravcomp + tendon spring/damping |
-| RNE | `mj_rne` | `rne()` | Full parity |
+| RNE | `mj_rne` | `rne()` | Full parity. Cached scatter matrices. |
 | Actuation | `mj_fwdActuation` | `fwd_actuation()` | FIXED + AFFINE gain, NONE/FILTER/FILTEREXACT/INTEGRATOR dynamics |
 | Acceleration | `mj_fwdAcceleration` | `fwd_acceleration()` | Full parity |
 | Solve | `mj_fwdConstraint` | `solve()` | CG + Newton (no PGS) |
-| Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | Yes — computes `cfrc_ext` |
+| Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | Computes `cfrc_ext` |
 | Euler | `mj_Euler` | `integrate_euler()` | Full parity + Metal kernel |
 | RK4 | `mj_RungeKutta` | `integrate_rk4()` | Full parity (scalar path) |
 | Implicit/Fast | `mj_implicit` | `integrate_implicit()` | Full parity (scalar path) |
-| Tendon | `mj_tendon` | `tendon()` | Fixed tendons (spatial DEFERRED) |
-| Flex | `mj_flex` | -- | Not implemented (DEFERRED) |
-| Sensor | `mj_sensorPos/Vel/Acc` | -- | Not implemented (DEFERRED) |
-| Inverse | `mj_inverse` | -- | Not implemented (DEFERRED) |
+| Flex | `mj_flex` | -- | DEFERRED |
+| Sensor | `mj_sensorPos/Vel/Acc` | -- | DEFERRED |
+| Inverse | `mj_inverse` | -- | DEFERRED |
 
 ### Summary Statistics
 
 | Metric | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |--------|----------|-----|----------------|
-| Collision pairs | 36+ | ~25 | 18+ |
+| Collision pairs | 36+ | ~25 | 20+ |
 | Constraint types | 8 | 7 | 8 (equality/DOF friction/joint limit/tendon limit/tendon friction/contact condim 1/3/4/6) |
 | Integrators | 4 | 3 | 4 (Euler, RK4, Implicit, ImplicitFast) |
 | Transmission types | 6 | 4 | 3 (JOINT, TENDON, SITE) |
@@ -609,5 +612,5 @@ architectural answer to the conformance gap:
 | Sensor types | 49 | ~30 | 0 (DEFERRED) |
 | Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
-| Batched GPU sim | No | Yes (CUDA/TPU) | Yes (Metal) |
+| Batched GPU sim | No | Yes (CUDA/TPU) | Yes (Metal, 73K SPS training) |
 | Differentiable | External | Native (JAX) | DEFERRED |

@@ -127,7 +127,9 @@ Our advantage over MJX: custom Metal kernels for the two hottest phases (kinemat
 
 Functions that follow these rules: `vmap_com_pos`, `vmap_crb`, `vmap_factor_m`, `vmap_com_vel`, `vmap_rne`, `vmap_collision`, `vmap_make_constraint`, `vmap_solve`, `vmap_transmission`, `vmap_tendon`, `vmap_passive`, `vmap_fwd_actuation`, `vmap_fwd_acceleration`.
 
-**Model constants** (topology arrays, scatter matrices, masks) are accessed inside vmap functions but are never mutated. They are precomputed in `ModelCache` during `init_cache()` using `eval()` + `data<>()`, which is safe because `init_cache()` runs at model load time, not inside vmap.
+**Model constants** (topology arrays, scatter matrices, masks, Jacobians, invweights, constraint parameters) are accessed inside vmap functions but are never mutated. They are precomputed in `ModelCache` during `init_cache()` using `eval()` + `data<>()`, which is safe because `init_cache()` runs at model load time, not inside vmap.
+
+**Zero-eval achievement**: The entire vmap pipeline (smooth, constraint, solver, forward) contains zero `mx::eval()`, zero `.data<>()`, and zero CPU-GPU sync calls. All model-constant data that the vmap path needs is precomputed into `ModelCache` at load time. This was achieved through two optimization passes: (1) tendon Jacobian caching, (2) scatter matrix + constraint data caching. The result: 73K training SPS with full physics conformance.
 
 ---
 
@@ -148,12 +150,18 @@ Loaded from MuJoCo XML via `io.cpp`. Contains all model parameters as `mx::array
 
 Precomputed at load time by `init_cache()`. Contains:
 - **Tree topology**: `tree_levels` (bodies grouped by depth), `body_dofs` (DOF indices per body), `body_parentid_vec` (C++ vector for fast indexing)
-- **Scatter matrices**: For level-parallel backward accumulation in `vmap_com_pos` and `vmap_crb`
+- **Tree scatter levels**: `ScatterLevel` per tree depth with precomputed `child_ids` and `scatter_mat` for zero-alloc backward accumulation in `vmap_com_pos`, `vmap_crb`, `vmap_rne`
+- **Body/DOF arrays**: `body_rootid_arr`, `dof_bodyid_arr` as `mx::array` (avoid per-step conversion from C++ vectors)
 - **Mass matrix mask**: Lower-triangular DOF ancestor mask (`make_m_mask`)
-- **Collision pairs**: Pre-filtered geometry pairs for broadphase (includes hfield, ellipsoid, mesh data)
+- **Collision pairs**: Pre-filtered geometry pairs for broadphase (includes hfield, ellipsoid, mesh data, precomputed `invweight_t`/`invweight_r`)
 - **Joint plans**: Integration plans (simple/free/ball joints), actuator moment matrices
 - **CDoF plan**: Precomputed indices for vectorized cdof computation
 - **Body DOF masks**: For Jacobian computation in constraints
+- **DOF friction cache**: Precomputed `J_row`, `invweight`, `solref`, `solimp` per DOF with frictionloss
+- **Joint limit cache**: Precomputed `J_row`, `invweight` per limited joint (in `LimitInfo`)
+- **Tendon constraint cache**: Precomputed `J_row_arr` per tendon friction/limit (in `TendonFrictionInfo`/`TendonLimitInfo`)
+- **Equality constraint cache**: Precomputed type, IDs, data, `solref`/`solimp`, `invweight`, `J_row`/`J2_row`, `qpos0` refs per equality
+- **Tendon Jacobian cache**: Constant `ten_J_const`, gather indices, scatter matrix for zero-eval tendon computation
 - **max_nefc**: Pre-computed maximum constraint rows (equality + friction + limits + contacts)
 
 ### Data
@@ -472,8 +480,8 @@ Spatial tendons wrap around geometry surfaces (spheres, cylinders) and require c
 | capsule-cylinder | Iterative | 1 | Yes |
 | capsule-ellipsoid | Analytic | 1 | Yes |
 | box-box | SAT (15 axes) | 1 | Yes |
-| mesh-* | GJK/EPA | 1 | GJK + depth est. |
-| hfield-* | Grid cells | Variable | 1 |
+| mesh-* | GJK/EPA (proper mesh support) | 1 | GJK + depth est. |
+| hfield-* | Grid-cell triangles | Variable | 1 |
 
 ### GJK/EPA (convex collision)
 
@@ -548,7 +556,8 @@ The forward dynamics computation graph has ~6,200 nodes (with 1 solver iteration
 | Batching | mx::vmap | mx.vmap | jax.vmap |
 | Compilation | mx::compile | mx.compile | jax.jit |
 | Cholesky (vmap) | MLX array ops | MLX array ops | JAX ops |
-| Peak SPS (humanoid) | 331K | 214K (post-hardening) | >1M (CUDA A100) |
+| Peak SPS (pure stepping) | 331K | 214K (post-hardening) | >1M (CUDA A100) |
+| Training SPS (8192 envs) | 73K | N/A | N/A |
 
 Key differences from Python mujoco-mlx:
 - Same architecture (Metal + vmap hybrid)
@@ -580,9 +589,9 @@ Key differences from Python mujoco-mlx:
 
 See [Collision System](#collision-system) above for the full collision pair matrix.
 
-Key algorithms: SAT for box-box, GJK/EPA for mesh/convex (64-iter scalar, 32-iter + depth estimation vmap), grid-cell for hfield, ellipsoid-to-sphere transform for ellipsoid. All pairs work in both scalar and vmap pipelines with proper support functions (no sphere approximation).
+Key algorithms: SAT for box-box, GJK/EPA for mesh/convex (64-iter scalar, 32-iter + depth estimation vmap), grid-cell for hfield, ellipsoid-to-sphere transform for ellipsoid. All pairs work in both scalar and vmap pipelines with proper support functions (vertex argmax for meshes, not sphere approximation).
 
-**Not yet implemented**: cylinder-cylinder collision (uncommon in RL models).
+**DEFERRED**: cylinder-cylinder collision (uncommon in RL models), SDF geoms.
 
 ### Phase 4: Equality Constraints + DOF Friction
 

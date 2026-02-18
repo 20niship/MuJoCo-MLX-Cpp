@@ -27,11 +27,15 @@ Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` 
 | Backend state | Best AvgR | Avg SPS | Wall time | Notes |
 |---------------|-----------|---------|-----------|-------|
 | Phase 1e (pre-conformance) | 5,678 | 70K | 454s | Tendons silently ignored; unrealistic leg dynamics |
-| **Full conformance** | **1,102** | **71K** | **451s** | Hip-knee tendon coupling active; physically correct |
+| **Full conformance** | **1,102** | **73K** | **439s** | Hip-knee tendon coupling active; physically correct |
 
 The Phase 1e result was inflated by missing tendon constraints -- the gymnasium humanoid XML has 2 fixed tendons coupling hip and knee joints, which were not implemented in the vmap path at Phase 1e. With tendons active, the humanoid must learn a more realistic gait. The conformance result (1,102) is still 2.4x the MuJoCo C baseline (451 @ 8M steps). Reward was still climbing at 32M steps.
 
-SPS parity maintained via comprehensive zero-eval caching: all model constants (scatter matrices, Jacobians, invweights, constraint parameters, actuator masks) precomputed at load time. The entire vmap pipeline (smooth, constraint, solver, forward) is zero `mx::eval()`, zero `.data<>()`, zero CPU-GPU sync.
+SPS parity maintained via comprehensive zero-eval caching across two optimization passes:
+1. **Tendon cache** -- constant Jacobian, scatter matrix, actuator masks precomputed at load time
+2. **Full vmap cache** -- tree scatter matrices (smooth_vmap), DOF friction/joint limit/tendon constraint/contact invweight/equality constraint data (constraint_vmap) all precomputed in `ModelCache`
+
+The entire vmap pipeline (smooth, constraint, solver, forward) is zero `mx::eval()`, zero `.data<>()`, zero CPU-GPU sync.
 
 ## Architecture
 
@@ -56,8 +60,8 @@ libmjmlx.dylib (GPU physics core)
     |
     +-- Tendon system
     |     Fixed (joint-based) tendons: ten_length, ten_velocity, ten_J
-    |     Tendon passive forces, limits, friction (scalar path)
-    |     TENDON + SITE actuator transmission
+    |     Tendon passive forces, limits, friction
+    |     TENDON + SITE actuator transmission (scalar + vmap)
     |
     +-- Metal kernels
     |     Kinematics FK, fused Euler (source-generated MSL)
@@ -118,7 +122,7 @@ The `mjb_*` API lets you pick a backend at creation time:
 ```c
 #include <mjmlx/mjb.h>
 
-// GPU physics (Metal, float32, 56K+ SPS training)
+// GPU physics (Metal, float32, 73K+ SPS training)
 MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);
 MjbModel* model = mjb_load_model(gpu, "humanoid.xml");
 MjbData* data = mjb_make_data(model);
@@ -175,12 +179,12 @@ All features validated against MuJoCo C reference implementation. **237 tests ac
 - **plane-cylinder** -- multi-contact (face center + rim points)
 - **sphere-cylinder** -- cylinder-local closest-point with barrel/cap/rim handling
 - **capsule-cylinder** -- segment-to-cylinder iterative projection refinement
-- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm (scalar: 64-iter GJK + 64-iter EPA; vmap: 32-iter GJK + support-based depth estimation)
+- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm (scalar: 64-iter GJK + 64-iter EPA; vmap: 32-iter GJK + support-based depth estimation). Both use proper mesh support functions (vertex argmax), not sphere approximation
 - **plane-mesh** -- multi-contact (all penetrating vertices), near-exact MuJoCo C match
-- **mesh-mesh** -- GJK/EPA with proper mesh support functions (vertex argmax), not sphere approximation
+- **mesh-mesh** -- GJK/EPA with proper mesh support functions
 - **plane-hfield** -- heightfield terrain collision against all geom types, grid-cell triangle tests
-- **plane-ellipsoid** -- analytic ellipsoid collision against planes, spheres, capsules
-- All collision pair types work in both scalar and vmap (batched) pipelines with proper support functions
+- **plane-ellipsoid, sphere-ellipsoid, capsule-ellipsoid** -- analytic collision via ellipsoid-to-sphere transform
+- All collision pair types work in both scalar and vmap (batched) pipelines
 
 ### Phase 4: Equality Constraints + DOF Friction
 - **Equality constraints (CONNECT/WELD/JOINT)** -- 12 tests, qacc diff ~0 vs MuJoCo C
