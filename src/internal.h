@@ -282,16 +282,17 @@ struct Model {
             float solimp[5];
             float size1[3], size2[3];
             int condim;
-            int dataid1 = -1, dataid2 = -1; // mesh/hfield id for mesh/hfield geoms, -1 otherwise
-            mx::array mesh_verts1{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
-            mx::array mesh_verts2{mx::zeros({0})}; // (nv, 3) pre-sliced vertices, empty if not mesh
-            // Hfield data for vmap path (pre-baked per pair)
+            int dataid1 = -1, dataid2 = -1;
+            mx::array mesh_verts1{mx::zeros({0})};
+            mx::array mesh_verts2{mx::zeros({0})};
             int hf_nrow = 0, hf_ncol = 0;
-            float hf_size[4] = {0,0,0,0};  // (x_half, y_half, z_top, z_bottom)
-            mx::array hf_data{mx::zeros({0})}; // (nrow, ncol) height grid for vmap
+            float hf_size[4] = {0,0,0,0};
+            mx::array hf_data{mx::zeros({0})};
+            float invweight_t = 0.0f;  // precomputed translational body invweight
+            float invweight_r = 0.0f;  // precomputed rotational body invweight
         };
         std::vector<CollisionPair> collision_pairs;
-        int max_ncon = 0;  // = collision_pairs.size()
+        int max_ncon = 0;
 
         // Joint limit plan: which joints are limited (HINGE/SLIDE)
         struct LimitInfo {
@@ -301,6 +302,8 @@ struct Model {
             float solref[2];
             float solimp[5];
             float margin;
+            float invweight;
+            mx::array J_row{mx::zeros({0})};  // (nv,) one-hot Jacobian row
         };
         std::vector<LimitInfo> limits;
 
@@ -312,7 +315,8 @@ struct Model {
             float solimp[5];
             float margin;
             float invweight;
-            std::vector<float> tenJ_row;  // (nv,) precomputed tendon Jacobian row
+            std::vector<float> tenJ_row;  // (nv,) raw data (used by scalar path)
+            mx::array J_row_arr{mx::zeros({0})};  // (nv,) prebuilt mx::array for vmap
         };
         std::vector<TendonLimitInfo> tendon_limits;
 
@@ -323,7 +327,8 @@ struct Model {
             float solref[2];
             float solimp[5];
             float invweight;
-            std::vector<float> tenJ_row;  // (nv,) precomputed tendon Jacobian row
+            std::vector<float> tenJ_row;  // (nv,) raw data (used by scalar path)
+            mx::array J_row_arr{mx::zeros({0})};  // (nv,) prebuilt mx::array for vmap
         };
         std::vector<TendonFrictionInfo> tendon_frictions;
 
@@ -418,6 +423,43 @@ struct Model {
 
         // Dense mass matrix tree mask: (nv, nv) float
         mx::array make_m_mask{mx::zeros({1})};
+
+        // Tree scatter cache (zero-alloc backward accumulation in vmap_com_pos/crb/rne)
+        struct ScatterLevel {
+            mx::array child_ids{mx::zeros({0}, mx::int32)};
+            mx::array scatter_mat{mx::zeros({0})};
+        };
+        std::vector<ScatterLevel> tree_scatter_levels;
+
+        // Precomputed body/dof index arrays (avoid raw pointer mx::array construction per step)
+        mx::array body_rootid_arr{mx::zeros({0}, mx::int32)};
+        mx::array dof_bodyid_arr{mx::zeros({0}, mx::int32)};
+
+        // DOF friction cache (for zero-eval vmap constraint)
+        struct DofFrictionCache {
+            int dof_idx;
+            float invweight;
+            float solref[2];
+            float solimp[5];
+            float frictionloss;
+            mx::array J_row{mx::zeros({0})};  // (nv,) one-hot
+        };
+        std::vector<DofFrictionCache> dof_frictions;
+
+        // Equality constraint cache (for zero-eval vmap constraint)
+        struct EqualityCache {
+            int type;     // mjEQ_CONNECT=0, mjEQ_WELD=1, mjEQ_JOINT=2
+            int id1, id2; // body IDs (CONNECT/WELD) or joint IDs (JOINT)
+            float data[11];
+            float solref[2];
+            float solimp[5];
+            float invweight;
+            int da1 = -1, da2 = -1;  // DOF addresses for JOINT type
+            float qpos0_ref1 = 0, qpos0_ref2 = 0;
+            mx::array J_row{mx::zeros({0})};   // (nv,) one-hot at da1
+            mx::array J2_row{mx::zeros({0})};  // (nv,) one-hot at da2
+        };
+        std::vector<EqualityCache> equality_cache;
 
         // Precomputed MLX arrays (model constants in the vmap graph)
         mx::array gravity_6d{mx::zeros({6})};

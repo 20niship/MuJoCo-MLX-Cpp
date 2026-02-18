@@ -554,6 +554,29 @@ void Model::init_cache() const {
         cache.tree_levels.push_back(next);
     }
 
+    // ── Tree scatter cache (precomputed for zero-alloc backward accumulation) ──
+    for (int lvl = 0; lvl < (int)cache.tree_levels.size(); lvl++) {
+        ModelCache::ScatterLevel sl;
+        if (lvl == 0 || cache.tree_levels[lvl].empty()) {
+            cache.tree_scatter_levels.push_back(std::move(sl));
+            continue;
+        }
+        const auto& level = cache.tree_levels[lvl];
+        int nc = (int)level.size();
+        sl.child_ids = mx::array(level.data(), {nc}, mx::int32);
+        std::vector<int> pids(nc);
+        for (int i = 0; i < nc; i++) pids[i] = parent_ptr[level[i]];
+        std::vector<float> smat(nbody * nc, 0.0f);
+        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
+        sl.scatter_mat = mx::array(smat.data(), {nbody, nc}, mx::float32);
+        cache.tree_scatter_levels.push_back(std::move(sl));
+    }
+
+    cache.body_rootid_arr = mx::array(cache.body_rootid_vec.data(), {nbody}, mx::int32);
+    if (nv > 0) {
+        cache.dof_bodyid_arr = mx::array(cache.dof_bodyid_vec.data(), {nv}, mx::int32);
+    }
+
     // ── Body-DOF mapping ──
     cache.body_dofs.resize(nbody);
     if (njnt > 0) {
@@ -876,6 +899,16 @@ void Model::init_cache() const {
 
         cache.max_ncon = (int)cache.collision_pairs.size();
 
+        // Precompute body invweights for collision pairs
+        if (!cache.collision_pairs.empty() && body_invweight0.size() > 0) {
+            mx::eval(body_invweight0);
+            auto biw = body_invweight0.data<float>();
+            for (auto& cp : cache.collision_pairs) {
+                cp.invweight_t = biw[cp.body1 * 2] + biw[cp.body2 * 2];
+                cp.invweight_r = biw[cp.body1 * 2 + 1] + biw[cp.body2 * 2 + 1];
+            }
+        }
+
         // Pre-bake mesh vertex slices for vmap collision path
         if (mesh_vert.size() > 0 && mesh_vertadr.size() > 0 && mesh_vertnum.size() > 0) {
             mx::eval(mesh_vertadr); mx::eval(mesh_vertnum); mx::eval(mesh_vert);
@@ -967,6 +1000,18 @@ void Model::init_cache() const {
                 li.margin = jnt_margin.data<float>()[j];
             }
             cache.limits.push_back(li);
+        }
+
+        // Precompute invweight + one-hot J_row for each joint limit
+        if (!cache.limits.empty() && nv > 0) {
+            mx::eval(dof_invweight0);
+            auto diw = dof_invweight0.data<float>();
+            for (auto& li : cache.limits) {
+                li.invweight = diw[li.dof_adr];
+                std::vector<float> jr(nv, 0.0f);
+                jr[li.dof_adr] = 1.0f;
+                li.J_row = mx::array(jr.data(), {nv}, mx::float32);
+            }
         }
     }
     // Tendon limit + friction plans (for vmap)
@@ -1072,6 +1117,7 @@ void Model::init_cache() const {
                 tli.margin = tmargin ? tmargin[t] : 0.0f;
                 tli.invweight = tinvw ? tinvw[t] : 1.0f;
                 tli.tenJ_row = tenJ_rows[t];
+                tli.J_row_arr = mx::array(tli.tenJ_row.data(), {nv}, mx::float32);
                 cache.tendon_limits.push_back(tli);
             }
         }
@@ -1100,6 +1146,7 @@ void Model::init_cache() const {
                 tfi.solimp[4] = tsolimp_f ? tsolimp_f[t*5+4] : 2.0f;
                 tfi.invweight = tinvw ? tinvw[t] : 1.0f;
                 tfi.tenJ_row = tenJ_rows[t];
+                tfi.J_row_arr = mx::array(tfi.tenJ_row.data(), {nv}, mx::float32);
                 cache.tendon_frictions.push_back(tfi);
             }
         }
@@ -1148,13 +1195,33 @@ void Model::init_cache() const {
             else if (eq_t[i] == 2) max_ne += 1;  // JOINT
         }
     }
-    // Count DOF friction loss rows + tendon friction rows
+    // Count DOF friction loss rows + build DOF friction cache
     int max_nf = 0;
     if (nv > 0) {
-        mx::eval(dof_frictionloss);
+        mx::eval(dof_frictionloss); mx::eval(dof_invweight0);
         auto fl = dof_frictionloss.data<float>();
+        auto diw = dof_invweight0.data<float>();
+        float* dsolref_ptr = nullptr;
+        if (dof_solref.size() > 0) { mx::eval(dof_solref); dsolref_ptr = const_cast<float*>(dof_solref.data<float>()); }
+        float* dsolimp_ptr = nullptr;
+        if (dof_solimp.size() > 0) { mx::eval(dof_solimp); dsolimp_ptr = const_cast<float*>(dof_solimp.data<float>()); }
+
         for (int i = 0; i < nv; i++) {
-            if (fl[i] > 0.0f) max_nf++;
+            if (fl[i] <= 0.0f) continue;
+            max_nf++;
+            ModelCache::DofFrictionCache dfc;
+            dfc.dof_idx = i;
+            dfc.invweight = diw[i];
+            dfc.frictionloss = fl[i];
+            dfc.solref[0] = dsolref_ptr ? dsolref_ptr[i * 2] : 0.02f;
+            dfc.solref[1] = dsolref_ptr ? dsolref_ptr[i * 2 + 1] : 1.0f;
+            float def_si[] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+            for (int k = 0; k < 5; k++)
+                dfc.solimp[k] = dsolimp_ptr ? dsolimp_ptr[i * 5 + k] : def_si[k];
+            std::vector<float> jr(nv, 0.0f);
+            jr[i] = 1.0f;
+            dfc.J_row = mx::array(jr.data(), {nv}, mx::float32);
+            cache.dof_frictions.push_back(std::move(dfc));
         }
     }
     max_nf += (int)cache.tendon_frictions.size();
@@ -1362,6 +1429,64 @@ void Model::init_cache() const {
         }
         cache.passive_stiffness = mx::array(stiff_per_dof.data(), mx::Shape{nv}, mx::float32);
         cache.passive_qpos_idxs = mx::array(qpos_per_dof.data(), mx::Shape{nv}, mx::int32);
+    }
+
+    // ── Equality constraint cache ──
+    if (neq > 0) {
+        mx::eval(eq_type); mx::eval(eq_obj1id); mx::eval(eq_obj2id);
+        mx::eval(eq_data); mx::eval(eq_solref); mx::eval(eq_solimp);
+        auto et = eq_type.data<int>();
+        auto eo1 = eq_obj1id.data<int>();
+        auto eo2 = eq_obj2id.data<int>();
+        auto ed = eq_data.data<float>();
+        auto esr = eq_solref.data<float>();
+        auto esi = eq_solimp.data<float>();
+        mx::eval(body_invweight0);
+        auto biw = body_invweight0.data<float>();
+
+        for (int i = 0; i < neq; i++) {
+            ModelCache::EqualityCache ec;
+            ec.type = et[i];
+            ec.id1 = eo1[i];
+            ec.id2 = eo2[i];
+            for (int k = 0; k < 11; k++)
+                ec.data[k] = ed[i * 11 + k];
+            ec.solref[0] = esr[i * 2];
+            ec.solref[1] = esr[i * 2 + 1];
+            for (int k = 0; k < 5; k++)
+                ec.solimp[k] = esi[i * 5 + k];
+
+            if (ec.type == 0 || ec.type == 1) {
+                ec.invweight = biw[ec.id1 * 2] + biw[ec.id2 * 2];
+            } else if (ec.type == 2) {
+                mx::eval(jnt_dofadr); mx::eval(jnt_qposadr);
+                auto jda = jnt_dofadr.data<int>();
+                auto jqa = jnt_qposadr.data<int>();
+                mx::eval(dof_invweight0);
+                auto diw_ptr = dof_invweight0.data<float>();
+
+                ec.da1 = jda[ec.id1];
+                ec.invweight = diw_ptr[ec.da1];
+
+                std::vector<float> jr(nv, 0.0f);
+                jr[ec.da1] = 1.0f;
+                ec.J_row = mx::array(jr.data(), {nv}, mx::float32);
+
+                mx::eval(qpos0);
+                ec.qpos0_ref1 = qpos0.data<float>()[jqa[ec.id1]];
+
+                if (ec.id2 >= 0 && ec.id2 < njnt) {
+                    ec.da2 = jda[ec.id2];
+                    ec.invweight += diw_ptr[ec.da2];
+                    ec.qpos0_ref2 = qpos0.data<float>()[jqa[ec.id2]];
+
+                    std::vector<float> jr2(nv, 0.0f);
+                    jr2[ec.da2] = 1.0f;
+                    ec.J2_row = mx::array(jr2.data(), {nv}, mx::float32);
+                }
+            }
+            cache.equality_cache.push_back(std::move(ec));
+        }
     }
 
     cache.initialized = true;

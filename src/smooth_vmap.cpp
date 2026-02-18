@@ -130,35 +130,21 @@ Data vmap_com_pos(const Model& m, Data d) {
     auto sub_pos = mx::multiply(d.xipos, mass_col);  // (nb, 3)
     auto sub_mass = mx::copy(m.body_mass);  // (nb,)
 
-    // Level-parallel backward accumulation using precomputed scatter matrices
-    for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        const auto& level = c.tree_levels[lvl];
-        if (level.empty()) continue;
-        int nc = (int)level.size();
-        // Gather child values
-        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
-        auto child_pos = mx::take(sub_pos, child_ids, 0);  // (nc, 3)
-        auto child_mass = mx::take(sub_mass, child_ids, 0);  // (nc,)
-        // Build parent IDs for this level
-        std::vector<int> pids(nc);
-        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
-        auto parent_ids = mx::array(pids.data(), mx::Shape{nc}, mx::int32);
-        // Scatter-add: for each child, add to its parent row
-        // Use precomputed (nb, nc) scatter matrix: scatter_mat[pid, idx] = 1
-        std::vector<float> smat(nb * nc, 0.0f);
-        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
-        auto scatter_mat = mx::array(smat.data(), mx::Shape{nb, nc}, mx::float32);
-        sub_pos = mx::add(sub_pos, mx::matmul(scatter_mat, child_pos));
-        sub_mass = mx::add(sub_mass, mx::flatten(mx::matmul(scatter_mat,
+    for (int lvl = (int)c.tree_scatter_levels.size() - 1; lvl >= 1; lvl--) {
+        const auto& sl = c.tree_scatter_levels[lvl];
+        if (sl.child_ids.size() == 0) continue;
+        int nc = (int)sl.child_ids.shape(0);
+        auto child_pos = mx::take(sub_pos, sl.child_ids, 0);
+        auto child_mass = mx::take(sub_mass, sl.child_ids, 0);
+        sub_pos = mx::add(sub_pos, mx::matmul(sl.scatter_mat, child_pos));
+        sub_mass = mx::add(sub_mass, mx::flatten(mx::matmul(sl.scatter_mat,
             mx::reshape(child_mass, mx::Shape{nc, 1}))));
     }
 
     auto safe_mass = mx::maximum(sub_mass, mx::array(MJMINVAL_V));
     d.subtree_com = mx::divide(sub_pos, mx::reshape(safe_mass, mx::Shape{nb, 1}));
 
-    // Fully vectorized cinert computation
-    auto root_ids = mx::array(c.body_rootid_vec.data(), mx::Shape{nb}, mx::int32);
-    auto root_com = mx::take(d.subtree_com, root_ids, 0);  // (nb, 3)
+    auto root_com = mx::take(d.subtree_com, c.body_rootid_arr, 0);  // (nb, 3)
     auto offsets = mx::subtract(d.xipos, root_com);  // (nb, 3)
     auto masses = mx::reshape(m.body_mass, mx::Shape{nb, 1, 1});  // (nb, 1, 1)
 
@@ -243,31 +229,21 @@ Data vmap_crb(const Model& m, Data d) {
     const auto& c = m.cache;
     int nb = m.nbody;
 
-    // Level-parallel backward accumulation using scatter matrices
     auto crb = mx::copy(d.cinert);  // (nb, 10)
 
-    for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        const auto& level = c.tree_levels[lvl];
-        if (level.empty()) continue;
-        int nc = (int)level.size();
-        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
-        auto child_vals = mx::take(crb, child_ids, 0);  // (nc, 10)
-        std::vector<int> pids(nc);
-        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
-        std::vector<float> smat(nb * nc, 0.0f);
-        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
-        auto scatter_mat = mx::array(smat.data(), mx::Shape{nb, nc}, mx::float32);
-        crb = mx::add(crb, mx::matmul(scatter_mat, child_vals));
+    for (int lvl = (int)c.tree_scatter_levels.size() - 1; lvl >= 1; lvl--) {
+        const auto& sl = c.tree_scatter_levels[lvl];
+        if (sl.child_ids.size() == 0) continue;
+        auto child_vals = mx::take(crb, sl.child_ids, 0);
+        crb = mx::add(crb, mx::matmul(sl.scatter_mat, child_vals));
     }
     // Zero out world body
     auto world_mask = mx::concatenate({mx::zeros(mx::Shape{1, 10}),
                                         mx::ones(mx::Shape{nb - 1, 10})}, 0);
     d.crb = mx::multiply(crb, world_mask);
 
-    // Vectorized crb_cdof and mass matrix
     if (m.nv > 0) {
-        auto dof_bid_arr = mx::array(c.dof_bodyid_vec.data(), mx::Shape{m.nv}, mx::int32);
-        auto crb_dof = mx::take(d.crb, dof_bid_arr, 0);
+        auto crb_dof = mx::take(d.crb, c.dof_bodyid_arr, 0);
         auto crb_cdof = batched_inert_mul(crb_dof, d.cdof);
 
         // Dense mass matrix: qM = (crb_cdof @ cdof^T) * tree_mask
@@ -384,23 +360,14 @@ Data vmap_rne(const Model& m, Data d) {
     auto vxIv = batched_motion_cross_force(d.cvel, Iv);
     auto loc_cfrc = mx::add(Ia, vxIv);
 
-    // Level-parallel backward force accumulation using scatter matrices
     auto cfrc_arr = mx::copy(loc_cfrc);  // (nb, 6)
-    for (int lvl = (int)c.tree_levels.size() - 1; lvl >= 1; lvl--) {
-        const auto& level = c.tree_levels[lvl];
-        if (level.empty()) continue;
-        int nc = (int)level.size();
-        auto child_ids = mx::array(level.data(), mx::Shape{nc}, mx::int32);
-        auto child_vals = mx::take(cfrc_arr, child_ids, 0);
-        std::vector<int> pids(nc);
-        for (int i = 0; i < nc; i++) pids[i] = c.body_parentid_vec[level[i]];
-        std::vector<float> smat(m.nbody * nc, 0.0f);
-        for (int i = 0; i < nc; i++) smat[pids[i] * nc + i] = 1.0f;
-        auto scatter_mat = mx::array(smat.data(), mx::Shape{m.nbody, nc}, mx::float32);
-        cfrc_arr = mx::add(cfrc_arr, mx::matmul(scatter_mat, child_vals));
+    for (int lvl = (int)c.tree_scatter_levels.size() - 1; lvl >= 1; lvl--) {
+        const auto& sl = c.tree_scatter_levels[lvl];
+        if (sl.child_ids.size() == 0) continue;
+        auto child_vals = mx::take(cfrc_arr, sl.child_ids, 0);
+        cfrc_arr = mx::add(cfrc_arr, mx::matmul(sl.scatter_mat, child_vals));
     }
-    auto dof_bid_arr = mx::array(c.dof_bodyid_vec.data(), mx::Shape{m.nv}, mx::int32);
-    auto cfrc_dof = mx::take(cfrc_arr, dof_bid_arr, 0);
+    auto cfrc_dof = mx::take(cfrc_arr, c.dof_bodyid_arr, 0);
     d.qfrc_bias = mx::sum(mx::multiply(d.cdof, cfrc_dof), -1);
 
     return d;

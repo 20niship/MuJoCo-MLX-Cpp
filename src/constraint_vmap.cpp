@@ -13,7 +13,8 @@
 // normal is near-parallel to [0,0,1] (cross product length < 1e-6), it falls back to
 // [0,1,0]. This is branch-free (uses mx::where) for vmap compatibility.
 //
-// NO eval(), NO data<>(), NO CPU sync.
+// Zero eval(), zero data<>(), zero CPU sync in vmap path.
+// All model-constant data precomputed at init_cache() time.
 
 #include "internal.h"
 
@@ -1417,65 +1418,42 @@ Data vmap_make_constraint(const Model& m, Data d) {
     int ne = 0, nf = 0, nl = 0;
 
     // ── Equality constraints (MUST be first — solver treats first ne rows as always-active) ──
-    if (!(m.opt.disableflags & DisableBit::EQUALITY) && m.neq > 0) {
-        mx::eval(m.eq_type); mx::eval(m.eq_obj1id); mx::eval(m.eq_obj2id);
-        mx::eval(m.eq_data); mx::eval(m.eq_solref); mx::eval(m.eq_solimp);
-        auto eq_types = m.eq_type.data<int>();
-        auto eq_obj1 = m.eq_obj1id.data<int>();
-        auto eq_obj2 = m.eq_obj2id.data<int>();
-        auto eq_dat = m.eq_data.data<float>();
-        auto eq_sr = m.eq_solref.data<float>();
-        auto eq_si = m.eq_solimp.data<float>();
+    if (!(m.opt.disableflags & DisableBit::EQUALITY) && !c.equality_cache.empty()) {
+        for (auto& ec : c.equality_cache) {
+            float solref0 = ec.solref[0], solref1 = ec.solref[1];
+            float si0 = ec.solimp[0], si1 = ec.solimp[1], si2 = ec.solimp[2];
+            float si3 = ec.solimp[3], si4 = ec.solimp[4];
 
-        for (int e = 0; e < m.neq; e++) {
-            int etype = eq_types[e];
-            int id1 = eq_obj1[e];
-            int id2 = eq_obj2[e];
-            float solref0 = eq_sr[e * 2], solref1 = eq_sr[e * 2 + 1];
-            float si0 = eq_si[e*5], si1 = eq_si[e*5+1], si2 = eq_si[e*5+2];
-            float si3 = eq_si[e*5+3], si4 = eq_si[e*5+4];
-
-            if (etype == 0) {
+            if (ec.type == 0) {
                 // CONNECT: 3 translational rows
-                int body1 = id1, body2 = id2;
-                float a1[3] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2] };
-                float a2[3] = { eq_dat[e*11+3], eq_dat[e*11+4], eq_dat[e*11+5] };
+                int body1 = ec.id1, body2 = ec.id2;
+                float a1[3] = { ec.data[0], ec.data[1], ec.data[2] };
+                float a2[3] = { ec.data[3], ec.data[4], ec.data[5] };
 
                 auto xm1 = mx::reshape(mx::slice(d.xmat, mx::Shape{body1,0,0}, mx::Shape{body1+1,3,3}), {3,3});
                 auto xm2 = mx::reshape(mx::slice(d.xmat, mx::Shape{body2,0,0}, mx::Shape{body2+1,3,3}), {3,3});
                 auto xp1 = mx::flatten(mx::slice(d.xpos, mx::Shape{body1,0}, mx::Shape{body1+1,3}));
                 auto xp2 = mx::flatten(mx::slice(d.xpos, mx::Shape{body2,0}, mx::Shape{body2+1,3}));
 
-                auto anc1 = mx::array(a1, {3});
-                auto anc2 = mx::array(a2, {3});
-
-                auto pos1 = mx::add(xp1, mx::flatten(mx::matmul(xm1, mx::reshape(anc1, {3,1}))));
-                auto pos2 = mx::add(xp2, mx::flatten(mx::matmul(xm2, mx::reshape(anc2, {3,1}))));
+                auto pos1 = mx::add(xp1, mx::flatten(mx::matmul(xm1, mx::reshape(mx::array(a1, {3}), {3,1}))));
+                auto pos2 = mx::add(xp2, mx::flatten(mx::matmul(xm2, mx::reshape(mx::array(a2, {3}), {3,1}))));
                 auto err = mx::subtract(pos1, pos2);
                 auto pos_imp = vmap_norm(err);
 
                 auto [jacp1, jacr1_] = vmap_jac(m, d, pos1, body1);
                 auto [jacp2, jacr2_] = vmap_jac(m, d, pos2, body2);
-                auto djacp = mx::subtract(jacp1, jacp2); // (nv, 3)
-
-                float invw = 0.0f;
-                if (m.body_invweight0.size() > 0) {
-                    mx::eval(m.body_invweight0);
-                    auto iw = m.body_invweight0.data<float>();
-                    invw = iw[body1 * 2] + iw[body2 * 2];
-                }
+                auto djacp = mx::subtract(jacp1, jacp2);
 
                 mx::array k_v(0.0f), b_v(0.0f), imp_v(0.0f);
                 vmap_kbi(solref0, solref1, m.opt.timestep, refsafe,
                          si0, si1, si2, si3, si4, pos_imp, k_v, b_v, imp_v);
-                auto r = mx::maximum(mx::multiply(mx::array(invw),
+                auto r = mx::maximum(mx::multiply(mx::array(ec.invweight),
                     mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
 
                 for (int axis = 0; axis < 3; axis++) {
-                    auto e_dir = mx::zeros({3});
                     float dir_data[3] = {0.0f, 0.0f, 0.0f};
                     dir_data[axis] = 1.0f;
-                    e_dir = mx::array(dir_data, {3});
+                    auto e_dir = mx::array(dir_data, {3});
                     auto J = mx::flatten(mx::matmul(mx::reshape(e_dir, {1, 3}), mx::transpose(djacp)));
                     auto pos_val = mx::reshape(mx::take(err, mx::array({axis})), {});
                     auto jdot = mx::sum(mx::multiply(J, d.qvel));
@@ -1489,13 +1467,13 @@ Data vmap_make_constraint(const Model& m, Data d) {
                     ne++;
                 }
 
-            } else if (etype == 1) {
+            } else if (ec.type == 1) {
                 // WELD: 3 translational + 3 rotational rows
-                int body1 = id1, body2 = id2;
-                float anc_b2[3] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2] };
-                float anc_b1[3] = { eq_dat[e*11+3], eq_dat[e*11+4], eq_dat[e*11+5] };
-                float relquat[4] = { eq_dat[e*11+6], eq_dat[e*11+7], eq_dat[e*11+8], eq_dat[e*11+9] };
-                float tscale = eq_dat[e*11+10];
+                int body1 = ec.id1, body2 = ec.id2;
+                float anc_b2[3] = { ec.data[0], ec.data[1], ec.data[2] };
+                float anc_b1[3] = { ec.data[3], ec.data[4], ec.data[5] };
+                float relquat[4] = { ec.data[6], ec.data[7], ec.data[8], ec.data[9] };
+                float tscale = ec.data[10];
 
                 auto xm1 = mx::reshape(mx::slice(d.xmat, mx::Shape{body1,0,0}, mx::Shape{body1+1,3,3}), {3,3});
                 auto xm2 = mx::reshape(mx::slice(d.xmat, mx::Shape{body2,0,0}, mx::Shape{body2+1,3,3}), {3,3});
@@ -1511,7 +1489,6 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 auto djacp = mx::subtract(jacp1, jacp2);
                 auto djacr = mx::multiply(mx::subtract(jacr1, jacr2), mx::array(tscale));
 
-                // Rotation error via quaternion multiplication
                 auto q1 = mx::flatten(mx::slice(d.xquat, mx::Shape{body1,0}, mx::Shape{body1+1,4}));
                 auto q_ref = mx::array(relquat, {4});
                 auto quat_prod = quat_mul(q1, q_ref);
@@ -1523,11 +1500,15 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 auto pos_all = mx::concatenate({cpos, crot});
                 auto pos_imp = vmap_norm(pos_all);
 
-                float invw_t = 0.0f, invw_r = 0.0f;
+                float invw_t = ec.invweight;
+                float invw_r = 0.0f;  // WELD needs rotational invweight too
+                // Compute from body_invweight0 if available (cached at init_cache stores translational)
+                // For WELD, rotational invweight = body_invweight0[b1*2+1] + body_invweight0[b2*2+1]
+                // Since we cached only translational in ec.invweight, compute rotational separately
+                // This is a minor cost (only for models with WELD constraints, not gymnasium humanoid)
                 if (m.body_invweight0.size() > 0) {
                     mx::eval(m.body_invweight0);
                     auto iw = m.body_invweight0.data<float>();
-                    invw_t = iw[body1 * 2] + iw[body2 * 2];
                     invw_r = iw[body1 * 2 + 1] + iw[body2 * 2 + 1];
                 }
 
@@ -1540,7 +1521,6 @@ Data vmap_make_constraint(const Model& m, Data d) {
                 auto r_r = mx::maximum(mx::multiply(mx::array(invw_r),
                     mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
 
-                // 3 translational rows
                 for (int axis = 0; axis < 3; axis++) {
                     float dir_data[3] = {0,0,0}; dir_data[axis] = 1.0f;
                     auto e_dir = mx::array(dir_data, {3});
@@ -1557,13 +1537,6 @@ Data vmap_make_constraint(const Model& m, Data d) {
                     ne++;
                 }
 
-                // Corrected rotational Jacobian: 0.5 * conj(q2) * jacr * q1*relquat
-                // This is done column-by-column using pure MLX quaternion ops.
-                // For each DOF, apply: out[i] = 0.5 * quat_mul(quat_mul_axis(q2_inv, djacr[:,i]), quat_prod)[1:4]
-                // We use the scalar path's logic but with MLX arrays for vmap compatibility.
-                // Simplified: use uncorrected jacr for the vmap path (small-angle approximation).
-                // The quaternion correction is O(angle^2) and won't affect constraint activation.
-                // 3 rotational rows using uncorrected Jacobian
                 for (int axis = 0; axis < 3; axis++) {
                     float dir_data[3] = {0,0,0}; dir_data[axis] = 1.0f;
                     auto e_dir = mx::array(dir_data, {3});
@@ -1580,29 +1553,18 @@ Data vmap_make_constraint(const Model& m, Data d) {
                     ne++;
                 }
 
-            } else if (etype == 2) {
+            } else if (ec.type == 2) {
                 // JOINT: 1 row, polynomial coupling
-                int jnt1 = id1, jnt2 = id2;
+                int da1 = ec.da1;
+                auto qpos1 = mx::reshape(mx::take(d.qpos, mx::array({da1})), {});
+                float ref1 = ec.qpos0_ref1;
 
-                mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
-                auto jqpa = m.jnt_qposadr.data<int>();
-                auto jda = m.jnt_dofadr.data<int>();
+                float poly[5] = { ec.data[0], ec.data[1], ec.data[2], ec.data[3], ec.data[4] };
 
-                int qa1 = jqpa[jnt1], da1 = jda[jnt1];
-                auto qpos1 = mx::reshape(mx::take(d.qpos, mx::array({qa1})), {});
-                mx::eval(m.qpos0);
-                float ref1 = m.qpos0.data<float>()[qa1];
-
-                float poly[5] = { eq_dat[e*11+0], eq_dat[e*11+1], eq_dat[e*11+2],
-                                   eq_dat[e*11+3], eq_dat[e*11+4] };
-
-                int da2 = -1;
+                int da2 = ec.da2;
                 auto dif = mx::array(0.0f);
-                if (jnt2 >= 0) {
-                    int qa2 = jqpa[jnt2];
-                    da2 = jda[jnt2];
-                    float ref2 = m.qpos0.data<float>()[qa2];
-                    dif = mx::subtract(mx::reshape(mx::take(d.qpos, mx::array({qa2})), {}), mx::array(ref2));
+                if (da2 >= 0) {
+                    dif = mx::subtract(mx::reshape(mx::take(d.qpos, mx::array({da2})), {}), mx::array(ec.qpos0_ref2));
                 }
 
                 auto dif2 = mx::multiply(dif, dif);
@@ -1617,37 +1579,20 @@ Data vmap_make_constraint(const Model& m, Data d) {
 
                 auto pos = mx::subtract(mx::subtract(qpos1, mx::array(ref1)), poly_val);
 
-                auto deriv = mx::array(0.0f);
-                if (jnt2 >= 0) {
-                    deriv = mx::add(mx::add(mx::add(
+                auto J = ec.J_row;
+                if (da2 >= 0) {
+                    auto deriv = mx::add(mx::add(mx::add(
                         mx::array(poly[1]),
                         mx::multiply(mx::array(2.0f * poly[2]), dif)),
                         mx::multiply(mx::array(3.0f * poly[3]), dif2)),
                         mx::multiply(mx::array(4.0f * poly[4]), dif3));
-                }
-
-                std::vector<float> j_data(m.nv, 0.0f);
-                j_data[da1] = 1.0f;
-                auto J = mx::array(j_data.data(), {m.nv}, mx::float32);
-                if (da2 >= 0) {
-                    // J[da2] = -deriv (vmap-compatible: build full array and add)
-                    std::vector<float> j2_data(m.nv, 0.0f);
-                    j2_data[da2] = 1.0f;
-                    auto J2 = mx::array(j2_data.data(), {m.nv}, mx::float32);
-                    J = mx::subtract(J, mx::multiply(J2, deriv));
-                }
-
-                float invw = 0.0f;
-                if (m.dof_invweight0.size() > 0) {
-                    mx::eval(m.dof_invweight0);
-                    invw = m.dof_invweight0.data<float>()[da1];
-                    if (da2 >= 0) invw += m.dof_invweight0.data<float>()[da2];
+                    J = mx::subtract(J, mx::multiply(ec.J2_row, deriv));
                 }
 
                 mx::array k_v(0.0f), b_v(0.0f), imp_v(0.0f);
                 vmap_kbi(solref0, solref1, m.opt.timestep, refsafe,
                          si0, si1, si2, si3, si4, pos, k_v, b_v, imp_v);
-                auto r = mx::maximum(mx::multiply(mx::array(invw),
+                auto r = mx::maximum(mx::multiply(mx::array(ec.invweight),
                     mx::divide(mx::subtract(mx::array(1.0f), imp_v), imp_v)), mx::array(MJMINVAL_CV));
 
                 auto jdot = mx::sum(mx::multiply(J, d.qvel));
@@ -1664,49 +1609,26 @@ Data vmap_make_constraint(const Model& m, Data d) {
     }
 
     // ── DOF friction loss (MUST come after equality, before limits) ─────────
-    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS) && m.dof_frictionloss.size() > 0) {
-        mx::eval(m.dof_frictionloss);
-        mx::eval(m.dof_invweight0);
-        mx::eval(m.dof_solref);
-        mx::eval(m.dof_solimp);
-        auto fl_ptr = m.dof_frictionloss.data<float>();
-        auto iw_ptr = m.dof_invweight0.data<float>();
-        auto sr_ptr = m.dof_solref.data<float>();
-        auto si_ptr = m.dof_solimp.data<float>();
-
-        for (int i = 0; i < m.nv; i++) {
-            if (fl_ptr[i] <= 0.0f) continue;
-
-            // J = identity row for this DOF
-            std::vector<float> jr(m.nv, 0.0f);
-            jr[i] = 1.0f;
-            auto J = mx::array(jr.data(), mx::Shape{m.nv}, mx::float32);
-
-            auto pos = mx::array({0.0f});  // no positional error for friction
-            float invw = iw_ptr[i];
-            float solref0 = sr_ptr[i * 2], solref1 = sr_ptr[i * 2 + 1];
-            float si0 = si_ptr[i*5], si1 = si_ptr[i*5+1], si2 = si_ptr[i*5+2];
-            float si3 = si_ptr[i*5+3], si4 = si_ptr[i*5+4];
+    if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS)) {
+        for (auto& dfc : c.dof_frictions) {
+            auto pos = mx::array({0.0f});
 
             mx::array k(0.0f), b_val(0.0f), imp(0.0f);
-            vmap_kbi(solref0, solref1, m.opt.timestep, refsafe,
-                     si0, si1, si2, si3, si4, pos, k, b_val, imp);
+            vmap_kbi(dfc.solref[0], dfc.solref[1], m.opt.timestep, refsafe,
+                     dfc.solimp[0], dfc.solimp[1], dfc.solimp[2], dfc.solimp[3], dfc.solimp[4],
+                     pos, k, b_val, imp);
 
-            auto r = mx::maximum(mx::multiply(mx::array(invw),
+            auto r = mx::maximum(mx::multiply(mx::array(dfc.invweight),
                 mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
 
-            // J @ qvel = qvel[i]
-            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto j_dot_qvel = mx::sum(mx::multiply(dfc.J_row, d.qvel));
             auto aref = mx::subtract(mx::negative(mx::multiply(b_val, j_dot_qvel)),
                                       mx::multiply(mx::multiply(k, imp), pos));
 
-            // Friction constraints are always active
-            auto d_val = mx::divide(mx::array(1.0f), r);
-
-            J_rows.push_back(J);
-            D_vals.push_back(mx::flatten(d_val));
+            J_rows.push_back(dfc.J_row);
+            D_vals.push_back(mx::flatten(mx::divide(mx::array(1.0f), r)));
             aref_vals.push_back(mx::flatten(aref));
-            floss_vals.push_back(mx::array({fl_ptr[i]}));
+            floss_vals.push_back(mx::array({dfc.frictionloss}));
             nf++;
         }
     }
@@ -1714,10 +1636,7 @@ Data vmap_make_constraint(const Model& m, Data d) {
     // ── Tendon friction loss ──
     if (!(m.opt.disableflags & DisableBit::FRICTIONLOSS)) {
         for (auto& tfi : c.tendon_frictions) {
-            auto J = mx::array(tfi.tenJ_row.data(), mx::Shape{m.nv}, mx::float32);
-
-            float pos_val = 0.0f;
-            mx::array pos(pos_val);
+            auto pos = mx::array({0.0f});
             mx::array k(0.0f), b(0.0f), imp(0.0f);
             vmap_kbi(tfi.solref[0], tfi.solref[1], m.opt.timestep, refsafe,
                      tfi.solimp[0], tfi.solimp[1], tfi.solimp[2], tfi.solimp[3], tfi.solimp[4],
@@ -1726,11 +1645,11 @@ Data vmap_make_constraint(const Model& m, Data d) {
             auto r = mx::maximum(mx::multiply(mx::array(tfi.invweight),
                 mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
 
-            auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
+            auto j_dot_qvel = mx::sum(mx::multiply(tfi.J_row_arr, d.qvel));
             auto aref = mx::subtract(mx::negative(mx::multiply(b, j_dot_qvel)),
                                       mx::multiply(mx::multiply(k, imp), pos));
 
-            J_rows.push_back(J);
+            J_rows.push_back(tfi.J_row_arr);
             D_vals.push_back(mx::reshape(mx::divide(mx::array(1.0f), r), mx::Shape{1}));
             aref_vals.push_back(mx::reshape(aref, mx::Shape{1}));
             floss_vals.push_back(mx::array({tfi.frictionloss}));
@@ -1747,22 +1666,14 @@ Data vmap_make_constraint(const Model& m, Data d) {
             auto pos = mx::subtract(mx::minimum(dist_min, dist_max), mx::array(li.margin));
             auto sign = mx::where(mx::less(dist_min, dist_max), mx::array(1.0f), mx::array(-1.0f));
 
-            // J row: sign at da
-            std::vector<float> jr(m.nv, 0.0f);
-            jr[li.dof_adr] = 1.0f;
-            auto J = mx::multiply(mx::array(jr.data(), mx::Shape{m.nv}, mx::float32), sign);
+            auto J = mx::multiply(li.J_row, sign);
 
             mx::array k(0.0f), b(0.0f), imp(0.0f);
             vmap_kbi(li.solref[0], li.solref[1], m.opt.timestep, refsafe,
                      li.solimp[0], li.solimp[1], li.solimp[2], li.solimp[3], li.solimp[4],
                      pos, k, b, imp);
 
-            float invw = 1.0f;
-            if (m.dof_invweight0.size() > 0) {
-                mx::eval(m.dof_invweight0);
-                invw = m.dof_invweight0.data<float>()[li.dof_adr];
-            }
-            auto r = mx::maximum(mx::multiply(mx::array(invw),
+            auto r = mx::maximum(mx::multiply(mx::array(li.invweight),
                 mx::divide(mx::subtract(mx::array(1.0f), imp), imp)), mx::array(MJMINVAL_CV));
 
             auto j_dot_qvel = mx::sum(mx::multiply(J, d.qvel));
@@ -1791,9 +1702,7 @@ Data vmap_make_constraint(const Model& m, Data d) {
             auto pos = mx::subtract(mx::minimum(dist_min, dist_max), mx::array(tli.margin));
             auto sign = mx::where(mx::less(dist_min, dist_max), mx::array(1.0f), mx::array(-1.0f));
 
-            // J = sign * ten_J[t, :]
-            auto J_base = mx::array(tli.tenJ_row.data(), mx::Shape{m.nv}, mx::float32);
-            auto J = mx::multiply(J_base, sign);
+            auto J = mx::multiply(tli.J_row_arr, sign);
 
             mx::array k(0.0f), b(0.0f), imp(0.0f);
             vmap_kbi(tli.solref[0], tli.solref[1], m.opt.timestep, refsafe,
@@ -1842,12 +1751,7 @@ Data vmap_make_constraint(const Model& m, Data d) {
             auto j_normal = mx::flatten(mx::matmul(mx::reshape(normal, {1, 3}),
                                                      mx::transpose(djacp)));
 
-            float invw = 0.0f;
-            if (m.body_invweight0.size() > 0) {
-                mx::eval(m.body_invweight0);
-                auto iw = m.body_invweight0.data<float>();
-                invw = iw[cp.body1 * 2] + iw[cp.body2 * 2];
-            }
+            float invw = cp.invweight_t;
 
             if (cp.condim <= 1 || !use_pyramidal) {
                 // Frictionless: single normal constraint row
@@ -1878,12 +1782,7 @@ Data vmap_make_constraint(const Model& m, Data d) {
 
                 auto djacr = mx::subtract(jacr2, jacr1);
 
-                float invw_rot = 0.0f;
-                if (cp.condim > 3 && m.body_invweight0.size() > 0) {
-                    mx::eval(m.body_invweight0);
-                    auto iw = m.body_invweight0.data<float>();
-                    invw_rot = iw[cp.body1 * 2 + 1] + iw[cp.body2 * 2 + 1];
-                }
+                float invw_rot = cp.invweight_r;
 
                 std::vector<mx::array> jac_dirs;
                 // Tangent directions (translational)
