@@ -83,11 +83,24 @@ endif()
 # Create imported target for MuJoCo
 if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
     add_library(mujoco_imported SHARED IMPORTED)
+    # Try lib/ subdirectory first (standard install), then root (pip package)
+    if(EXISTS "${MUJOCO_ROOT}/lib/libmujoco.dylib")
+        set(_MJ_DYLIB_PATH "${MUJOCO_ROOT}/lib/libmujoco.dylib")
+    else()
+        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/libmujoco*.dylib")
+        if(_MJ_DYLIB)
+            list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
+        else()
+            message(FATAL_ERROR "Found MuJoCo headers at ${MUJOCO_ROOT} but no libmujoco dylib")
+        endif()
+    endif()
+    # Record the original dylib filename for install_name_tool fixups
+    get_filename_component(_MJ_OLD_NAME "${_MJ_DYLIB_PATH}" NAME)
     set_target_properties(mujoco_imported PROPERTIES
-        IMPORTED_LOCATION "${MUJOCO_ROOT}/lib/libmujoco.dylib"
+        IMPORTED_LOCATION "${_MJ_DYLIB_PATH}"
         INTERFACE_INCLUDE_DIRECTORIES "${MUJOCO_ROOT}/include"
     )
-    message(STATUS "MUJOCO_ROOT: ${MUJOCO_ROOT}")
+    message(STATUS "MUJOCO_ROOT: ${MUJOCO_ROOT} -> ${_MJ_DYLIB_PATH}")
 elseif(MUJOCO_PKG_DIR AND EXISTS "${MUJOCO_PKG_DIR}/include/mujoco/mujoco.h")
     add_library(mujoco_imported SHARED IMPORTED)
     file(GLOB _MJ_DYLIB "${MUJOCO_PKG_DIR}/libmujoco*.dylib")
