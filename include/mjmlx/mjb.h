@@ -217,6 +217,9 @@ MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_qfrc_actuator(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cfrc_ext(const MjbBatchedSim* sim, int* n_out);
 
+// Evaluate qpos + qvel in a single GPU fence before reading state. No-op for CPU backend.
+MJB_API void mjb_batched_eval_state(const MjbBatchedSim* sim);
+
 // ============================================================
 // Differentiable simulation (MLX backend only)
 // ============================================================

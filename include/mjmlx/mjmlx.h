@@ -183,6 +183,10 @@ MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n
 MJMLX_API const float* mjmlx_batched_get_qfrc_actuator(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, int* n_out);
 
+// Evaluate qpos + qvel in a single GPU fence. Call before get_qpos/get_qvel to
+// avoid two sequential GPU syncs.
+MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim);
+
 // ============================================================
 // Differentiable simulation (for empowerment, model-based RL)
 // ============================================================

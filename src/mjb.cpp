@@ -929,6 +929,13 @@ MJB_API const float* mjb_batched_get_cfrc_ext(const MjbBatchedSim* sim, int* n_o
 
 #undef CPU_BATCHED_GET
 
+MJB_API void mjb_batched_eval_state(const MjbBatchedSim* sim) {
+    if (!sim) return;
+    if (sim->type != MJB_BACKEND_CPU && sim->mlx_sim)
+        mjmlx_batched_eval_state(sim->mlx_sim);
+    // CPU backend: state arrays are always materialized — no-op
+}
+
 // ── Differentiable simulation ───────────────────────────────────────────
 
 MJB_API int mjb_grad_step(MjbModel* model, MjbData* data, float* grad_out) {

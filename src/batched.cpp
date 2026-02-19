@@ -884,6 +884,11 @@ MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, in
     return (sim->sim.cfrc_ext.size() > 0) ? sim->sim.cfrc_ext.data<float>() : nullptr;
 }
 
+MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim) {
+    if (!sim) return;
+    mx::eval({sim->sim.qpos, sim->sim.qvel});
+}
+
 MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) {
     if (!sim || !reset_mask) return;
     auto& s = sim->sim;
