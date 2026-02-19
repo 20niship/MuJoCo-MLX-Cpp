@@ -127,13 +127,7 @@ set(MJMLX_SOURCES
     src/types.cpp
     src/io.cpp
     src/math.cpp
-    src/scan.cpp
-    src/passive.cpp
     src/support.cpp
-    src/smooth.cpp
-    src/collision.cpp
-    src/constraint.cpp
-    src/solver.cpp
     src/forward.cpp
     src/smooth_vmap.cpp
     src/constraint_vmap.cpp

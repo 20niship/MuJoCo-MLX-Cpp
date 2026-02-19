@@ -24,26 +24,14 @@ namespace mjmlx {
 
 // ── Forward sub-pipelines ─────────────────────────────────────────────────────
 
-static Data fwd_position(const Model& m, Data d) {
-  d = kinematics(m, d);
-  d = com_pos(m, d);
-  d = crb(m, d);
-  d = factor_m(m, d);
-  d = tendon(m, d);
-  d = collision(m, d);
-  d = make_constraint(m, d);
-  d = transmission(m, d);
-  return d;
+static Data fwd_position(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
-static Data fwd_velocity(const Model& m, Data d) {
-  if (m.nu > 0 && d.actuator_moment.size() > 0) {
-    d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment, mx::reshape(d.qvel, {m.nv, 1})));
-  }
-  d = com_vel(m, d);
-  d = passive(m, d);
-  d = rne(m, d);
-  return d;
+static Data fwd_velocity(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
 static Data fwd_actuation(const Model& m, Data d) {
@@ -172,39 +160,14 @@ static Data fwd_actuation(const Model& m, Data d) {
   return d;
 }
 
-static Data fwd_acceleration(const Model& m, Data d) {
-  auto qfrc_applied = d.qfrc_applied;
-  if (d.xfrc_applied.size() > 0) {
-    qfrc_applied = mx::add(qfrc_applied, xfrc_accumulate(m, d));
-  }
-  auto qfrc_smooth = mx::add(mx::subtract(d.qfrc_passive, d.qfrc_bias),
-                              mx::add(d.qfrc_actuator, qfrc_applied));
-  auto qacc_smooth = solve_m(m, d, qfrc_smooth);
-  d.qfrc_smooth = qfrc_smooth;
-  d.qacc_smooth = qacc_smooth;
-  return d;
+static Data fwd_acceleration(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
-Data forward(const Model& m, Data d) {
-  d = fwd_position(m, d);
-  d = fwd_velocity(m, d);
-  d = fwd_actuation(m, d);
-  d = fwd_acceleration(m, d);
-
-  // Solve constraints
-  int nefc_count = d.efc_J.shape(0);
-  if (nefc_count == 0) {
-    d.qacc = d.qacc_smooth;
-    d.qfrc_constraint = mx::zeros({m.nv});
-  } else {
-    d = solve(m, d);
-  }
-
-  // Compute per-body contact forces (cfrc_ext) from constraint forces.
-  // Always called after constraint solve so cfrc_ext is available as observation.
-  d = rne_post_constraint(m, d);
-
-  return d;
+Data forward(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
 static Data integrate_pos(const Model& m, Data d, const mx::array& qvel_for_pos, float dt) {
@@ -296,127 +259,9 @@ static Data integrate_act(const Model& m, Data d, const mx::array& act_dot, floa
     return d;
 }
 
-// Analytical derivative of smooth forces w.r.t. velocity: d(qfrc_smooth)/d(qvel)
-// Used by ImplicitFast integrator. Returns (nv, nv) dense matrix or empty if no velocity-dependent forces.
-static mx::array deriv_smooth_vel(const Model& m, const Data& d) {
-    bool has_deriv = false;
-    auto qderiv = mx::zeros({m.nv, m.nv});
-
-    // d(qfrc_actuator)/d(qvel): for affine gain/bias, the velocity-dependent term
-    if (!(m.opt.disableflags & DisableBit::ACTUATION) && m.nu > 0 &&
-        m.actuator_gaintype.size() > 0 && m.actuator_biastype.size() > 0 &&
-        d.actuator_moment.size() > 0) {
-
-        mx::eval(m.actuator_gaintype); mx::eval(m.actuator_gainprm);
-        mx::eval(m.actuator_biastype); mx::eval(m.actuator_biasprm);
-        mx::eval(m.actuator_dyntype); mx::eval(m.actuator_actadr);
-        mx::eval(d.ctrl); mx::eval(d.act); mx::eval(d.actuator_moment);
-
-        auto gaintype_ptr = m.actuator_gaintype.data<int>();
-        auto biastype_ptr = m.actuator_biastype.data<int>();
-        auto gp = m.actuator_gainprm.data<float>();
-        auto bp = m.actuator_biasprm.data<float>();
-        auto dyntype_ptr = m.actuator_dyntype.data<int>();
-        auto actadr_ptr = m.actuator_actadr.data<int>();
-        auto ctrl_ptr = d.ctrl.data<float>();
-        auto act_ptr = (d.act.size() > 0) ? d.act.data<float>() : nullptr;
-
-        // vel[i] = bias_vel + gain_vel * ctrl_act
-        // bias_vel = biasprm[2] if AFFINE bias, else 0
-        // gain_vel = gainprm[2] if AFFINE gain, else 0
-        // ctrl_act = act if dyntype != NONE, else ctrl
-        std::vector<float> vel_data(m.nu, 0.0f);
-        bool any_nonzero = false;
-        for (int i = 0; i < m.nu; i++) {
-            float bias_vel = 0.0f;
-            if (biastype_ptr[i] == static_cast<int>(BiasType::AFFINE))
-                bias_vel = bp[i * 10 + 2];
-
-            float gain_vel = 0.0f;
-            if (gaintype_ptr[i] == static_cast<int>(GainType::AFFINE))
-                gain_vel = gp[i * 10 + 2];
-
-            float ctrl_act = ctrl_ptr[i];
-            if (dyntype_ptr[i] != 0 && actadr_ptr[i] >= 0 && act_ptr)
-                ctrl_act = act_ptr[actadr_ptr[i]];
-
-            vel_data[i] = bias_vel + gain_vel * ctrl_act;
-            if (vel_data[i] != 0.0f) any_nonzero = true;
-        }
-
-        if (any_nonzero) {
-            // qderiv += moment^T @ diag(vel) @ moment
-            auto vel = mx::array(vel_data.data(), {m.nu}, mx::float32);
-            auto moment = d.actuator_moment;  // (nu, nv)
-            // diag(vel) @ moment = vel[:, None] * moment
-            auto scaled = mx::multiply(mx::reshape(vel, {m.nu, 1}), moment);
-            qderiv = mx::add(qderiv, mx::matmul(mx::transpose(moment), scaled));
-            has_deriv = true;
-        }
-    }
-
-    // d(qfrc_passive)/d(qvel): joint damping + tendon damping
-    if (!(m.opt.disableflags & DisableBit::DAMPER)) {
-        // -diag(dof_damping)
-        if (m.dof_damping.size() > 0) {
-            qderiv = mx::subtract(qderiv, mx::diag(m.dof_damping));
-            has_deriv = true;
-        }
-
-        // Tendon damping: -ten_J^T @ diag(tendon_damping) @ ten_J
-        if (m.ntendon > 0 && d.ten_J.size() > 0 && m.tendon_damping.size() > 0) {
-            mx::eval(m.tendon_damping);
-            auto td_ptr = m.tendon_damping.data<float>();
-            bool any_td = false;
-            for (int i = 0; i < m.ntendon; i++) {
-                if (td_ptr[i] != 0.0f) { any_td = true; break; }
-            }
-            if (any_td) {
-                auto td_scaled = mx::multiply(mx::reshape(m.tendon_damping, {m.ntendon, 1}), d.ten_J);
-                qderiv = mx::subtract(qderiv, mx::matmul(mx::transpose(d.ten_J), td_scaled));
-                has_deriv = true;
-            }
-        }
-    }
-
-    if (!has_deriv) return mx::array({});
-    return qderiv;
-}
-
-static Data integrate_implicit(const Model& m, Data d) {
-    float dt = m.opt.timestep;
-
-    auto qderiv = deriv_smooth_vel(m, d);
-
-    // Use original qacc from forward pass as the "observation" qacc
-    auto qacc_for_vel = d.qacc;
-    if (qderiv.size() > 0) {
-        // Modified mass matrix: M_mod = M - dt * qderiv
-        auto qm_full = full_m(m, d);
-        auto qm_mod = mx::subtract(qm_full, mx::multiply(mx::array(dt), qderiv));
-
-        // Add small regularization for numerical stability
-        qm_mod = mx::add(qm_mod, mx::multiply(mx::eye(m.nv), mx::array(1e-8f)));
-
-        // Cholesky factor and solve: qacc_impl = M_mod^{-1} @ (qfrc_smooth + qfrc_constraint)
-        auto qfrc = mx::add(d.qfrc_smooth, d.qfrc_constraint);
-        auto L = mx::linalg::cholesky(qm_mod, false, mx::Device::cpu);
-        auto y = mx::linalg::solve_triangular(L, mx::reshape(qfrc, {m.nv, 1}), false, mx::Device::cpu);
-        auto x = mx::linalg::solve_triangular(mx::transpose(L), y, true, mx::Device::cpu);
-        qacc_for_vel = mx::flatten(x);
-    }
-
-    // Advance: use implicit qacc for velocity update, but store original qacc
-    d.qvel = mx::add(d.qvel, mx::multiply(qacc_for_vel, mx::array(dt)));
-    d = integrate_pos(m, d, d.qvel, dt);
-    d.qacc_warmstart = d.qacc;
-
-    // Integrate activation state
-    if (m.na > 0 && d.act.size() > 0 && d.act_dot.size() > 0) {
-        d = integrate_act(m, d, d.act_dot, dt);
-    }
-
-    return d;
+static Data integrate_implicit(const Model&, Data) {
+    throw std::runtime_error(
+        "Single-env MLX implicit integrator removed. Use the batched API.");
 }
 
 static Data integrate_euler(const Model& m, Data d) {
@@ -435,130 +280,24 @@ static Data integrate_euler(const Model& m, Data d) {
   return d;
 }
 
-static Data integrate_rk4(const Model& m, Data d) {
-    float dt = m.opt.timestep;
-
-    // Save initial state
-    auto qpos0 = d.qpos;
-    auto qvel0 = d.qvel;
-    auto act0 = d.act;
-
-    // k1: qacc and qvel from current forward pass (already computed)
-    auto k1_qacc = d.qacc;
-    auto k1_qvel = d.qvel;
-    auto k1_act_dot = d.act_dot;
-
-    // Weighted sums (B = [1/6, 1/3, 1/3, 1/6])
-    mx::eval(k1_qacc); mx::eval(k1_qvel);
-    auto qacc_sum = mx::multiply(mx::array(1.0f / 6.0f), k1_qacc);
-    auto qvel_sum = mx::multiply(mx::array(1.0f / 6.0f), k1_qvel);
-    auto act_dot_sum = (m.na > 0 && k1_act_dot.size() > 0)
-        ? mx::multiply(mx::array(1.0f / 6.0f), k1_act_dot) : mx::zeros({std::max(m.na, 1)});
-
-    // k2: forward at d0 + 0.5*dt*k1
-    {
-        d.qvel = mx::add(qvel0, mx::multiply(mx::array(0.5f * dt), k1_qacc));
-        d.qpos = qpos0;
-        d = integrate_pos(m, d, k1_qvel, 0.5f * dt);
-        if (m.na > 0 && act0.size() > 0 && k1_act_dot.size() > 0)
-            d.act = mx::add(act0, mx::multiply(mx::array(0.5f * dt), k1_act_dot));
-
-        d = forward(m, d);
-
-        auto k2_qacc = d.qacc;
-        auto k2_qvel = d.qvel;
-        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 3.0f), k2_qacc));
-        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 3.0f), k2_qvel));
-        if (m.na > 0 && d.act_dot.size() > 0)
-            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 3.0f), d.act_dot));
-
-        // k3: forward at d0 + 0.5*dt*k2
-        d.qvel = mx::add(qvel0, mx::multiply(mx::array(0.5f * dt), k2_qacc));
-        d.qpos = qpos0;
-        d = integrate_pos(m, d, k2_qvel, 0.5f * dt);
-        if (m.na > 0 && act0.size() > 0 && d.act_dot.size() > 0)
-            d.act = mx::add(act0, mx::multiply(mx::array(0.5f * dt), d.act_dot));
-
-        d = forward(m, d);
-
-        auto k3_qacc = d.qacc;
-        auto k3_qvel = d.qvel;
-        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 3.0f), k3_qacc));
-        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 3.0f), k3_qvel));
-        if (m.na > 0 && d.act_dot.size() > 0)
-            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 3.0f), d.act_dot));
-
-        // k4: forward at d0 + dt*k3
-        d.qvel = mx::add(qvel0, mx::multiply(mx::array(dt), k3_qacc));
-        d.qpos = qpos0;
-        d = integrate_pos(m, d, k3_qvel, dt);
-        if (m.na > 0 && act0.size() > 0 && d.act_dot.size() > 0)
-            d.act = mx::add(act0, mx::multiply(mx::array(dt), d.act_dot));
-
-        d = forward(m, d);
-
-        qacc_sum = mx::add(qacc_sum, mx::multiply(mx::array(1.0f / 6.0f), d.qacc));
-        qvel_sum = mx::add(qvel_sum, mx::multiply(mx::array(1.0f / 6.0f), d.qvel));
-        if (m.na > 0 && d.act_dot.size() > 0)
-            act_dot_sum = mx::add(act_dot_sum, mx::multiply(mx::array(1.0f / 6.0f), d.act_dot));
-    }
-
-    // Final advance: use weighted average qacc for velocity, weighted average qvel for position
-    d.qpos = qpos0;
-    d.qvel = mx::add(qvel0, mx::multiply(mx::array(dt), qacc_sum));
-    d = integrate_pos(m, d, qvel_sum, dt);
-
-    // Integrate activation with weighted act_dot
-    if (m.na > 0 && act0.size() > 0) {
-        d.act = act0;
-        d = integrate_act(m, d, act_dot_sum, dt);
-    }
-
-    d.qacc_warmstart = d.qacc;
-
-    return d;
+static Data integrate_rk4(const Model&, Data) {
+    throw std::runtime_error(
+        "Single-env MLX RK4 integrator removed. Use the batched API.");
 }
 
-Data step(const Model& m, Data d) {
-  d = forward(m, d);
-  if (m.opt.integrator == IntegratorType::RK4) {
-    d = integrate_rk4(m, d);
-  } else if (m.opt.integrator == IntegratorType::IMPLICIT ||
-             m.opt.integrator == IntegratorType::IMPLICITFAST) {
-    d = integrate_implicit(m, d);
-  } else {
-    d = integrate_euler(m, d);
-  }
-  return d;
+Data step(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
-// step1: forward position + velocity + actuation (user can modify ctrl before step2)
-Data step1(const Model& m, Data d) {
-  d = fwd_position(m, d);
-  d = fwd_velocity(m, d);
-  d = fwd_actuation(m, d);
-  return d;
+Data step1(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
-// step2: acceleration + constraint solve + integration
-Data step2(const Model& m, Data d) {
-  d = fwd_acceleration(m, d);
-  int nefc_count = d.efc_J.shape(0);
-  if (nefc_count == 0) {
-    d.qacc = d.qacc_smooth;
-    d.qfrc_constraint = mx::zeros({m.nv});
-  } else {
-    d = solve(m, d);
-  }
-  if (m.opt.integrator == IntegratorType::RK4) {
-    d = integrate_rk4(m, d);
-  } else if (m.opt.integrator == IntegratorType::IMPLICIT ||
-             m.opt.integrator == IntegratorType::IMPLICITFAST) {
-    d = integrate_implicit(m, d);
-  } else {
-    d = integrate_euler(m, d);
-  }
-  return d;
+Data step2(const Model&, Data) {
+  throw std::runtime_error(
+      "Single-env MLX pipeline removed. Use the batched API (mjb_batched_step).");
 }
 
 // rne_post_constraint: compute per-body contact forces from constraint forces.
@@ -752,13 +491,9 @@ MJMLX_API void mjmlx_step2(const MjmlxModel* model, MjmlxData* data) {
   }
 }
 
-MJMLX_API void mjmlx_kinematics(const MjmlxModel* model, MjmlxData* data) {
-  if (!model || !data) return;
-  try {
-    data->data = mjmlx::kinematics(model->model, data->data);
-  } catch (...) {
-    throw;
-  }
+MJMLX_API void mjmlx_kinematics(const MjmlxModel*, MjmlxData*) {
+  throw std::runtime_error(
+      "Single-env MLX kinematics removed. Use the batched API.");
 }
 
 MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* data) {

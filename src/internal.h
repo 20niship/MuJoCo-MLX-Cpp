@@ -601,35 +601,10 @@ mx::array axis_angle_to_quat(const mx::array& axis, const mx::array& angle);
 mx::array inert_mul(const mx::array& inert, const mx::array& vel);
 mx::array motion_cross(const mx::array& u, const mx::array& v);
 mx::array motion_cross_force(const mx::array& v, const mx::array& f);
-std::pair<mx::array, mx::array> orthogonals(const mx::array& n);
-mx::array closest_segment_point(const mx::array& p0, const mx::array& p1,
-                                 const mx::array& point);
-std::pair<mx::array, mx::array> closest_segment_to_segment_points(
-    const mx::array& a0, const mx::array& a1,
-    const mx::array& b0, const mx::array& b1);
-
-// smooth.cpp
-Data kinematics(const Model& m, Data d);
-Data com_pos(const Model& m, Data d);
-Data crb(const Model& m, Data d);
-Data factor_m(const Model& m, Data d);
-mx::array solve_m(const Model& m, const Data& d, const mx::array& rhs);
-Data com_vel(const Model& m, Data d);
-Data rne(const Model& m, Data d, bool flg_acc = false);
-Data tendon(const Model& m, Data d);
-Data transmission(const Model& m, Data d);
-
-// collision.cpp
-Data collision(const Model& m, Data d);
-
-// constraint.cpp
-Data make_constraint(const Model& m, Data d);
-
-// solver.cpp
-Data solve(const Model& m, Data d);
-
-// passive.cpp
-Data passive(const Model& m, Data d);
+// NOTE: Single-env smooth.cpp, collision.cpp, constraint.cpp, solver.cpp,
+// passive.cpp, scan.cpp have been removed from the build.
+// Their declarations are no longer needed here.
+// The batched pipeline (vmap files + batched.cpp) replaces them entirely.
 
 // support.cpp
 bool is_sparse(const Model& m);
