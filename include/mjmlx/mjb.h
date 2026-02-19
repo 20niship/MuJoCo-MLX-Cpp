@@ -142,6 +142,53 @@ MJB_API const float* mjb_model_geom_pos(const MjbModel* model, int* n_out);
 MJB_API const float* mjb_model_geom_quat(const MjbModel* model, int* n_out);
 
 // ============================================================
+// Per-index state setters (float→double on CPU)
+// ============================================================
+
+MJB_API void mjb_set_qpos_at(MjbData* data, int index, float value);
+MJB_API void mjb_set_qvel_at(MjbData* data, int index, float value);
+MJB_API void mjb_set_ctrl_at(MjbData* data, int index, float value);
+
+// ============================================================
+// xfrc_applied (external force/torque per body, 6 floats each)
+// ============================================================
+
+MJB_API const float* mjb_get_xfrc_applied(const MjbData* data, int* n_out);
+MJB_API void mjb_set_xfrc_applied(MjbData* data, const float* values, int n);
+
+// ============================================================
+// Warnings / diagnostics
+// ============================================================
+
+// Returns data->warning[index].number (0..mjNWARNING-1).
+MJB_API int mjb_get_warning_count(const MjbData* data, int index);
+
+// ============================================================
+// Model I/O (save)
+// ============================================================
+
+// Save the last compiled model to XML. Returns 0 on success, -1 on error.
+MJB_API int mjb_save_last_xml(const MjbModel* model, const char* path,
+                              char* error_buf, int error_buf_size);
+
+// ============================================================
+// Utility wrappers
+// ============================================================
+
+// Compute 6D object velocity (3 rotational + 3 translational).
+// result must point to 6 floats. flg_local: 0=global, 1=local frame.
+MJB_API void mjb_object_velocity(const MjbModel* model, const MjbData* data,
+                                 int objtype, int objid, int flg_local,
+                                 float* result6);
+
+// Load a MuJoCo plugin library (.so/.dylib).
+MJB_API void mjb_load_plugin_library(const char* path);
+
+// Write to model hfield_data array (already float in MuJoCo).
+MJB_API void mjb_model_set_hfield_data(MjbModel* model, int offset,
+                                       const float* values, int n);
+
+// ============================================================
 // Batched simulation
 // ============================================================
 

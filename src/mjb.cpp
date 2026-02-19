@@ -675,6 +675,99 @@ MJB_API void mjb_set_mocap_quat(MjbData* data, const float* quat, int n) {
     }
 }
 
+// ── Per-index state setters ─────────────────────────────────────────────
+
+MJB_API void mjb_set_qpos_at(MjbData* data, int index, float value) {
+    if (!data || index < 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        if (index < data->model_ref->mj->nq)
+            data->mj->qpos[index] = (double)value;
+    }
+}
+
+MJB_API void mjb_set_qvel_at(MjbData* data, int index, float value) {
+    if (!data || index < 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        if (index < data->model_ref->mj->nv)
+            data->mj->qvel[index] = (double)value;
+    }
+}
+
+MJB_API void mjb_set_ctrl_at(MjbData* data, int index, float value) {
+    if (!data || index < 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        if (index < data->model_ref->mj->nu)
+            data->mj->ctrl[index] = (double)value;
+    }
+}
+
+// ── xfrc_applied ────────────────────────────────────────────────────────
+
+MJB_API const float* mjb_get_xfrc_applied(const MjbData* data, int* n_out) {
+    if (!data) { if (n_out) *n_out = 0; return nullptr; }
+    if (data->type == MJB_BACKEND_CPU)
+        return cpu_get(data->mj->xfrc_applied, data->model_ref->mj->nbody * 6, n_out, data->fbuf);
+    return nullptr;
+}
+
+MJB_API void mjb_set_xfrc_applied(MjbData* data, const float* values, int n) {
+    if (!data || !values || n <= 0) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        int max_n = data->model_ref->mj->nbody * 6;
+        int count = n < max_n ? n : max_n;
+        for (int i = 0; i < count; i++) data->mj->xfrc_applied[i] = (double)values[i];
+    }
+}
+
+// ── Warnings / diagnostics ──────────────────────────────────────────────
+
+MJB_API int mjb_get_warning_count(const MjbData* data, int index) {
+    if (!data || index < 0 || index >= mjNWARNING) return 0;
+    if (data->type == MJB_BACKEND_CPU) return data->mj->warning[index].number;
+    return 0;
+}
+
+// ── Model I/O (save) ────────────────────────────────────────────────────
+
+MJB_API int mjb_save_last_xml(const MjbModel* model, const char* path,
+                              char* error_buf, int error_buf_size) {
+    const mjModel* m = get_mj_model(model);
+    if (!m || !path) return -1;
+    mj_saveLastXML(path, const_cast<mjModel*>(m), error_buf, error_buf_size);
+    if (error_buf && error_buf[0] != '\0') return -1;
+    return 0;
+}
+
+// ── Utility wrappers ────────────────────────────────────────────────────
+
+MJB_API void mjb_object_velocity(const MjbModel* model, const MjbData* data,
+                                 int objtype, int objid, int flg_local,
+                                 float* result6) {
+    if (!model || !data || !result6) return;
+    if (data->type == MJB_BACKEND_CPU) {
+        double res[6];
+        mj_objectVelocity(model->mj, data->mj, objtype, objid, res, flg_local);
+        for (int i = 0; i < 6; i++) result6[i] = (float)res[i];
+    }
+}
+
+MJB_API void mjb_load_plugin_library(const char* path) {
+    if (path) mj_loadPluginLibrary(path);
+}
+
+MJB_API void mjb_model_set_hfield_data(MjbModel* model, int offset,
+                                       const float* values, int n) {
+    if (!model || !values || n <= 0 || offset < 0) return;
+    mjModel* m = nullptr;
+    if (model->type == MJB_BACKEND_CPU) m = model->mj;
+    else m = const_cast<mjModel*>(static_cast<const mjModel*>(mjmlx_get_mj_model(model->mlx)));
+    if (!m) return;
+    int max_n = (int)m->nhfielddata - offset;
+    if (max_n <= 0) return;
+    int count = n < max_n ? n : max_n;
+    for (int i = 0; i < count; i++) m->hfield_data[offset + i] = values[i];
+}
+
 // ── Batched simulation ──────────────────────────────────────────────────
 
 MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfig* config) {
