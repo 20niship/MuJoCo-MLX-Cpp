@@ -42,6 +42,8 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <dispatch/dispatch.h>
+#include <mujoco/mujoco.h>
 
 namespace mjmlx {
 
@@ -748,6 +750,80 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
 } // namespace mjmlx
 
+// ── CPU batched helpers (used by C API and Python bindings) ──────────────────
+
+// CPU batched: gather state from N mjData* into BatchedSim mx::array fields.
+MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
+    auto& s = handle->sim;
+    int B = s.num_envs;
+    const mjModel* m = handle->cpu_model;
+    int nq = m->nq, nv = m->nv, nb = m->nbody;
+
+    std::vector<float> qp(B * nq), qv(B * nv);
+    std::vector<float> xp(B * nb * 3), sc(B * nb * 3);
+    std::vector<float> ci(B * nb * 10), cv(B * nb * 6);
+    std::vector<float> qa(B * nv), ce(B * nb * 6);
+
+    for (int i = 0; i < B; i++) {
+        const mjData* d = handle->cpu_datas[i];
+        for (int j = 0; j < nq; j++) qp[i*nq + j] = (float)d->qpos[j];
+        for (int j = 0; j < nv; j++) qv[i*nv + j] = (float)d->qvel[j];
+        for (int j = 0; j < nb*3; j++) xp[i*nb*3 + j] = (float)d->xpos[j];
+        for (int j = 0; j < nb*3; j++) sc[i*nb*3 + j] = (float)d->subtree_com[j];
+        for (int j = 0; j < nb*10; j++) ci[i*nb*10 + j] = (float)d->cinert[j];
+        for (int j = 0; j < nb*6; j++) cv[i*nb*6 + j] = (float)d->cvel[j];
+        for (int j = 0; j < nv; j++) qa[i*nv + j] = (float)d->qfrc_actuator[j];
+        for (int j = 0; j < nb*6; j++) ce[i*nb*6 + j] = (float)d->cfrc_ext[j];
+    }
+
+    s.qpos = mx::reshape(mx::array(qp.data(), {B*nq}, mx::float32), {B, nq});
+    s.qvel = mx::reshape(mx::array(qv.data(), {B*nv}, mx::float32), {B, nv});
+    s.xpos = mx::reshape(mx::array(xp.data(), {B*nb*3}, mx::float32), {B, nb, 3});
+    s.subtree_com = mx::reshape(mx::array(sc.data(), {B*nb*3}, mx::float32), {B, nb, 3});
+    s.cinert = mx::reshape(mx::array(ci.data(), {B*nb*10}, mx::float32), {B, nb, 10});
+    s.cvel = mx::reshape(mx::array(cv.data(), {B*nb*6}, mx::float32), {B, nb, 6});
+    s.qfrc_actuator = mx::reshape(mx::array(qa.data(), {B*nv}, mx::float32), {B, nv});
+    s.cfrc_ext = mx::reshape(mx::array(ce.data(), {B*nb*6}, mx::float32), {B, nb, 6});
+}
+
+// CPU batched: sync qpos/qvel mx::arrays back to mjData instances.
+MJMLX_API void cpu_sync_state(MjmlxBatchedSim* handle) {
+    auto& s = handle->sim;
+    int B = s.num_envs;
+    const mjModel* m = handle->cpu_model;
+    int nq = m->nq, nv = m->nv;
+
+    mx::eval(s.qpos, s.qvel);
+    const float* qp = s.qpos.data<float>();
+    const float* qv = s.qvel.data<float>();
+
+    for (int i = 0; i < B; i++) {
+        mjData* d = handle->cpu_datas[i];
+        for (int j = 0; j < nq; j++) d->qpos[j] = (double)qp[i*nq + j];
+        for (int j = 0; j < nv; j++) d->qvel[j] = (double)qv[i*nv + j];
+    }
+}
+
+// CPU batched: step all environments in parallel using GCD dispatch_apply.
+MJMLX_API void cpu_batched_step(MjmlxBatchedSim* handle, const float* ctrl_flat, int frame_skip) {
+    int B = handle->sim.num_envs;
+    mjModel* m = handle->cpu_model;
+    int nu = m->nu;
+
+    dispatch_apply((size_t)B,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+        ^(size_t i) {
+            mjData* d = handle->cpu_datas[i];
+            if (ctrl_flat && nu > 0) {
+                for (int j = 0; j < nu; j++)
+                    d->ctrl[j] = (double)ctrl_flat[i * nu + j];
+            }
+            for (int fs = 0; fs < frame_skip; fs++)
+                mj_step(m, d);
+        }
+    );
+}
+
 // ── C API ────────────────────────────────────────────────────────────────────
 
 extern "C" {
@@ -764,19 +840,43 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
 
         int B = config->num_envs;
         int nq = model->model.nq, nv = model->model.nv;
-        int nu = model->model.nu;
 
-        // Initialize batched state from qpos0
-        std::vector<mx::array> qpos_list, qvel_list;
-        for (int i = 0; i < B; i++) {
-            qpos_list.push_back(model->model.qpos0);
-            qvel_list.push_back(mx::zeros({nv}));
+        if (config->use_gpu == 0 && model->mj_model) {
+            // CPU path: N independent mjData* with dispatch_apply stepping
+            handle->cpu_mode = true;
+            handle->cpu_model = model->mj_model;
+            handle->cpu_datas.resize(B);
+            for (int i = 0; i < B; i++) {
+                handle->cpu_datas[i] = mj_makeData(model->mj_model);
+                if (!handle->cpu_datas[i]) {
+                    delete handle;
+                    return nullptr;
+                }
+            }
+            if (config->solver_iterations > 0)
+                handle->cpu_model->opt.iterations = config->solver_iterations;
+
+            // Initialize mx::array state from default qpos0/zero qvel
+            std::vector<mx::array> qpos_list, qvel_list;
+            for (int i = 0; i < B; i++) {
+                qpos_list.push_back(model->model.qpos0);
+                qvel_list.push_back(mx::zeros({nv}));
+            }
+            handle->sim.qpos = mx::stack(qpos_list);
+            handle->sim.qvel = mx::stack(qvel_list);
+        } else {
+            // GPU path: compiled + vmapped MLX step function
+            std::vector<mx::array> qpos_list, qvel_list;
+            for (int i = 0; i < B; i++) {
+                qpos_list.push_back(model->model.qpos0);
+                qvel_list.push_back(mx::zeros({nv}));
+            }
+            handle->sim.qpos = mx::stack(qpos_list);
+            handle->sim.qvel = mx::stack(qvel_list);
+
+            handle->sim.compiled_step = mjmlx::make_batched_step(
+                model->model, B, config->use_gpu, config->solver_iterations);
         }
-        handle->sim.qpos = mx::stack(qpos_list);
-        handle->sim.qvel = mx::stack(qvel_list);
-
-        handle->sim.compiled_step = mjmlx::make_batched_step(
-            model->model, B, config->use_gpu, config->solver_iterations);
 
         return handle;
     } catch (const std::exception& e) {
@@ -787,6 +887,14 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
 
 MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) {
     if (!sim) return;
+
+    if (sim->cpu_mode) {
+        cpu_sync_state(sim);
+        cpu_batched_step(sim, ctrl_flat, 1);
+        cpu_gather_state(sim);
+        return;
+    }
+
     auto& s = sim->sim;
     int B = s.num_envs;
     int nu = s.model->nu;
@@ -885,12 +993,23 @@ MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, in
 }
 
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim) {
-    if (!sim) return;
+    if (!sim || sim->cpu_mode) return;
     mx::eval({sim->sim.qpos, sim->sim.qvel});
 }
 
 MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) {
     if (!sim || !reset_mask) return;
+
+    if (sim->cpu_mode) {
+        mjModel* m = sim->cpu_model;
+        for (int i = 0; i < sim->sim.num_envs; i++) {
+            if (reset_mask[i])
+                mj_resetData(m, sim->cpu_datas[i]);
+        }
+        cpu_gather_state(sim);
+        return;
+    }
+
     auto& s = sim->sim;
     int B = s.num_envs;
     int nq = s.model->nq, nv = s.model->nv;
@@ -916,6 +1035,15 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
 MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx,
                                            const float* qpos, int nq) {
     if (!sim || !qpos || env_idx < 0 || env_idx >= sim->sim.num_envs) return;
+
+    if (sim->cpu_mode) {
+        int model_nq = sim->cpu_model->nq;
+        if (nq != model_nq) return;
+        mjData* d = sim->cpu_datas[env_idx];
+        for (int j = 0; j < model_nq; j++) d->qpos[j] = (double)qpos[j];
+        return;
+    }
+
     auto& s = sim->sim;
     int B = s.num_envs;
     int model_nq = s.model->nq;
@@ -930,6 +1058,15 @@ MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx,
 MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx,
                                            const float* qvel, int nv) {
     if (!sim || !qvel || env_idx < 0 || env_idx >= sim->sim.num_envs) return;
+
+    if (sim->cpu_mode) {
+        int model_nv = sim->cpu_model->nv;
+        if (nv != model_nv) return;
+        mjData* d = sim->cpu_datas[env_idx];
+        for (int j = 0; j < model_nv; j++) d->qvel[j] = (double)qvel[j];
+        return;
+    }
+
     auto& s = sim->sim;
     int B = s.num_envs;
     int model_nv = s.model->nv;

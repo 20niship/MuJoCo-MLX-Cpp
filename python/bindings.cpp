@@ -188,9 +188,38 @@ NB_MODULE(_mjmlx_native, m) {
     nb::class_<PyBatchedSim>(m, "BatchedSim")
         .def_prop_ro("num_envs", [](const PyBatchedSim& s) { return s.num_envs; })
         .def_prop_ro("frame_skip", [](const PyBatchedSim& s) { return s.frame_skip; })
+        .def_prop_ro("cpu_mode", [](const PyBatchedSim& s) { return s.handle->cpu_mode; })
 
         // Step: advance all environments by frame_skip physics substeps
         .def("step", [](PyBatchedSim& s, nb::object ctrl_obj) {
+            auto* handle = &*s.handle;
+
+            if (handle->cpu_mode) {
+                // CPU path: dispatch_apply over N mjData*
+                auto& sim = s.sim();
+                int B = s.num_envs;
+                int nu = handle->cpu_model->nu;
+
+                // Sync qpos/qvel to mjData (in case set_qpos/set_qvel were called)
+                cpu_sync_state(handle);
+
+                // Extract ctrl as flat float* for the C stepping function
+                const float* ctrl_ptr = nullptr;
+                std::vector<float> ctrl_buf;
+                if (!ctrl_obj.is_none() && nu > 0) {
+                    mx::array ctrl = nb::cast<mx::array>(ctrl_obj);
+                    mx::eval(ctrl);
+                    const float* src = ctrl.data<float>();
+                    ctrl_buf.assign(src, src + B * nu);
+                    ctrl_ptr = ctrl_buf.data();
+                }
+
+                cpu_batched_step(handle, ctrl_ptr, s.frame_skip);
+                cpu_gather_state(handle);
+                return;
+            }
+
+            // GPU path: compiled + vmapped MLX step
             auto& sim = s.sim();
             int B = s.num_envs;
             int nu = sim.model->nu;
@@ -215,15 +244,27 @@ NB_MODULE(_mjmlx_native, m) {
 
         // Reset environments where mask[i] != 0
         .def("reset", [](PyBatchedSim& s, mx::array mask) {
+            auto* handle = &*s.handle;
             auto& sim = s.sim();
             int B = s.num_envs;
-            int nq = sim.model->nq, nv = sim.model->nv;
 
             mx::eval(mask);
+            auto mask_data = mask.data<int32_t>();
+
+            if (handle->cpu_mode) {
+                mjModel* m = handle->cpu_model;
+                for (int i = 0; i < B; i++) {
+                    if (mask_data[i])
+                        mj_resetData(m, handle->cpu_datas[i]);
+                }
+                cpu_gather_state(handle);
+                return;
+            }
+
+            int nq = sim.model->nq, nv = sim.model->nv;
             mx::eval(sim.qpos);
             mx::eval(sim.qvel);
 
-            auto mask_data = mask.data<int32_t>();
             auto qp = std::vector<float>(sim.qpos.data<float>(),
                                           sim.qpos.data<float>() + B * nq);
             auto qv = std::vector<float>(sim.qvel.data<float>(),
@@ -252,8 +293,30 @@ NB_MODULE(_mjmlx_native, m) {
         .def_prop_ro("cfrc_ext", [](const PyBatchedSim& s) { return s.sim().cfrc_ext; })
 
         // Direct state setters (for initialization with noise)
-        .def("set_qpos", [](PyBatchedSim& s, mx::array qpos) { s.sim().qpos = qpos; })
-        .def("set_qvel", [](PyBatchedSim& s, mx::array qvel) { s.sim().qvel = qvel; })
+        .def("set_qpos", [](PyBatchedSim& s, mx::array qpos) {
+            s.sim().qpos = qpos;
+            if (s.handle->cpu_mode) {
+                mx::eval(qpos);
+                const float* p = qpos.data<float>();
+                int nq = s.handle->cpu_model->nq;
+                for (int i = 0; i < s.num_envs; i++) {
+                    mjData* d = s.handle->cpu_datas[i];
+                    for (int j = 0; j < nq; j++) d->qpos[j] = (double)p[i*nq + j];
+                }
+            }
+        })
+        .def("set_qvel", [](PyBatchedSim& s, mx::array qvel) {
+            s.sim().qvel = qvel;
+            if (s.handle->cpu_mode) {
+                mx::eval(qvel);
+                const float* v = qvel.data<float>();
+                int nv = s.handle->cpu_model->nv;
+                for (int i = 0; i < s.num_envs; i++) {
+                    mjData* d = s.handle->cpu_datas[i];
+                    for (int j = 0; j < nv; j++) d->qvel[j] = (double)v[i*nv + j];
+                }
+            }
+        })
     ;
 
     // ── Free functions ───────────────────────────────────────────────────────

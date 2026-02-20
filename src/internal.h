@@ -670,4 +670,20 @@ struct MjmlxModel {
     ~MjmlxModel() { if (mj_model) mj_deleteModel(mj_model); }
 };
 struct MjmlxData { mjmlx::Data data; const mjmlx::Model* model_ref; };
-struct MjmlxBatchedSim { mjmlx::BatchedSim sim; };
+struct MjmlxBatchedSim {
+    mjmlx::BatchedSim sim;
+
+    // CPU batched path: dispatch_apply over N mjData* (fast C MuJoCo)
+    bool cpu_mode = false;
+    mjModel* cpu_model = nullptr;           // borrowed from MjmlxModel, not owned
+    std::vector<mjData*> cpu_datas;
+
+    ~MjmlxBatchedSim() {
+        for (auto* d : cpu_datas) if (d) mj_deleteData(d);
+    }
+};
+
+// CPU batched helper functions (defined in batched.cpp, used by bindings.cpp)
+MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle);
+MJMLX_API void cpu_sync_state(MjmlxBatchedSim* handle);
+MJMLX_API void cpu_batched_step(MjmlxBatchedSim* handle, const float* ctrl_flat, int frame_skip);
