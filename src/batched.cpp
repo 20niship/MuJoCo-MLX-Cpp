@@ -913,6 +913,34 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
     s.qvel = mx::reshape(mx::array(qv.data(), {B * nv}, mx::float32), {B, nv});
 }
 
+MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx,
+                                           const float* qpos, int nq) {
+    if (!sim || !qpos || env_idx < 0 || env_idx >= sim->sim.num_envs) return;
+    auto& s = sim->sim;
+    int B = s.num_envs;
+    int model_nq = s.model->nq;
+    if (nq != model_nq) return;
+
+    mx::eval(s.qpos);
+    std::vector<float> qp(s.qpos.data<float>(), s.qpos.data<float>() + B * model_nq);
+    std::memcpy(&qp[env_idx * model_nq], qpos, model_nq * sizeof(float));
+    s.qpos = mx::reshape(mx::array(qp.data(), {B * model_nq}, mx::float32), {B, model_nq});
+}
+
+MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx,
+                                           const float* qvel, int nv) {
+    if (!sim || !qvel || env_idx < 0 || env_idx >= sim->sim.num_envs) return;
+    auto& s = sim->sim;
+    int B = s.num_envs;
+    int model_nv = s.model->nv;
+    if (nv != model_nv) return;
+
+    mx::eval(s.qvel);
+    std::vector<float> qv(s.qvel.data<float>(), s.qvel.data<float>() + B * model_nv);
+    std::memcpy(&qv[env_idx * model_nv], qvel, model_nv * sizeof(float));
+    s.qvel = mx::reshape(mx::array(qv.data(), {B * model_nv}, mx::float32), {B, model_nv});
+}
+
 MJMLX_API void mjmlx_batched_free(MjmlxBatchedSim* sim) {
     delete sim;
 }

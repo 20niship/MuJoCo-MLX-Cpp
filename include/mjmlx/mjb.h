@@ -217,6 +217,12 @@ MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_qfrc_actuator(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cfrc_ext(const MjbBatchedSim* sim, int* n_out);
 
+// Per-env state setters (for custom RSI resets with noise).
+// CPU backend: writes directly to env's mjData.
+// MLX backend: eval + copy + modify row + create new mx::array.
+MJB_API void mjb_batched_set_env_qpos(MjbBatchedSim* sim, int env_idx, const float* qpos, int nq);
+MJB_API void mjb_batched_set_env_qvel(MjbBatchedSim* sim, int env_idx, const float* qvel, int nv);
+
 // Evaluate qpos + qvel in a single GPU fence before reading state. No-op for CPU backend.
 MJB_API void mjb_batched_eval_state(const MjbBatchedSim* sim);
 

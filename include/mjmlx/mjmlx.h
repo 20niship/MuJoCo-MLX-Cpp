@@ -183,6 +183,10 @@ MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n
 MJMLX_API const float* mjmlx_batched_get_qfrc_actuator(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, int* n_out);
 
+// Per-env state setters (for custom RSI resets with noise).
+MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx, const float* qpos, int nq);
+MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx, const float* qvel, int nv);
+
 // Evaluate qpos + qvel in a single GPU fence. Call before get_qpos/get_qvel to
 // avoid two sequential GPU syncs.
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim);
