@@ -31,6 +31,13 @@ Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` 
 
 The Phase 1e result was inflated by missing tendon constraints -- the gymnasium humanoid XML has 2 fixed tendons coupling hip and knee joints, which were not implemented in the vmap path at Phase 1e. With tendons active, the humanoid must learn a more realistic gait. The conformance result (1,102) is still 2.4x the MuJoCo C baseline (451 @ 8M steps). Reward was still climbing at 32M steps.
 
+Reproduce the 73K SPS benchmark (requires [MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX) Python package):
+
+```bash
+python examples/train_humanoid.py --gpu-ceiling
+# or explicitly: --use-batched --num-envs 8192 --num-steps 10 --update-epochs 4 --hidden-size 64
+```
+
 SPS parity maintained via comprehensive zero-eval caching across two optimization passes:
 1. **Tendon cache** -- constant Jacobian, scatter matrix, actuator masks precomputed at load time
 2. **Full vmap cache** -- tree scatter matrices (smooth_vmap), DOF friction/joint limit/tendon constraint/contact invweight/equality constraint data (constraint_vmap) all precomputed in `ModelCache`
