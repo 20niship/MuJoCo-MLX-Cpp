@@ -245,6 +245,72 @@ mx::array transform_motion(const mx::array& vel, const mx::array& offset,
     return mx::concatenate({mx::flatten(new_ang), mx::flatten(new_lin)}, 0);
 }
 
+// ── Geometry helpers ──────────────────────────────────────────────────────────
+
+mx::array closest_segment_point(const mx::array& a, const mx::array& b,
+                                 const mx::array& pt) {
+    auto ab = mx::subtract(b, a);
+    auto ap = mx::subtract(pt, a);
+    auto num = mx::sum(mx::multiply(ap, ab));
+    auto den = mx::add(mx::sum(mx::multiply(ab, ab)), mx::array(1e-6f));
+    auto t = mx::clip(mx::divide(num, den), mx::array(0.0f), mx::array(1.0f));
+    return mx::add(a, mx::multiply(ab, t));
+}
+
+static std::pair<mx::array, mx::array> closest_segment_point_and_dist(
+    const mx::array& a, const mx::array& b, const mx::array& pt) {
+    auto closest = closest_segment_point(a, b, pt);
+    auto diff = mx::subtract(pt, closest);
+    auto dist = mx::sum(mx::multiply(diff, diff));
+    return {closest, dist};
+}
+
+static std::pair<mx::array, mx::array> normalize_with_norm(const mx::array& x) {
+    auto n = norm(x);
+    auto eps = mx::array(1e-6f);
+    auto is_zero = mx::less(n, eps);
+    auto safe_n = mx::where(is_zero, mx::array(1.0f), n);
+    return {mx::divide(x, safe_n), n};
+}
+
+std::pair<mx::array, mx::array> closest_segment_to_segment_points(
+    const mx::array& a0, const mx::array& a1,
+    const mx::array& b0, const mx::array& b1) {
+    auto [dir_a, len_a] = normalize_with_norm(mx::subtract(a1, a0));
+    auto [dir_b, len_b] = normalize_with_norm(mx::subtract(b1, b0));
+
+    auto half_a = mx::multiply(len_a, mx::array(0.5f));
+    auto half_b = mx::multiply(len_b, mx::array(0.5f));
+    auto a_mid = mx::add(a0, mx::multiply(dir_a, half_a));
+    auto b_mid = mx::add(b0, mx::multiply(dir_b, half_b));
+
+    auto trans = mx::subtract(a_mid, b_mid);
+    auto dab = mx::sum(mx::multiply(dir_a, dir_b));
+    auto dat = mx::sum(mx::multiply(dir_a, trans));
+    auto dbt = mx::sum(mx::multiply(dir_b, trans));
+
+    auto denom = mx::add(mx::subtract(mx::array(1.0f), mx::multiply(dab, dab)),
+                         mx::array(1e-6f));
+    auto orig_ta = mx::divide(mx::add(mx::negative(dat), mx::multiply(dab, dbt)), denom);
+    auto orig_tb = mx::add(dbt, mx::multiply(orig_ta, dab));
+
+    auto ta = mx::clip(orig_ta, mx::negative(half_a), half_a);
+    auto tb = mx::clip(orig_tb, mx::negative(half_b), half_b);
+
+    auto best_a = mx::add(a_mid, mx::multiply(dir_a, ta));
+    auto best_b = mx::add(b_mid, mx::multiply(dir_b, tb));
+
+    auto [new_a, d1] = closest_segment_point_and_dist(a0, a1, best_b);
+    auto [new_b, d2] = closest_segment_point_and_dist(b0, b1, best_a);
+
+    mx::eval(d1); mx::eval(d2);
+    if (d1.item<float>() < d2.item<float>()) {
+        return {new_a, best_b};
+    } else {
+        return {best_a, new_b};
+    }
+}
+
 // ── Batched math helpers (for vmap-compatible path) ───────────────────────────
 
 mx::array batched_cross(const mx::array& a, const mx::array& b) {

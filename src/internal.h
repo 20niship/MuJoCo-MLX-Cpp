@@ -601,10 +601,10 @@ mx::array axis_angle_to_quat(const mx::array& axis, const mx::array& angle);
 mx::array inert_mul(const mx::array& inert, const mx::array& vel);
 mx::array motion_cross(const mx::array& u, const mx::array& v);
 mx::array motion_cross_force(const mx::array& v, const mx::array& f);
-// NOTE: Single-env smooth.cpp, collision.cpp, constraint.cpp, solver.cpp,
-// passive.cpp, scan.cpp have been removed from the build.
-// Their declarations are no longer needed here.
-// The batched pipeline (vmap files + batched.cpp) replaces them entirely.
+mx::array closest_segment_point(const mx::array& a, const mx::array& b, const mx::array& pt);
+std::pair<mx::array, mx::array> closest_segment_to_segment_points(
+    const mx::array& a0, const mx::array& a1,
+    const mx::array& b0, const mx::array& b1);
 
 // support.cpp
 bool is_sparse(const Model& m);
