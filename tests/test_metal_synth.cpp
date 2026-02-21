@@ -191,6 +191,157 @@ int main(int argc, char** argv) {
     }
     TEST_END();
 
+    // ═══════════════════════════════════════════════════════════════
+    // Phase 1: Metal forward kernel (smooth dynamics)
+    // ═══════════════════════════════════════════════════════════════
+    TEST_SECTION("Phase 1: Metal Forward Kernel");
+
+    TEST_BEGIN("metal_forward_qM_vs_mjc");
+    {
+        mj_resetData(mj_m, mj_d);
+        mj_forward(mj_m, mj_d);
+
+        std::vector<double> mj_qM_dense(nv * nv, 0.0);
+        mj_fullM(mj_m, mj_qM_dense.data(), mj_d->qM);
+
+        mjmlx::Model& m_ref = model->model;
+        m_ref.init_cache();
+
+        int nj = m_ref.njnt, ng = m_ref.ngeom;
+        auto cvt = [](const double* src, int n) {
+            std::vector<float> v(n); for (int i = 0; i < n; i++) v[i] = (float)src[i]; return v;
+        };
+
+        auto xip = cvt(mj_d->xipos, nb*3);
+        auto xim = cvt(mj_d->ximat, nb*9);
+        auto xa = cvt(mj_d->xanchor, nj*3);
+        auto xax = cvt(mj_d->xaxis, nj*3);
+        auto xm = cvt(mj_d->xmat, nb*9);
+        std::vector<float> qp(nq); for (int i = 0; i < nq; i++) qp[i] = (float)mj_m->qpos0[i];
+        std::vector<float> qv(nv, 0.0f);
+        std::vector<float> ct(std::max(info.nu, 1), 0.0f);
+
+        auto result = mjmlx::test_metal_forward(
+            m_ref,
+            mx::array(xip.data(), {nb*3}, mx::float32),
+            mx::array(xim.data(), {nb*9}, mx::float32),
+            mx::array(xa.data(), {nj*3}, mx::float32),
+            mx::array(xax.data(), {nj*3}, mx::float32),
+            mx::array(xm.data(), {nb*9}, mx::float32),
+            mx::array(qp.data(), {nq}, mx::float32),
+            mx::array(qv.data(), {nv}, mx::float32),
+            mx::array(ct.data(), {std::max(info.nu, 1)}, mx::float32)
+        );
+
+        mx::eval(result.qM, result.qfrc_smooth, result.qfrc_actuator);
+
+        auto qM_flat = mx::flatten(result.qM);
+        mx::eval(qM_flat);
+        const float* metal_qM = qM_flat.data<float>();
+
+        float maxd_qM = 0; int wi = -1, wj = -1;
+        for (int i = 0; i < nv; i++)
+            for (int j = 0; j < nv; j++) {
+                float diff = std::abs(metal_qM[i*nv+j] - (float)mj_qM_dense[i*nv+j]);
+                if (diff > maxd_qM) { maxd_qM = diff; wi = i; wj = j; }
+            }
+        printf("    Metal qM max diff: %.6e at [%d,%d]\n", maxd_qM, wi, wj);
+        if (wi >= 0) printf("    Metal qM[%d,%d]=%.6f, MjC=%.6f\n", wi, wj,
+                            metal_qM[wi*nv+wj], (float)mj_qM_dense[wi*nv+wj]);
+
+        float min_diag = 1e30f, max_diag = 0;
+        for (int i = 0; i < nv; i++) {
+            float v = std::abs(metal_qM[i*nv+i]);
+            if (v < min_diag) min_diag = v;
+            if (v > max_diag) max_diag = v;
+        }
+        printf("    Metal qM diag range: [%.6e, %.6e]\n", min_diag, max_diag);
+
+        CHECK_LT(maxd_qM, 0.01f, "Metal kernel qM matches MuJoCo C within 0.01");
+        CHECK_LT(min_diag, 1e10f, "Metal kernel qM diag not exploded");
+
+        const float* metal_qfs = result.qfrc_smooth.data<float>();
+        float maxd_qfs = 0; int wf = -1;
+        for (int i = 0; i < nv; i++) {
+            float diff = std::abs(metal_qfs[i] - (float)mj_d->qfrc_smooth[i]);
+            if (diff > maxd_qfs) { maxd_qfs = diff; wf = i; }
+        }
+        printf("    Metal qfrc_smooth max diff: %.6e at [%d]\n", maxd_qfs, wf);
+        if (wf >= 0) printf("    Metal qfrc_smooth[%d]=%.6f, MjC=%.6f\n", wf,
+                            metal_qfs[wf], (float)mj_d->qfrc_smooth[wf]);
+
+        CHECK_LT(maxd_qfs, 1.0f, "Metal kernel qfrc_smooth matches MuJoCo C within 1.0");
+    }
+    TEST_END();
+
+    TEST_BEGIN("metal_forward_subtree_com_cinert_cvel_vs_mjc");
+    {
+        mj_resetData(mj_m, mj_d);
+
+        // Apply random qvel for cvel testing
+        for (int i = 0; i < nv; i++) mj_d->qvel[i] = 0.01 * (i % 7 - 3);
+        mj_forward(mj_m, mj_d);
+
+        mjmlx::Model& m_ref = model->model;
+        m_ref.init_cache();
+        int nj = m_ref.njnt, ng = m_ref.ngeom;
+
+        auto cvt = [](const double* src, int n) {
+            std::vector<float> v(n); for (int i = 0; i < n; i++) v[i] = (float)src[i]; return v;
+        };
+
+        auto xip = cvt(mj_d->xipos, nb*3);
+        auto xim = cvt(mj_d->ximat, nb*9);
+        auto xa = cvt(mj_d->xanchor, nj*3);
+        auto xax = cvt(mj_d->xaxis, nj*3);
+        auto xm = cvt(mj_d->xmat, nb*9);
+        auto qp = cvt(mj_d->qpos, nq);
+        auto qv = cvt(mj_d->qvel, nv);
+        std::vector<float> ct(std::max(info.nu, 1), 0.0f);
+
+        auto result = mjmlx::test_metal_forward(
+            m_ref,
+            mx::array(xip.data(), {nb*3}, mx::float32),
+            mx::array(xim.data(), {nb*9}, mx::float32),
+            mx::array(xa.data(), {nj*3}, mx::float32),
+            mx::array(xax.data(), {nj*3}, mx::float32),
+            mx::array(xm.data(), {nb*9}, mx::float32),
+            mx::array(qp.data(), {nq}, mx::float32),
+            mx::array(qv.data(), {nv}, mx::float32),
+            mx::array(ct.data(), {std::max(info.nu, 1)}, mx::float32)
+        );
+
+        mx::eval(result.subtree_com, result.cinert, result.cvel);
+
+        const float* metal_sc = result.subtree_com.data<float>();
+        float maxd_sc = 0;
+        for (int i = 0; i < nb * 3; i++) {
+            float diff = std::abs(metal_sc[i] - (float)mj_d->subtree_com[i]);
+            if (diff > maxd_sc) maxd_sc = diff;
+        }
+        printf("    subtree_com max diff: %.6e\n", maxd_sc);
+        CHECK_LT(maxd_sc, 0.01f, "Metal subtree_com matches MuJoCo C within 0.01");
+
+        const float* metal_ci = result.cinert.data<float>();
+        float maxd_ci = 0;
+        for (int i = 0; i < nb * 10; i++) {
+            float diff = std::abs(metal_ci[i] - (float)mj_d->cinert[i]);
+            if (diff > maxd_ci) maxd_ci = diff;
+        }
+        printf("    cinert max diff: %.6e\n", maxd_ci);
+        CHECK_LT(maxd_ci, 0.1f, "Metal cinert matches MuJoCo C within 0.1");
+
+        const float* metal_cv = result.cvel.data<float>();
+        float maxd_cv = 0;
+        for (int i = 0; i < nb * 6; i++) {
+            float diff = std::abs(metal_cv[i] - (float)mj_d->cvel[i]);
+            if (diff > maxd_cv) maxd_cv = diff;
+        }
+        printf("    cvel max diff: %.6e\n", maxd_cv);
+        CHECK_LT(maxd_cv, 0.01f, "Metal cvel matches MuJoCo C within 0.01");
+    }
+    TEST_END();
+
     // Test 1: GPU vs MuJoCo C (contact-free) — 1 step from default state
     TEST_BEGIN("gpu_vs_mjc_contact_free_1step");
     {

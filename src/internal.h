@@ -657,6 +657,20 @@ Data vmap_solve(const Model& m, Data d);
 // forward_vmap.cpp (exported for test_metal_synth diagnostics)
 MJMLX_API Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
 
+struct MetalForwardResult {
+    mx::array qM{0.0f};
+    mx::array qfrc_smooth{0.0f};
+    mx::array subtree_com{0.0f};
+    mx::array cinert{0.0f};
+    mx::array cvel{0.0f};
+    mx::array qfrc_actuator{0.0f};
+};
+MJMLX_API MetalForwardResult test_metal_forward(
+    const Model& m,
+    const mx::array& xipos, const mx::array& ximat,
+    const mx::array& xanchor, const mx::array& xaxis, const mx::array& xmat,
+    const mx::array& qpos, const mx::array& qvel, const mx::array& ctrl);
+
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);
 mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel);

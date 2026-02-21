@@ -534,6 +534,637 @@ static std::string make_euler_devmem_source(
     return ss.str();
 }
 
+// ── Metal forward dynamics kernel (smooth dynamics for nv > 80) ──────────────
+// Replaces the vmap(forward_dynamics) path for large models. Single Metal dispatch
+// per batch. Computes: com_pos → cinert → cdof → crb → qM → com_vel → rne →
+// passive → actuation → qfrc_smooth.
+//
+// Scratch layout per env (in floats):
+//   crb[nb*10], cdof[nv*6], cdof_dot[nv*6], cacc[nb*6], cfrc[nb*6],
+//   sub_pos[nb*3], sub_mass[nb], qfrc_bias[nv], qfrc_passive[nv]
+
+static std::string make_forward_source(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int nb = m.nbody, nv = m.nv, nq = m.nq, nu = m.nu, njnt = m.njnt;
+    float dt = m.opt.timestep;
+
+    // Scratch offsets per env
+    int off_crb = 0;
+    int off_cdof = nb * 10;
+    int off_cdof_dot = off_cdof + nv * 6;
+    int off_cacc = off_cdof_dot + nv * 6;
+    int off_cfrc = off_cacc + nb * 6;
+    int off_subpos = off_cfrc + nb * 6;
+    int off_submass = off_subpos + nb * 3;
+    int off_qfrc_bias = off_submass + nb;
+    int off_qfrc_passive = off_qfrc_bias + nv;
+    int scratch_per_env = off_qfrc_passive + nv;
+
+    // Extract model constants to bake into source
+    mx::eval(m.body_parentid, m.body_mass, m.body_inertia, m.dof_damping);
+    mx::eval(m.jnt_type, m.jnt_dofadr, m.jnt_qposadr, m.body_jntadr, m.body_jntnum);
+    mx::eval(m.dof_bodyid);
+    if (m.dof_armature.size() > 0) mx::eval(m.dof_armature);
+    if (m.dof_parentid.size() > 0) mx::eval(m.dof_parentid);
+
+    auto bpar_ptr = m.body_parentid.data<int>();
+    auto bmass_ptr = m.body_mass.data<float>();
+    auto binert_ptr = m.body_inertia.data<float>();
+    auto jt_ptr = m.jnt_type.data<int>();
+    auto jda_ptr = m.jnt_dofadr.data<int>();
+    auto jqa_ptr = m.jnt_qposadr.data<int>();
+    auto bja_ptr = m.body_jntadr.data<int>();
+    auto bjn_ptr = m.body_jntnum.data<int>();
+    auto dbid_ptr = m.dof_bodyid.data<int>();
+    auto ddamp_ptr = m.dof_damping.data<float>();
+    auto dpar_ptr = m.dof_parentid.data<int>();
+
+    // body_rootid
+    mx::eval(m.body_rootid);
+    auto broot_ptr = m.body_rootid.data<int>();
+
+    // dof_armature
+    std::vector<float> armature_vals(nv, 0.0f);
+    if (m.dof_armature.size() > 0) {
+        auto arm_ptr = m.dof_armature.data<float>();
+        for (int i = 0; i < nv; i++) armature_vals[i] = arm_ptr[i];
+    }
+
+    // Passive force: extract per-dof stiffness (jnt_stiffness mapped via joint→dof)
+    std::vector<float> dof_stiffness(nv, 0.0f);
+    if (m.jnt_stiffness.size() > 0) {
+        mx::eval(m.jnt_stiffness);
+        auto jstiff_ptr = m.jnt_stiffness.data<float>();
+        for (int j = 0; j < njnt; j++) {
+            int jt = jt_ptr[j];
+            int da = jda_ptr[j];
+            if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) {
+                dof_stiffness[da] = jstiff_ptr[j];
+            } else if (jt == (int)JointType::FREE) {
+                // Free joints: no spring force on translation DOFs
+            }
+        }
+    }
+
+    // qpos_spring: the spring reference position
+    std::vector<float> qpos_spring_vals(nq, 0.0f);
+    if (m.qpos_spring.size() > 0) {
+        mx::eval(m.qpos_spring);
+        auto qsp_ptr = m.qpos_spring.data<float>();
+        for (int i = 0; i < nq; i++) qpos_spring_vals[i] = qsp_ptr[i];
+    }
+
+    // Actuator parameters
+    std::vector<float> act_gain0(std::max(nu, 1), 0.0f);
+    std::vector<float> act_bias0(std::max(nu, 1), 0.0f);
+    std::vector<float> act_bias1(std::max(nu, 1), 0.0f);
+    std::vector<float> act_bias2(std::max(nu, 1), 0.0f);
+    if (nu > 0 && m.actuator_gainprm.size() > 0) {
+        mx::eval(m.actuator_gainprm, m.actuator_biasprm);
+        auto gp = m.actuator_gainprm.data<float>();
+        auto bp = m.actuator_biasprm.data<float>();
+        int ncol = (int)m.actuator_gainprm.shape(1);
+        for (int i = 0; i < nu; i++) {
+            act_gain0[i] = gp[i * ncol];
+            act_bias0[i] = bp[i * ncol];
+            act_bias1[i] = bp[i * ncol + 1];
+            act_bias2[i] = bp[i * ncol + 2];
+        }
+    }
+
+    // Build per-DOF joint index (which joint does each DOF belong to)
+    std::vector<int> dof_jntid(nv, -1);
+    for (int j = 0; j < njnt; j++) {
+        int jt = jt_ptr[j];
+        int da = jda_ptr[j];
+        int ndof = (jt == 0) ? 6 : (jt == 1) ? 3 : 1;
+        for (int k = 0; k < ndof; k++) dof_jntid[da + k] = j;
+    }
+
+    // Per-DOF qpos address (for passive spring forces)
+    std::vector<int> dof_qposadr(nv, 0);
+    for (int j = 0; j < njnt; j++) {
+        int jt = jt_ptr[j], da = jda_ptr[j], qa = jqa_ptr[j];
+        int ndof = (jt == 0) ? 6 : (jt == 1) ? 3 : 1;
+        for (int k = 0; k < ndof; k++) dof_qposadr[da + k] = qa + k;
+    }
+
+    // Build body→dofs mapping
+    std::vector<std::vector<int>> body_dofs(nb);
+    for (int di = 0; di < nv; di++) body_dofs[dbid_ptr[di]].push_back(di);
+
+    // Gravity
+    float grav[3] = {0, 0, 0};
+    if (m.opt.gravity.size() > 0) {
+        mx::eval(m.opt.gravity);
+        auto gp = m.opt.gravity.data<float>();
+        grav[0] = gp[0]; grav[1] = gp[1]; grav[2] = gp[2];
+    }
+
+    std::ostringstream ss;
+    ss << std::scientific;
+
+    // ── Dimensions and offsets ──
+    ss << "uint bid = thread_position_in_grid.x;\n"
+       << "const int NB = " << nb << ";\n"
+       << "const int NV = " << nv << ";\n"
+       << "const int NQ = " << nq << ";\n"
+       << "const int NU = " << nu << ";\n"
+       << "const int NJNT = " << njnt << ";\n"
+       << "const int SCRATCH_SZ = " << scratch_per_env << ";\n\n";
+
+    // Per-env offsets for batched arrays
+    ss << "uint xip_off = bid * NB * 3;\n"
+       << "uint xim_off = bid * NB * 9;\n"
+       << "uint xa_off  = bid * NJNT * 3;\n"
+       << "uint xax_off = bid * NJNT * 3;\n"
+       << "uint xm_off  = bid * NB * 9;\n"
+       << "uint q_off   = bid * NQ;\n"
+       << "uint v_off   = bid * NV;\n"
+       << "uint u_off   = bid * NU;\n"
+       << "uint qM_off  = bid * NV * NV;\n"
+       << "uint qfs_off = bid * NV;\n"
+       << "uint sc_off  = bid * NB * 3;\n"
+       << "uint ci_off  = bid * NB * 10;\n"
+       << "uint cv_off  = bid * NB * 6;\n"
+       << "uint qa_off  = bid * NV;\n"
+       << "uint s_off   = bid * SCRATCH_SZ;\n\n";
+
+    // Scratch sub-offsets
+    ss << "const int S_CRB = " << off_crb << ";\n"
+       << "const int S_CDOF = " << off_cdof << ";\n"
+       << "const int S_CDOFD = " << off_cdof_dot << ";\n"
+       << "const int S_CACC = " << off_cacc << ";\n"
+       << "const int S_CFRC = " << off_cfrc << ";\n"
+       << "const int S_SUBP = " << off_subpos << ";\n"
+       << "const int S_SUBM = " << off_submass << ";\n"
+       << "const int S_BIAS = " << off_qfrc_bias << ";\n"
+       << "const int S_PASS = " << off_qfrc_passive << ";\n\n";
+
+    // ── Baked model constants ──
+    ss << "// Body parent IDs\n"
+       << "const int body_par[] = {";
+    for (int i = 0; i < nb; i++) ss << bpar_ptr[i] << (i < nb-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const int body_root[] = {";
+    for (int i = 0; i < nb; i++) ss << broot_ptr[i] << (i < nb-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float body_mass[] = {";
+    for (int i = 0; i < nb; i++) ss << bmass_ptr[i] << "f" << (i < nb-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float body_inert[] = {";
+    for (int i = 0; i < nb * 3; i++) ss << binert_ptr[i] << "f" << (i < nb*3-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const int dof_bodyid[] = {";
+    for (int i = 0; i < nv; i++) ss << dbid_ptr[i] << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const int dof_par[] = {";
+    for (int i = 0; i < nv; i++) ss << dpar_ptr[i] << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float dof_damp[] = {";
+    for (int i = 0; i < nv; i++) ss << ddamp_ptr[i] << "f" << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float dof_arm[] = {";
+    for (int i = 0; i < nv; i++) ss << armature_vals[i] << "f" << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float dof_stiff[] = {";
+    for (int i = 0; i < nv; i++) ss << dof_stiffness[i] << "f" << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const int dof_qa[] = {";
+    for (int i = 0; i < nv; i++) ss << dof_qposadr[i] << (i < nv-1 ? "," : "");
+    ss << "};\n";
+
+    ss << "const float qpos_spr[] = {";
+    for (int i = 0; i < nq; i++) ss << qpos_spring_vals[i] << "f" << (i < nq-1 ? "," : "");
+    ss << "};\n";
+
+    if (nu > 0) {
+        ss << "const float act_g0[] = {";
+        for (int i = 0; i < nu; i++) ss << act_gain0[i] << "f" << (i < nu-1 ? "," : "");
+        ss << "};\n";
+        ss << "const float act_b0[] = {";
+        for (int i = 0; i < nu; i++) ss << act_bias0[i] << "f" << (i < nu-1 ? "," : "");
+        ss << "};\n";
+        ss << "const float act_b1[] = {";
+        for (int i = 0; i < nu; i++) ss << act_bias1[i] << "f" << (i < nu-1 ? "," : "");
+        ss << "};\n";
+        ss << "const float act_b2[] = {";
+        for (int i = 0; i < nu; i++) ss << act_bias2[i] << "f" << (i < nu-1 ? "," : "");
+        ss << "};\n";
+    }
+
+    // Per-DOF joint type and sub-index (for cdof computation)
+    ss << "const int dof_jtype[] = {";
+    for (int i = 0; i < nv; i++) {
+        int ji = dof_jntid[i];
+        ss << (ji >= 0 ? jt_ptr[ji] : -1) << (i < nv-1 ? "," : "");
+    }
+    ss << "};\n";
+
+    // For free/ball rotation DOFs: which rotation axis (0,1,2)
+    ss << "const int dof_rotaxis[] = {";
+    for (int i = 0; i < nv; i++) {
+        int ji = dof_jntid[i];
+        int da = (ji >= 0) ? jda_ptr[ji] : 0;
+        int jt = (ji >= 0) ? jt_ptr[ji] : -1;
+        int sub = i - da;
+        int rotax = -1;
+        if (jt == 0 && sub >= 3) rotax = sub - 3;
+        if (jt == 1) rotax = sub;
+        ss << rotax << (i < nv-1 ? "," : "");
+    }
+    ss << "};\n";
+
+    // Per-DOF joint index (for anchor/axis lookup)
+    ss << "const int dof_jid[] = {";
+    for (int i = 0; i < nv; i++) ss << dof_jntid[i] << (i < nv-1 ? "," : "");
+    ss << "};\n\n";
+
+    // ═══ PHASE A: Subtree COM + Cinert + CDof ═══
+    ss << "// ── Phase A: subtree COM, cinert, cdof ──\n";
+
+    // Initialize subtree mass/pos
+    ss << "for (int b = 0; b < NB; b++) {\n"
+       << "  float m = body_mass[b];\n"
+       << "  scratch[s_off + S_SUBM + b] = m;\n"
+       << "  for (int k = 0; k < 3; k++)\n"
+       << "    scratch[s_off + S_SUBP + b*3+k] = xipos[xip_off + b*3+k] * m;\n"
+       << "}\n";
+
+    // Backward accumulation for subtree COM
+    ss << "for (int b = NB-1; b >= 1; b--) {\n"
+       << "  int p = body_par[b];\n"
+       << "  scratch[s_off + S_SUBM + p] += scratch[s_off + S_SUBM + b];\n"
+       << "  for (int k = 0; k < 3; k++)\n"
+       << "    scratch[s_off + S_SUBP + p*3+k] += scratch[s_off + S_SUBP + b*3+k];\n"
+       << "}\n";
+
+    // Compute subtree_com = sub_pos / sub_mass
+    ss << "for (int b = 0; b < NB; b++) {\n"
+       << "  float sm = max(scratch[s_off + S_SUBM + b], 1e-8f);\n"
+       << "  for (int k = 0; k < 3; k++)\n"
+       << "    subtree_com_out[sc_off + b*3+k] = scratch[s_off + S_SUBP + b*3+k] / sm;\n"
+       << "}\n\n";
+
+    // Compute cinert for each body
+    ss << "for (int b = 0; b < NB; b++) {\n"
+       << "  float m = body_mass[b];\n"
+       << "  int rid = body_root[b];\n"
+       << "  float off[3];\n"
+       << "  for (int k = 0; k < 3; k++)\n"
+       << "    off[k] = xipos[xip_off + b*3+k] - subtree_com_out[sc_off + rid*3+k];\n"
+       // Transform inertia to global frame: R diag(I) R^T
+       << "  float R[9]; for (int k=0;k<9;k++) R[k] = ximat[xim_off + b*9+k];\n"
+       << "  float Ix = body_inert[b*3], Iy = body_inert[b*3+1], Iz = body_inert[b*3+2];\n"
+       // RI = R * diag(Ix,Iy,Iz)
+       << "  float RI[9] = {R[0]*Ix,R[1]*Iy,R[2]*Iz, R[3]*Ix,R[4]*Iy,R[5]*Iz, R[6]*Ix,R[7]*Iy,R[8]*Iz};\n"
+       // I_g = RI * R^T
+       << "  float Ig[9];\n"
+       << "  for (int r=0;r<3;r++) for (int c=0;c<3;c++) {\n"
+       << "    float s=0; for (int k=0;k<3;k++) s += RI[r*3+k]*R[c*3+k];\n"
+       << "    Ig[r*3+c] = s;\n"
+       << "  }\n"
+       // Parallel axis theorem: I += m*(d²I - outer(off,off))
+       << "  float d2 = off[0]*off[0]+off[1]*off[1]+off[2]*off[2];\n"
+       << "  Ig[0] += m*(d2 - off[0]*off[0]); Ig[4] += m*(d2 - off[1]*off[1]); Ig[8] += m*(d2 - off[2]*off[2]);\n"
+       << "  Ig[1] -= m*off[0]*off[1]; Ig[3] -= m*off[1]*off[0];\n"
+       << "  Ig[2] -= m*off[0]*off[2]; Ig[6] -= m*off[2]*off[0];\n"
+       << "  Ig[5] -= m*off[1]*off[2]; Ig[7] -= m*off[2]*off[1];\n"
+       // cinert: [I00, I11, I22, I01, I02, I12, px*m, py*m, pz*m, mass]
+       << "  cinert_out[ci_off + b*10+0] = Ig[0];\n"
+       << "  cinert_out[ci_off + b*10+1] = Ig[4];\n"
+       << "  cinert_out[ci_off + b*10+2] = Ig[8];\n"
+       << "  cinert_out[ci_off + b*10+3] = Ig[1];\n"
+       << "  cinert_out[ci_off + b*10+4] = Ig[2];\n"
+       << "  cinert_out[ci_off + b*10+5] = Ig[5];\n"
+       << "  cinert_out[ci_off + b*10+6] = off[0]*m;\n"
+       << "  cinert_out[ci_off + b*10+7] = off[1]*m;\n"
+       << "  cinert_out[ci_off + b*10+8] = off[2]*m;\n"
+       << "  cinert_out[ci_off + b*10+9] = m;\n"
+       << "}\n\n";
+
+    // Compute cdof for each DOF
+    ss << "for (int di = 0; di < NV; di++) {\n"
+       << "  int bdi = dof_bodyid[di];\n"
+       << "  int jt = dof_jtype[di];\n"
+       << "  int ji = dof_jid[di];\n"
+       << "  int ra = dof_rotaxis[di];\n"
+       << "  int rid = body_root[bdi];\n"
+       << "  float rc[3]; for (int k=0;k<3;k++) rc[k] = subtree_com_out[sc_off + rid*3+k];\n"
+       << "  float c6[6] = {0,0,0,0,0,0};\n"
+       << "  if (jt == 3) {\n"  // HINGE
+       << "    float ax[3] = {xaxis[xax_off+ji*3], xaxis[xax_off+ji*3+1], xaxis[xax_off+ji*3+2]};\n"
+       << "    float anc[3] = {xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]};\n"
+       << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
+       << "    c6[0]=ax[0]; c6[1]=ax[1]; c6[2]=ax[2];\n"
+       << "    c6[3]=ax[1]*d[2]-ax[2]*d[1]; c6[4]=ax[2]*d[0]-ax[0]*d[2]; c6[5]=ax[0]*d[1]-ax[1]*d[0];\n"
+       << "  } else if (jt == 0 && ra < 0) {\n"  // FREE translation
+       << "    int sub = di - " << (njnt > 0 ? jda_ptr[0] : 0) << ";\n"  // relative dof within free joint
+       << "    c6[3+sub] = 1.0f;\n"
+       << "  } else if (jt == 0 && ra >= 0) {\n"  // FREE rotation
+       << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[xm_off + bdi*9+k];\n"
+       << "    float col[3] = {rm[ra], rm[3+ra], rm[6+ra]};\n"
+       << "    float anc[3] = {xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]};\n"
+       << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
+       << "    c6[0]=col[0]; c6[1]=col[1]; c6[2]=col[2];\n"
+       << "    c6[3]=col[1]*d[2]-col[2]*d[1]; c6[4]=col[2]*d[0]-col[0]*d[2]; c6[5]=col[0]*d[1]-col[1]*d[0];\n"
+       << "  } else if (jt == 2) {\n"  // SLIDE
+       << "    float ax[3] = {xaxis[xax_off+ji*3], xaxis[xax_off+ji*3+1], xaxis[xax_off+ji*3+2]};\n"
+       << "    c6[3]=ax[0]; c6[4]=ax[1]; c6[5]=ax[2];\n"
+       << "  } else if (jt == 1) {\n"  // BALL
+       << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[xm_off + bdi*9+k];\n"
+       << "    float col[3] = {rm[ra], rm[3+ra], rm[6+ra]};\n"
+       << "    float anc[3] = {xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]};\n"
+       << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
+       << "    c6[0]=col[0]; c6[1]=col[1]; c6[2]=col[2];\n"
+       << "    c6[3]=col[1]*d[2]-col[2]*d[1]; c6[4]=col[2]*d[0]-col[0]*d[2]; c6[5]=col[0]*d[1]-col[1]*d[0];\n"
+       << "  }\n"
+       << "  for (int k=0;k<6;k++) scratch[s_off + S_CDOF + di*6+k] = c6[k];\n"
+       << "}\n\n";
+
+    // ═══ PHASE B: CRB → Mass Matrix ═══
+    ss << "// ── Phase B: CRB + mass matrix ──\n";
+
+    // Copy cinert to crb scratch
+    ss << "for (int b=0;b<NB;b++) for (int k=0;k<10;k++)\n"
+       << "  scratch[s_off + S_CRB + b*10+k] = cinert_out[ci_off + b*10+k];\n";
+
+    // Zero world body in crb
+    ss << "for (int k=0;k<10;k++) scratch[s_off + S_CRB + k] = 0;\n";
+
+    // Backward accumulation of CRB (leaf→root)
+    ss << "for (int b=NB-1;b>=1;b--) {\n"
+       << "  int p = body_par[b];\n"
+       << "  for (int k=0;k<10;k++) scratch[s_off + S_CRB + p*10+k] += scratch[s_off + S_CRB + b*10+k];\n"
+       << "}\n\n";
+
+    // Compute qM using dof parent chain (efficient sparse traversal)
+    // Initialize qM to zero
+    ss << "for (int i=0;i<NV*NV;i++) qM_out[qM_off+i] = 0;\n";
+
+    // For each DOF i, compute crb_cdof[i] = inert_mul(crb[body_of_i], cdof[i])
+    // Then walk parent chain: qM[i,j] = dot(crb_cdof[i], cdof[j])
+    ss << "for (int i=0;i<NV;i++) {\n"
+       << "  int bi = dof_bodyid[i];\n"
+       // inert_mul: crb[bi] * cdof[i] → cc[6]
+       << "  float I00=scratch[s_off+S_CRB+bi*10], I11=scratch[s_off+S_CRB+bi*10+1], I22=scratch[s_off+S_CRB+bi*10+2];\n"
+       << "  float I01=scratch[s_off+S_CRB+bi*10+3], I02=scratch[s_off+S_CRB+bi*10+4], I12=scratch[s_off+S_CRB+bi*10+5];\n"
+       << "  float px=scratch[s_off+S_CRB+bi*10+6], py=scratch[s_off+S_CRB+bi*10+7], pz=scratch[s_off+S_CRB+bi*10+8];\n"
+       << "  float mass=scratch[s_off+S_CRB+bi*10+9];\n"
+       << "  float w0=scratch[s_off+S_CDOF+i*6], w1=scratch[s_off+S_CDOF+i*6+1], w2=scratch[s_off+S_CDOF+i*6+2];\n"
+       << "  float l0=scratch[s_off+S_CDOF+i*6+3], l1=scratch[s_off+S_CDOF+i*6+4], l2=scratch[s_off+S_CDOF+i*6+5];\n"
+       // ang_out = I*w + p×lin
+       << "  float cc0 = I00*w0+I01*w1+I02*w2 + (py*l2-pz*l1);\n"
+       << "  float cc1 = I01*w0+I11*w1+I12*w2 + (pz*l0-px*l2);\n"
+       << "  float cc2 = I02*w0+I12*w1+I22*w2 + (px*l1-py*l0);\n"
+       // lin_out = mass*lin - p×ang
+       << "  float cc3 = mass*l0 - (py*w2-pz*w1);\n"
+       << "  float cc4 = mass*l1 - (pz*w0-px*w2);\n"
+       << "  float cc5 = mass*l2 - (px*w1-py*w0);\n"
+       // Walk parent chain
+       << "  int j = i;\n"
+       << "  while (j >= 0) {\n"
+       << "    float dot = 0;\n"
+       << "    for (int k=0;k<6;k++) {\n"
+       << "      float ck = (k==0?cc0:k==1?cc1:k==2?cc2:k==3?cc3:k==4?cc4:cc5);\n"
+       << "      dot += ck * scratch[s_off+S_CDOF+j*6+k];\n"
+       << "    }\n"
+       << "    qM_out[qM_off + i*NV+j] = dot;\n"
+       << "    qM_out[qM_off + j*NV+i] = dot;\n"
+       << "    j = dof_par[j];\n"
+       << "  }\n"
+       << "}\n";
+
+    // Add armature to diagonal
+    ss << "for (int i=0;i<NV;i++) qM_out[qM_off + i*NV+i] += dof_arm[i];\n\n";
+
+    // ═══ PHASE C: COM velocity ═══
+    ss << "// ── Phase C: COM velocity ──\n";
+
+    // Initialize cvel and cdof_dot to zero
+    ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) { cvel_out[cv_off+b*6+k]=0; scratch[s_off+S_CDOFD+k]=0; }\n"
+       << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++) scratch[s_off+S_CDOFD+di*6+k]=0;\n";
+
+    // Forward propagation (root→leaf): cvel[b] = cvel[parent] + sum(cdof[di]*qvel[di])
+    // cdof_dot[di] = motion_cross(cvel[partial], cdof[di])
+    for (int b = 1; b < nb; b++) {
+        int pid = bpar_ptr[b];
+        ss << "{\n"
+           << "  float cv[6]; for (int k=0;k<6;k++) cv[k] = cvel_out[cv_off+" << pid << "*6+k];\n";
+
+        for (int di : body_dofs[b]) {
+            // cdof_dot[di] = motion_cross(cv, cdof[di])
+            ss << "  {\n"
+               << "    float ua[3]={cv[0],cv[1],cv[2]}, ul[3]={cv[3],cv[4],cv[5]};\n"
+               << "    float va[3],vl[3]; for (int k=0;k<3;k++) { va[k]=scratch[s_off+S_CDOF+" << di << "*6+k]; vl[k]=scratch[s_off+S_CDOF+" << di << "*6+3+k]; }\n"
+               // motion_cross: ang=ua×va, lin=ul×va+ua×vl
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+0]=ua[1]*va[2]-ua[2]*va[1];\n"
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+1]=ua[2]*va[0]-ua[0]*va[2];\n"
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+2]=ua[0]*va[1]-ua[1]*va[0];\n"
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+3]=ul[1]*va[2]-ul[2]*va[1]+ua[1]*vl[2]-ua[2]*vl[1];\n"
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+4]=ul[2]*va[0]-ul[0]*va[2]+ua[2]*vl[0]-ua[0]*vl[2];\n"
+               << "    scratch[s_off+S_CDOFD+" << di << "*6+5]=ul[0]*va[1]-ul[1]*va[0]+ua[0]*vl[1]-ua[1]*vl[0];\n"
+               // cv += cdof[di] * qvel[di]
+               << "    float qv = qvel[v_off+" << di << "];\n"
+               << "    for (int k=0;k<6;k++) cv[k] += scratch[s_off+S_CDOF+" << di << "*6+k] * qv;\n"
+               << "  }\n";
+        }
+
+        ss << "  for (int k=0;k<6;k++) cvel_out[cv_off+" << b << "*6+k] = cv[k];\n"
+           << "}\n";
+    }
+    ss << "\n";
+
+    // ═══ PHASE D: RNE (Newton-Euler) ═══
+    ss << "// ── Phase D: RNE ──\n";
+
+    // Forward: cacc[b] = cacc[parent] + sum(cdof_dot[di]*qvel[di])
+    ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) scratch[s_off+S_CACC+b*6+k]=0;\n"
+       << "scratch[s_off+S_CACC+3] = " << -grav[0] << "f;\n"
+       << "scratch[s_off+S_CACC+4] = " << -grav[1] << "f;\n"
+       << "scratch[s_off+S_CACC+5] = " << -grav[2] << "f;\n";
+
+    for (int b = 1; b < nb; b++) {
+        int pid = bpar_ptr[b];
+        ss << "{\n"
+           << "  float ac[6]; for (int k=0;k<6;k++) ac[k] = scratch[s_off+S_CACC+" << pid << "*6+k];\n";
+        for (int di : body_dofs[b]) {
+            ss << "  { float qv=qvel[v_off+" << di << "]; for (int k=0;k<6;k++) ac[k]+=scratch[s_off+S_CDOFD+" << di << "*6+k]*qv; }\n";
+        }
+        ss << "  for (int k=0;k<6;k++) scratch[s_off+S_CACC+" << b << "*6+k]=ac[k];\n"
+           << "}\n";
+    }
+
+    // Local forces: f = I*a + v×(I*v)
+    ss << "for (int b=0;b<NB;b++) {\n"
+       // inert_mul(cinert[b], cacc[b]) → Ia
+       << "  float I00=cinert_out[ci_off+b*10], I11=cinert_out[ci_off+b*10+1], I22=cinert_out[ci_off+b*10+2];\n"
+       << "  float I01=cinert_out[ci_off+b*10+3], I02=cinert_out[ci_off+b*10+4], I12=cinert_out[ci_off+b*10+5];\n"
+       << "  float px=cinert_out[ci_off+b*10+6], py=cinert_out[ci_off+b*10+7], pz=cinert_out[ci_off+b*10+8], mass=cinert_out[ci_off+b*10+9];\n"
+       << "  float aw0=scratch[s_off+S_CACC+b*6], aw1=scratch[s_off+S_CACC+b*6+1], aw2=scratch[s_off+S_CACC+b*6+2];\n"
+       << "  float al0=scratch[s_off+S_CACC+b*6+3], al1=scratch[s_off+S_CACC+b*6+4], al2=scratch[s_off+S_CACC+b*6+5];\n"
+       << "  float Ia0=I00*aw0+I01*aw1+I02*aw2+(py*al2-pz*al1);\n"
+       << "  float Ia1=I01*aw0+I11*aw1+I12*aw2+(pz*al0-px*al2);\n"
+       << "  float Ia2=I02*aw0+I12*aw1+I22*aw2+(px*al1-py*al0);\n"
+       << "  float Ia3=mass*al0-(py*aw2-pz*aw1);\n"
+       << "  float Ia4=mass*al1-(pz*aw0-px*aw2);\n"
+       << "  float Ia5=mass*al2-(px*aw1-py*aw0);\n"
+       // inert_mul(cinert[b], cvel[b]) → Iv
+       << "  float vw0=cvel_out[cv_off+b*6], vw1=cvel_out[cv_off+b*6+1], vw2=cvel_out[cv_off+b*6+2];\n"
+       << "  float vl0=cvel_out[cv_off+b*6+3], vl1=cvel_out[cv_off+b*6+4], vl2=cvel_out[cv_off+b*6+5];\n"
+       << "  float Iv0=I00*vw0+I01*vw1+I02*vw2+(py*vl2-pz*vl1);\n"
+       << "  float Iv1=I01*vw0+I11*vw1+I12*vw2+(pz*vl0-px*vl2);\n"
+       << "  float Iv2=I02*vw0+I12*vw1+I22*vw2+(px*vl1-py*vl0);\n"
+       << "  float Iv3=mass*vl0-(py*vw2-pz*vw1);\n"
+       << "  float Iv4=mass*vl1-(pz*vw0-px*vw2);\n"
+       << "  float Iv5=mass*vl2-(px*vw1-py*vw0);\n"
+       // motion_cross_force(cvel, Iv): ang=va×fa+vl×fl, lin=va×fl
+       << "  float mcf0=vw1*Iv2-vw2*Iv1+vl1*Iv5-vl2*Iv4;\n"
+       << "  float mcf1=vw2*Iv0-vw0*Iv2+vl2*Iv3-vl0*Iv5;\n"
+       << "  float mcf2=vw0*Iv1-vw1*Iv0+vl0*Iv4-vl1*Iv3;\n"
+       << "  float mcf3=vw1*Iv5-vw2*Iv4;\n"
+       << "  float mcf4=vw2*Iv3-vw0*Iv5;\n"
+       << "  float mcf5=vw0*Iv4-vw1*Iv3;\n"
+       // f = Ia + vxIv
+       << "  scratch[s_off+S_CFRC+b*6+0]=Ia0+mcf0;\n"
+       << "  scratch[s_off+S_CFRC+b*6+1]=Ia1+mcf1;\n"
+       << "  scratch[s_off+S_CFRC+b*6+2]=Ia2+mcf2;\n"
+       << "  scratch[s_off+S_CFRC+b*6+3]=Ia3+mcf3;\n"
+       << "  scratch[s_off+S_CFRC+b*6+4]=Ia4+mcf4;\n"
+       << "  scratch[s_off+S_CFRC+b*6+5]=Ia5+mcf5;\n"
+       << "}\n";
+
+    // Backward accumulation of cfrc
+    ss << "for (int b=NB-1;b>=1;b--) {\n"
+       << "  int p = body_par[b];\n"
+       << "  for (int k=0;k<6;k++) scratch[s_off+S_CFRC+p*6+k] += scratch[s_off+S_CFRC+b*6+k];\n"
+       << "}\n";
+
+    // qfrc_bias[di] = dot(cdof[di], cfrc[body_of_di])
+    ss << "for (int di=0;di<NV;di++) {\n"
+       << "  int b=dof_bodyid[di]; float dot=0;\n"
+       << "  for (int k=0;k<6;k++) dot+=scratch[s_off+S_CDOF+di*6+k]*scratch[s_off+S_CFRC+b*6+k];\n"
+       << "  scratch[s_off+S_BIAS+di]=dot;\n"
+       << "}\n\n";
+
+    // ═══ PHASE E: Passive + Actuation + qfrc_smooth ═══
+    ss << "// ── Phase E: passive, actuation, qfrc_smooth ──\n";
+
+    // Passive: spring + damping
+    ss << "for (int di=0;di<NV;di++) {\n"
+       << "  float f = 0;\n"
+       << "  if (dof_stiff[di] != 0) f -= dof_stiff[di] * (qpos[q_off+dof_qa[di]] - qpos_spr[dof_qa[di]]);\n"
+       << "  if (dof_damp[di] != 0) f -= dof_damp[di] * qvel[v_off+di];\n"
+       << "  scratch[s_off+S_PASS+di] = f;\n"
+       << "}\n";
+
+    // Actuation: force = gain * ctrl + bias, qfrc_actuator = moment^T @ force
+    if (nu > 0) {
+        ss << "for (int di=0;di<NV;di++) {\n"
+           << "  float fa = 0;\n"
+           << "  for (int ai=0;ai<NU;ai++) {\n"
+           << "    float mom = act_moment[ai*NV+di];\n"
+           << "    if (mom != 0) {\n"
+           << "      float force = act_g0[ai] * ctrl[u_off+ai] + act_b0[ai];\n"
+           << "      fa += mom * force;\n"
+           << "    }\n"
+           << "  }\n"
+           << "  qfrc_actuator_out[qa_off+di] = fa;\n"
+           << "}\n";
+    } else {
+        ss << "for (int di=0;di<NV;di++) qfrc_actuator_out[qa_off+di] = 0;\n";
+    }
+
+    // qfrc_smooth = passive - bias + actuator
+    ss << "for (int di=0;di<NV;di++) {\n"
+       << "  qfrc_smooth_out[qfs_off+di] = scratch[s_off+S_PASS+di] - scratch[s_off+S_BIAS+di] + qfrc_actuator_out[qa_off+di];\n"
+       << "}\n";
+
+    return ss.str();
+}
+
+static int forward_scratch_per_env(const Model& m) {
+    int nb = m.nbody, nv = m.nv;
+    return nb*10 + nv*6 + nv*6 + nb*6 + nb*6 + nb*3 + nb + nv + nv;
+}
+
+// ── MSL header for forward kernel (spatial algebra helpers) ──────────────────
+
+static const std::string FORWARD_HEADER = R"(
+)";
+
+// ── Test helper: dispatch Metal forward kernel for 1 env ────────────────────
+
+MJMLX_API MetalForwardResult test_metal_forward(
+    const Model& m,
+    const mx::array& xipos, const mx::array& ximat,
+    const mx::array& xanchor, const mx::array& xaxis, const mx::array& xmat,
+    const mx::array& qpos, const mx::array& qvel, const mx::array& ctrl)
+{
+    m.init_cache();
+    int nb = m.nbody, nv = m.nv, nq = m.nq, nu = m.nu, njnt = m.njnt;
+    int scratchSz = forward_scratch_per_env(m);
+
+    auto fwd_source = make_forward_source(m);
+
+    auto mm = mx::astype(mx::flatten(m.cache.make_m_mask), mx::float32);
+    mx::array am = mx::zeros({std::max(nv, 1)});
+    if (nu > 0 && m.cache.act_moment_const.size() > 0) {
+        am = mx::astype(mx::flatten(m.cache.act_moment_const), mx::float32);
+    }
+    mx::eval(mm, am);
+
+    auto kernel = mx::fast::metal_kernel(
+        "mjmlx_test_forward_" + std::to_string(nb) + "_" + std::to_string(nv),
+        {"xipos", "ximat", "xanchor", "xaxis", "xmat",
+         "qpos", "qvel", "ctrl",
+         "make_m_mask", "act_moment"},
+        {"qM_out", "qfrc_smooth_out", "subtree_com_out",
+         "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch"},
+        fwd_source,
+        FORWARD_HEADER
+    );
+
+    int B = 1;
+    auto fwd = kernel(
+        {mx::astype(mx::flatten(xipos), mx::float32),
+         mx::astype(mx::flatten(ximat), mx::float32),
+         mx::astype(mx::flatten(xanchor), mx::float32),
+         mx::astype(mx::flatten(xaxis), mx::float32),
+         mx::astype(mx::flatten(xmat), mx::float32),
+         mx::astype(mx::flatten(qpos), mx::float32),
+         mx::astype(mx::flatten(qvel), mx::float32),
+         mx::astype(mx::flatten(ctrl), mx::float32),
+         mm, am},
+        {{B * nv * nv}, {B * nv}, {B * nb * 3},
+         {B * nb * 10}, {B * nb * 6}, {B * nv},
+         {B * scratchSz}},
+        {mx::float32, mx::float32, mx::float32,
+         mx::float32, mx::float32, mx::float32, mx::float32},
+        std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+        {}, std::nullopt, false, {}
+    );
+
+    MetalForwardResult r;
+    r.qM = mx::reshape(fwd[0], {nv, nv});
+    r.qfrc_smooth = fwd[1];
+    r.subtree_com = mx::reshape(fwd[2], {nb, 3});
+    r.cinert = mx::reshape(fwd[3], {nb, 10});
+    r.cvel = mx::reshape(fwd[4], {nb, 6});
+    r.qfrc_actuator = fwd[5];
+    return r;
+}
+
 // ── Context: Metal kernels + model constants ─────────────────────────────────
 
 using KernelFn = mx::fast::CustomKernelFunction;
@@ -542,7 +1173,9 @@ struct BatchedStepContext {
     std::optional<KernelFn> kin_kernel;
     std::optional<KernelFn> euler_kernel;
     std::optional<KernelFn> euler_devmem_kernel;
+    std::optional<KernelFn> forward_kernel;
     bool uses_devmem_euler = false;
+    bool uses_metal_forward = false;
 
     mx::array body_parentid{mx::zeros({1}, mx::int32)};
     mx::array body_pos{mx::zeros({1})};
@@ -559,6 +1192,11 @@ struct BatchedStepContext {
     mx::array geom_bodyid_arr{mx::zeros({1}, mx::int32)};
     mx::array geom_pos_arr{mx::zeros({1})};
     mx::array geom_quat_arr{mx::zeros({1})};
+
+    // Forward kernel model constants
+    mx::array make_m_mask{mx::zeros({1})};
+    mx::array act_moment{mx::zeros({1})};
+    int fwd_scratch_per_env = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
@@ -673,6 +1311,35 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
         ctx->uses_devmem_euler = true;
     }
 
+    // Build Metal forward kernel for large models (replaces vmap forward)
+    if (m.nv > 80) {
+        auto fwd_source = make_forward_source(m);
+        ctx->fwd_scratch_per_env = forward_scratch_per_env(m);
+
+        // Prepare model constant buffers
+        ctx->make_m_mask = mx::astype(mx::flatten(m.cache.make_m_mask), mx::float32);
+        mx::eval(ctx->make_m_mask);
+
+        if (m.nu > 0 && m.cache.act_moment_const.size() > 0) {
+            ctx->act_moment = mx::astype(mx::flatten(m.cache.act_moment_const), mx::float32);
+        } else {
+            ctx->act_moment = mx::zeros({std::max(m.nv, 1)});
+        }
+        mx::eval(ctx->act_moment);
+
+        ctx->forward_kernel = mx::fast::metal_kernel(
+            "mjmlx_forward_" + std::to_string(m.nbody) + "_" + std::to_string(m.nv),
+            {"xipos", "ximat", "xanchor", "xaxis", "xmat",
+             "qpos", "qvel", "ctrl",
+             "make_m_mask", "act_moment"},
+            {"qM_out", "qfrc_smooth_out", "subtree_com_out",
+             "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch"},
+            fwd_source,
+            FORWARD_HEADER
+        );
+        ctx->uses_metal_forward = true;
+    }
+
     return ctx;
 }
 
@@ -710,91 +1377,63 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
     }
 
     if (has_kin && (has_euler || has_euler_dm) && use_gpu) {
-        // ── Primary path: Metal kin → compile(vmap(forward)) → Metal euler ──
 
-        // For large models (nv > 80), skip contacts in forward dynamics to keep
-        // the vmap computation graph under Metal's resource limit (~499K buffers).
-        bool skip_contacts = (nv > 80);
+        // For large models (nv > 80), use all-Metal pipeline:
+        //   Metal kin → Metal forward → Metal euler_devmem
+        // For small models (nv ≤ 80), use hybrid pipeline:
+        //   Metal kin → vmap(forward) → Metal euler
+        bool use_metal_fwd = ctx->uses_metal_forward;
 
-        // Per-env forward function: takes per-env arrays, returns per-env results
-        // This runs under vmap — no eval, no data<>, pure graph building
-        auto forward_fn = [mp, nq, nv, nu, nb, nj, ng, skip_contacts](
-            const std::vector<mx::array>& inputs) -> std::vector<mx::array>
-        {
-            const Model& m_ref = *mp;
-            Data d;
-
-            // Unpack per-env state (vmap slices batch dim away)
-            d.qpos = inputs[0];                               // (nq,)
-            d.qvel = inputs[1];                               // (nv,)
-            d.ctrl = (nu > 0) ? inputs[2] : mx::zeros({1});  // (nu,) or dummy
-
-            // Kinematics results from Metal kernel
-            d.xpos = mx::reshape(inputs[3], {nb, 3});
-            d.xquat = mx::reshape(inputs[4], {nb, 4});
-            d.xmat = mx::reshape(inputs[5], {nb, 3, 3});
-            d.xipos = mx::reshape(inputs[6], {nb, 3});
-            d.ximat = mx::reshape(inputs[7], {nb, 3, 3});
-            if (nj > 0) {
-                d.xanchor = mx::reshape(inputs[8], {nj, 3});
-                d.xaxis = mx::reshape(inputs[9], {nj, 3});
-            }
-            if (ng > 0) {
-                d.geom_xpos = mx::reshape(inputs[10], {ng, 3});
-                d.geom_xmat = mx::reshape(inputs[11], {ng, 3, 3});
-            }
-
-            // Initialize non-state fields to zeros
-            d.qfrc_applied = mx::zeros(mx::Shape{nv});
-            d.xfrc_applied = mx::zeros(mx::Shape{nb, 6});
-
-            d = vmap_forward(m_ref, d, skip_contacts);
-
-            // Pack outputs needed by Metal euler + observations
-            return {
-                mx::flatten(d.qM),           // 0: mass matrix (nv*nv,)
-                d.qfrc_smooth,                // 1: smooth forces (nv,)
-                d.qfrc_constraint,            // 2: constraint forces (nv,)
-                mx::flatten(d.xpos),          // 3: body positions (nb*3,)
-                mx::flatten(d.subtree_com),   // 4: subtree COM (nb*3,)
-                mx::flatten(d.cinert),        // 5: body inertias (nb*10,)
-                mx::flatten(d.cvel),          // 6: body COM vel (nb*6,)
-                d.qfrc_actuator,              // 7: actuator forces (nv,)
-                mx::flatten(d.qfrc_bias),     // 8: Coriolis+gravity (nv,) -- for cfrc_ext
+        // vmap forward (only built for nv ≤ 80)
+        std::function<std::vector<mx::array>(const std::vector<mx::array>&)> vmapped_fwd;
+        if (!use_metal_fwd) {
+            auto forward_fn = [mp, nq, nv, nu, nb, nj, ng](
+                const std::vector<mx::array>& inputs) -> std::vector<mx::array>
+            {
+                const Model& m_ref = *mp;
+                Data d;
+                d.qpos = inputs[0]; d.qvel = inputs[1];
+                d.ctrl = (nu > 0) ? inputs[2] : mx::zeros({1});
+                d.xpos = mx::reshape(inputs[3], {nb, 3});
+                d.xquat = mx::reshape(inputs[4], {nb, 4});
+                d.xmat = mx::reshape(inputs[5], {nb, 3, 3});
+                d.xipos = mx::reshape(inputs[6], {nb, 3});
+                d.ximat = mx::reshape(inputs[7], {nb, 3, 3});
+                if (nj > 0) { d.xanchor = mx::reshape(inputs[8], {nj, 3}); d.xaxis = mx::reshape(inputs[9], {nj, 3}); }
+                if (ng > 0) { d.geom_xpos = mx::reshape(inputs[10], {ng, 3}); d.geom_xmat = mx::reshape(inputs[11], {ng, 3, 3}); }
+                d.qfrc_applied = mx::zeros(mx::Shape{nv});
+                d.xfrc_applied = mx::zeros(mx::Shape{nb, 6});
+                d = vmap_forward(m_ref, d, false);
+                return {
+                    mx::flatten(d.qM), d.qfrc_smooth, d.qfrc_constraint,
+                    mx::flatten(d.xpos), mx::flatten(d.subtree_com),
+                    mx::flatten(d.cinert), mx::flatten(d.cvel),
+                    d.qfrc_actuator, mx::flatten(d.qfrc_bias),
+                };
             };
-        };
+            std::vector<int> in_axes(12, 0);
+            std::vector<int> out_axes = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+            vmapped_fwd = mx::vmap(forward_fn, in_axes, out_axes);
+        }
 
-        // vmap: batch axis 0 for all 12 inputs and 9 outputs
-        std::vector<int> in_axes(12, 0);
-        std::vector<int> out_axes = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-        auto vmapped_fwd = mx::vmap(forward_fn, in_axes, out_axes);
-
-        // Full hybrid pipeline: Metal kin → vmapped forward → Metal euler
-        // Wrapped in compile for fused graph execution
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
-            [ctx, vmapped_fwd, model_override, B, nq, nv, nu, nb, nj, ng](
+            [ctx, vmapped_fwd, model_override, use_metal_fwd, B, nq, nv, nu, nb, nj, ng](
                 const std::vector<mx::array>& state) -> std::vector<mx::array>
         {
-            auto qpos_batch = state[0];  // (B, nq)
-            auto qvel_batch = state[1];  // (B, nv)
-            auto ctrl_batch = state[2];  // (B, max(1,nu))
+            auto qpos_batch = state[0];
+            auto qvel_batch = state[1];
+            auto ctrl_batch = state[2];
 
-            // ── Phase 1: Metal kinematics (single dispatch for all B envs) ──
+            // ── Phase 1: Metal kinematics ──
             auto qpos_flat = mx::astype(mx::flatten(qpos_batch), mx::float32);
-
             std::vector<mx::Shape> kin_shapes = {
-                mx::Shape{B * nb * 3},   // xpos
-                mx::Shape{B * nb * 4},   // xquat
-                mx::Shape{B * nb * 9},   // xmat
-                mx::Shape{B * nb * 3},   // xipos
-                mx::Shape{B * nb * 9},   // ximat
-                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},  // xanchor
-                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},  // xaxis
-                (ng > 0) ? mx::Shape{B * ng * 3} : mx::Shape{1},  // geom_xpos
-                (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},  // geom_xmat
+                {B * nb * 3}, {B * nb * 4}, {B * nb * 9},
+                {B * nb * 3}, {B * nb * 9},
+                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},
+                (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},
+                (ng > 0) ? mx::Shape{B * ng * 3} : mx::Shape{1},
+                (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},
             };
-            std::vector<mx::Dtype> kin_dtypes(9, mx::float32);
-
             auto kin = (*ctx->kin_kernel)(
                 {ctx->body_parentid, ctx->body_pos, ctx->body_quat,
                  ctx->body_ipos, ctx->body_iquat,
@@ -804,54 +1443,79 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->qpos0,
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat},
-                kin_shapes,
-                kin_dtypes,
-                std::make_tuple(B, 1, 1),
-                std::make_tuple(1, 1, 1),
-                {},              // template_args
-                std::nullopt,    // init_value
-                false,           // verbose
-                {}               // default stream
+                kin_shapes, std::vector<mx::Dtype>(9, mx::float32),
+                std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+                {}, std::nullopt, false, {}
             );
 
-            // Reshape kin outputs to (B, ...)
             auto xpos   = mx::reshape(kin[0], {B, nb, 3});
-            auto xquat  = mx::reshape(kin[1], {B, nb, 4});
-            auto xmat   = mx::reshape(kin[2], {B, nb, 3, 3});
             auto xipos  = mx::reshape(kin[3], {B, nb, 3});
             auto ximat  = mx::reshape(kin[4], {B, nb, 3, 3});
             auto xanchor = (nj > 0) ? mx::reshape(kin[5], {B, nj, 3}) : mx::zeros({B, 1});
             auto xaxis   = (nj > 0) ? mx::reshape(kin[6], {B, nj, 3}) : mx::zeros({B, 1});
-            auto gxpos   = (ng > 0) ? mx::reshape(kin[7], {B, ng, 3}) : mx::zeros({B, 1});
-            auto gxmat   = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
 
-            // ── Phase 2: compile(vmap(forward_dynamics)) ──
-#ifdef PHASE2_SKIP
-            // Dummy forward for timing Metal kernels only
-            std::vector<mx::array> mid = {
-                mx::zeros({B, nv*nv}),   // qM
-                mx::zeros({B, nv}),       // qfrc_smooth
-                mx::zeros({B, nv}),       // qfrc_constraint
-                mx::flatten(xpos)         // xpos_flat → (B, nb*3) via reshape below
-            };
-            mid[3] = mx::reshape(mid[3], {B, nb*3});
-#else
-            auto mid = vmapped_fwd({
-                qpos_batch, qvel_batch, ctrl_batch,
-                xpos, xquat, xmat, xipos, ximat,
-                xanchor, xaxis, gxpos, gxmat
-            });
-#endif
-            // mid[0]=qM, mid[1]=qfrc_smooth, mid[2]=qfrc_constraint, mid[3]=xpos
-            // mid[4]=subtree_com, mid[5]=cinert, mid[6]=cvel, mid[7]=qfrc_actuator, mid[8]=qfrc_bias
+            mx::array qM_flat = mx::zeros({1});
+            mx::array qfrc_smooth_flat = mx::zeros({1});
+            mx::array qfrc_constraint_flat = mx::zeros({1});
+            mx::array subtree_com_out = mx::zeros({1});
+            mx::array cinert_out = mx::zeros({1});
+            mx::array cvel_out = mx::zeros({1});
+            mx::array qfrc_actuator_out = mx::zeros({1});
 
-            // ── Phase 3: Metal Euler (single dispatch for all B envs) ──
+            if (use_metal_fwd) {
+                // ── Phase 2a: Metal forward kernel (all-Metal path for nv > 80) ──
+                auto xmat = mx::reshape(kin[2], {B, nb, 3, 3});
+                int scratchSz = ctx->fwd_scratch_per_env;
+
+                auto fwd = (*ctx->forward_kernel)(
+                    {mx::flatten(xipos), mx::flatten(ximat),
+                     mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
+                     mx::flatten(qpos_batch), mx::flatten(qvel_batch), mx::flatten(ctrl_batch),
+                     ctx->make_m_mask, ctx->act_moment},
+                    {{B * nv * nv}, {B * nv}, {B * nb * 3},
+                     {B * nb * 10}, {B * nb * 6}, {B * nv},
+                     {B * scratchSz}},
+                    {mx::float32, mx::float32, mx::float32,
+                     mx::float32, mx::float32, mx::float32, mx::float32},
+                    std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+                    {}, std::nullopt, false, {}
+                );
+
+                qM_flat = fwd[0];
+                qfrc_smooth_flat = fwd[1];
+                qfrc_constraint_flat = mx::zeros({B * nv});
+                subtree_com_out = mx::reshape(fwd[2], {B, nb, 3});
+                cinert_out = mx::reshape(fwd[3], {B, nb, 10});
+                cvel_out = mx::reshape(fwd[4], {B, nb, 6});
+                qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
+            } else {
+                // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
+                auto xquat = mx::reshape(kin[1], {B, nb, 4});
+                auto xmat  = mx::reshape(kin[2], {B, nb, 3, 3});
+                auto gxpos = (ng > 0) ? mx::reshape(kin[7], {B, ng, 3}) : mx::zeros({B, 1});
+                auto gxmat = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
+
+                auto mid = vmapped_fwd({
+                    qpos_batch, qvel_batch, ctrl_batch,
+                    xpos, xquat, xmat, xipos, ximat,
+                    xanchor, xaxis, gxpos, gxmat
+                });
+                qM_flat = mx::flatten(mid[0]);
+                qfrc_smooth_flat = mx::flatten(mid[1]);
+                qfrc_constraint_flat = mx::flatten(mid[2]);
+                subtree_com_out = mx::reshape(mid[4], {B, nb, 3});
+                cinert_out = mx::reshape(mid[5], {B, nb, 10});
+                cvel_out = mx::reshape(mid[6], {B, nb, 6});
+                qfrc_actuator_out = mid[7];
+            }
+
+            // ── Phase 3: Metal Euler ──
             std::vector<mx::array> euler_inputs = {
-                mx::astype(mx::flatten(mid[0]), mx::float32),       // qM flat
-                mx::astype(mx::flatten(mid[1]), mx::float32),       // qfrc_smooth flat
-                mx::astype(mx::flatten(mid[2]), mx::float32),       // qfrc_constraint flat
-                mx::astype(mx::flatten(qvel_batch), mx::float32),   // qvel flat
-                mx::astype(mx::flatten(qpos_batch), mx::float32)    // qpos flat
+                mx::astype(qM_flat, mx::float32),
+                mx::astype(qfrc_smooth_flat, mx::float32),
+                mx::astype(qfrc_constraint_flat, mx::float32),
+                mx::astype(mx::flatten(qvel_batch), mx::float32),
+                mx::astype(mx::flatten(qpos_batch), mx::float32)
             };
             auto grid = std::make_tuple(B, 1, 1);
             auto tgroup = std::make_tuple(1, 1, 1);
@@ -875,13 +1539,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
-            auto xpos_out = mx::reshape(mid[3], {B, nb, 3});
-            auto subtree_com_out = mx::reshape(mid[4], {B, nb, 3});
-            auto cinert_out = mx::reshape(mid[5], {B, nb, 10});
-            auto cvel_out = mx::reshape(mid[6], {B, nb, 6});
-            auto qfrc_actuator_out = mid[7]; // (B, nv)
-            // cfrc_ext: approximate as qfrc_constraint projected back to body forces
-            // For now, store qfrc_constraint directly (B, nv) -- env can use it
+            auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
             auto cfrc_ext_out = mx::zeros({B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out,
@@ -889,9 +1547,6 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     qfrc_actuator_out, cfrc_ext_out};
         };
 
-        // compile() fuses the computation graph for max throughput. For large models
-        // with contacts, the graph can exceed Metal's ~499K buffer limit. But the
-        // contact-free path (nv > 80) creates ~7K ops per env, which compiles fine.
         auto compiled = mx::compile(pipeline);
         return compiled;
     }
