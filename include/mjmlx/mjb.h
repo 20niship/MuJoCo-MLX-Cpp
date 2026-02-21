@@ -201,6 +201,10 @@ MJB_API MjbBatchedSim* mjb_batched_create(
 
 MJB_API void mjb_batched_free(MjbBatchedSim* sim);
 
+// Returns 1 if the batched sim is actually running Metal GPU kernels,
+// 0 if it fell back to CPU thread pool (e.g. nv > 80).
+MJB_API int mjb_batched_is_gpu(const MjbBatchedSim* sim);
+
 // Step all environments. ctrl: float[num_envs * nu].
 MJB_API void mjb_batched_step(MjbBatchedSim* sim, const float* ctrl);
 
