@@ -684,7 +684,9 @@ void Model::init_cache() const {
     // An earlier bug had mask[j][i]=1 too (making it symmetric), which broke the
     // Cholesky factorization (error=30.34). The Python reference _get_mass_matrix_mask
     // in support.py is also strictly lower-triangular.
-    if (nv > 0 && !is_sparse(*this)) {
+    // Always build the dense mask: even sparse-classified models (nv>=60) need it
+    // for the GPU vmap path which always operates on dense matrices.
+    if (nv > 0) {
         mx::eval(dof_parentid);
         auto dof_par_ptr = dof_parentid.data<int>();
         std::vector<float> mask_data(nv * nv, 0.0f);

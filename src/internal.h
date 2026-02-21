@@ -468,7 +468,7 @@ struct Model {
     mutable ModelCache cache;
 
     // Populate cache (called once after loading)
-    void init_cache() const;
+    MJMLX_API void init_cache() const;
 };
 
 // ── Data ─────────────────────────────────────────────────────
@@ -654,8 +654,8 @@ Data vmap_make_constraint(const Model& m, Data d);
 // solver_vmap.cpp
 Data vmap_solve(const Model& m, Data d);
 
-// forward_vmap.cpp
-Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
+// forward_vmap.cpp (exported for test_metal_synth diagnostics)
+MJMLX_API Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
 
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);

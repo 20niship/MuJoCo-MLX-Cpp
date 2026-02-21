@@ -263,11 +263,33 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME linalg_full COMMAND test_linalg_full)
     set_tests_properties(math_full linalg_full PROPERTIES LABELS "correctness")
 
+    add_executable(test_metal_synth tests/test_metal_synth.cpp)
+    target_link_libraries(test_metal_synth PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(test_metal_synth PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET test_metal_synth POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:test_metal_synth>"
+            COMMENT "Fixing MuJoCo dylib for test_metal_synth"
+        )
+    endif()
+
     if(MJMLX_TEST_MODEL)
         add_test(NAME io COMMAND test_io ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
         add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
         set_tests_properties(io batched batched_diag PROPERTIES LABELS "correctness")
+    endif()
+
+    set(MJMLX_SYNTH_MODEL "" CACHE FILEPATH "Path to synth_humanoid.xml for Synth Metal tests")
+    if(MJMLX_SYNTH_MODEL)
+        add_test(NAME metal_synth COMMAND test_metal_synth ${MJMLX_SYNTH_MODEL})
+        set_tests_properties(metal_synth PROPERTIES LABELS "correctness")
     endif()
 endif()
 
