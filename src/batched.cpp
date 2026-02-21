@@ -1506,9 +1506,8 @@ static mx::array build_collision_pair_data(const Model& m) {
 // ── Metal constraint + Newton solver kernel ──────────────────────────────────
 
 static const int MAX_EFC = 256;
-static const int SOLVER_ITERS = 10;
 
-static std::string make_solver_source(const Model& m) {
+static std::string make_solver_source(const Model& m, int solver_iters = 1, int cg_iters = 15) {
     m.init_cache();
     const auto& c = m.cache;
     int nb = m.nbody, nv = m.nv, npairs = (int)c.collision_pairs.size();
@@ -1541,7 +1540,7 @@ static std::string make_solver_source(const Model& m) {
        << "const int NV = " << nv << ";\n"
        << "const int NB = " << nb << ";\n"
        << "const int MAX_EFC_N = " << MAX_EFC << ";\n"
-       << "const int NSOLVE = " << SOLVER_ITERS << ";\n"
+       << "const int NSOLVE = " << solver_iters << ";\n"
        << "const int CON_STRIDE = " << CONTACT_STRIDE << ";\n"
        << "const int MAX_CON = " << MAX_CONTACTS_PER_ENV << ";\n"
        << "const float TIMESTEP = " << timestep << "f;\n"
@@ -1588,7 +1587,7 @@ static std::string make_solver_source(const Model& m) {
        << "#define cg_Ap(i)  H(2*NV + (i))\n";
 
     // CG iterations for inner linear solve
-    ss << "const int CG_ITERS = 50;\n\n";
+    ss << "const int CG_ITERS = " << cg_iters << ";\n\n";
 
     // Zero scratch (parallel: each thread zeros a stride)
     ss << "for (int ii = (int)tid; ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0;\n"
@@ -1951,14 +1950,20 @@ MJMLX_API MetalCollisionResult test_metal_solver(
     const mx::array& contact_data, const mx::array& contact_count)
 {
     int nv = m.nv, nb = m.nbody;
-    auto solver_source = make_solver_source(m);
+    // GPU CG solver: cap iterations for performance. MuJoCo C defaults to 100
+    // Newton iters with exact Cholesky; our approximate CG needs fewer outer
+    // iterations. For RL training, 1 Newton + 10 CG gives sufficient contact
+    // resolution while keeping GPU overhead manageable.
+    int si = (nv > 80) ? std::min(std::max(m.opt.iterations, 1), 3) : std::max(m.opt.iterations, 1);
+    int cgi = (nv > 80) ? 20 : 50;
+    auto solver_source = make_solver_source(m, si, cgi);
     auto pair_props = build_solver_pair_props(m);
     auto body_dof_masks_buf = build_body_dof_masks(m);
     auto body_rootid_buf = build_body_rootid(m);
     mx::eval(pair_props, body_dof_masks_buf, body_rootid_buf);
 
     auto kernel = mx::fast::metal_kernel(
-        "mjmlx_test_solver_" + std::to_string(nv) + "_v" + std::to_string(SOLVER_ITERS),
+        "mjmlx_test_solver_" + std::to_string(nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
         {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
          "qvel_in", "contact_data_in", "contact_count_in",
          "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
@@ -2044,7 +2049,7 @@ struct BatchedStepContext {
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
 
-static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
+static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int solver_iters_override = 0) {
     auto ctx = std::make_shared<BatchedStepContext>();
     ctx->nbody = m.nbody;
     ctx->njnt = m.njnt;
@@ -2213,7 +2218,11 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
 
     // Build Metal solver kernel (constraint construction + Newton solver)
     if (m.nv > 80 && m.cache.collision_pairs.size() > 0) {
-        auto solver_source = make_solver_source(m);
+        int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
+        // GPU CG solver: cap at 1 for large models (100 default is for CPU exact Cholesky)
+        int si = (m.nv > 80) ? std::min(raw_si, 3) : raw_si;
+        int cgi = (m.nv > 80) ? 20 : 50;
+        auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_scratch_size = solver_scratch_per_env(m);
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
@@ -2221,7 +2230,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
         mx::eval(ctx->solver_pair_props, ctx->solver_body_dof_masks, ctx->solver_body_rootid);
 
         ctx->solver_kernel = mx::fast::metal_kernel(
-            "mjmlx_solver_" + std::to_string(m.nv) + "_v" + std::to_string(SOLVER_ITERS),
+            "mjmlx_solver_" + std::to_string(m.nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
             {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
              "qvel_in", "contact_data_in", "contact_count_in",
              "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
@@ -2240,7 +2249,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override) {
     m.init_cache();
-    auto ctx = build_context(m);
+    auto ctx = build_context(m, solver_iterations_override);
     int B = num_envs;
 
     int nq = m.nq, nv = m.nv, nu = m.nu;

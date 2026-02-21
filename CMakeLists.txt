@@ -323,6 +323,22 @@ if(MJMLX_BUILD_BENCHMARKS AND MJMLX_BUILD_TESTS)
     endif()
     set_tests_properties(bench_baseline PROPERTIES LABELS "benchmark")
 
+    # Synth benchmark
+    add_executable(bench_synth tests/bench_synth.cpp)
+    target_link_libraries(bench_synth PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_include_directories(bench_synth PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET bench_synth POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:bench_synth>"
+            COMMENT "Fixing MuJoCo dylib for bench_synth"
+        )
+    endif()
+
     # Copy benchmark model files to build directory for easy access
     file(COPY tests/models DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/tests)
 endif()
