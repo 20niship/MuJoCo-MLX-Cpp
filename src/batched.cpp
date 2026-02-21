@@ -1535,7 +1535,9 @@ static std::string make_solver_source(const Model& m) {
 
     std::ostringstream ss;
 
-    ss << "uint bid = thread_position_in_grid.x;\n"
+    // Threadgroup-parallel solver: NV threads per env cooperate on matrix ops
+    ss << "uint bid = threadgroup_position_in_grid.x;\n"
+       << "uint tid = thread_position_in_threadgroup.x;\n"
        << "const int NV = " << nv << ";\n"
        << "const int NB = " << nb << ";\n"
        << "const int MAX_EFC_N = " << MAX_EFC << ";\n"
@@ -1574,11 +1576,27 @@ static std::string make_solver_source(const Model& m) {
        << "uint con_off = bid * MAX_CON * CON_STRIDE;\n"
        << "uint qfc_off = bid * NV;\n\n";
 
-    // Zero scratch
-    ss << "for (int ii = 0; ii < " << SCRATCH_PER_ENV << "; ii++) solver_scratch[s_off + ii] = 0;\n\n";
+    // Threadgroup shared state for cross-thread communication
+    ss << "threadgroup int tg_nefc;\n"
+       << "threadgroup float tg_ba;\n"
+       << "threadgroup float tg_rr;\n"
+       << "threadgroup float tg_pAp;\n\n";
 
-    // Get contact count
-    ss << "int ncon = (int)contact_count_in[bid];\n"
+    // CG buffer aliases (reuse H region which is NV*NV — only need 3*NV for CG)
+    ss << "#define cg_r(i)   H(i)\n"
+       << "#define cg_p(i)   H(NV + (i))\n"
+       << "#define cg_Ap(i)  H(2*NV + (i))\n";
+
+    // CG iterations for inner linear solve
+    ss << "const int CG_ITERS = 50;\n\n";
+
+    // Zero scratch (parallel: each thread zeros a stride)
+    ss << "for (int ii = (int)tid; ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0;\n"
+       << "threadgroup_barrier(mem_flags::mem_device);\n\n";
+
+    // ── Constraint construction (thread 0 only — data-dependent serial work) ──
+    ss << "if (tid == 0) {\n"
+       << "int ncon = (int)contact_count_in[bid];\n"
        << "int nefc = 0;\n\n";
 
     // ── Build constraint rows from contacts ──
@@ -1729,125 +1747,147 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
         nefc++;
     }
 }
+tg_nefc = nefc;
+} // end if (tid == 0)
+threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+int nefc = tg_nefc;
 
-// ── Newton solver ──
-// Cholesky of qM to get qacc_smooth
-for (int i = 0; i < NV*NV; i++) H(i) = qM_in[qm_off+i];
-for (int j = 0; j < NV; j++) {
-    float s = 0; for (int k = 0; k < j; k++) s += H(j*NV+k)*H(j*NV+k);
-    H(j*NV+j) = sqrt(max(H(j*NV+j)-s, 1e-6f));
-    for (int i = j+1; i < NV; i++) {
-        float s2 = 0; for (int k = 0; k < j; k++) s2 += H(i*NV+k)*H(j*NV+k);
-        H(i*NV+j) = (H(i*NV+j)-s2)/max(H(j*NV+j), 1e-10f);
-    }
-}
-for (int i = 0; i < NV; i++) {
-    float s = qfrc_smooth_in[qfs_off+i];
-    for (int k = 0; k < i; k++) s -= H(i*NV+k)*qacc(k);
-    qacc(i) = s/max(H(i*NV+i), 1e-10f);
-}
-for (int i = NV-1; i >= 0; i--) {
-    float s = qacc(i);
-    for (int k = i+1; k < NV; k++) s -= H(k*NV+i)*qacc(k);
-    qacc(i) = s/max(H(i*NV+i), 1e-10f);
-}
+// ── Initial qacc = 0 ──
+// Starting from zero ensures all penetrating contacts are detected as active
+// (Jaref = -efc_aref < 0), so the Newton solver can converge properly.
+// A diagonal solve would produce wildly inaccurate values for coupled DOFs,
+// causing constraints to appear inactive.
+qacc((int)tid) = 0;
+threadgroup_barrier(mem_flags::mem_device);
 
+// Early exit if no constraints (all threads)
 if (nefc == 0) {
-    for (int di = 0; di < NV; di++) qfrc_constraint_out[qfc_off+di] = 0;
-} else {
-    // Ma = M @ qacc
-    for (int i = 0; i < NV; i++) {
-        float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off+i*NV+j]*qacc(j);
-        Ma(i) = s;
-    }
-    // Jaref = J @ qacc - aref
-    for (int r = 0; r < nefc; r++) {
-        float s = 0; for (int j = 0; j < NV; j++) s += J(r,j)*qacc(j);
-        Jaref(r) = s - efc_aref(r);
-    }
-    for (int r = 0; r < nefc; r++) act(r) = (Jaref(r) < 0) ? 1.0f : 0.0f;
-    for (int r = 0; r < nefc; r++) efc_force(r) = efc_D(r)*(-Jaref(r))*act(r);
+    qfrc_constraint_out[qfc_off + (int)tid] = 0;
+    return;
+}
 
-    for (int i = 0; i < NV; i++) {
-        float s = 0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
-        grad(i) = Ma(i) - qfrc_smooth_in[qfs_off+i] - s;
+// Ma = M @ qacc (parallel: each thread computes one element)
+{ float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off + (int)tid*NV + j]*qacc(j); Ma((int)tid) = s; }
+threadgroup_barrier(mem_flags::mem_device);
+
+// Jaref, act, force (thread 0 — nefc-dependent)
+if (tid == 0) {
+    for (int r2 = 0; r2 < nefc; r2++) {
+        float s = 0; for (int j = 0; j < NV; j++) s += J(r2,j)*qacc(j);
+        Jaref(r2) = s - efc_aref(r2);
+    }
+    for (int r2 = 0; r2 < nefc; r2++) act(r2) = (Jaref(r2) < 0) ? 1.0f : 0.0f;
+    for (int r2 = 0; r2 < nefc; r2++) efc_force(r2) = efc_D(r2)*(-Jaref(r2))*act(r2);
+}
+threadgroup_barrier(mem_flags::mem_device);
+
+// grad (parallel)
+{ float s = 0; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,(int)tid)*efc_force(r2);
+  grad((int)tid) = Ma((int)tid) - qfrc_smooth_in[qfs_off+(int)tid] - s; }
+threadgroup_barrier(mem_flags::mem_device);
+
+// ── Newton solver iterations (threadgroup-parallel) ──
+#pragma clang loop unroll(disable)
+for (int iter = 0; iter < NSOLVE; iter++) {
+    // CG solve: search_d = -H^{-1} grad, where H = M + J^T D_act J
+    // Avoids explicit H construction and numerically unstable Cholesky
+    search_d((int)tid) = 0;
+    cg_r((int)tid) = -grad((int)tid);
+    cg_p((int)tid) = -grad((int)tid);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Initial r·r
+    if (tid == 0) { float s = 0; for (int i = 0; i < NV; i++) { float v = cg_r(i); s += v*v; } tg_rr = s; }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    #pragma clang loop unroll(disable)
+    for (int cg_it = 0; cg_it < CG_ITERS; cg_it++) {
+        if (tg_rr < 1e-20f) break;
+
+        // Ap = H*p = M*p + MJMINVAL_SV*p + J^T*(D_act*(J*p))
+        // M*p + regularization (parallel)
+        float mp = MJMINVAL_SV * cg_p((int)tid);
+        for (int j = 0; j < NV; j++) mp += qM_in[qm_off + (int)tid*NV + j] * cg_p(j);
+
+        // J*p → D_act*(J*p) (parallel over constraint rows)
+        for (int r2 = (int)tid; r2 < nefc; r2 += NV) {
+            float s = 0; for (int j = 0; j < NV; j++) s += J(r2,j)*cg_p(j);
+            Jv_arr(r2) = efc_D(r2)*act(r2)*s;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // J^T * (D_act * J*p) (parallel)
+        float jt = 0; for (int r2 = 0; r2 < nefc; r2++) jt += J(r2,(int)tid)*Jv_arr(r2);
+        cg_Ap((int)tid) = mp + jt;
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // p·Ap reduction
+        if (tid == 0) { float s = 0; for (int i = 0; i < NV; i++) s += cg_p(i)*cg_Ap(i); tg_pAp = s; }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        float alpha_cg = tg_rr / max(tg_pAp, 1e-30f);
+        search_d((int)tid) += alpha_cg * cg_p((int)tid);
+        cg_r((int)tid) -= alpha_cg * cg_Ap((int)tid);
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // New r·r
+        float old_rr = tg_rr;
+        if (tid == 0) { float s = 0; for (int i = 0; i < NV; i++) { float v = cg_r(i); s += v*v; } tg_rr = s; }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        float beta_cg = tg_rr / max(old_rr, 1e-30f);
+        cg_p((int)tid) = cg_r((int)tid) + beta_cg * cg_p((int)tid);
+        threadgroup_barrier(mem_flags::mem_device);
     }
 
-    for (int iter = 0; iter < NSOLVE; iter++) {
-        // H = M + J^T D_active J
-        for (int i = 0; i < NV; i++) for (int j = 0; j < NV; j++) {
-            float s = qM_in[qm_off+i*NV+j]; if (i==j) s += MJMINVAL_SV;
-            for (int r = 0; r < nefc; r++) s += J(r,i)*efc_D(r)*act(r)*J(r,j);
-            H(i*NV+j) = s;
-        }
-        // Cholesky
-        for (int j = 0; j < NV; j++) {
-            float s = 0; for (int k = 0; k < j; k++) s += H(j*NV+k)*H(j*NV+k);
-            H(j*NV+j) = sqrt(max(H(j*NV+j)-s, 1e-6f));
-            for (int i = j+1; i < NV; i++) {
-                float s2 = 0; for (int k = 0; k < j; k++) s2 += H(i*NV+k)*H(j*NV+k);
-                H(i*NV+j) = (H(i*NV+j)-s2)/max(H(j*NV+j), 1e-10f);
-            }
-        }
-        // search = -L^{-T} L^{-1} grad
-        for (int i = 0; i < NV; i++) {
-            float s = -grad(i); for (int k = 0; k < i; k++) s -= H(i*NV+k)*search_d(k);
-            search_d(i) = s/max(H(i*NV+i), 1e-10f);
-        }
-        for (int i = NV-1; i >= 0; i--) {
-            float s = search_d(i); for (int k = i+1; k < NV; k++) s -= H(k*NV+i)*search_d(k);
-            search_d(i) = s/max(H(i*NV+i), 1e-10f);
-        }
-        // Line search
-        for (int i = 0; i < NV; i++) {
-            float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off+i*NV+j]*search_d(j);
-            Mv_arr(i) = s;
-        }
-        for (int r = 0; r < nefc; r++) {
-            float s = 0; for (int j = 0; j < NV; j++) s += J(r,j)*search_d(j);
-            Jv_arr(r) = s;
+    // Mv = M @ search (parallel)
+    { float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off + (int)tid*NV + j]*search_d(j); Mv_arr((int)tid) = s; }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Jv + line search + efc updates (thread 0)
+    if (tid == 0) {
+        for (int r2 = 0; r2 < nefc; r2++) {
+            float s = 0; for (int j = 0; j < NV; j++) s += J(r2,j)*search_d(j);
+            Jv_arr(r2) = s;
         }
         float qg=0,lg=0,qc=0,lc=0;
-        for (int i = 0; i < NV; i++) {
-            qg += 0.5f*search_d(i)*Mv_arr(i);
-            lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]);
-        }
-        for (int r = 0; r < nefc; r++) {
-            qc += 0.5f*efc_D(r)*Jv_arr(r)*Jv_arr(r)*act(r);
-            lc += efc_D(r)*Jv_arr(r)*Jaref(r)*act(r);
-        }
+        for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]); }
+        for (int r2 = 0; r2 < nefc; r2++) { qc += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc += efc_D(r2)*Jv_arr(r2)*Jaref(r2)*act(r2); }
         float dnom = 2.0f*(qg+qc);
         float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
         float als[5] = {an, 0.5f*an, 0.1f*an, 0.01f, 0.001f};
-        float bc = 1e30f, ba = 0;
-        // Current cost
-        float cc=0; for (int r = 0; r < nefc; r++) cc += 0.5f*efc_D(r)*Jaref(r)*Jaref(r)*act(r);
-        float cg=0; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*(qacc(i)-0);
-        bc = cc+cg;
+        float bc = 1e30f, ba_local = 0;
+        float cc2=0; for (int r2 = 0; r2 < nefc; r2++) cc2 += 0.5f*efc_D(r2)*Jaref(r2)*Jaref(r2)*act(r2);
+        float cg=0; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*qacc(i);
+        bc = cc2+cg;
         for (int ai = 0; ai < 5; ai++) {
             float a = als[ai]; float tc2=0;
-            for (int r = 0; r < nefc; r++) {
-                float x = Jaref(r)+a*Jv_arr(r); float ar = (x<0)?1.0f:0.0f;
-                tc2 += 0.5f*efc_D(r)*x*x*ar;
-            }
-            float tg = cg + a*lg + 0.5f*a*a*(2.0f*qg);
-            float tt = tc2+tg;
-            if (tt < bc) { bc=tt; ba=a; }
+            for (int r2 = 0; r2 < nefc; r2++) { float x = Jaref(r2)+a*Jv_arr(r2); float ar = (x<0)?1.0f:0.0f; tc2 += 0.5f*efc_D(r2)*x*x*ar; }
+            float tg2 = cg + a*lg + 0.5f*a*a*(2.0f*qg); float tt = tc2+tg2;
+            if (tt < bc) { bc=tt; ba_local=a; }
         }
-        for (int i = 0; i < NV; i++) { qacc(i) += ba*search_d(i); Ma(i) += ba*Mv_arr(i); }
-        for (int r = 0; r < nefc; r++) Jaref(r) += ba*Jv_arr(r);
-        for (int r = 0; r < nefc; r++) act(r) = (Jaref(r)<0)?1.0f:0.0f;
-        for (int r = 0; r < nefc; r++) efc_force(r) = efc_D(r)*(-Jaref(r))*act(r);
-        for (int i = 0; i < NV; i++) {
-            float s=0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
-            grad(i) = Ma(i)-qfrc_smooth_in[qfs_off+i]-s;
-        }
+        tg_ba = ba_local;
+        for (int r2 = 0; r2 < nefc; r2++) Jaref(r2) += ba_local*Jv_arr(r2);
+        for (int r2 = 0; r2 < nefc; r2++) act(r2) = (Jaref(r2)<0)?1.0f:0.0f;
+        for (int r2 = 0; r2 < nefc; r2++) efc_force(r2) = efc_D(r2)*(-Jaref(r2))*act(r2);
     }
-    for (int i = 0; i < NV; i++) {
-        float s=0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
-        qfrc_constraint_out[qfc_off+i] = s;
-    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    float ba = tg_ba;
+
+    // Update qacc, Ma (parallel)
+    qacc((int)tid) += ba * search_d((int)tid);
+    Ma((int)tid) += ba * Mv_arr((int)tid);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Update grad (parallel)
+    { float s = 0; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,(int)tid)*efc_force(r2);
+      grad((int)tid) = Ma((int)tid) - qfrc_smooth_in[qfs_off+(int)tid] - s; }
+    threadgroup_barrier(mem_flags::mem_device);
 }
+
+// Final qfrc_constraint (parallel: each thread computes one DOF)
+{ float s = 0; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,(int)tid)*efc_force(r2);
+  qfrc_constraint_out[qfc_off + (int)tid] = s; }
 )";
 
     return ss.str();
@@ -1918,7 +1958,7 @@ MJMLX_API MetalCollisionResult test_metal_solver(
     mx::eval(pair_props, body_dof_masks_buf, body_rootid_buf);
 
     auto kernel = mx::fast::metal_kernel(
-        "mjmlx_test_solver_" + std::to_string(nv),
+        "mjmlx_test_solver_" + std::to_string(nv) + "_v" + std::to_string(SOLVER_ITERS),
         {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
          "qvel_in", "contact_data_in", "contact_count_in",
          "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
@@ -1940,7 +1980,7 @@ MJMLX_API MetalCollisionResult test_metal_solver(
          pair_props, body_dof_masks_buf, body_rootid_buf},
         {{B * nv}, {B * scratch_sz}},
         {mx::float32, mx::float32},
-        std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+        std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),
         {}, std::nullopt, false, {}
     );
 
@@ -1992,6 +2032,14 @@ struct BatchedStepContext {
     mx::array coll_mesh_vertnum{mx::zeros({1})};
     mx::array coll_geom_dataid{mx::zeros({1})};
     int num_collision_pairs = 0;
+
+    // Solver kernel
+    std::optional<KernelFn> solver_kernel;
+    bool uses_metal_solver = false;
+    mx::array solver_pair_props{mx::zeros({1})};
+    mx::array solver_body_dof_masks{mx::zeros({1})};
+    mx::array solver_body_rootid{mx::zeros({1})};
+    int solver_scratch_size = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
@@ -2163,6 +2211,27 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
         ctx->uses_metal_collision = true;
     }
 
+    // Build Metal solver kernel (constraint construction + Newton solver)
+    if (m.nv > 80 && m.cache.collision_pairs.size() > 0) {
+        auto solver_source = make_solver_source(m);
+        ctx->solver_scratch_size = solver_scratch_per_env(m);
+        ctx->solver_pair_props = build_solver_pair_props(m);
+        ctx->solver_body_dof_masks = build_body_dof_masks(m);
+        ctx->solver_body_rootid = build_body_rootid(m);
+        mx::eval(ctx->solver_pair_props, ctx->solver_body_dof_masks, ctx->solver_body_rootid);
+
+        ctx->solver_kernel = mx::fast::metal_kernel(
+            "mjmlx_solver_" + std::to_string(m.nv) + "_v" + std::to_string(SOLVER_ITERS),
+            {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
+             "qvel_in", "contact_data_in", "contact_count_in",
+             "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
+            {"qfrc_constraint_out", "solver_scratch"},
+            solver_source,
+            COLLISION_HEADER_FWD
+        );
+        ctx->uses_metal_solver = true;
+    }
+
     return ctx;
 }
 
@@ -2306,12 +2375,51 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
                 qM_flat = fwd[0];
                 qfrc_smooth_flat = fwd[1];
-                qfrc_constraint_flat = mx::zeros({B * nv});
                 subtree_com_out = mx::reshape(fwd[2], {B, nb, 3});
                 cinert_out = mx::reshape(fwd[3], {B, nb, 10});
                 cvel_out = mx::reshape(fwd[4], {B, nb, 6});
                 qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
-                // fwd[7] = cdof_out (B * nv * 6) — available for constraint kernel
+                auto cdof_flat = fwd[7]; // (B * nv * 6)
+
+                // ── Collision + Solver for nv > 80 ──
+                if (ctx->uses_metal_collision) {
+                    // Collision kernel: detect contacts from geom transforms
+                    auto geom_xpos_flat = mx::flatten(mx::reshape(kin[7], {B, ng, 3}));
+                    auto geom_xmat_flat = mx::flatten(mx::reshape(kin[8], {B, ng, 3, 3}));
+
+                    int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
+                    auto coll = (*ctx->collision_kernel)(
+                        {geom_xpos_flat, geom_xmat_flat,
+                         ctx->coll_mesh_verts, ctx->coll_pair_data,
+                         ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
+                         ctx->coll_geom_dataid},
+                        {{con_buf_sz}, {B}},
+                        {mx::float32, mx::float32},
+                        std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+                        {}, std::nullopt, false, {}
+                    );
+
+                    if (ctx->uses_metal_solver) {
+                        int scratch_sz = ctx->solver_scratch_size;
+                        auto solver = (*ctx->solver_kernel)(
+                            {qM_flat, qfrc_smooth_flat, cdof_flat,
+                             mx::flatten(subtree_com_out),
+                             mx::astype(mx::flatten(qvel_batch), mx::float32),
+                             coll[0], coll[1],
+                             ctx->solver_pair_props, ctx->solver_body_dof_masks,
+                             ctx->solver_body_rootid},
+                            {{B * nv}, {B * scratch_sz}},
+                            {mx::float32, mx::float32},
+                            std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),
+                            {}, std::nullopt, false, {}
+                        );
+                        qfrc_constraint_flat = solver[0];
+                    } else {
+                        qfrc_constraint_flat = mx::zeros({B * nv});
+                    }
+                } else {
+                    qfrc_constraint_flat = mx::zeros({B * nv});
+                }
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
                 auto xquat = mx::reshape(kin[1], {B, nb, 4});
@@ -2371,8 +2479,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     qfrc_actuator_out, cfrc_ext_out};
         };
 
-        auto compiled = mx::compile(pipeline);
-        return compiled;
+        // mx::compile fuses ops (reshape, astype, etc.) in the computation graph.
+        // For nv≤80 (vmap path), this provides significant speedup by fusing many
+        // small ops. For nv>80 (all-Metal path), custom kernels already do bulk work
+        // per dispatch and mx::compile can deadlock with the large solver kernel.
+        if (!use_metal_fwd) {
+            auto compiled = mx::compile(pipeline);
+            return compiled;
+        }
+        return pipeline;
     }
 
     // Metal kernels could not be built for this model.
