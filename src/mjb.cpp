@@ -789,34 +789,22 @@ MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfi
                 model->mj->opt.iterations = config->solver_iterations;
             }
         } else {
-            const mjModel* cmj = get_mj_model(model);
-            int nv = cmj ? (int)cmj->nv : 0;
-
-            // For large models (nv > 80), CPU thread pool is ~45x faster than
-            // Metal GPU pipeline due to sequential tree-structured physics.
-            // Auto-route to CPU batched mode (dispatch_apply) for best throughput.
-            bool force_cpu = (nv > 80);
-
             MjmlxBatchedConfig mlx_config = {};
             mlx_config.num_envs = config->num_envs;
             mlx_config.foot_contacts_only = config->foot_contacts_only;
             mlx_config.integrator = MJMLX_INTEGRATOR_EULER;
-            mlx_config.use_gpu = force_cpu ? 0 : 1;
+            mlx_config.use_gpu = 1;
             mlx_config.solver_iterations = config->solver_iterations;
 
-            if (force_cpu) {
-                fprintf(stderr, "mjb_batched_create: nv=%d > 80, using CPU thread pool "
-                        "(~22K SPS) instead of Metal GPU (~480 SPS).\n", nv);
-            }
-
             sim->mlx_sim = mjmlx_batched_create(model->mlx, &mlx_config);
-            sim->gpu_active = !force_cpu && sim->mlx_sim != nullptr;
+            sim->gpu_active = (sim->mlx_sim != nullptr);
 
             if (!sim->mlx_sim) {
                 fprintf(stderr, "mjb_batched_create: GPU batched sim failed, "
                         "falling back to CPU batched mode.\n");
                 sim->type = MJB_BACKEND_CPU;
                 sim->model_ref = model;
+                const mjModel* cmj = get_mj_model(model);
                 if (!cmj) { delete sim; return nullptr; }
                 mjModel* mj = const_cast<mjModel*>(cmj);
                 sim->cpu_datas.resize(config->num_envs);
