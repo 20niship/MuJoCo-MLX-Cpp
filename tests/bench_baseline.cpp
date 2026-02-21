@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
         bench_print_stats(s);
     }
 
-    // Humanoid (external, if provided)
+    // Humanoid (external, if provided) — uses batched API with 1 env
     if (humanoid_path) {
         BenchStats hs;
         hs.name = "scalar/humanoid";
@@ -67,13 +67,22 @@ int main(int argc, char** argv) {
 
         MjmlxModel* model = mjmlx_load_model(humanoid_path);
         if (model) {
-            MjmlxData* data = mjmlx_make_data(model);
-            BENCH_RUN(hs, 3, 10, {
-                mjmlx_reset_data(model, data);
-                for (int s = 0; s < 100; s++) mjmlx_step(model, data);
-                int tmp; mjmlx_get_xpos(data, &tmp);
-            });
-            mjmlx_free_data(data);
+            MjmlxBatchedConfig config = {};
+            config.num_envs = 1;
+            config.use_gpu = 0;
+            config.foot_contacts_only = 0;
+            config.integrator = MJMLX_INTEGRATOR_EULER;
+
+            MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
+            if (sim) {
+                BENCH_RUN(hs, 3, 10, {
+                    std::vector<int> mask(1, 1);
+                    mjmlx_batched_reset(sim, mask.data());
+                    for (int s = 0; s < 100; s++) mjmlx_batched_step(sim, nullptr);
+                    int tmp; mjmlx_batched_get_xpos(sim, &tmp);
+                });
+                mjmlx_batched_free(sim);
+            }
             mjmlx_free_model(model);
 
             // MuJoCo C reference

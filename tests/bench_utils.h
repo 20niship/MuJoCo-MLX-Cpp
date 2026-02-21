@@ -231,7 +231,7 @@ static inline void bench_write_csv(const char* csv_path) {
 
 // ── Convenience: single-env scalar benchmark ─────────────────────────────────
 
-// Benchmark mjmlx scalar stepping: warmup, then measure num_steps.
+// Benchmark single-env stepping via batched API (num_envs=1, CPU mode).
 // Automatically computes MuJoCo C comparison throughput.
 static inline BenchStats bench_scalar_step(
     const char* name,
@@ -248,25 +248,36 @@ static inline BenchStats bench_scalar_step(
     stats.num_steps = num_steps;
     stats.work = num_steps;
 
-    // Load mjmlx model
     MjmlxModel* model = mjmlx_load_model_from_string(xml_str);
     if (!model) {
         fprintf(stderr, "  SKIP %s: failed to load mjmlx model\n", name);
         return stats;
     }
-    MjmlxData* data = mjmlx_make_data(model);
+
+    MjmlxBatchedConfig config = {};
+    config.num_envs = 1;
+    config.use_gpu = 0;
+    config.foot_contacts_only = 0;
+    config.integrator = MJMLX_INTEGRATOR_EULER;
+
+    MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
+    if (!sim) {
+        fprintf(stderr, "  SKIP %s: failed to create batched sim\n", name);
+        mjmlx_free_model(model);
+        return stats;
+    }
 
     BENCH_RUN(stats, warmup_iters, measure_iters, {
-        mjmlx_reset_data(model, data);
+        std::vector<int> mask(1, 1);
+        mjmlx_batched_reset(sim, mask.data());
         for (int s = 0; s < num_steps; s++) {
-            mjmlx_step(model, data);
+            mjmlx_batched_step(sim, nullptr);
         }
-        // Force eval by reading back
         int tmp;
-        mjmlx_get_xpos(data, &tmp);
+        mjmlx_batched_get_xpos(sim, &tmp);
     });
 
-    mjmlx_free_data(data);
+    mjmlx_batched_free(sim);
     mjmlx_free_model(model);
 
     // MuJoCo C reference

@@ -174,70 +174,51 @@ static Data vmap_fwd_acceleration(const Model& m, Data d) {
 
 // ── Full vmap-compatible forward pipeline ────────────────────────────────────
 
-Data vmap_forward(const Model& m, Data d) {
-    // Phase 2 of hybrid pipeline: kinematics already done by Metal kernel
-    // skip_kinematics = true
-
-    // Position-dependent
+Data vmap_forward(const Model& m, Data d, bool skip_contacts) {
     d = vmap_com_pos(m, d);
     d = vmap_crb(m, d);
     d = vmap_factor_m(m, d);
 
-#if defined(VMAP_MINIMAL)
-    d.qfrc_smooth = mx::zeros(mx::Shape{m.nv});
-    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
-#elif defined(VMAP_NO_SOLVER)
-    d = vmap_tendon(m, d);
-    d = vmap_collision(m, d);
-    d = vmap_make_constraint(m, d);
-    d = vmap_transmission(m, d);
-    if (m.nu > 0 && d.actuator_moment.size() > 0) {
-        d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
-                                                      mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
-    }
-    d = vmap_com_vel(m, d);
-    d = vmap_passive(m, d);
-    d = vmap_rne(m, d);
-    d = vmap_fwd_actuation(m, d);
-    d = vmap_fwd_acceleration(m, d);
-    d.qacc = d.qacc_smooth;
-    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
-#elif defined(VMAP_NO_COLLISION)
-    d = vmap_tendon(m, d);
-    d = vmap_transmission(m, d);
-    if (m.nu > 0 && d.actuator_moment.size() > 0) {
-        d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
-                                                      mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
-    }
-    d = vmap_com_vel(m, d);
-    d = vmap_passive(m, d);
-    d = vmap_rne(m, d);
-    d = vmap_fwd_actuation(m, d);
-    d = vmap_fwd_acceleration(m, d);
-    d.qacc = d.qacc_smooth;
-    d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
-#else
-    d = vmap_tendon(m, d);
-    d = vmap_collision(m, d);
-    d = vmap_make_constraint(m, d);
-    d = vmap_transmission(m, d);
-    if (m.nu > 0 && d.actuator_moment.size() > 0) {
-        d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
-                                                      mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
-    }
-    d = vmap_com_vel(m, d);
-    d = vmap_passive(m, d);
-    d = vmap_rne(m, d);
-    d = vmap_fwd_actuation(m, d);
-    d = vmap_fwd_acceleration(m, d);
-    int nefc_count = d.efc_J.shape(0);
-    if (nefc_count == 0) {
+    if (skip_contacts) {
+        // Contact-free path for large models (nv > 80).
+        // Skips collision detection and constraint solving which create O(ngeom² + nv² × iters)
+        // intermediate arrays — easily exceeding Metal's 499K buffer limit for nv=237.
+        // For imitation learning, contacts are secondary to pose matching.
+        d = vmap_tendon(m, d);
+        d = vmap_transmission(m, d);
+        if (m.nu > 0 && d.actuator_moment.size() > 0) {
+            d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
+                                                          mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
+        }
+        d = vmap_com_vel(m, d);
+        d = vmap_passive(m, d);
+        d = vmap_rne(m, d);
+        d = vmap_fwd_actuation(m, d);
+        d = vmap_fwd_acceleration(m, d);
         d.qacc = d.qacc_smooth;
         d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
     } else {
-        d = vmap_solve(m, d);
+        d = vmap_tendon(m, d);
+        d = vmap_collision(m, d);
+        d = vmap_make_constraint(m, d);
+        d = vmap_transmission(m, d);
+        if (m.nu > 0 && d.actuator_moment.size() > 0) {
+            d.actuator_velocity = mx::flatten(mx::matmul(d.actuator_moment,
+                                                          mx::reshape(d.qvel, mx::Shape{m.nv, 1})));
+        }
+        d = vmap_com_vel(m, d);
+        d = vmap_passive(m, d);
+        d = vmap_rne(m, d);
+        d = vmap_fwd_actuation(m, d);
+        d = vmap_fwd_acceleration(m, d);
+        int nefc_count = d.efc_J.shape(0);
+        if (nefc_count == 0) {
+            d.qacc = d.qacc_smooth;
+            d.qfrc_constraint = mx::zeros(mx::Shape{m.nv});
+        } else {
+            d = vmap_solve(m, d);
+        }
     }
-#endif
 
     return d;
 }

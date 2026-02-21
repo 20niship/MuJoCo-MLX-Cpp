@@ -655,7 +655,7 @@ Data vmap_make_constraint(const Model& m, Data d);
 Data vmap_solve(const Model& m, Data d);
 
 // forward_vmap.cpp
-Data vmap_forward(const Model& m, Data d);
+Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
 
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);

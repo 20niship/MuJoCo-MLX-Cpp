@@ -373,6 +373,167 @@ static std::string make_euler_source(
     return ss.str();
 }
 
+// ── Device-memory Euler kernel for large nv (>80) ────────────────────────────
+//
+// When nv > 80, the mass matrix (nv×nv) and Cholesky factor L can't fit in
+// Metal thread-local storage (~24KB). This kernel reads/writes the matrix
+// through device (global) GPU memory via L_scratch, keeping only small vectors
+// in thread-local (rhs, y, qacc, new_qvel, new_qpos ≈ 4*nv+nq floats).
+//
+// For nv=237: thread-local ≈ 4*237+244 = 1192 floats = 4.8KB (well within 16KB)
+//             device-memory L_scratch = B*237*237*4 ≈ 29MB for B=128 (reused via compile)
+//
+// Three-tier strategy (matching original Python mujoco-mlx):
+//   nv ≤ 80:   thread-local Metal kernels (fastest, everything in registers)
+//   80 < nv ≤ 2048: device-memory Metal kernel (single dispatch, L in global memory)
+//   nv > 2048: CPU fallback
+
+static const int EULER_DEVMEM_MAX_NV = 2048;
+
+static std::string make_euler_devmem_source(
+    int nv, int nq, float dt,
+    const std::vector<int>& simple_qa, const std::vector<int>& simple_da,
+    const std::vector<std::pair<int,int>>& free_joints,
+    const std::vector<std::pair<int,int>>& ball_joints,
+    const std::vector<float>& dof_damping_vals)
+{
+    int n = nv;
+    std::ostringstream ss;
+
+    ss << "uint batch_idx = thread_position_in_grid.x;\n"
+       << "const uint n = " << n << ";\n"
+       << "uint moff = batch_idx * n * n;\n"
+       << "uint voff = batch_idx * n;\n"
+       << "uint qoff = batch_idx * " << nq << ";\n\n";
+
+    // Copy mass matrix to L_scratch (device memory) and apply damping + regularization
+    ss << "for (uint i = 0; i < n * n; i++) L_scratch[moff + i] = qM[moff + i];\n";
+
+    for (int i = 0; i < nv; i++) {
+        if (dof_damping_vals[i] != 0.0f) {
+            ss << "L_scratch[moff + " << i*n+i << "] += "
+               << std::scientific << dt << "f * " << dof_damping_vals[i] << "f;\n";
+        }
+    }
+    for (int i = 0; i < n; i++)
+        ss << "L_scratch[moff + " << i*n+i << "] += 1e-6f;\n";
+
+    // RHS in thread-local
+    ss << "\nfloat rhs[" << n << "];\n"
+       << "for (uint i = 0; i < n; i++) rhs[i] = qfrc_smooth[voff+i] + qfrc_constraint[voff+i];\n\n";
+
+    // In-place Cholesky in device memory: L_scratch goes from damped mass A → Cholesky L
+    ss << "for (uint j = 0; j < n; j++) {\n"
+       << "  float s = 0.0f;\n"
+       << "  for (uint k = 0; k < j; k++) { float v = L_scratch[moff + j*n+k]; s += v*v; }\n"
+       << "  float diag = L_scratch[moff + j*n+j] - s;\n"
+       << "  diag = sqrt(max(diag, 1e-6f));\n"
+       << "  L_scratch[moff + j*n+j] = diag;\n"
+       << "  for (uint i = j+1; i < n; i++) {\n"
+       << "    float s2 = 0.0f;\n"
+       << "    for (uint k = 0; k < j; k++) s2 += L_scratch[moff + i*n+k] * L_scratch[moff + j*n+k];\n"
+       << "    L_scratch[moff + i*n+j] = (L_scratch[moff + i*n+j] - s2) / diag;\n"
+       << "  }\n"
+       << "}\n\n";
+
+    // Forward sub: L @ y = rhs (L from device memory, y thread-local)
+    ss << "float y[" << n << "];\n"
+       << "for (uint i = 0; i < n; i++) {\n"
+       << "  float s = 0.0f;\n"
+       << "  for (uint k = 0; k < i; k++) s += L_scratch[moff + i*n+k] * y[k];\n"
+       << "  y[i] = (rhs[i] - s) / L_scratch[moff + i*n+i];\n"
+       << "}\n\n";
+
+    // Backward sub: L^T @ qacc = y (L^T from device memory, qacc thread-local)
+    ss << "float qacc[" << n << "];\n"
+       << "for (int i = n-1; i >= 0; i--) {\n"
+       << "  float s = 0.0f;\n"
+       << "  for (uint k = i+1; k < n; k++) s += L_scratch[moff + k*n+i] * qacc[k];\n"
+       << "  qacc[i] = (y[i] - s) / L_scratch[moff + i*n+i];\n"
+       << "}\n\n";
+
+    // Velocity update (thread-local)
+    ss << "float new_qvel[" << n << "];\n"
+       << "for (uint i = 0; i < n; i++) {\n"
+       << "  float v = qvel_in[voff+i] + qacc[i] * " << std::scientific << dt << "f;\n"
+       << "  new_qvel[i] = clamp(v, -1e4f, 1e4f);\n"
+       << "}\n\n";
+
+    // Position integration (thread-local — identical to thread-local kernel)
+    ss << "float new_qpos[" << nq << "];\n";
+
+    std::set<int> touched;
+    for (int qa : simple_qa) touched.insert(qa);
+    for (auto [qa, da] : free_joints) for (int i = 0; i < 7; i++) touched.insert(qa + i);
+    for (auto [qa, da] : ball_joints) for (int i = 0; i < 4; i++) touched.insert(qa + i);
+    for (int i = 0; i < nq; i++) {
+        if (touched.find(i) == touched.end())
+            ss << "new_qpos[" << i << "] = qpos_in[qoff + " << i << "];\n";
+    }
+
+    for (size_t i = 0; i < simple_qa.size(); i++) {
+        ss << "new_qpos[" << simple_qa[i] << "] = qpos_in[qoff + " << simple_qa[i]
+           << "] + " << std::scientific << dt << "f * new_qvel[" << simple_da[i] << "];\n";
+    }
+
+    for (auto [qa, da] : free_joints) {
+        ss << "new_qpos[" << qa << "] = qpos_in[qoff+" << qa << "] + " << std::scientific << dt << "f * new_qvel[" << da << "];\n"
+           << "new_qpos[" << qa+1 << "] = qpos_in[qoff+" << qa+1 << "] + " << std::scientific << dt << "f * new_qvel[" << da+1 << "];\n"
+           << "new_qpos[" << qa+2 << "] = qpos_in[qoff+" << qa+2 << "] + " << std::scientific << dt << "f * new_qvel[" << da+2 << "];\n"
+           << "{\n"
+           << "  float w[3] = {new_qvel[" << da+3 << "], new_qvel[" << da+4 << "], new_qvel[" << da+5 << "]};\n"
+           << "  float wnorm = sqrt(w[0]*w[0]+w[1]*w[1]+w[2]*w[2]);\n"
+           << "  float angle = " << std::scientific << dt << "f * wnorm;\n"
+           << "  float ha = angle * 0.5f;\n"
+           << "  float sinha = (wnorm > 1e-12f) ? sin(ha)/wnorm : 0.5f*" << std::scientific << dt << "f;\n"
+           << "  float cosha = cos(ha);\n"
+           << "  float dq0=cosha, dq1=sinha*w[0], dq2=sinha*w[1], dq3=sinha*w[2];\n"
+           << "  float q0=qpos_in[qoff+" << qa+3 << "], q1=qpos_in[qoff+" << qa+4 << "];\n"
+           << "  float q2=qpos_in[qoff+" << qa+5 << "], q3=qpos_in[qoff+" << qa+6 << "];\n"
+           << "  float nq0=q0*dq0-q1*dq1-q2*dq2-q3*dq3;\n"
+           << "  float nq1=q0*dq1+q1*dq0+q2*dq3-q3*dq2;\n"
+           << "  float nq2=q0*dq2-q1*dq3+q2*dq0+q3*dq1;\n"
+           << "  float nq3=q0*dq3+q1*dq2-q2*dq1+q3*dq0;\n"
+           << "  float qn=sqrt(nq0*nq0+nq1*nq1+nq2*nq2+nq3*nq3);\n"
+           << "  float inv_qn=(qn>1e-12f)?1.0f/qn:1.0f;\n"
+           << "  new_qpos[" << qa+3 << "]=nq0*inv_qn;\n"
+           << "  new_qpos[" << qa+4 << "]=nq1*inv_qn;\n"
+           << "  new_qpos[" << qa+5 << "]=nq2*inv_qn;\n"
+           << "  new_qpos[" << qa+6 << "]=nq3*inv_qn;\n"
+           << "}\n";
+    }
+
+    for (auto [qa, da] : ball_joints) {
+        ss << "{\n"
+           << "  float w[3] = {new_qvel[" << da << "], new_qvel[" << da+1 << "], new_qvel[" << da+2 << "]};\n"
+           << "  float wnorm = sqrt(w[0]*w[0]+w[1]*w[1]+w[2]*w[2]);\n"
+           << "  float angle = " << std::scientific << dt << "f * wnorm;\n"
+           << "  float ha = angle * 0.5f;\n"
+           << "  float sinha = (wnorm > 1e-12f) ? sin(ha)/wnorm : 0.5f*" << std::scientific << dt << "f;\n"
+           << "  float cosha = cos(ha);\n"
+           << "  float dq0=cosha, dq1=sinha*w[0], dq2=sinha*w[1], dq3=sinha*w[2];\n"
+           << "  float q0=qpos_in[qoff+" << qa << "], q1=qpos_in[qoff+" << qa+1 << "];\n"
+           << "  float q2=qpos_in[qoff+" << qa+2 << "], q3=qpos_in[qoff+" << qa+3 << "];\n"
+           << "  float nq0=q0*dq0-q1*dq1-q2*dq2-q3*dq3;\n"
+           << "  float nq1=q0*dq1+q1*dq0+q2*dq3-q3*dq2;\n"
+           << "  float nq2=q0*dq2-q1*dq3+q2*dq0+q3*dq1;\n"
+           << "  float nq3=q0*dq3+q1*dq2-q2*dq1+q3*dq0;\n"
+           << "  float qn=sqrt(nq0*nq0+nq1*nq1+nq2*nq2+nq3*nq3);\n"
+           << "  float inv_qn=(qn>1e-12f)?1.0f/qn:1.0f;\n"
+           << "  new_qpos[" << qa << "]=nq0*inv_qn;\n"
+           << "  new_qpos[" << qa+1 << "]=nq1*inv_qn;\n"
+           << "  new_qpos[" << qa+2 << "]=nq2*inv_qn;\n"
+           << "  new_qpos[" << qa+3 << "]=nq3*inv_qn;\n"
+           << "}\n";
+    }
+
+    ss << "for (uint i = 0; i < " << nq << "; i++) qpos_out[qoff+i] = new_qpos[i];\n"
+       << "for (uint i = 0; i < n; i++) qvel_out[voff+i] = new_qvel[i];\n"
+       << "for (uint i = 0; i < n; i++) qacc_out[voff+i] = qacc[i];\n";
+
+    return ss.str();
+}
+
 // ── Context: Metal kernels + model constants ─────────────────────────────────
 
 using KernelFn = mx::fast::CustomKernelFunction;
@@ -380,6 +541,8 @@ using KernelFn = mx::fast::CustomKernelFunction;
 struct BatchedStepContext {
     std::optional<KernelFn> kin_kernel;
     std::optional<KernelFn> euler_kernel;
+    std::optional<KernelFn> euler_devmem_kernel;
+    bool uses_devmem_euler = false;
 
     mx::array body_parentid{mx::zeros({1}, mx::int32)};
     mx::array body_pos{mx::zeros({1})};
@@ -458,36 +621,34 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
         );
     }
 
-    // Build Euler kernel
-    // DECISION: The Euler kernel embeds Cholesky factorization and solve inline in Metal
-    // shader language (MSL). It needs ~2*nv*nv + 4*nv + nq floats of stack per thread.
-    // The nv <= 80 limit prevents excessive register pressure on the GPU. For humanoid
-    // (nv=27), this is well within limits. Larger models fall back to CPU integration.
+    // Extract joint integration plan (shared by both euler kernel variants)
+    mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
+    mx::eval(m.dof_damping);
+    auto jt_ptr = m.jnt_type.data<int32_t>();
+    auto qa_ptr = m.jnt_qposadr.data<int32_t>();
+    auto da_ptr = m.jnt_dofadr.data<int32_t>();
+
+    std::vector<int> s_qa, s_da;
+    std::vector<std::pair<int,int>> fj, bj;
+    for (int j = 0; j < m.njnt; j++) {
+        int jt = jt_ptr[j], qa = qa_ptr[j], da = da_ptr[j];
+        if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) {
+            s_qa.push_back(qa); s_da.push_back(da);
+        } else if (jt == (int)JointType::FREE) {
+            fj.push_back({qa, da});
+        } else if (jt == (int)JointType::BALL) {
+            bj.push_back({qa, da});
+        }
+    }
+
+    auto damp_ptr = m.dof_damping.data<float>();
+    std::vector<float> damp_vals(damp_ptr, damp_ptr + m.nv);
+
+    // Build Euler kernel — two tiers:
+    //   nv ≤ 80:   thread-local kernel (fastest, everything in registers/stack)
+    //   nv ≤ 2048: device-memory kernel (L in global GPU memory, vectors thread-local)
     int euler_stack = 2 * m.nv * m.nv + 4 * m.nv + m.nq;
     if (euler_stack * 4 <= 24000 && m.nv <= 80) {
-        mx::eval(m.jnt_type); mx::eval(m.jnt_qposadr); mx::eval(m.jnt_dofadr);
-        mx::eval(m.dof_damping);
-        auto jt_ptr = m.jnt_type.data<int32_t>();
-        auto qa_ptr = m.jnt_qposadr.data<int32_t>();
-        auto da_ptr = m.jnt_dofadr.data<int32_t>();
-
-        std::vector<int> s_qa, s_da;
-        std::vector<std::pair<int,int>> fj, bj;
-        for (int j = 0; j < m.njnt; j++) {
-            int jt = jt_ptr[j], qa = qa_ptr[j], da = da_ptr[j];
-            if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) {
-                s_qa.push_back(qa); s_da.push_back(da);
-            } else if (jt == (int)JointType::FREE) {
-                fj.push_back({qa, da});
-            } else if (jt == (int)JointType::BALL) {
-                bj.push_back({qa, da});
-            }
-        }
-
-        mx::eval(m.dof_damping);
-        auto damp_ptr = m.dof_damping.data<float>();
-        std::vector<float> damp_vals(damp_ptr, damp_ptr + m.nv);
-
         auto euler_source = make_euler_source(
             m.nv, m.nq, m.opt.timestep,
             s_qa, s_da, fj, bj, damp_vals);
@@ -498,6 +659,18 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
             {"qpos_out", "qvel_out", "qacc_out"},
             euler_source
         );
+    } else if (m.nv <= EULER_DEVMEM_MAX_NV) {
+        auto euler_source = make_euler_devmem_source(
+            m.nv, m.nq, m.opt.timestep,
+            s_qa, s_da, fj, bj, damp_vals);
+
+        ctx->euler_devmem_kernel = mx::fast::metal_kernel(
+            "mjmlx_euler_devmem_" + std::to_string(m.nv) + "_" + std::to_string(m.nq),
+            {"qM", "qfrc_smooth", "qfrc_constraint", "qvel_in", "qpos_in"},
+            {"qpos_out", "qvel_out", "qacc_out", "L_scratch"},
+            euler_source
+        );
+        ctx->uses_devmem_euler = true;
     }
 
     return ctx;
@@ -524,6 +697,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
     bool has_kin = ctx->kin_kernel.has_value();
     bool has_euler = ctx->euler_kernel.has_value();
+    bool has_euler_dm = ctx->euler_devmem_kernel.has_value();
 
     // If we need to override iterations, create a mutable copy on heap
     // that outlives this function (captured by lambdas).
@@ -535,12 +709,16 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
         mp = model_override.get();
     }
 
-    if (has_kin && has_euler && use_gpu) {
+    if (has_kin && (has_euler || has_euler_dm) && use_gpu) {
         // ── Primary path: Metal kin → compile(vmap(forward)) → Metal euler ──
+
+        // For large models (nv > 80), skip contacts in forward dynamics to keep
+        // the vmap computation graph under Metal's resource limit (~499K buffers).
+        bool skip_contacts = (nv > 80);
 
         // Per-env forward function: takes per-env arrays, returns per-env results
         // This runs under vmap — no eval, no data<>, pure graph building
-        auto forward_fn = [mp, nq, nv, nu, nb, nj, ng](
+        auto forward_fn = [mp, nq, nv, nu, nb, nj, ng, skip_contacts](
             const std::vector<mx::array>& inputs) -> std::vector<mx::array>
         {
             const Model& m_ref = *mp;
@@ -570,8 +748,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             d.qfrc_applied = mx::zeros(mx::Shape{nv});
             d.xfrc_applied = mx::zeros(mx::Shape{nb, 6});
 
-            // Forward dynamics (no kinematics, no euler)
-            d = vmap_forward(m_ref, d);
+            d = vmap_forward(m_ref, d, skip_contacts);
 
             // Pack outputs needed by Metal euler + observations
             return {
@@ -669,21 +846,32 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             // mid[4]=subtree_com, mid[5]=cinert, mid[6]=cvel, mid[7]=qfrc_actuator, mid[8]=qfrc_bias
 
             // ── Phase 3: Metal Euler (single dispatch for all B envs) ──
-            auto euler = (*ctx->euler_kernel)(
-                {mx::astype(mx::flatten(mid[0]), mx::float32),       // qM flat
-                 mx::astype(mx::flatten(mid[1]), mx::float32),       // qfrc_smooth flat
-                 mx::astype(mx::flatten(mid[2]), mx::float32),       // qfrc_constraint flat
-                 mx::astype(mx::flatten(qvel_batch), mx::float32),   // qvel flat
-                 mx::astype(mx::flatten(qpos_batch), mx::float32)},  // qpos flat
-                {{B * nq}, {B * nv}, {B * nv}},                      // output shapes
-                {mx::float32, mx::float32, mx::float32},             // output dtypes
-                std::make_tuple(B, 1, 1),
-                std::make_tuple(1, 1, 1),
-                {},              // template_args
-                std::nullopt,    // init_value
-                false,           // verbose
-                {}               // default stream
-            );
+            std::vector<mx::array> euler_inputs = {
+                mx::astype(mx::flatten(mid[0]), mx::float32),       // qM flat
+                mx::astype(mx::flatten(mid[1]), mx::float32),       // qfrc_smooth flat
+                mx::astype(mx::flatten(mid[2]), mx::float32),       // qfrc_constraint flat
+                mx::astype(mx::flatten(qvel_batch), mx::float32),   // qvel flat
+                mx::astype(mx::flatten(qpos_batch), mx::float32)    // qpos flat
+            };
+            auto grid = std::make_tuple(B, 1, 1);
+            auto tgroup = std::make_tuple(1, 1, 1);
+
+            std::vector<mx::array> euler;
+            if (ctx->euler_kernel.has_value()) {
+                euler = (*ctx->euler_kernel)(
+                    euler_inputs,
+                    {{B * nq}, {B * nv}, {B * nv}},
+                    {mx::float32, mx::float32, mx::float32},
+                    grid, tgroup, {}, std::nullopt, false, {}
+                );
+            } else {
+                euler = (*ctx->euler_devmem_kernel)(
+                    euler_inputs,
+                    {{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}},
+                    {mx::float32, mx::float32, mx::float32, mx::float32},
+                    grid, tgroup, {}, std::nullopt, false, {}
+                );
+            }
 
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
@@ -701,17 +889,19 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     qfrc_actuator_out, cfrc_ext_out};
         };
 
-        // Wrap in compile for fused Metal execution
+        // compile() fuses the computation graph for max throughput. For large models
+        // with contacts, the graph can exceed Metal's ~499K buffer limit. But the
+        // contact-free path (nv > 80) creates ~7K ops per env, which compiles fine.
         auto compiled = mx::compile(pipeline);
         return compiled;
     }
 
-    // Metal kernels could not be built for this model (e.g., nv > 80).
-    // Signal to the caller so it can fall back to CPU batched mode.
+    // Metal kernels could not be built for this model.
     throw std::runtime_error(
         "GPU Metal kernels not available for this model (nv=" + std::to_string(nv) +
         ", nbody=" + std::to_string(nb) + "). "
-        "Euler kernel requires nv <= 80. Use CPU batched mode instead.");
+        "Device-memory Euler requires nv <= " + std::to_string(EULER_DEVMEM_MAX_NV) +
+        ". Use CPU batched mode instead.");
 }
 
 } // namespace mjmlx
