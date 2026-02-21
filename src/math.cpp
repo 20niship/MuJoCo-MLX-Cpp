@@ -247,6 +247,32 @@ mx::array transform_motion(const mx::array& vel, const mx::array& offset,
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
 
+std::pair<mx::array, mx::array> orthogonals(const mx::array& n) {
+    mx::eval(n);
+    auto np = n.data<float>();
+    float nx = np[0], ny = np[1], nz = np[2];
+
+    float ax, ay, az;
+    if (std::abs(nx) < std::abs(ny) && std::abs(nx) < std::abs(nz)) {
+        ax = 0; ay = -nz; az = ny;
+    } else if (std::abs(ny) < std::abs(nz)) {
+        ax = nz; ay = 0; az = -nx;
+    } else {
+        ax = -ny; ay = nx; az = 0;
+    }
+
+    float len = std::sqrt(ax*ax + ay*ay + az*az);
+    if (len > MJMINVAL) { ax /= len; ay /= len; az /= len; }
+
+    float cx = ny*az - nz*ay;
+    float cy = nz*ax - nx*az;
+    float cz = nx*ay - ny*ax;
+    len = std::sqrt(cx*cx + cy*cy + cz*cz);
+    if (len > MJMINVAL) { cx /= len; cy /= len; cz /= len; }
+
+    return {mx::array({ax, ay, az}), mx::array({cx, cy, cz})};
+}
+
 mx::array closest_segment_point(const mx::array& a, const mx::array& b,
                                  const mx::array& pt) {
     auto ab = mx::subtract(b, a);

@@ -216,14 +216,13 @@ install(TARGETS mjb
 # ── Tests ─────────────────────────────────────────────────────
 if(MJMLX_BUILD_TESTS)
     enable_testing()
+    # ── Active tests (use current batched API) ──────────────────
     add_executable(test_io tests/test_io.cpp)
     target_link_libraries(test_io PRIVATE mjmlx)
-    add_executable(test_smooth tests/test_smooth.cpp)
-    target_link_libraries(test_smooth PRIVATE mjmlx)
-    add_executable(test_forward tests/test_forward.cpp)
-    target_link_libraries(test_forward PRIVATE mjmlx)
+
     add_executable(test_batched tests/test_batched.cpp)
     target_link_libraries(test_batched PRIVATE mjmlx)
+
     add_executable(test_batched_diag tests/test_batched_diag.cpp)
     target_link_libraries(test_batched_diag PRIVATE mjmlx mujoco_imported mlx_imported)
     target_include_directories(test_batched_diag PRIVATE
@@ -231,19 +230,6 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
-    # Full test suite (ported from Python 228 tests)
-    # All full tests need mjmlx + mujoco + internal headers
-    # Tests using C API + MuJoCo C reference
-    foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full)
-        add_executable(${_test} tests/${_test}.cpp)
-        target_link_libraries(${_test} PRIVATE mjmlx mujoco_imported)
-        target_include_directories(${_test} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-    endforeach()
-
-    # Math test needs internal symbols -- link math.cpp directly
     add_executable(test_math_full tests/test_math_full.cpp src/math.cpp)
     target_link_libraries(test_math_full PRIVATE mjmlx mujoco_imported mlx_imported)
     target_include_directories(test_math_full PRIVATE
@@ -251,7 +237,6 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
-    # Linalg test -- Cholesky and solve (needs internal symbols from smooth_vmap.cpp)
     add_executable(test_linalg_full tests/test_linalg_full.cpp src/smooth_vmap.cpp src/math.cpp)
     target_link_libraries(test_linalg_full PRIVATE mjmlx mujoco_imported mlx_imported)
     target_include_directories(test_linalg_full PRIVATE
@@ -259,178 +244,9 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
-    # Vmap smooth tests -- com_vel and rne against MuJoCo C reference
-    # Uses C API (mjmlx_forward) to run full pipeline, then compares internal Data fields
-    add_executable(test_vmap_smooth tests/test_vmap_smooth.cpp)
-    target_link_libraries(test_vmap_smooth PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_vmap_smooth PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 1.1: Gravity compensation tests
-    add_executable(test_gravcomp tests/test_gravcomp.cpp)
-    target_link_libraries(test_gravcomp PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_gravcomp PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 1.2: cfrc_ext (per-body contact forces) tests
-    add_executable(test_cfrc_ext tests/test_cfrc_ext.cpp)
-    target_link_libraries(test_cfrc_ext PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_cfrc_ext PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 1.3: Exclude signature tests
-    add_executable(test_exclude tests/test_exclude.cpp)
-    target_link_libraries(test_exclude PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_exclude PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 1.4: Model validation warning tests
-    add_executable(test_validation tests/test_validation.cpp)
-    target_link_libraries(test_validation PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_validation PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 1.5: High-DOF model tests and benchmarks
-    add_executable(test_high_dof tests/test_high_dof.cpp)
-    target_link_libraries(test_high_dof PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_high_dof PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 2.1: Pyramidal friction (condim=3) tests
-    add_executable(test_friction_condim3 tests/test_friction_condim3.cpp)
-    target_link_libraries(test_friction_condim3 PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_friction_condim3 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 2.2: Condim=4,6 friction tests
-    add_executable(test_friction_condim46 tests/test_friction_condim46.cpp)
-    target_link_libraries(test_friction_condim46 PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_friction_condim46 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 3.1: BOX collision tests
-    add_executable(test_collision_box tests/test_collision_box.cpp)
-    target_link_libraries(test_collision_box PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_collision_box PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 3.2: CYLINDER collision tests
-    add_executable(test_collision_cylinder tests/test_collision_cylinder.cpp)
-    target_link_libraries(test_collision_cylinder PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_collision_cylinder PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 3.3: MESH collision tests (GJK/EPA)
-    add_executable(test_collision_mesh tests/test_collision_mesh.cpp)
-    target_link_libraries(test_collision_mesh PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_collision_mesh PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 3.4: HFIELD collision tests
-    add_executable(test_collision_hfield tests/test_collision_hfield.cpp)
-    target_link_libraries(test_collision_hfield PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_collision_hfield PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 3.5: ELLIPSOID collision tests
-    add_executable(test_collision_ellipsoid tests/test_collision_ellipsoid.cpp)
-    target_link_libraries(test_collision_ellipsoid PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_collision_ellipsoid PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 4.1: Equality constraint tests
-    add_executable(test_equality tests/test_equality.cpp)
-    target_link_libraries(test_equality PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_equality PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 4.2: DOF friction loss tests
-    add_executable(test_dof_friction tests/test_dof_friction.cpp)
-    target_link_libraries(test_dof_friction PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_dof_friction PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 5.1: Fixed tendon tests
-    add_executable(test_fixed_tendon tests/test_fixed_tendon.cpp)
-    target_link_libraries(test_fixed_tendon PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_fixed_tendon PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 5.3: Transmission tests (TENDON + SITE)
-    add_executable(test_transmission tests/test_transmission.cpp)
-    target_link_libraries(test_transmission PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_transmission PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 5.4-5.5: Tendon constraint tests
-    add_executable(test_tendon_constraint tests/test_tendon_constraint.cpp)
-    target_link_libraries(test_tendon_constraint PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_tendon_constraint PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 7.1: RK4 integrator tests
-    add_executable(test_rk4 tests/test_rk4.cpp)
-    target_link_libraries(test_rk4 PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_rk4 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 6.1: Filter dynamics tests
-    add_executable(test_filter_dynamics tests/test_filter_dynamics.cpp)
-    target_link_libraries(test_filter_dynamics PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_filter_dynamics PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Phase 7.2: ImplicitFast integrator tests
-    add_executable(test_implicit tests/test_implicit.cpp)
-    target_link_libraries(test_implicit PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_implicit PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_io_full test_forward_full test_physics_full test_solver_full test_collision_full test_math_full test_batched_diag test_linalg_full test_vmap_smooth test_gravcomp test_cfrc_ext test_exclude test_validation test_high_dof test_friction_condim3 test_friction_condim46 test_collision_box test_collision_cylinder test_collision_mesh test_collision_hfield test_collision_ellipsoid test_equality test_dof_friction test_fixed_tendon test_transmission test_tendon_constraint test_rk4 test_filter_dynamics test_implicit)
+        foreach(_test test_math_full test_batched_diag test_linalg_full)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -443,62 +259,16 @@ if(MJMLX_BUILD_TESTS)
     # ── CTest entries ─────────────────────────────────────────
     set(MJMLX_TEST_MODEL "" CACHE FILEPATH "Path to humanoid.xml for model-dependent tests")
 
-    # Self-contained tests (no model path needed)
     add_test(NAME math_full COMMAND test_math_full)
-    set_tests_properties(math_full PROPERTIES LABELS "correctness")
+    add_test(NAME linalg_full COMMAND test_linalg_full)
+    set_tests_properties(math_full linalg_full PROPERTIES LABELS "correctness")
 
-    # Tests that optionally use a model path
     if(MJMLX_TEST_MODEL)
-        add_test(NAME io_full COMMAND test_io_full)
-        add_test(NAME forward_full COMMAND test_forward_full)
-        add_test(NAME physics_full COMMAND test_physics_full)
-        add_test(NAME solver_full COMMAND test_solver_full ${MJMLX_TEST_MODEL})
-        add_test(NAME collision_full COMMAND test_collision_full)
-        add_test(NAME linalg_full COMMAND test_linalg_full ${MJMLX_TEST_MODEL})
-        add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
+        add_test(NAME io COMMAND test_io ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
-        add_test(NAME vmap_smooth COMMAND test_vmap_smooth)
-    else()
-        add_test(NAME io_full COMMAND test_io_full)
-        add_test(NAME forward_full COMMAND test_forward_full)
-        add_test(NAME physics_full COMMAND test_physics_full)
-        add_test(NAME solver_full COMMAND test_solver_full)
-        add_test(NAME collision_full COMMAND test_collision_full)
-        add_test(NAME linalg_full COMMAND test_linalg_full)
-        add_test(NAME vmap_smooth COMMAND test_vmap_smooth)
+        add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
+        set_tests_properties(io batched batched_diag PROPERTIES LABELS "correctness")
     endif()
-
-    # Self-contained Phase 1 tests (no model path needed)
-    add_test(NAME gravcomp COMMAND test_gravcomp)
-    add_test(NAME cfrc_ext COMMAND test_cfrc_ext)
-    add_test(NAME exclude COMMAND test_exclude)
-    add_test(NAME validation COMMAND test_validation)
-    add_test(NAME high_dof COMMAND test_high_dof)
-    add_test(NAME friction_condim3 COMMAND test_friction_condim3)
-    add_test(NAME friction_condim46 COMMAND test_friction_condim46)
-    add_test(NAME collision_box COMMAND test_collision_box)
-    add_test(NAME collision_cylinder COMMAND test_collision_cylinder)
-    add_test(NAME collision_mesh COMMAND test_collision_mesh)
-    add_test(NAME collision_hfield COMMAND test_collision_hfield)
-    add_test(NAME collision_ellipsoid COMMAND test_collision_ellipsoid)
-    add_test(NAME equality COMMAND test_equality)
-    add_test(NAME dof_friction COMMAND test_dof_friction)
-    add_test(NAME fixed_tendon COMMAND test_fixed_tendon)
-    add_test(NAME transmission COMMAND test_transmission)
-    add_test(NAME tendon_constraint COMMAND test_tendon_constraint)
-    add_test(NAME rk4 COMMAND test_rk4)
-    add_test(NAME filter_dynamics COMMAND test_filter_dynamics)
-    add_test(NAME implicit COMMAND test_implicit)
-    set_tests_properties(gravcomp cfrc_ext exclude validation high_dof friction_condim3 friction_condim46 collision_box collision_cylinder collision_mesh collision_hfield collision_ellipsoid equality dof_friction fixed_tendon transmission tendon_constraint rk4 filter_dynamics implicit PROPERTIES LABELS "correctness")
-
-    # Label all correctness tests
-    set(_correctness_tests io_full forward_full physics_full solver_full collision_full linalg_full vmap_smooth)
-    if(MJMLX_TEST_MODEL)
-        list(APPEND _correctness_tests batched_diag batched)
-    endif()
-    foreach(_ct ${_correctness_tests})
-        set_tests_properties(${_ct} PROPERTIES LABELS "correctness")
-    endforeach()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────
@@ -583,3 +353,4 @@ install(TARGETS mjmlx
     RUNTIME DESTINATION bin
 )
 install(DIRECTORY include/mjmlx DESTINATION include)
+

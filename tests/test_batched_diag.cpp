@@ -81,9 +81,12 @@ int main(int argc, char** argv) {
             float d = std::abs(cpu_qvel[i] - gpu_qvel[i]);
             if (d > max_diff) max_diff = d;
         }
-        // CPU uses MuJoCo C (double); GPU uses MLX (float32). Forward dynamics
-        // (inertia solve) accumulates precision differences; 0.57+ observed.
-        CHECK_LT(max_diff, 1.0f, "qvel: GPU matches CPU within 1.0 (float32 vs double)");
+        // The mass matrix solve itself is accurate (float32 dense Cholesky matches
+        // within 0.0003). The 0.57 divergence comes from the constraint solver:
+        // the humanoid has 21 limited joints (many active at qpos0), producing
+        // constraint forces up to 300+. With 1 Newton iteration, the GPU solver
+        // converges differently than MuJoCo C's sparse double-precision solver.
+        CHECK_LT(max_diff, 1.0f, "qvel: GPU matches CPU within 1.0 (constraint solver diff)");
 
         mjmlx_batched_free(sim_cpu);
         mjmlx_batched_free(sim_gpu);

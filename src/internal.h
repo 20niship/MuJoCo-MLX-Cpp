@@ -601,6 +601,7 @@ mx::array axis_angle_to_quat(const mx::array& axis, const mx::array& angle);
 mx::array inert_mul(const mx::array& inert, const mx::array& vel);
 mx::array motion_cross(const mx::array& u, const mx::array& v);
 mx::array motion_cross_force(const mx::array& v, const mx::array& f);
+std::pair<mx::array, mx::array> orthogonals(const mx::array& n);
 mx::array closest_segment_point(const mx::array& a, const mx::array& b, const mx::array& pt);
 std::pair<mx::array, mx::array> closest_segment_to_segment_points(
     const mx::array& a0, const mx::array& a1,
