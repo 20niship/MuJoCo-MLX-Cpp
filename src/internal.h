@@ -679,6 +679,13 @@ MJMLX_API MetalCollisionResult test_metal_collision(
     const Model& m,
     const mx::array& geom_xpos, const mx::array& geom_xmat);
 
+MJMLX_API MetalCollisionResult test_metal_solver(
+    const Model& m,
+    const mx::array& qM, const mx::array& qfrc_smooth,
+    const mx::array& cdof, const mx::array& subtree_com,
+    const mx::array& qvel,
+    const mx::array& contact_data, const mx::array& contact_count);
+
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);
 mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel);

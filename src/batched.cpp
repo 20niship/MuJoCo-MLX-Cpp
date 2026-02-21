@@ -39,6 +39,7 @@
 #include "internal.h"
 #include "mjmlx/mjmlx.h"
 #include <sstream>
+#include <iomanip>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -1090,6 +1091,11 @@ static std::string make_forward_source(const Model& m) {
        << "  qfrc_smooth_out[qfs_off+di] = scratch[s_off+S_PASS+di] - scratch[s_off+S_BIAS+di] + qfrc_actuator_out[qa_off+di];\n"
        << "}\n";
 
+    // Copy cdof from scratch to output
+    ss << "uint cd_off = bid * NV * 6;\n"
+       << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++)\n"
+       << "  cdof_out[cd_off + di*6+k] = scratch[s_off+S_CDOF+di*6+k];\n";
+
     return ss.str();
 }
 
@@ -1130,7 +1136,7 @@ MJMLX_API MetalForwardResult test_metal_forward(
          "qpos", "qvel", "ctrl",
          "make_m_mask", "act_moment"},
         {"qM_out", "qfrc_smooth_out", "subtree_com_out",
-         "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch"},
+         "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"},
         fwd_source,
         FORWARD_HEADER
     );
@@ -1148,9 +1154,9 @@ MJMLX_API MetalForwardResult test_metal_forward(
          mm, am},
         {{B * nv * nv}, {B * nv}, {B * nb * 3},
          {B * nb * 10}, {B * nb * 6}, {B * nv},
-         {B * scratchSz}},
+         {B * scratchSz}, {B * nv * 6}},
         {mx::float32, mx::float32, mx::float32,
-         mx::float32, mx::float32, mx::float32, mx::float32},
+         mx::float32, mx::float32, mx::float32, mx::float32, mx::float32},
         std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
         {}, std::nullopt, false, {}
     );
@@ -1497,6 +1503,453 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
+// ── Metal constraint + Newton solver kernel ──────────────────────────────────
+
+static const int MAX_EFC = 256;
+static const int SOLVER_ITERS = 10;
+
+static std::string make_solver_source(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int nb = m.nbody, nv = m.nv, npairs = (int)c.collision_pairs.size();
+    float timestep = m.opt.timestep;
+    bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
+    bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
+
+    // Scratch layout per env (all in solver_scratch buffer)
+    int S_H = 0;
+    int S_J = S_H + nv * nv;
+    int S_D = S_J + MAX_EFC * nv;
+    int S_AREF = S_D + MAX_EFC;
+    int S_FORCE = S_AREF + MAX_EFC;
+    int S_GRAD = S_FORCE + MAX_EFC;
+    int S_SEARCH = S_GRAD + nv;
+    int S_QACC = S_SEARCH + nv;
+    int S_MA = S_QACC + nv;
+    int S_JAREF = S_MA + nv;
+    int S_ACTIVE = S_JAREF + MAX_EFC;
+    int S_MV = S_ACTIVE + MAX_EFC;
+    int S_JV = S_MV + nv;
+    int S_JACP = S_JV + MAX_EFC;
+    int SCRATCH_PER_ENV = S_JACP + nv * 3;
+
+    std::ostringstream ss;
+
+    ss << "uint bid = thread_position_in_grid.x;\n"
+       << "const int NV = " << nv << ";\n"
+       << "const int NB = " << nb << ";\n"
+       << "const int MAX_EFC_N = " << MAX_EFC << ";\n"
+       << "const int NSOLVE = " << SOLVER_ITERS << ";\n"
+       << "const int CON_STRIDE = " << CONTACT_STRIDE << ";\n"
+       << "const int MAX_CON = " << MAX_CONTACTS_PER_ENV << ";\n"
+       << "const float TIMESTEP = " << timestep << "f;\n"
+       << "const float MJMINVAL_CV = 1e-12f;\n"
+       << "const float MJMINVAL_SV = 1e-14f;\n"
+       << "const float MJMINIMP = 0.0001f;\n"
+       << "const float MJMAXIMP = 0.9999f;\n\n";
+
+    // Scratch offsets via macros (avoid device pointer issues in MSL)
+    ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n"
+       << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
+       << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
+       << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
+       << "#define efc_aref(i)  solver_scratch[s_off + " << S_AREF << " + (i)]\n"
+       << "#define efc_force(i) solver_scratch[s_off + " << S_FORCE << " + (i)]\n"
+       << "#define grad(i)      solver_scratch[s_off + " << S_GRAD << " + (i)]\n"
+       << "#define search_d(i)  solver_scratch[s_off + " << S_SEARCH << " + (i)]\n"
+       << "#define qacc(i)      solver_scratch[s_off + " << S_QACC << " + (i)]\n"
+       << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
+       << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
+       << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
+       << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
+       << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n"
+       << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + (i)]\n\n";
+
+    // State offsets
+    ss << "uint qm_off = bid * NV * NV;\n"
+       << "uint qfs_off = bid * NV;\n"
+       << "uint cd_off = bid * NV * 6;\n"
+       << "uint sc_off = bid * NB * 3;\n"
+       << "uint qv_off = bid * NV;\n"
+       << "uint con_off = bid * MAX_CON * CON_STRIDE;\n"
+       << "uint qfc_off = bid * NV;\n\n";
+
+    // Zero scratch
+    ss << "for (int ii = 0; ii < " << SCRATCH_PER_ENV << "; ii++) solver_scratch[s_off + ii] = 0;\n\n";
+
+    // Get contact count
+    ss << "int ncon = (int)contact_count_in[bid];\n"
+       << "int nefc = 0;\n\n";
+
+    // ── Build constraint rows from contacts ──
+    ss << R"(
+for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
+    int ci_off = con_off + ci * CON_STRIDE;
+    float c_pos_x = contact_data_in[ci_off+0];
+    float c_pos_y = contact_data_in[ci_off+1];
+    float c_pos_z = contact_data_in[ci_off+2];
+    float c_norm_x = contact_data_in[ci_off+3];
+    float c_norm_y = contact_data_in[ci_off+4];
+    float c_norm_z = contact_data_in[ci_off+5];
+    float c_dist = contact_data_in[ci_off+6];
+    int pair_idx = (int)contact_data_in[ci_off+7];
+
+    int pp = pair_idx * 18;
+    int body1 = (int)pair_props[pp+0];
+    int body2 = (int)pair_props[pp+1];
+    int condim = (int)pair_props[pp+2];
+    float pair_margin_v = pair_props[pp+3];
+    float fri0 = pair_props[pp+4];
+    float fri1 = pair_props[pp+5];
+    float solref0 = pair_props[pp+9];
+    float solref1_v = pair_props[pp+10];
+    float si0 = pair_props[pp+11], si1 = pair_props[pp+12];
+    float si2 = pair_props[pp+13], si3 = pair_props[pp+14], si4 = pair_props[pp+15];
+    float invw_t = pair_props[pp+16];
+
+    bool contact_active = (c_dist < pair_margin_v);
+    float pos = c_dist;
+
+    float tc = solref0;
+)";
+    if (!refsafe) ss << "    tc = max(tc, 2.0f * TIMESTEP);\n";
+    ss << R"(
+    float dmin = clamp(si0, MJMINIMP, MJMAXIMP);
+    float dmax_v = clamp(si1, MJMINIMP, MJMAXIMP);
+    float width_v = max(si2, MJMINVAL_CV);
+    float mid_v = clamp(si3, MJMINIMP, MJMAXIMP);
+    float power_v = max(si4, 1.0f);
+
+    float k_val = (tc > 0) ? 1.0f/(dmax_v*dmax_v*tc*tc*solref1_v*solref1_v) : -tc/(dmax_v*dmax_v);
+    float b_val = (solref1_v > 0) ? 2.0f/(dmax_v*tc) : -solref1_v/dmax_v;
+
+    float imp_x_val = abs(pos) / width_v;
+    float imp_y_val;
+    if (imp_x_val < mid_v) {
+        imp_y_val = pow(imp_x_val, power_v) / pow(mid_v, power_v - 1.0f);
+    } else {
+        imp_y_val = 1.0f - pow(1.0f - imp_x_val, power_v) / pow(1.0f - mid_v, power_v - 1.0f);
+    }
+    float imp_val = clamp(dmin + imp_y_val * (dmax_v - dmin), dmin, dmax_v);
+    if (imp_x_val > 1.0f) imp_val = dmax_v;
+
+    // Compute Jacobian djacp via body_dof_masks and cdof
+    for (int di = 0; di < NV*3; di++) jacp_tmp(di) = 0;
+
+    // body2 (+)
+    {
+        int rid = (int)body_rootid_buf[body2];
+        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
+        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
+        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        for (int di = 0; di < NV; di++) {
+            if (body_dof_masks_buf[body2*NV+di] < 0.5f) continue;
+            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
+            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            jacp_tmp(di*3+0) += lx + (ay*oz - az*oy);
+            jacp_tmp(di*3+1) += ly + (az*ox - ax*oz);
+            jacp_tmp(di*3+2) += lz + (ax*oy - ay*ox);
+        }
+    }
+    // body1 (-)
+    {
+        int rid = (int)body_rootid_buf[body1];
+        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
+        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
+        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        for (int di = 0; di < NV; di++) {
+            if (body_dof_masks_buf[body1*NV+di] < 0.5f) continue;
+            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
+            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            jacp_tmp(di*3+0) -= lx + (ay*oz - az*oy);
+            jacp_tmp(di*3+1) -= ly + (az*ox - ax*oz);
+            jacp_tmp(di*3+2) -= lz + (ax*oy - ay*ox);
+        }
+    }
+
+    // j_normal = normal^T @ djacp^T
+    float j_normal_arr[)";
+    ss << nv << R"(];
+    for (int di = 0; di < NV; di++)
+        j_normal_arr[di] = c_norm_x*jacp_tmp(di*3) + c_norm_y*jacp_tmp(di*3+1) + c_norm_z*jacp_tmp(di*3+2);
+)";
+
+    if (use_pyramidal) {
+        ss << R"(
+    float3 nn = float3(c_norm_x, c_norm_y, c_norm_z);
+    float3 tt1, tt2;
+    if (abs(nn.z) < 0.999f) tt1 = msl_cross(nn, float3(0,0,1));
+    else tt1 = msl_cross(nn, float3(0,1,0));
+    tt1 = msl_norm(tt1); tt2 = msl_cross(nn, tt1);
+
+    if (condim >= 3 && contact_active) {
+        float mu0 = fri0, mu0_sq = mu0*mu0;
+        float invw_py = invw_t + mu0_sq*invw_t;
+        float r_first = max(invw_py*(1.0f-imp_val)/imp_val, MJMINVAL_CV);
+)";
+        ss << "        float r_py = max(2.0f*mu0_sq/" << std::fixed << std::setprecision(6) << m.opt.impratio << "f*r_first, MJMINVAL_CV);\n";
+        ss << R"(
+        float D_py = 1.0f/r_py;
+        float mu_vals[2] = {fri0, fri1};
+        for (int tk = 0; tk < 2; tk++) {
+            float mu_k = mu_vals[tk];
+            float3 tang = (tk==0) ? tt1 : tt2;
+            for (int di = 0; di < NV; di++) {
+                float jt = tang.x*jacp_tmp(di*3)+tang.y*jacp_tmp(di*3+1)+tang.z*jacp_tmp(di*3+2);
+                J(nefc,di) = j_normal_arr[di] + mu_k*jt;
+            }
+            float jdot = 0;
+            for (int di = 0; di < NV; di++) jdot += J(nefc,di)*qvel_in[qv_off+di];
+            efc_D(nefc) = D_py;
+            efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
+            nefc++;
+            for (int di = 0; di < NV; di++) {
+                float jt = tang.x*jacp_tmp(di*3)+tang.y*jacp_tmp(di*3+1)+tang.z*jacp_tmp(di*3+2);
+                J(nefc,di) = j_normal_arr[di] - mu_k*jt;
+            }
+            jdot = 0;
+            for (int di = 0; di < NV; di++) jdot += J(nefc,di)*qvel_in[qv_off+di];
+            efc_D(nefc) = D_py;
+            efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
+            nefc++;
+        }
+    } else if (contact_active) {
+)";
+    } else {
+        ss << "    if (contact_active) {\n";
+    }
+
+    ss << R"(
+        for (int di = 0; di < NV; di++) J(nefc,di) = j_normal_arr[di];
+        float r = max(invw_t*(1.0f-imp_val)/imp_val, MJMINVAL_CV);
+        efc_D(nefc) = 1.0f/r;
+        float jdot = 0;
+        for (int di = 0; di < NV; di++) jdot += j_normal_arr[di]*qvel_in[qv_off+di];
+        efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
+        nefc++;
+    }
+}
+
+// ── Newton solver ──
+// Cholesky of qM to get qacc_smooth
+for (int i = 0; i < NV*NV; i++) H(i) = qM_in[qm_off+i];
+for (int j = 0; j < NV; j++) {
+    float s = 0; for (int k = 0; k < j; k++) s += H(j*NV+k)*H(j*NV+k);
+    H(j*NV+j) = sqrt(max(H(j*NV+j)-s, 1e-6f));
+    for (int i = j+1; i < NV; i++) {
+        float s2 = 0; for (int k = 0; k < j; k++) s2 += H(i*NV+k)*H(j*NV+k);
+        H(i*NV+j) = (H(i*NV+j)-s2)/max(H(j*NV+j), 1e-10f);
+    }
+}
+for (int i = 0; i < NV; i++) {
+    float s = qfrc_smooth_in[qfs_off+i];
+    for (int k = 0; k < i; k++) s -= H(i*NV+k)*qacc(k);
+    qacc(i) = s/max(H(i*NV+i), 1e-10f);
+}
+for (int i = NV-1; i >= 0; i--) {
+    float s = qacc(i);
+    for (int k = i+1; k < NV; k++) s -= H(k*NV+i)*qacc(k);
+    qacc(i) = s/max(H(i*NV+i), 1e-10f);
+}
+
+if (nefc == 0) {
+    for (int di = 0; di < NV; di++) qfrc_constraint_out[qfc_off+di] = 0;
+} else {
+    // Ma = M @ qacc
+    for (int i = 0; i < NV; i++) {
+        float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off+i*NV+j]*qacc(j);
+        Ma(i) = s;
+    }
+    // Jaref = J @ qacc - aref
+    for (int r = 0; r < nefc; r++) {
+        float s = 0; for (int j = 0; j < NV; j++) s += J(r,j)*qacc(j);
+        Jaref(r) = s - efc_aref(r);
+    }
+    for (int r = 0; r < nefc; r++) act(r) = (Jaref(r) < 0) ? 1.0f : 0.0f;
+    for (int r = 0; r < nefc; r++) efc_force(r) = efc_D(r)*(-Jaref(r))*act(r);
+
+    for (int i = 0; i < NV; i++) {
+        float s = 0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
+        grad(i) = Ma(i) - qfrc_smooth_in[qfs_off+i] - s;
+    }
+
+    for (int iter = 0; iter < NSOLVE; iter++) {
+        // H = M + J^T D_active J
+        for (int i = 0; i < NV; i++) for (int j = 0; j < NV; j++) {
+            float s = qM_in[qm_off+i*NV+j]; if (i==j) s += MJMINVAL_SV;
+            for (int r = 0; r < nefc; r++) s += J(r,i)*efc_D(r)*act(r)*J(r,j);
+            H(i*NV+j) = s;
+        }
+        // Cholesky
+        for (int j = 0; j < NV; j++) {
+            float s = 0; for (int k = 0; k < j; k++) s += H(j*NV+k)*H(j*NV+k);
+            H(j*NV+j) = sqrt(max(H(j*NV+j)-s, 1e-6f));
+            for (int i = j+1; i < NV; i++) {
+                float s2 = 0; for (int k = 0; k < j; k++) s2 += H(i*NV+k)*H(j*NV+k);
+                H(i*NV+j) = (H(i*NV+j)-s2)/max(H(j*NV+j), 1e-10f);
+            }
+        }
+        // search = -L^{-T} L^{-1} grad
+        for (int i = 0; i < NV; i++) {
+            float s = -grad(i); for (int k = 0; k < i; k++) s -= H(i*NV+k)*search_d(k);
+            search_d(i) = s/max(H(i*NV+i), 1e-10f);
+        }
+        for (int i = NV-1; i >= 0; i--) {
+            float s = search_d(i); for (int k = i+1; k < NV; k++) s -= H(k*NV+i)*search_d(k);
+            search_d(i) = s/max(H(i*NV+i), 1e-10f);
+        }
+        // Line search
+        for (int i = 0; i < NV; i++) {
+            float s = 0; for (int j = 0; j < NV; j++) s += qM_in[qm_off+i*NV+j]*search_d(j);
+            Mv_arr(i) = s;
+        }
+        for (int r = 0; r < nefc; r++) {
+            float s = 0; for (int j = 0; j < NV; j++) s += J(r,j)*search_d(j);
+            Jv_arr(r) = s;
+        }
+        float qg=0,lg=0,qc=0,lc=0;
+        for (int i = 0; i < NV; i++) {
+            qg += 0.5f*search_d(i)*Mv_arr(i);
+            lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]);
+        }
+        for (int r = 0; r < nefc; r++) {
+            qc += 0.5f*efc_D(r)*Jv_arr(r)*Jv_arr(r)*act(r);
+            lc += efc_D(r)*Jv_arr(r)*Jaref(r)*act(r);
+        }
+        float dnom = 2.0f*(qg+qc);
+        float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
+        float als[5] = {an, 0.5f*an, 0.1f*an, 0.01f, 0.001f};
+        float bc = 1e30f, ba = 0;
+        // Current cost
+        float cc=0; for (int r = 0; r < nefc; r++) cc += 0.5f*efc_D(r)*Jaref(r)*Jaref(r)*act(r);
+        float cg=0; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*(qacc(i)-0);
+        bc = cc+cg;
+        for (int ai = 0; ai < 5; ai++) {
+            float a = als[ai]; float tc2=0;
+            for (int r = 0; r < nefc; r++) {
+                float x = Jaref(r)+a*Jv_arr(r); float ar = (x<0)?1.0f:0.0f;
+                tc2 += 0.5f*efc_D(r)*x*x*ar;
+            }
+            float tg = cg + a*lg + 0.5f*a*a*(2.0f*qg);
+            float tt = tc2+tg;
+            if (tt < bc) { bc=tt; ba=a; }
+        }
+        for (int i = 0; i < NV; i++) { qacc(i) += ba*search_d(i); Ma(i) += ba*Mv_arr(i); }
+        for (int r = 0; r < nefc; r++) Jaref(r) += ba*Jv_arr(r);
+        for (int r = 0; r < nefc; r++) act(r) = (Jaref(r)<0)?1.0f:0.0f;
+        for (int r = 0; r < nefc; r++) efc_force(r) = efc_D(r)*(-Jaref(r))*act(r);
+        for (int i = 0; i < NV; i++) {
+            float s=0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
+            grad(i) = Ma(i)-qfrc_smooth_in[qfs_off+i]-s;
+        }
+    }
+    for (int i = 0; i < NV; i++) {
+        float s=0; for (int r = 0; r < nefc; r++) s += J(r,i)*efc_force(r);
+        qfrc_constraint_out[qfc_off+i] = s;
+    }
+}
+)";
+
+    return ss.str();
+}
+
+static int solver_scratch_per_env(const Model& m) {
+    int nv = m.nv;
+    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+}
+
+// Build solver pair properties buffer (18 floats per pair)
+static mx::array build_solver_pair_props(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int npairs = (int)c.collision_pairs.size();
+    std::vector<float> data(npairs * 18, 0.0f);
+    for (int p = 0; p < npairs; p++) {
+        const auto& cp = c.collision_pairs[p];
+        data[p*18+0] = (float)cp.body1;
+        data[p*18+1] = (float)cp.body2;
+        data[p*18+2] = (float)cp.condim;
+        data[p*18+3] = cp.margin + cp.gap;
+        for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
+        data[p*18+9] = cp.solref[0];
+        data[p*18+10] = cp.solref[1];
+        for (int k = 0; k < 5; k++) data[p*18+11+k] = cp.solimp[k];
+        data[p*18+16] = cp.invweight_t;
+        data[p*18+17] = cp.invweight_r;
+    }
+    return mx::array(data.data(), {npairs * 18}, mx::float32);
+}
+
+// Build body_dof_masks buffer (nb × nv flat)
+static mx::array build_body_dof_masks(const Model& m) {
+    m.init_cache();
+    int nb = m.nbody, nv = m.nv;
+    std::vector<float> data(nb * nv, 0.0f);
+    for (int b = 0; b < nb; b++) {
+        mx::eval(m.cache.body_dof_masks[b]);
+        auto ptr = m.cache.body_dof_masks[b].data<float>();
+        for (int d = 0; d < nv; d++) data[b * nv + d] = ptr[d];
+    }
+    return mx::array(data.data(), {nb * nv}, mx::float32);
+}
+
+// Build body_rootid buffer
+static mx::array build_body_rootid(const Model& m) {
+    m.init_cache();
+    int nb = m.nbody;
+    std::vector<float> data(nb);
+    for (int b = 0; b < nb; b++) data[b] = (float)m.cache.body_rootid_vec[b];
+    return mx::array(data.data(), {nb}, mx::float32);
+}
+
+// Test helper for solver kernel
+MJMLX_API MetalCollisionResult test_metal_solver(
+    const Model& m,
+    const mx::array& qM, const mx::array& qfrc_smooth,
+    const mx::array& cdof, const mx::array& subtree_com,
+    const mx::array& qvel,
+    const mx::array& contact_data, const mx::array& contact_count)
+{
+    int nv = m.nv, nb = m.nbody;
+    auto solver_source = make_solver_source(m);
+    auto pair_props = build_solver_pair_props(m);
+    auto body_dof_masks_buf = build_body_dof_masks(m);
+    auto body_rootid_buf = build_body_rootid(m);
+    mx::eval(pair_props, body_dof_masks_buf, body_rootid_buf);
+
+    auto kernel = mx::fast::metal_kernel(
+        "mjmlx_test_solver_" + std::to_string(nv),
+        {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
+         "qvel_in", "contact_data_in", "contact_count_in",
+         "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
+        {"qfrc_constraint_out", "solver_scratch"},
+        solver_source,
+        COLLISION_HEADER_FWD
+    );
+
+    int B = 1;
+    int scratch_sz = solver_scratch_per_env(m);
+    auto result = kernel(
+        {mx::astype(mx::flatten(qM), mx::float32),
+         mx::astype(mx::flatten(qfrc_smooth), mx::float32),
+         mx::astype(mx::flatten(cdof), mx::float32),
+         mx::astype(mx::flatten(subtree_com), mx::float32),
+         mx::astype(mx::flatten(qvel), mx::float32),
+         mx::astype(mx::flatten(contact_data), mx::float32),
+         mx::astype(mx::flatten(contact_count), mx::float32),
+         pair_props, body_dof_masks_buf, body_rootid_buf},
+        {{B * nv}, {B * scratch_sz}},
+        {mx::float32, mx::float32},
+        std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+        {}, std::nullopt, false, {}
+    );
+
+    MetalCollisionResult r;
+    r.contact_data = result[0]; // qfrc_constraint
+    r.contact_count = mx::array(0.0f); // unused
+    return r;
+}
+
 // ── Context: Metal kernels + model constants ─────────────────────────────────
 
 using KernelFn = mx::fast::CustomKernelFunction;
@@ -1675,7 +2128,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
              "qpos", "qvel", "ctrl",
              "make_m_mask", "act_moment"},
             {"qM_out", "qfrc_smooth_out", "subtree_com_out",
-             "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch"},
+             "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"},
             fwd_source,
             FORWARD_HEADER
         );
@@ -1844,9 +2297,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                      ctx->make_m_mask, ctx->act_moment},
                     {{B * nv * nv}, {B * nv}, {B * nb * 3},
                      {B * nb * 10}, {B * nb * 6}, {B * nv},
-                     {B * scratchSz}},
+                     {B * scratchSz}, {B * nv * 6}},
                     {mx::float32, mx::float32, mx::float32,
-                     mx::float32, mx::float32, mx::float32, mx::float32},
+                     mx::float32, mx::float32, mx::float32, mx::float32, mx::float32},
                     std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
                     {}, std::nullopt, false, {}
                 );
@@ -1858,6 +2311,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 cinert_out = mx::reshape(fwd[3], {B, nb, 10});
                 cvel_out = mx::reshape(fwd[4], {B, nb, 6});
                 qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
+                // fwd[7] = cdof_out (B * nv * 6) — available for constraint kernel
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
                 auto xquat = mx::reshape(kin[1], {B, nb, 4});
