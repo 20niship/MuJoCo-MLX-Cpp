@@ -706,46 +706,12 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
         return compiled;
     }
 
-    // ── Fallback: per-env loop using validated scalar pipeline ──
-    auto step_fn = [ctx, B, mp, model_override](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-        const Model& m = *mp;
-        auto qpos_batch = inputs[0];
-        auto qvel_batch = inputs[1];
-        auto ctrl_batch = inputs[2];
-
-        int nq = ctx->nq, nv = ctx->nv, nu = ctx->nu;
-        int nb = ctx->nbody;
-
-        std::vector<mx::array> new_qpos_list, new_qvel_list, xpos_list;
-        std::vector<mx::array> stcom_list, cinert_list, cvel_list, qfact_list, cfrc_list;
-        new_qpos_list.reserve(B); new_qvel_list.reserve(B); xpos_list.reserve(B);
-        stcom_list.reserve(B); cinert_list.reserve(B); cvel_list.reserve(B);
-        qfact_list.reserve(B); cfrc_list.reserve(B);
-
-        for (int e = 0; e < B; e++) {
-            Data d = make_data(m);
-            d.qpos = mx::reshape(mx::slice(qpos_batch, {e, 0}, {e + 1, nq}), {nq});
-            d.qvel = mx::reshape(mx::slice(qvel_batch, {e, 0}, {e + 1, nv}), {nv});
-            if (nu > 0) {
-                d.ctrl = mx::reshape(mx::slice(ctrl_batch, {e, 0}, {e + 1, nu}), {nu});
-            }
-            d = step(m, d);
-            new_qpos_list.push_back(d.qpos);
-            new_qvel_list.push_back(d.qvel);
-            xpos_list.push_back(d.xpos);
-            stcom_list.push_back(d.subtree_com);
-            cinert_list.push_back(d.cinert);
-            cvel_list.push_back(d.cvel);
-            qfact_list.push_back(d.qfrc_actuator);
-            cfrc_list.push_back(mx::zeros({nb, 6}));
-        }
-
-        return {mx::stack(new_qpos_list), mx::stack(new_qvel_list), mx::stack(xpos_list),
-                mx::stack(stcom_list), mx::stack(cinert_list), mx::stack(cvel_list),
-                mx::stack(qfact_list), mx::stack(cfrc_list)};
-    };
-
-    return step_fn;
+    // Metal kernels could not be built for this model (e.g., nv > 80).
+    // Signal to the caller so it can fall back to CPU batched mode.
+    throw std::runtime_error(
+        "GPU Metal kernels not available for this model (nv=" + std::to_string(nv) +
+        ", nbody=" + std::to_string(nb) + "). "
+        "Euler kernel requires nv <= 80. Use CPU batched mode instead.");
 }
 
 } // namespace mjmlx

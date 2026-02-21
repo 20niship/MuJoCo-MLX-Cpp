@@ -796,7 +796,23 @@ MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfi
             mlx_config.use_gpu = 1;
             mlx_config.solver_iterations = config->solver_iterations;
             sim->mlx_sim = mjmlx_batched_create(model->mlx, &mlx_config);
-            if (!sim->mlx_sim) { delete sim; return nullptr; }
+            if (!sim->mlx_sim) {
+                // GPU Metal kernels unavailable (e.g., nv > 80). Fall back to CPU.
+                fprintf(stderr, "mjb_batched_create: GPU batched sim failed, "
+                        "falling back to CPU batched mode.\n");
+                sim->type = MJB_BACKEND_CPU;
+                sim->model_ref = model;
+                const mjModel* cmj = get_mj_model(model);
+                if (!cmj) { delete sim; return nullptr; }
+                mjModel* mj = const_cast<mjModel*>(cmj);
+                sim->cpu_datas.resize(config->num_envs);
+                for (int i = 0; i < config->num_envs; i++) {
+                    sim->cpu_datas[i] = mj_makeData(mj);
+                    if (!sim->cpu_datas[i]) { delete sim; return nullptr; }
+                }
+                if (config->solver_iterations > 0)
+                    mj->opt.iterations = config->solver_iterations;
+            }
         }
     } catch (...) {
         delete sim;
@@ -813,11 +829,11 @@ MJB_API void mjb_batched_step(MjbBatchedSim* sim, const float* ctrl) {
     if (!sim || !ctrl) return;
 
     if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* cm = get_mj_model(sim->model_ref);
+        mjModel* m = const_cast<mjModel*>(cm);
         int ne = sim->num_envs;
-        int nu = sim->model_ref->mj->nu;
-        mjModel* m = sim->model_ref->mj;
+        int nu = cm->nu;
 
-        // Parallel step using Grand Central Dispatch
         dispatch_apply((size_t)ne,
             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
             ^(size_t i) {
@@ -836,7 +852,8 @@ MJB_API void mjb_batched_reset(MjbBatchedSim* sim, const int* reset_mask) {
     if (!sim || !reset_mask) return;
 
     if (sim->type == MJB_BACKEND_CPU) {
-        mjModel* m = sim->model_ref->mj;
+        const mjModel* cm = get_mj_model(sim->model_ref);
+        mjModel* m = const_cast<mjModel*>(cm);
         for (int i = 0; i < sim->num_envs; i++) {
             if (reset_mask[i]) {
                 mj_resetData(m, sim->cpu_datas[i]);
@@ -873,57 +890,73 @@ static const float* cpu_batched_gather(
 
 MJB_API const float* mjb_batched_get_qpos(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(qpos, sim->model_ref->mj->nq);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(qpos, m->nq);
+    }
     return mjmlx_batched_get_qpos(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_qvel(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(qvel, sim->model_ref->mj->nv);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(qvel, m->nv);
+    }
     return mjmlx_batched_get_qvel(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(xpos, sim->model_ref->mj->nbody * 3);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(xpos, m->nbody * 3);
+    }
     return mjmlx_batched_get_xpos(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(subtree_com, sim->model_ref->mj->nbody * 3);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(subtree_com, m->nbody * 3);
+    }
     return mjmlx_batched_get_subtree_com(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_cinert(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(cinert, sim->model_ref->mj->nbody * 10);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(cinert, m->nbody * 10);
+    }
     return mjmlx_batched_get_cinert(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(cvel, sim->model_ref->mj->nbody * 6);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(cvel, m->nbody * 6);
+    }
     return mjmlx_batched_get_cvel(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_qfrc_actuator(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(qfrc_actuator, sim->model_ref->mj->nv);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(qfrc_actuator, m->nv);
+    }
     return mjmlx_batched_get_qfrc_actuator(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_cfrc_ext(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
-    if (sim->type == MJB_BACKEND_CPU)
-        return CPU_BATCHED_GET(cfrc_ext, sim->model_ref->mj->nbody * 6);
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(cfrc_ext, m->nbody * 6);
+    }
     return mjmlx_batched_get_cfrc_ext(sim->mlx_sim, n_out);
 }
 
