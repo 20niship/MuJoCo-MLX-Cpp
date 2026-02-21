@@ -1165,6 +1165,338 @@ MJMLX_API MetalForwardResult test_metal_forward(
     return r;
 }
 
+// Forward declarations for collision helpers
+static const int CONTACT_STRIDE = 8;
+static const int MAX_CONTACTS_PER_ENV = 128;
+static const std::string COLLISION_HEADER_FWD = R"(
+inline float3 msl_cross(float3 a, float3 b) {
+    return float3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
+inline float msl_dot(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+inline float msl_len(float3 a) { return sqrt(msl_dot(a, a)); }
+inline float3 msl_norm(float3 a) {
+    float l = msl_len(a);
+    return l > 1e-12f ? a / l : float3(0, 0, 1);
+}
+)";
+static std::string make_collision_source(const Model& m);
+static mx::array build_collision_pair_data(const Model& m);
+
+// ── Test helper: dispatch Metal collision kernel for 1 env ──────────────────
+
+MJMLX_API MetalCollisionResult test_metal_collision(
+    const Model& m,
+    const mx::array& geom_xpos, const mx::array& geom_xmat)
+{
+    m.init_cache();
+    int ng = m.ngeom;
+
+    auto coll_source = make_collision_source(m);
+    auto pair_data = build_collision_pair_data(m);
+    mx::eval(pair_data);
+
+    auto mesh_verts = mx::astype(mx::flatten(m.mesh_vert), mx::float32);
+    auto mesh_vertadr = mx::astype(mx::flatten(m.mesh_vertadr), mx::float32);
+    auto mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
+    auto geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
+    mx::eval(mesh_verts, mesh_vertadr, mesh_vertnum, geom_dataid);
+
+    auto kernel = mx::fast::metal_kernel(
+        "mjmlx_test_collision_" + std::to_string(ng),
+        {"geom_xpos", "geom_xmat",
+         "mesh_verts", "pair_data",
+         "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf"},
+        {"contact_data", "contact_count"},
+        coll_source,
+        COLLISION_HEADER_FWD
+    );
+
+    int B = 1;
+    int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
+    auto result = kernel(
+        {mx::astype(mx::flatten(geom_xpos), mx::float32),
+         mx::astype(mx::flatten(geom_xmat), mx::float32),
+         mesh_verts, pair_data,
+         mesh_vertadr, mesh_vertnum, geom_dataid},
+        {{con_buf_sz}, {B}},
+        {mx::float32, mx::float32},
+        std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
+        {}, std::nullopt, false, {}
+    );
+
+    MetalCollisionResult r;
+    r.contact_data = result[0];
+    r.contact_count = result[1];
+    return r;
+}
+
+// ── Metal collision kernel source ────────────────────────────────────────────
+
+// CONTACT_STRIDE, MAX_CONTACTS_PER_ENV, COLLISION_HEADER_FWD defined above
+
+static std::string make_collision_source(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int ng = m.ngeom;
+    int npairs = (int)c.collision_pairs.size();
+
+    std::ostringstream ss;
+    ss << std::scientific;
+
+    ss << "uint bid = thread_position_in_grid.x;\n"
+       << "const int NG = " << ng << ";\n"
+       << "const int NUM_PAIRS = " << npairs << ";\n"
+       << "const int MAX_CON = " << MAX_CONTACTS_PER_ENV << ";\n"
+       << "const int STRIDE = " << CONTACT_STRIDE << ";\n\n"
+       << "uint gx_off = bid * NG * 3;\n"
+       << "uint gm_off = bid * NG * 9;\n"
+       << "uint con_off = bid * MAX_CON * STRIDE;\n\n"
+       << "for (int i = 0; i < MAX_CON * STRIDE; i++) contact_data[con_off + i] = 0;\n"
+       << "int ncon = 0;\n\n";
+
+    // pair_data layout per pair: g1, g2, type1, type2, margin+gap, rbound_sum = 6 floats
+    ss << "const int PAIR_STRIDE = 6;\n\n";
+
+    // Support mesh function
+    ss << R"(
+for (int p = 0; p < NUM_PAIRS; p++) {
+    int pd = p * PAIR_STRIDE;
+    int g1 = (int)pair_data[pd+0], g2 = (int)pair_data[pd+1];
+    int t1 = (int)pair_data[pd+2], t2 = (int)pair_data[pd+3];
+    float pair_margin = pair_data[pd+4];
+    float rbound_sum = pair_data[pd+5];
+
+    // Bounding sphere broadphase (skip for plane pairs)
+    if (t1 != 0 && t2 != 0) {
+        float3 c1 = float3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
+        float3 c2 = float3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
+        if (msl_len(c1 - c2) >= rbound_sum) continue;
+    }
+
+    float c_pos[3], c_norm[3], c_dist;
+    bool has_contact = false;
+
+    if (t1 == 0 && t2 == 7) {
+        // Plane-mesh collision
+        int plane_g = g1, mesh_g = g2;
+        float3 ppos = float3(geom_xpos[gx_off+plane_g*3], geom_xpos[gx_off+plane_g*3+1], geom_xpos[gx_off+plane_g*3+2]);
+        float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[gm_off+plane_g*9+k];
+        float3 normal = float3(pR[2], pR[5], pR[8]);
+        float3 mpos = float3(geom_xpos[gx_off+mesh_g*3], geom_xpos[gx_off+mesh_g*3+1], geom_xpos[gx_off+mesh_g*3+2]);
+        float mR[9]; for (int k=0;k<9;k++) mR[k] = geom_xmat[gm_off+mesh_g*9+k];
+        int mesh_id = (int)geom_dataid_buf[mesh_g];
+        int adr = (int)mesh_vertadr_buf[mesh_id];
+        int nverts = (int)mesh_vertnum_buf[mesh_id];
+        float best_d = 1e30f; float3 best_w;
+        for (int i = 0; i < nverts; i++) {
+            float3 lv = float3(mesh_verts[adr*3+i*3], mesh_verts[adr*3+i*3+1], mesh_verts[adr*3+i*3+2]);
+            float3 wv = float3(mR[0]*lv.x+mR[1]*lv.y+mR[2]*lv.z+mpos.x,
+                                mR[3]*lv.x+mR[4]*lv.y+mR[5]*lv.z+mpos.y,
+                                mR[6]*lv.x+mR[7]*lv.y+mR[8]*lv.z+mpos.z);
+            float d = msl_dot(wv - ppos, normal);
+            if (d < best_d) { best_d = d; best_w = wv; }
+        }
+        if (best_d < pair_margin) {
+            float3 cp = best_w - normal * best_d;
+            c_pos[0]=cp.x; c_pos[1]=cp.y; c_pos[2]=cp.z;
+            c_norm[0]=normal.x; c_norm[1]=normal.y; c_norm[2]=normal.z;
+            c_dist = best_d;
+            has_contact = true;
+        }
+    } else if (t1 == 7 && t2 == 7) {
+        // Mesh-mesh GJK collision
+        float3 pos1 = float3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
+        float3 pos2 = float3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
+        float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[gm_off+g1*9+k];
+        float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[gm_off+g2*9+k];
+        int mid1 = (int)geom_dataid_buf[g1], mid2 = (int)geom_dataid_buf[g2];
+        int adr1=(int)mesh_vertadr_buf[mid1], nv1=(int)mesh_vertnum_buf[mid1];
+        int adr2=(int)mesh_vertadr_buf[mid2], nv2=(int)mesh_vertnum_buf[mid2];
+
+        // Inline mesh support lambda
+        #define SUPPORT_MESH(MID, ADR, NV, GPOS, ROT, DIR, OUT) { \
+            float3 ld = float3(ROT[0]*DIR.x+ROT[3]*DIR.y+ROT[6]*DIR.z, \
+                                ROT[1]*DIR.x+ROT[4]*DIR.y+ROT[7]*DIR.z, \
+                                ROT[2]*DIR.x+ROT[5]*DIR.y+ROT[8]*DIR.z); \
+            float bd = -1e30f; int bi = 0; \
+            for (int vi=0;vi<NV;vi++) { \
+                float3 v=float3(mesh_verts[ADR*3+vi*3],mesh_verts[ADR*3+vi*3+1],mesh_verts[ADR*3+vi*3+2]); \
+                float dd=msl_dot(v,ld); if(dd>bd){bd=dd;bi=vi;} \
+            } \
+            float3 lp=float3(mesh_verts[ADR*3+bi*3],mesh_verts[ADR*3+bi*3+1],mesh_verts[ADR*3+bi*3+2]); \
+            OUT=float3(ROT[0]*lp.x+ROT[1]*lp.y+ROT[2]*lp.z+GPOS.x, \
+                        ROT[3]*lp.x+ROT[4]*lp.y+ROT[5]*lp.z+GPOS.y, \
+                        ROT[6]*lp.x+ROT[7]*lp.y+ROT[8]*lp.z+GPOS.z); \
+        }
+
+        float3 dir = pos2 - pos1;
+        if (msl_len(dir) < 1e-12f) dir = float3(1,0,0);
+
+        float3 sdiff[4], sa_pts[4], sb_pts[4];
+        int sn = 0;
+        float3 sup_a, sup_b;
+        SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
+        float3 neg_dir = -dir;
+        SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+        sdiff[0] = sup_a - sup_b; sa_pts[0] = sup_a; sb_pts[0] = sup_b;
+        sn = 1; dir = -sdiff[0];
+        if (msl_len(dir) < 1e-12f) dir = float3(1,0,0);
+        bool gjk_overlap = false;
+
+        for (int iter = 0; iter < 32; iter++) {
+            SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
+            neg_dir = -dir;
+            SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+            float3 new_sd = sup_a - sup_b;
+            if (msl_dot(new_sd, dir) < 0) break;
+            sdiff[sn] = new_sd; sa_pts[sn] = sup_a; sb_pts[sn] = sup_b;
+            sn++;
+            if (sn == 2) {
+                float3 A=sdiff[1], B=sdiff[0], AB=B-A, AO=-A;
+                if (msl_dot(AB,AO)>0) { dir=msl_cross(msl_cross(AB,AO),AB); if(msl_len(dir)<1e-12f)dir=AO; }
+                else { sdiff[0]=A;sa_pts[0]=sa_pts[1];sb_pts[0]=sb_pts[1];sn=1;dir=AO; }
+            } else if (sn == 3) {
+                float3 A=sdiff[2],B=sdiff[1],C=sdiff[0],AB=B-A,AC=C-A,AO=-A;
+                float3 ABC=msl_cross(AB,AC);
+                if (msl_dot(msl_cross(ABC,AC),AO)>0) { sdiff[0]=C;sdiff[1]=A;sa_pts[0]=sa_pts[0];sa_pts[1]=sa_pts[2];sb_pts[0]=sb_pts[0];sb_pts[1]=sb_pts[2];sn=2;dir=msl_cross(msl_cross(AC,AO),AC);if(msl_len(dir)<1e-12f)dir=AO; }
+                else if (msl_dot(msl_cross(AB,ABC),AO)>0) { sdiff[0]=B;sdiff[1]=A;sa_pts[0]=sa_pts[1];sa_pts[1]=sa_pts[2];sb_pts[0]=sb_pts[1];sb_pts[1]=sb_pts[2];sn=2;dir=msl_cross(msl_cross(AB,AO),AB);if(msl_len(dir)<1e-12f)dir=AO; }
+                else if (msl_dot(ABC,AO)>0) { dir=ABC; }
+                else { float3 t=sdiff[0];sdiff[0]=sdiff[1];sdiff[1]=t;t=sa_pts[0];sa_pts[0]=sa_pts[1];sa_pts[1]=t;t=sb_pts[0];sb_pts[0]=sb_pts[1];sb_pts[1]=t;dir=-ABC; }
+            } else if (sn == 4) {
+                float3 A=sdiff[3],B=sdiff[2],C=sdiff[1],D=sdiff[0];
+                float3 AB=B-A,AC=C-A,AD=D-A,AO=-A;
+                float3 ABC=msl_cross(AB,AC),ACD=msl_cross(AC,AD),ADB=msl_cross(AD,AB);
+                bool abc_o=msl_dot(ABC,AO)>0, acd_o=msl_dot(ACD,AO)>0, adb_o=msl_dot(ADB,AO)>0;
+                if (!abc_o&&!acd_o&&!adb_o) { gjk_overlap=true; break; }
+                if (abc_o) { sdiff[0]=C;sdiff[1]=B;sdiff[2]=A;sa_pts[0]=sa_pts[1];sa_pts[1]=sa_pts[2];sa_pts[2]=sa_pts[3];sb_pts[0]=sb_pts[1];sb_pts[1]=sb_pts[2];sb_pts[2]=sb_pts[3];sn=3;dir=ABC; }
+                else if (acd_o) { sdiff[0]=D;sdiff[1]=C;sdiff[2]=A;sa_pts[2]=sa_pts[3];sb_pts[2]=sb_pts[3];sn=3;dir=ACD; }
+                else { float3 ts;sdiff[0]=B;sdiff[1]=D;sdiff[2]=A;ts=sa_pts[0];sa_pts[0]=sa_pts[2];sa_pts[2]=sa_pts[3];sa_pts[1]=ts;ts=sb_pts[0];sb_pts[0]=sb_pts[2];sb_pts[2]=sb_pts[3];sb_pts[1]=ts;sn=3;dir=ADB; }
+            }
+            if (msl_len(dir) < 1e-12f) dir = float3(1,0,0);
+        }
+
+        if (!gjk_overlap) {
+            float3 p0=sdiff[0], p1=(sn>=2)?sdiff[1]:sdiff[0];
+            float3 seg=p1-p0; float seg_sq=msl_dot(seg,seg);
+            float t=(seg_sq>1e-12f)?-msl_dot(p0,seg)/seg_sq:0.0f;
+            t=clamp(t,0.0f,1.0f);
+            float gap_d=msl_len(p0+seg*t);
+            if (gap_d < pair_margin) {
+                float3 wa=sa_pts[0]+(sa_pts[min(sn-1,1)]-sa_pts[0])*t;
+                float3 wb=sb_pts[0]+(sb_pts[min(sn-1,1)]-sb_pts[0])*t;
+                float3 n=msl_norm(wa-wb);
+                float3 cp=(wa+wb)*0.5f;
+                c_pos[0]=cp.x;c_pos[1]=cp.y;c_pos[2]=cp.z;
+                c_norm[0]=n.x;c_norm[1]=n.y;c_norm[2]=n.z;
+                c_dist=gap_d; has_contact=true;
+            }
+        } else {
+            // Penetration depth via direction sampling
+            float bw=1e30f; float3 bn=float3(0,0,1),bpa,bpb;
+            const float D=0.577350269f;
+            float3 sd[14]={float3(1,0,0),float3(-1,0,0),float3(0,1,0),float3(0,-1,0),float3(0,0,1),float3(0,0,-1),
+                float3(D,D,D),float3(-D,D,D),float3(D,-D,D),float3(D,D,-D),
+                float3(-D,-D,D),float3(-D,D,-D),float3(D,-D,-D),float3(-D,-D,-D)};
+            for (int si=0;si<14;si++) {
+                float3 d=sd[si],pa,pb;
+                SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
+                float3 nd=-d;
+                SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                float w=msl_dot(pa-pb,d);
+                if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
+            }
+            for (int fi=0;fi<4&&sn>=3;fi++) {
+                float3 e1,e2;
+                if(fi==0){e1=sdiff[1]-sdiff[0];e2=sdiff[2]-sdiff[0];}
+                else if(fi==1){e1=sdiff[2]-sdiff[0];e2=sdiff[min(sn-1,3)]-sdiff[0];}
+                else if(fi==2){e1=sdiff[min(sn-1,3)]-sdiff[0];e2=sdiff[1]-sdiff[0];}
+                else{e1=sdiff[2]-sdiff[1];e2=sdiff[min(sn-1,3)]-sdiff[1];}
+                float3 fn=msl_cross(e1,e2);
+                if(msl_len(fn)<1e-8f)continue;
+                fn=msl_norm(fn);
+                for(int s=-1;s<=1;s+=2){
+                    float3 d=fn*(float)s,pa,pb;
+                    SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
+                    float3 nd=-d;
+                    SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                    float w=msl_dot(pa-pb,d);
+                    if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
+                }
+            }
+            float pen=max(bw,0.0f);
+            float3 cp=(bpa+bpb)*0.5f;
+            c_pos[0]=cp.x;c_pos[1]=cp.y;c_pos[2]=cp.z;
+            c_norm[0]=bn.x;c_norm[1]=bn.y;c_norm[2]=bn.z;
+            c_dist=-pen; has_contact=true;
+        }
+        #undef SUPPORT_MESH
+    }
+
+    if (has_contact && ncon < MAX_CON) {
+        int idx = con_off + ncon * STRIDE;
+        contact_data[idx+0]=c_pos[0]; contact_data[idx+1]=c_pos[1]; contact_data[idx+2]=c_pos[2];
+        contact_data[idx+3]=c_norm[0]; contact_data[idx+4]=c_norm[1]; contact_data[idx+5]=c_norm[2];
+        contact_data[idx+6]=c_dist;
+        contact_data[idx+7]=(float)p;
+        ncon++;
+    }
+}
+
+contact_count[bid] = (float)ncon;
+)";
+
+    return ss.str();
+}
+
+// Helper: build collision pair data buffer
+static mx::array build_collision_pair_data(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int npairs = (int)c.collision_pairs.size();
+
+    mx::eval(m.geom_type, m.geom_size, m.geom_dataid,
+             m.mesh_vertadr, m.mesh_vertnum, m.mesh_vert);
+    auto gt = m.geom_type.data<int>();
+    auto gs = m.geom_size.data<float>();
+    auto gdi = m.geom_dataid.data<int>();
+
+    // Compute per-geom bounding radius
+    std::vector<float> geom_rb(m.ngeom, 0.0f);
+    for (int g = 0; g < m.ngeom; g++) {
+        int t = gt[g];
+        if (t == 0) { geom_rb[g] = 1e6f; continue; }
+        if (t == 2) { geom_rb[g] = gs[g*3]; continue; }
+        if (t == 3) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1]); continue; }
+        if (t == 6) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1] + gs[g*3+2]*gs[g*3+2]); continue; }
+        if (t == 7 && gdi[g] >= 0) {
+            auto mva = m.mesh_vertadr.data<int>();
+            auto mvn = m.mesh_vertnum.data<int>();
+            auto mv = m.mesh_vert.data<float>();
+            int mid = gdi[g], adr = mva[mid], nverts = mvn[mid];
+            float maxr = 0;
+            for (int v = 0; v < nverts; v++) {
+                float x = mv[(adr+v)*3], y = mv[(adr+v)*3+1], z = mv[(adr+v)*3+2];
+                float r = std::sqrt(x*x + y*y + z*z);
+                if (r > maxr) maxr = r;
+            }
+            geom_rb[g] = maxr;
+        }
+    }
+
+    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
+    std::vector<float> data(npairs * 6);
+    for (int p = 0; p < npairs; p++) {
+        const auto& cp = c.collision_pairs[p];
+        data[p*6+0] = (float)cp.g1;
+        data[p*6+1] = (float)cp.g2;
+        data[p*6+2] = (float)cp.type1;
+        data[p*6+3] = (float)cp.type2;
+        data[p*6+4] = cp.margin + cp.gap;
+        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
+    }
+    return mx::array(data.data(), {npairs * 6}, mx::float32);
+}
+
 // ── Context: Metal kernels + model constants ─────────────────────────────────
 
 using KernelFn = mx::fast::CustomKernelFunction;
@@ -1197,6 +1529,16 @@ struct BatchedStepContext {
     mx::array make_m_mask{mx::zeros({1})};
     mx::array act_moment{mx::zeros({1})};
     int fwd_scratch_per_env = 0;
+
+    // Collision kernel
+    std::optional<KernelFn> collision_kernel;
+    bool uses_metal_collision = false;
+    mx::array coll_pair_data{mx::zeros({1})};
+    mx::array coll_mesh_verts{mx::zeros({1})};
+    mx::array coll_mesh_vertadr{mx::zeros({1})};
+    mx::array coll_mesh_vertnum{mx::zeros({1})};
+    mx::array coll_geom_dataid{mx::zeros({1})};
+    int num_collision_pairs = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
@@ -1338,6 +1680,34 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m) {
             FORWARD_HEADER
         );
         ctx->uses_metal_forward = true;
+    }
+
+    // Build Metal collision kernel for large models (replaces vmap collision)
+    if (m.nv > 80 && m.cache.collision_pairs.size() > 0) {
+        auto coll_source = make_collision_source(m);
+        ctx->num_collision_pairs = (int)m.cache.collision_pairs.size();
+
+        ctx->coll_pair_data = build_collision_pair_data(m);
+        mx::eval(ctx->coll_pair_data);
+
+        // Mesh vertex data
+        ctx->coll_mesh_verts = mx::astype(mx::flatten(m.mesh_vert), mx::float32);
+        ctx->coll_mesh_vertadr = mx::astype(mx::flatten(m.mesh_vertadr), mx::float32);
+        ctx->coll_mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
+        ctx->coll_geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
+        mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
+                 ctx->coll_mesh_vertnum, ctx->coll_geom_dataid);
+
+        ctx->collision_kernel = mx::fast::metal_kernel(
+            "mjmlx_collision_" + std::to_string(m.ngeom),
+            {"geom_xpos", "geom_xmat",
+             "mesh_verts", "pair_data",
+             "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf"},
+            {"contact_data", "contact_count"},
+            coll_source,
+            COLLISION_HEADER_FWD
+        );
+        ctx->uses_metal_collision = true;
     }
 
     return ctx;

@@ -671,6 +671,14 @@ MJMLX_API MetalForwardResult test_metal_forward(
     const mx::array& xanchor, const mx::array& xaxis, const mx::array& xmat,
     const mx::array& qpos, const mx::array& qvel, const mx::array& ctrl);
 
+struct MetalCollisionResult {
+    mx::array contact_data{0.0f};  // (MAX_CON * STRIDE,) flat
+    mx::array contact_count{0.0f}; // scalar
+};
+MJMLX_API MetalCollisionResult test_metal_collision(
+    const Model& m,
+    const mx::array& geom_xpos, const mx::array& geom_xmat);
+
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);
 mx::array batched_inert_mul(const mx::array& inert, const mx::array& vel);

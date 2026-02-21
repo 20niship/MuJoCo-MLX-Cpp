@@ -342,6 +342,119 @@ int main(int argc, char** argv) {
     }
     TEST_END();
 
+    // ═══════════════════════════════════════════════════════════════
+    // Phase 2: Metal collision kernel
+    // ═══════════════════════════════════════════════════════════════
+    TEST_SECTION("Phase 2: Metal Collision Kernel");
+
+    TEST_BEGIN("metal_collision_contact_count");
+    {
+        mj_resetData(mj_m, mj_d);
+        mj_forward(mj_m, mj_d);
+        int mj_ncon = mj_d->ncon;
+        printf("    MuJoCo C ncon: %d\n", mj_ncon);
+
+        mjmlx::Model& m_ref = model->model;
+        m_ref.init_cache();
+        int nj = m_ref.njnt, ng = m_ref.ngeom;
+
+        auto cvt = [](const double* src, int n) {
+            std::vector<float> v(n); for (int i = 0; i < n; i++) v[i] = (float)src[i]; return v;
+        };
+        auto gxp = cvt(mj_d->geom_xpos, ng*3);
+        auto gxm = cvt(mj_d->geom_xmat, ng*9);
+
+        auto result = mjmlx::test_metal_collision(
+            m_ref,
+            mx::array(gxp.data(), {ng*3}, mx::float32),
+            mx::array(gxm.data(), {ng*9}, mx::float32)
+        );
+
+        mx::eval(result.contact_count, result.contact_data);
+        int metal_ncon = (int)result.contact_count.item<float>();
+        printf("    Metal ncon: %d\n", metal_ncon);
+
+        // Allow small difference in contact count (GJK float32 vs MuJoCo double)
+        int count_diff = std::abs(metal_ncon - mj_ncon);
+        printf("    Contact count diff: %d\n", count_diff);
+        CHECK_LT((float)count_diff, 10.0f, "Contact count within 10 of MuJoCo C");
+        CHECK(metal_ncon > 0, "At least 1 contact detected");
+    }
+    TEST_END();
+
+    TEST_BEGIN("metal_collision_contact_positions");
+    {
+        mj_resetData(mj_m, mj_d);
+        mj_forward(mj_m, mj_d);
+
+        mjmlx::Model& m_ref = model->model;
+        m_ref.init_cache();
+        int ng = m_ref.ngeom;
+
+        auto cvt = [](const double* src, int n) {
+            std::vector<float> v(n); for (int i = 0; i < n; i++) v[i] = (float)src[i]; return v;
+        };
+        auto gxp = cvt(mj_d->geom_xpos, ng*3);
+        auto gxm = cvt(mj_d->geom_xmat, ng*9);
+
+        auto result = mjmlx::test_metal_collision(
+            m_ref,
+            mx::array(gxp.data(), {ng*3}, mx::float32),
+            mx::array(gxm.data(), {ng*9}, mx::float32)
+        );
+        mx::eval(result.contact_data, result.contact_count);
+
+        int metal_ncon = (int)result.contact_count.item<float>();
+        const float* cd = result.contact_data.data<float>();
+
+        // Print first few Metal contacts
+        printf("    Metal contacts (first 5):\n");
+        for (int i = 0; i < std::min(metal_ncon, 5); i++) {
+            int off = i * 8;
+            printf("      [%d] pos=(%.4f,%.4f,%.4f) normal=(%.4f,%.4f,%.4f) dist=%.6f pair_idx=%.0f\n",
+                   i, cd[off], cd[off+1], cd[off+2],
+                   cd[off+3], cd[off+4], cd[off+5], cd[off+6], cd[off+7]);
+        }
+
+        // Print first few MuJoCo C contacts for comparison
+        printf("    MuJoCo C contacts (first 5):\n");
+        for (int i = 0; i < std::min(mj_d->ncon, 5); i++) {
+            auto& c = mj_d->contact[i];
+            printf("      [%d] pos=(%.4f,%.4f,%.4f) normal=(%.4f,%.4f,%.4f) dist=%.6f geoms=(%d,%d)\n",
+                   i, c.pos[0], c.pos[1], c.pos[2],
+                   c.frame[0], c.frame[1], c.frame[2], c.dist,
+                   c.geom1, c.geom2);
+        }
+
+        // Match contacts: for each MuJoCo C contact, find nearest Metal contact
+        int matched = 0;
+        float max_pos_diff = 0;
+        for (int mc = 0; mc < mj_d->ncon; mc++) {
+            float best_pdiff = 1e30f;
+            int best_mi = -1;
+            for (int mi = 0; mi < metal_ncon; mi++) {
+                int off = mi * 8;
+                float dx = cd[off] - (float)mj_d->contact[mc].pos[0];
+                float dy = cd[off+1] - (float)mj_d->contact[mc].pos[1];
+                float dz = cd[off+2] - (float)mj_d->contact[mc].pos[2];
+                float pdiff = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (pdiff < best_pdiff) { best_pdiff = pdiff; best_mi = mi; }
+            }
+            if (best_pdiff < 0.05f) {
+                matched++;
+                if (best_pdiff > max_pos_diff) max_pos_diff = best_pdiff;
+            }
+        }
+        printf("    Matched contacts: %d/%d (max pos diff: %.6f)\n",
+               matched, mj_d->ncon, max_pos_diff);
+
+        // Expect most contacts to match (float32 precision may lose some)
+        float match_ratio = (mj_d->ncon > 0) ? (float)matched / mj_d->ncon : 1.0f;
+        printf("    Match ratio: %.2f\n", match_ratio);
+        CHECK(match_ratio > 0.5f, "At least 50% of MuJoCo C contacts matched by Metal");
+    }
+    TEST_END();
+
     // Test 1: GPU vs MuJoCo C (contact-free) — 1 step from default state
     TEST_BEGIN("gpu_vs_mjc_contact_free_1step");
     {
