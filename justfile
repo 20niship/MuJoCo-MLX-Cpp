@@ -10,11 +10,15 @@ build:
 
 # Build then run the test suite
 check: build
-    ./run_tests.sh
+    ./scripts/run_tests.sh
 
 # Build then run only the tests that don't depend on the removed single-env pipeline (for CI)
 check-ci: build
     cd build && ./test_math_full && ./test_linalg_full
+
+# Build then run the benchmark regression check
+bench: build
+    ./scripts/bench_check.sh
 
 # Remove build directory
 clean:
