@@ -52,7 +52,12 @@
 #include "compat/mkx_kernels/collision.hpp"
 #include "compat/mkx_kernels/solver.hpp"
 #endif
+#if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#else
+#include <thread>
+#include <vector>
+#endif
 #include <mujoco/mujoco.h>
 
 namespace mjmlx {
@@ -2668,24 +2673,42 @@ MJMLX_API void cpu_sync_state(MjmlxBatchedSim* handle) {
     }
 }
 
-// CPU batched: step all environments in parallel using GCD dispatch_apply.
+// CPU batched: step all environments in parallel (GCD dispatch_apply on Apple, std::thread elsewhere).
 MJMLX_API void cpu_batched_step(MjmlxBatchedSim* handle, const float* ctrl_flat, int frame_skip) {
     int B = handle->sim.num_envs;
     mjModel* m = handle->cpu_model;
     int nu = m->nu;
 
+    auto step_one = [&](size_t i) {
+        mjData* d = handle->cpu_datas[i];
+        if (ctrl_flat && nu > 0) {
+            for (int j = 0; j < nu; j++)
+                d->ctrl[j] = (double)ctrl_flat[i * nu + j];
+        }
+        for (int fs = 0; fs < frame_skip; fs++)
+            mj_step(m, d);
+    };
+
+#if defined(__APPLE__)
     dispatch_apply((size_t)B,
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-        ^(size_t i) {
-            mjData* d = handle->cpu_datas[i];
-            if (ctrl_flat && nu > 0) {
-                for (int j = 0; j < nu; j++)
-                    d->ctrl[j] = (double)ctrl_flat[i * nu + j];
-            }
-            for (int fs = 0; fs < frame_skip; fs++)
-                mj_step(m, d);
-        }
+        ^(size_t i) { step_one(i); }
     );
+#else
+    unsigned n_threads = std::min<unsigned>(std::thread::hardware_concurrency(), (unsigned)B);
+    if (n_threads <= 1) {
+        for (size_t i = 0; i < (size_t)B; i++) step_one(i);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(n_threads);
+        for (unsigned t = 0; t < n_threads; t++) {
+            pool.emplace_back([&, t]() {
+                for (size_t i = t; i < (size_t)B; i += n_threads) step_one(i);
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+#endif
 }
 
 // ── C API ────────────────────────────────────────────────────────────────────
