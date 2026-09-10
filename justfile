@@ -16,6 +16,17 @@ check: build
 check-ci: build
     cd build && ./test_math_full && ./test_linalg_full
 
+# Configure + build the MKX (Vulkan) backend into build-mkx/
+build-mkx:
+    mkdir -p build-mkx
+    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX \
+        {{ if mujoco_root != "" { "-DMUJOCO_ROOT=" + mujoco_root } else { "" } }}
+    cmake --build build-mkx -j
+
+# Build the MKX backend then run its tests (requires a working Vulkan device)
+check-ci-mkx: build-mkx
+    cd build-mkx && ./test_math_full && ./test_linalg_full
+
 # Build then run the benchmark regression check
 bench: build
     ./scripts/bench_check.sh

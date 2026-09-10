@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <mlx/mlx.h>
-#include <mlx/linalg.h>
 #include <mujoco/mujoco.h>
 #include <functional>
 #include <optional>
@@ -17,9 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "compat/mx_compat.h"
 #include "mjmlx/mjmlx_types.h"
-
-namespace mx = mlx::core;
 
 namespace mjmlx {
 
@@ -657,6 +654,8 @@ Data vmap_solve(const Model& m, Data d);
 // forward_vmap.cpp (exported for test_metal_synth diagnostics)
 MJMLX_API Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
 
+#if defined(MJMLX_BACKEND_MLX)
+// Raw-MSL diagnostic helpers, only exercised by tests/test_metal_synth.cpp (MLX-only target).
 struct MetalForwardResult {
     mx::array qM{0.0f};
     mx::array qfrc_smooth{0.0f};
@@ -685,6 +684,7 @@ MJMLX_API MetalCollisionResult test_metal_solver(
     const mx::array& cdof, const mx::array& subtree_com,
     const mx::array& qvel,
     const mx::array& contact_data, const mx::array& contact_count);
+#endif
 
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);

@@ -1,4 +1,5 @@
 build/
+build-mkx/
 *.o
 *.dylib
 *.so

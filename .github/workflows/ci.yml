@@ -31,3 +31,26 @@ jobs:
         run: just check-ci
         env:
           MLX_ROOT: /opt/homebrew/opt/mlx
+
+  build-mkx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH deploy key for mlx-cross-platform (private repo)
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.MKX_DEPLOY_KEY }}
+
+      - name: Install just, Vulkan (lavapipe) and glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just vulkan-tools mesa-vulkan-drivers libvulkan-dev glslang-tools
+
+      - name: Install MuJoCo (Python)
+        run: |
+          pip3 install --user --break-system-packages mujoco==3.5.0
+          echo "MUJOCO_ROOT=$(python3 -c 'import mujoco, os; print(os.path.dirname(mujoco.__file__))')" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: just check-ci-mkx
