@@ -100,9 +100,9 @@ static mx::array vmap_normalize(const mx::array& x) {
 }
 
 struct VmapCollResult {
-    mx::array dist{mx::array(0.0f)};
-    mx::array pos{mx::array(0.0f)};
-    mx::array frame{mx::array(0.0f)};
+    mx::array dist = mx::array(0.0f);
+    mx::array pos = mx::array(0.0f);
+    mx::array frame = mx::array(0.0f);
 };
 
 static mx::array vmap_make_frame(const mx::array& normal) {
@@ -685,10 +685,10 @@ enum VmapGeomKind { VGK_SPHERE=0, VGK_CAPSULE, VGK_BOX, VGK_CYLINDER, VGK_ELLIPS
 
 struct VmapConvexShape {
     VmapGeomKind kind;
-    mx::array pos{mx::zeros({3})};
-    mx::array mat{mx::zeros({9})};
+    mx::array pos = mx::zeros({3});
+    mx::array mat = mx::zeros({9});
     float size[3] = {0,0,0};
-    mx::array verts{mx::zeros({0})};
+    mx::array verts = mx::zeros({0});
 };
 
 static mx::array vmap_support(const VmapConvexShape& g, const mx::array& dir) {

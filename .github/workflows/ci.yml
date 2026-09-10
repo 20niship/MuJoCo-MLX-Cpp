@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install just
+        run: brew install just
+
+      - name: Install MLX
+        run: brew install mlx
+
+      - name: Install MuJoCo (Python)
+        run: |
+          pip3 install --user --break-system-packages mujoco==3.5.0
+          echo "MUJOCO_ROOT=$(python3 -c 'import mujoco, os; print(os.path.dirname(mujoco.__file__))')" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: just build
+        env:
+          MLX_ROOT: /opt/homebrew/opt/mlx
+
+      - name: Run tests
+        run: just check
+        env:
+          MLX_ROOT: /opt/homebrew/opt/mlx

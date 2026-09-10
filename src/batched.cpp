@@ -2007,43 +2007,43 @@ struct BatchedStepContext {
     bool uses_devmem_euler = false;
     bool uses_metal_forward = false;
 
-    mx::array body_parentid{mx::zeros({1}, mx::int32)};
-    mx::array body_pos{mx::zeros({1})};
-    mx::array body_quat{mx::zeros({1})};
-    mx::array body_ipos{mx::zeros({1})};
-    mx::array body_iquat{mx::zeros({1})};
-    mx::array body_jntadr{mx::zeros({1}, mx::int32)};
-    mx::array body_jntnum{mx::zeros({1}, mx::int32)};
-    mx::array jnt_type_arr{mx::zeros({1}, mx::int32)};
-    mx::array jnt_qposadr_arr{mx::zeros({1}, mx::int32)};
-    mx::array jnt_pos_arr{mx::zeros({1})};
-    mx::array jnt_axis_arr{mx::zeros({1})};
-    mx::array qpos0{mx::zeros({1})};
-    mx::array geom_bodyid_arr{mx::zeros({1}, mx::int32)};
-    mx::array geom_pos_arr{mx::zeros({1})};
-    mx::array geom_quat_arr{mx::zeros({1})};
+    mx::array body_parentid = mx::zeros({1}, mx::int32);
+    mx::array body_pos = mx::zeros({1});
+    mx::array body_quat = mx::zeros({1});
+    mx::array body_ipos = mx::zeros({1});
+    mx::array body_iquat = mx::zeros({1});
+    mx::array body_jntadr = mx::zeros({1}, mx::int32);
+    mx::array body_jntnum = mx::zeros({1}, mx::int32);
+    mx::array jnt_type_arr = mx::zeros({1}, mx::int32);
+    mx::array jnt_qposadr_arr = mx::zeros({1}, mx::int32);
+    mx::array jnt_pos_arr = mx::zeros({1});
+    mx::array jnt_axis_arr = mx::zeros({1});
+    mx::array qpos0 = mx::zeros({1});
+    mx::array geom_bodyid_arr = mx::zeros({1}, mx::int32);
+    mx::array geom_pos_arr = mx::zeros({1});
+    mx::array geom_quat_arr = mx::zeros({1});
 
     // Forward kernel model constants
-    mx::array make_m_mask{mx::zeros({1})};
-    mx::array act_moment{mx::zeros({1})};
+    mx::array make_m_mask = mx::zeros({1});
+    mx::array act_moment = mx::zeros({1});
     int fwd_scratch_per_env = 0;
 
     // Collision kernel
     std::optional<KernelFn> collision_kernel;
     bool uses_metal_collision = false;
-    mx::array coll_pair_data{mx::zeros({1})};
-    mx::array coll_mesh_verts{mx::zeros({1})};
-    mx::array coll_mesh_vertadr{mx::zeros({1})};
-    mx::array coll_mesh_vertnum{mx::zeros({1})};
-    mx::array coll_geom_dataid{mx::zeros({1})};
+    mx::array coll_pair_data = mx::zeros({1});
+    mx::array coll_mesh_verts = mx::zeros({1});
+    mx::array coll_mesh_vertadr = mx::zeros({1});
+    mx::array coll_mesh_vertnum = mx::zeros({1});
+    mx::array coll_geom_dataid = mx::zeros({1});
     int num_collision_pairs = 0;
 
     // Solver kernel
     std::optional<KernelFn> solver_kernel;
     bool uses_metal_solver = false;
-    mx::array solver_pair_props{mx::zeros({1})};
-    mx::array solver_body_dof_masks{mx::zeros({1})};
-    mx::array solver_body_rootid{mx::zeros({1})};
+    mx::array solver_pair_props = mx::zeros({1});
+    mx::array solver_body_dof_masks = mx::zeros({1});
+    mx::array solver_body_rootid = mx::zeros({1});
     int solver_scratch_size = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
