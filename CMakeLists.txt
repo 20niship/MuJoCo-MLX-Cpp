@@ -130,8 +130,6 @@ if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
             message(FATAL_ERROR "Found MuJoCo headers at ${MUJOCO_ROOT} but no libmujoco dylib/so")
         endif()
     endif()
-    # Record the original dylib filename for install_name_tool fixups
-    get_filename_component(_MJ_OLD_NAME "${_MJ_DYLIB_PATH}" NAME)
     set_target_properties(mujoco_imported PROPERTIES
         IMPORTED_LOCATION "${_MJ_DYLIB_PATH}"
         INTERFACE_INCLUDE_DIRECTORIES "${MUJOCO_ROOT}/include"
