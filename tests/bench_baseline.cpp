@@ -2,17 +2,16 @@
 // Run this ONCE before starting conformance work to capture starting metrics.
 // Subsequent phase benchmarks compare against these baselines.
 //
-// Usage:
-//   bench_baseline [humanoid.xml] [csv_path]
-//
-// If humanoid.xml is provided, it is included in the benchmark suite.
-// CSV output defaults to benchmarks/baseline.csv.
+// Usage: bench_baseline [humanoid.xml] [csv_path] [go2.xml] [h1.xml] -- any model path may be "".
 
 #include "test_utils.h"
 #include "bench_utils.h"
 #include "test_models.h"
 #include <cstring>
+#include <exception>
 #include <string>
+#include <utility>
+#include <vector>
 
 int main(int argc, char** argv) {
     const char* humanoid_path = nullptr;
@@ -20,6 +19,8 @@ int main(int argc, char** argv) {
         humanoid_path = argv[1];
     }
     const char* csv_path = (argc >= 3) ? argv[2] : "benchmarks/baseline.csv";
+    const char* go2_path = (argc >= 4 && strlen(argv[3]) > 0) ? argv[3] : nullptr;
+    const char* h1_path = (argc >= 5 && strlen(argv[4]) > 0) ? argv[4] : nullptr;
 
     printf("=== MuJoCo-MLX-Cpp Baseline Benchmarks ===\n");
     printf("Git: %s\n\n", bench_git_hash().c_str());
@@ -56,50 +57,21 @@ int main(int argc, char** argv) {
         bench_print_stats(s);
     }
 
-    // Humanoid (external, if provided) — uses batched API with 1 env
-    if (humanoid_path) {
-        BenchStats hs;
-        hs.name = "scalar/humanoid";
-        hs.model_name = "humanoid";
-        hs.num_envs = 1;
-        hs.num_steps = 100;
-        hs.work = 100;
+    // T-shape push task (self-contained, no external assets)
+    {
+        auto s = bench_scalar_step("scalar/t_shape", "t_shape", T_SHAPE_XML, 50, 2, 5);
+        _bench_results.push_back(s);
+        bench_print_stats(s);
+    }
 
-        MjmlxModel* model = mjmlx_load_model(humanoid_path);
-        if (model) {
-            MjmlxBatchedConfig config = {};
-            config.num_envs = 1;
-            config.use_gpu = 0;
-            config.foot_contacts_only = 0;
-            config.integrator = MJMLX_INTEGRATOR_EULER;
-
-            MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
-            if (sim) {
-                BENCH_RUN(hs, 3, 10, {
-                    std::vector<int> mask(1, 1);
-                    mjmlx_batched_reset(sim, mask.data());
-                    for (int s = 0; s < 100; s++) mjmlx_batched_step(sim, nullptr);
-                    int tmp; mjmlx_batched_get_xpos(sim, &tmp);
-                });
-                mjmlx_batched_free(sim);
-            }
-            mjmlx_free_model(model);
-
-            // MuJoCo C reference
-            char error[1024] = {0};
-            mjModel* mj_m = mj_loadXML(humanoid_path, nullptr, error, sizeof(error));
-            if (mj_m) {
-                mjData* mj_d = mj_makeData(mj_m);
-                hs.mj_c_steps_per_sec = bench_mujoco_c_throughput(mj_m, mj_d, 100);
-                mj_deleteData(mj_d);
-                mj_deleteModel(mj_m);
-            }
-
-            hs.compute();
-            _bench_results.push_back(hs);
-            bench_print_stats(hs);
-        } else {
-            printf("  SKIP scalar/humanoid: failed to load %s\n", humanoid_path);
+    // External models (menagerie-style, may reference mesh assets) — skipped if path not given
+    for (auto& mp : std::vector<std::pair<const char*, const char*>>{
+             {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
+        std::string name = std::string("scalar/") + mp.first;
+        auto s = bench_scalar_step_file(name.c_str(), mp.first, mp.second, 100, 3, 10);
+        if (s.steps_per_sec > 0) {
+            _bench_results.push_back(s);
+            bench_print_stats(s);
         }
     }
 
@@ -107,66 +79,43 @@ int main(int argc, char** argv) {
 
     printf("\n--- Batched Benchmarks (64 envs, GPU) ---\n");
 
-    // Simple pendulum batched
-    {
+    // try/catch per benchmark: one throwing (e.g. Metal resource-limit error) must not lose results already collected.
+    try {
         auto s = bench_batched_step("batched/pendulum", "pendulum", SIMPLE_PENDULUM_XML, 64, 20, 1, 3);
         _bench_results.push_back(s);
         bench_print_stats(s);
+    } catch (const std::exception& e) {
+        printf("  CRASH batched/pendulum: %s\n", e.what());
     }
 
-    // High-DOF tree batched (critical for Synth Metal pipeline)
-    // Uses fewer envs and steps due to large model size
-    {
+    try {
+        auto s = bench_batched_step("batched/t_shape", "t_shape", T_SHAPE_XML, 64, 20, 1, 3);
+        _bench_results.push_back(s);
+        bench_print_stats(s);
+    } catch (const std::exception& e) {
+        printf("  CRASH batched/t_shape: %s\n", e.what());
+    }
+
+    for (auto& mp : std::vector<std::pair<const char*, const char*>>{
+             {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
+        std::string name = std::string("batched/") + mp.first;
+        try {
+            auto s = bench_batched_step_file(name.c_str(), mp.first, mp.second, 32, 20, 1, 3);
+            if (s.steps_per_sec > 0) {
+                _bench_results.push_back(s);
+                bench_print_stats(s);
+            }
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
+    }
+
+    try {
         auto s = bench_batched_step("batched/high_dof_tree", "high_dof_tree", HIGH_DOF_TREE_XML, 16, 10, 1, 2);
         _bench_results.push_back(s);
         bench_print_stats(s);
-    }
-
-    // Humanoid batched (if provided)
-    if (humanoid_path) {
-        BenchStats hs;
-        hs.name = "batched/humanoid";
-        hs.model_name = "humanoid";
-        hs.num_envs = 32;
-        hs.num_steps = 20;
-        hs.work = 32.0 * 20;
-
-        MjmlxModel* model = mjmlx_load_model(humanoid_path);
-        if (model) {
-            MjmlxBatchedConfig config;
-            config.num_envs = 32;
-            config.use_gpu = 1;
-            config.foot_contacts_only = 0;
-            config.integrator = MJMLX_INTEGRATOR_EULER;
-
-            MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
-            if (sim) {
-                BENCH_RUN(hs, 1, 3, {
-                    std::vector<int> mask(32, 1);
-                    mjmlx_batched_reset(sim, mask.data());
-                    for (int s = 0; s < 20; s++) mjmlx_batched_step(sim, nullptr);
-                    int tmp; mjmlx_batched_get_xpos(sim, &tmp);
-                });
-                mjmlx_batched_free(sim);
-
-                // MuJoCo C single-env reference
-                char error[1024] = {0};
-                mjModel* mj_m = mj_loadXML(humanoid_path, nullptr, error, sizeof(error));
-                if (mj_m) {
-                    mjData* mj_d = mj_makeData(mj_m);
-                    hs.mj_c_steps_per_sec = bench_mujoco_c_throughput(mj_m, mj_d, 20);
-                    mj_deleteData(mj_d);
-                    mj_deleteModel(mj_m);
-                }
-
-                hs.compute();
-                _bench_results.push_back(hs);
-                bench_print_stats(hs);
-            } else {
-                printf("  SKIP batched/humanoid: failed to create batched sim\n");
-            }
-            mjmlx_free_model(model);
-        }
+    } catch (const std::exception& e) {
+        printf("  CRASH batched/high_dof_tree: %s\n", e.what());
     }
 
     // ── Summary and CSV output ───────────────────────────────────────────────

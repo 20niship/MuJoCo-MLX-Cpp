@@ -365,6 +365,135 @@ static inline BenchStats bench_batched_step(
     return stats;
 }
 
+// ── Convenience: file-path scalar/batched benchmarks (external models with mesh assets) ─────
+
+// Like bench_scalar_step but loads from a file path so relative <mesh file="..."/> assets resolve; returns zero-throughput stats if path is empty/load fails.
+static inline BenchStats bench_scalar_step_file(
+    const char* name,
+    const char* model_name,
+    const char* path,
+    int num_steps = 100,
+    int warmup_iters = 3,
+    int measure_iters = 10)
+{
+    BenchStats stats;
+    stats.name = name;
+    stats.model_name = model_name;
+    stats.num_envs = 1;
+    stats.num_steps = num_steps;
+    stats.work = num_steps;
+
+    if (!path || strlen(path) == 0) return stats;
+
+    MjmlxModel* model = mjmlx_load_model(path);
+    if (!model) {
+        fprintf(stderr, "  SKIP %s: failed to load %s\n", name, path);
+        return stats;
+    }
+
+    MjmlxBatchedConfig config = {};
+    config.num_envs = 1;
+    config.use_gpu = 0;
+    config.foot_contacts_only = 0;
+    config.integrator = MJMLX_INTEGRATOR_EULER;
+
+    MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
+    if (!sim) {
+        fprintf(stderr, "  SKIP %s: failed to create batched sim\n", name);
+        mjmlx_free_model(model);
+        return stats;
+    }
+
+    BENCH_RUN(stats, warmup_iters, measure_iters, {
+        std::vector<int> mask(1, 1);
+        mjmlx_batched_reset(sim, mask.data());
+        for (int s = 0; s < num_steps; s++) {
+            mjmlx_batched_step(sim, nullptr);
+        }
+        int tmp;
+        mjmlx_batched_get_xpos(sim, &tmp);
+    });
+
+    mjmlx_batched_free(sim);
+    mjmlx_free_model(model);
+
+    char error[1024] = {0};
+    mjModel* mj_m = mj_loadXML(path, nullptr, error, sizeof(error));
+    if (mj_m) {
+        mjData* mj_d = mj_makeData(mj_m);
+        stats.mj_c_steps_per_sec = bench_mujoco_c_throughput(mj_m, mj_d, num_steps);
+        mj_deleteData(mj_d);
+        mj_deleteModel(mj_m);
+    }
+
+    stats.compute();
+    return stats;
+}
+
+// Same as bench_batched_step but loads from a real file path (see bench_scalar_step_file).
+static inline BenchStats bench_batched_step_file(
+    const char* name,
+    const char* model_name,
+    const char* path,
+    int num_envs = 32,
+    int num_steps = 20,
+    int warmup_iters = 1,
+    int measure_iters = 3)
+{
+    BenchStats stats;
+    stats.name = name;
+    stats.model_name = model_name;
+    stats.num_envs = num_envs;
+    stats.num_steps = num_steps;
+    stats.work = (double)num_envs * num_steps;
+
+    if (!path || strlen(path) == 0) return stats;
+
+    MjmlxModel* model = mjmlx_load_model(path);
+    if (!model) {
+        fprintf(stderr, "  SKIP %s: failed to load %s\n", name, path);
+        return stats;
+    }
+
+    MjmlxBatchedConfig config = {};
+    config.num_envs = num_envs;
+    config.use_gpu = 1;
+    config.foot_contacts_only = 0;
+    config.integrator = MJMLX_INTEGRATOR_EULER;
+
+    MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
+    if (!sim) {
+        fprintf(stderr, "  SKIP %s: failed to create batched sim\n", name);
+        mjmlx_free_model(model);
+        return stats;
+    }
+
+    BENCH_RUN(stats, warmup_iters, measure_iters, {
+        std::vector<int> mask(num_envs, 1);
+        mjmlx_batched_reset(sim, mask.data());
+        for (int s = 0; s < num_steps; s++) {
+            mjmlx_batched_step(sim, nullptr);
+        }
+        int tmp;
+        mjmlx_batched_get_xpos(sim, &tmp);
+    });
+
+    mjmlx_batched_free(sim);
+    mjmlx_free_model(model);
+
+    char error[1024] = {0};
+    mjModel* mj_m = mj_loadXML(path, nullptr, error, sizeof(error));
+    if (mj_m) {
+        mjData* mj_d = mj_makeData(mj_m);
+        stats.mj_c_steps_per_sec = bench_mujoco_c_throughput(mj_m, mj_d, num_steps);
+        mj_deleteData(mj_d);
+        mj_deleteModel(mj_m);
+    }
+
+    stats.compute();
+    return stats;
+}
+
 // ── Temp file helper ─────────────────────────────────────────────────────────
 // bench_utils.h expects test_utils.h to be included first (provides write_temp_xml).
 // All benchmark files should #include "test_utils.h" before #include "bench_utils.h".

@@ -35,6 +35,10 @@ bench: build
 bench-mkx: build-mkx
     BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_check.sh
 
+# Download external benchmark robot models (Go2, H1); bench/bench-mkx already do this automatically
+fetch-models:
+    ./scripts/fetch_models.sh
+
 # Remove build directory
 clean:
     /bin/rm -rf build

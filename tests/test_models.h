@@ -689,3 +689,25 @@ static const char* SIMPLE_PENDULUM_XML = R"(
   </actuator>
 </mujoco>
 )";
+
+// T-shape block pushing task: T-shaped body (two fused boxes) on a plane, pusher sphere with slide actuator.
+static const char* T_SHAPE_XML = R"(
+<mujoco>
+  <option gravity="0 0 -9.81" timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0"/>
+    <body name="t_block" pos="0 0 0.05">
+      <freejoint/>
+      <geom name="t_stem" type="box" size="0.05 0.15 0.05" pos="0 0 0" mass="1"/>
+      <geom name="t_bar" type="box" size="0.2 0.05 0.05" pos="0 0.15 0" mass="1"/>
+    </body>
+    <body name="pusher" pos="-0.5 0 0.05">
+      <joint name="pusher_x" type="slide" axis="1 0 0"/>
+      <geom name="pusher_geom" type="sphere" size="0.05" mass="0.5"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="pusher_x" gear="20"/>
+  </actuator>
+</mujoco>
+)";
