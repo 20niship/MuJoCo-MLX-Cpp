@@ -15,10 +15,7 @@
 #include "internal.h"
 #include "mjmlx/mjmlx.h"
 
-#include <mlx/mlx.h>
 #include <stdexcept>
-
-namespace mx = mlx::core;
 
 namespace mjmlx {
 

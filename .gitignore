@@ -1,4 +1,6 @@
 build/
+build-mkx/
+benchmarks/models/external/
 *.o
 *.dylib
 *.so

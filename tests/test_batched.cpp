@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include <vector>
 
 int main(int argc, char** argv) {
     if (argc < 2) {

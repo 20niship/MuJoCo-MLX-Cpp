@@ -19,8 +19,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="${PROJECT_DIR}/build"
-HISTORY_CSV="${PROJECT_DIR}/benchmarks/history.csv"
+BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
+HISTORY_CSV="${HISTORY_CSV:-${PROJECT_DIR}/benchmarks/history.csv}"
 THRESHOLD_PCT="${2:-10}"
 HUMANOID="${1:-}"
 
@@ -40,6 +40,12 @@ fi
 # Ensure benchmarks directory exists
 mkdir -p "${PROJECT_DIR}/benchmarks"
 
+# Fetch external robot models (Go2, H1) if not already present.
+"${SCRIPT_DIR}/fetch_models.sh"
+MENAGERIE_DIR="${PROJECT_DIR}/benchmarks/models/external/mujoco_menagerie"
+GO2_MODEL="${MENAGERIE_DIR}/unitree_go2/scene.xml"
+H1_MODEL="${MENAGERIE_DIR}/unitree_h1/scene.xml"
+
 # Run bench_baseline
 BENCH_BASELINE="${BUILD_DIR}/bench_baseline"
 if [ ! -x "$BENCH_BASELINE" ]; then
@@ -48,11 +54,7 @@ if [ ! -x "$BENCH_BASELINE" ]; then
 fi
 
 echo "--- Running bench_baseline ---"
-if [ -n "$HUMANOID" ]; then
-    "$BENCH_BASELINE" "$HUMANOID" "$HISTORY_CSV"
-else
-    "$BENCH_BASELINE" "" "$HISTORY_CSV"
-fi
+"$BENCH_BASELINE" "$HUMANOID" "$HISTORY_CSV" "$GO2_MODEL" "$H1_MODEL"
 
 # Run any phase-specific benchmarks that exist
 for bench_exe in "${BUILD_DIR}"/bench_*; do

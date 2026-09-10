@@ -18,10 +18,15 @@
 #include "mjmlx/mjb.h"
 #include "mjmlx/mjmlx.h"
 #include <mujoco/mujoco.h>
+#if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#else
+#include <thread>
+#endif
 #include <cstring>
 #include <vector>
 #include <cstdio>
+#include <algorithm>
 
 // ── Opaque handle definitions ────────────────────────────────────────────
 
@@ -841,15 +846,33 @@ MJB_API void mjb_batched_step(MjbBatchedSim* sim, const float* ctrl) {
         int ne = sim->num_envs;
         int nu = cm->nu;
 
+        auto step_one = [&](size_t i) {
+            mjData* d = sim->cpu_datas[i];
+            for (int j = 0; j < nu; j++)
+                d->ctrl[j] = (double)ctrl[i * nu + j];
+            mj_step(m, d);
+        };
+
+#if defined(__APPLE__)
         dispatch_apply((size_t)ne,
             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-            ^(size_t i) {
-                mjData* d = sim->cpu_datas[i];
-                for (int j = 0; j < nu; j++)
-                    d->ctrl[j] = (double)ctrl[i * nu + j];
-                mj_step(m, d);
-            }
+            ^(size_t i) { step_one(i); }
         );
+#else
+        unsigned n_threads = std::min<unsigned>(std::thread::hardware_concurrency(), (unsigned)ne);
+        if (n_threads <= 1) {
+            for (size_t i = 0; i < (size_t)ne; i++) step_one(i);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(n_threads);
+            for (unsigned t = 0; t < n_threads; t++) {
+                pool.emplace_back([&, t]() {
+                    for (size_t i = t; i < (size_t)ne; i += n_threads) step_one(i);
+                });
+            }
+            for (auto& th : pool) th.join();
+        }
+#endif
     } else {
         mjmlx_batched_step(sim->mlx_sim, ctrl);
     }

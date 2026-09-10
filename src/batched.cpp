@@ -43,7 +43,21 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+
+#if defined(MJMLX_BACKEND_MKX)
+#include "compat/mkx_kernels/kinematics.hpp"
+#include "compat/mkx_kernels/euler.hpp"
+#include "compat/mkx_kernels/euler_devmem.hpp"
+#include "compat/mkx_kernels/forward.hpp"
+#include "compat/mkx_kernels/collision.hpp"
+#include "compat/mkx_kernels/solver.hpp"
+#endif
+#if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#else
+#include <thread>
+#include <vector>
+#endif
 #include <mujoco/mujoco.h>
 
 namespace mjmlx {
@@ -1109,7 +1123,8 @@ static int forward_scratch_per_env(const Model& m) {
 static const std::string FORWARD_HEADER = R"(
 )";
 
-// ── Test helper: dispatch Metal forward kernel for 1 env ────────────────────
+// ── Test helper: dispatch Metal forward kernel for 1 env (MLX-only, tests/test_metal_synth.cpp) ──
+#if defined(MJMLX_BACKEND_MLX)
 
 MJMLX_API MetalForwardResult test_metal_forward(
     const Model& m,
@@ -1995,9 +2010,15 @@ MJMLX_API MetalCollisionResult test_metal_solver(
     return r;
 }
 
+#endif // MJMLX_BACKEND_MLX
+
 // ── Context: Metal kernels + model constants ─────────────────────────────────
 
+#if defined(MJMLX_BACKEND_MLX)
 using KernelFn = mx::fast::CustomKernelFunction;
+#else
+using KernelFn = mkx::fast::Kernel;
+#endif
 
 struct BatchedStepContext {
     std::optional<KernelFn> kin_kernel;
@@ -2093,6 +2114,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
     // large, we skip the Metal kernel and fall back to the scalar CPU path.
     int stack_bytes = m.nbody * 7 * 4;
     if (stack_bytes <= 24000) {
+#if defined(MJMLX_BACKEND_MKX)
+        ctx->kin_kernel = mkx_kernels::make_kinematics_kernel(m.nbody, m.njnt, m.nq, m.ngeom);
+#else
         auto source = make_kinematics_source(m.nbody, m.njnt, m.nq, m.ngeom);
         ctx->kin_kernel = mx::fast::metal_kernel(
             "mjmlx_kin_" + std::to_string(m.nbody),
@@ -2105,6 +2129,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             source,
             QUAT_HEADER
         );
+#endif
     }
 
     // Extract joint integration plan (shared by both euler kernel variants)
@@ -2135,6 +2160,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
     //   nv ≤ 2048: device-memory kernel (L in global GPU memory, vectors thread-local)
     int euler_stack = 2 * m.nv * m.nv + 4 * m.nv + m.nq;
     if (euler_stack * 4 <= 24000 && m.nv <= 80) {
+#if defined(MJMLX_BACKEND_MKX)
+        ctx->euler_kernel = mkx_kernels::make_euler_kernel(m.nv, m.nq, m.opt.timestep, s_qa, s_da, fj, bj, damp_vals);
+#else
         auto euler_source = make_euler_source(
             m.nv, m.nq, m.opt.timestep,
             s_qa, s_da, fj, bj, damp_vals);
@@ -2145,7 +2173,12 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             {"qpos_out", "qvel_out", "qacc_out"},
             euler_source
         );
+#endif
     } else if (m.nv <= EULER_DEVMEM_MAX_NV) {
+#if defined(MJMLX_BACKEND_MKX)
+        ctx->euler_devmem_kernel = mkx_kernels::make_euler_devmem_kernel(m.nv, m.nq, m.opt.timestep, s_qa, s_da, fj, bj, damp_vals);
+        ctx->uses_devmem_euler = true;
+#else
         auto euler_source = make_euler_devmem_source(
             m.nv, m.nq, m.opt.timestep,
             s_qa, s_da, fj, bj, damp_vals);
@@ -2157,9 +2190,11 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             euler_source
         );
         ctx->uses_devmem_euler = true;
+#endif
     }
 
-    // Build Metal forward kernel for large models (replaces vmap forward)
+    // ponytail: MKX has no GLSL port of the forward/collision/solver Metal kernels yet, so nv > 80 falls back to the slower (still correct) vmap path; add GLSL versions in src/compat/mkx_kernels/ to restore the large-model speedup on MKX.
+#if defined(MJMLX_BACKEND_MLX)
     if (m.nv > 80) {
         auto fwd_source = make_forward_source(m);
         ctx->fwd_scratch_per_env = forward_scratch_per_env(m);
@@ -2240,11 +2275,51 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         );
         ctx->uses_metal_solver = true;
     }
+#endif // MJMLX_BACKEND_MLX
 
     return ctx;
 }
 
 // ── Hybrid batched step ──────────────────────────────────────────────────────
+
+#if defined(MJMLX_BACKEND_MKX)
+// mkx::vmap only supports one input/output; this generalizes its own slice/reshape/concatenate loop (mkx/ops/transforms.hpp) to forward_fn's 12 inputs/9 outputs, all batched on axis 0.
+static std::vector<mx::array> mkx_vmap_batch0(
+    const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>& fn,
+    const std::vector<mx::array>& batched_inputs, int batch_size)
+{
+    std::vector<std::vector<mx::array>> per_env(static_cast<size_t>(batch_size));
+    for (int b = 0; b < batch_size; b++) {
+        std::vector<mx::array> sliced;
+        sliced.reserve(batched_inputs.size());
+        for (auto& in : batched_inputs) {
+            mx::Shape shp = in.shape();
+            mx::Shape starts(shp.size(), 0), stops = shp;
+            starts[0] = b;
+            stops[0] = b + 1;
+            mx::array s = mx::slice(in, starts, stops);
+            mx::Shape squeezed(shp.begin() + 1, shp.end());
+            sliced.push_back(mx::reshape(s, squeezed));
+        }
+        per_env[static_cast<size_t>(b)] = fn(sliced);
+    }
+    size_t num_outputs = per_env[0].size();
+    std::vector<mx::array> result;
+    result.reserve(num_outputs);
+    for (size_t o = 0; o < num_outputs; o++) {
+        std::vector<mx::array> pieces;
+        pieces.reserve(static_cast<size_t>(batch_size));
+        for (int b = 0; b < batch_size; b++) {
+            mx::Shape shp = per_env[static_cast<size_t>(b)][o].shape();
+            mx::Shape unsq = shp;
+            unsq.insert(unsq.begin(), 1);
+            pieces.push_back(mx::reshape(per_env[static_cast<size_t>(b)][o], unsq));
+        }
+        result.push_back(mx::concatenate(pieces, 0));
+    }
+    return result;
+}
+#endif
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override) {
@@ -2312,9 +2387,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     d.qfrc_actuator, mx::flatten(d.qfrc_bias),
                 };
             };
+#if defined(MJMLX_BACKEND_MKX)
+            vmapped_fwd = [forward_fn, B](const std::vector<mx::array>& state) {
+                return mkx_vmap_batch0(forward_fn, state, B);
+            };
+#else
             std::vector<int> in_axes(12, 0);
             std::vector<int> out_axes = {0, 0, 0, 0, 0, 0, 0, 0, 0};
             vmapped_fwd = mx::vmap(forward_fn, in_axes, out_axes);
+#endif
         }
 
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
@@ -2335,6 +2416,21 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 (ng > 0) ? mx::Shape{B * ng * 3} : mx::Shape{1},
                 (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},
             };
+#if defined(MJMLX_BACKEND_MKX)
+            auto kin_raw = (*ctx->kin_kernel)(
+                mx::fast::kernel_inputs({ctx->body_parentid, ctx->body_pos, ctx->body_quat,
+                 ctx->body_ipos, ctx->body_iquat,
+                 ctx->body_jntadr, ctx->body_jntnum,
+                 ctx->jnt_type_arr, ctx->jnt_qposadr_arr,
+                 ctx->jnt_pos_arr, ctx->jnt_axis_arr,
+                 ctx->qpos0,
+                 ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
+                 qpos_flat}),
+                mx::fast::kernel_shapes(kin_shapes),
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+            );
+            auto kin = mx::fast::kernel_outputs(kin_raw);
+#else
             auto kin = (*ctx->kin_kernel)(
                 {ctx->body_parentid, ctx->body_pos, ctx->body_quat,
                  ctx->body_ipos, ctx->body_iquat,
@@ -2348,6 +2444,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
                 {}, std::nullopt, false, {}
             );
+#endif
 
             auto xpos   = mx::reshape(kin[0], {B, nb, 3});
             auto xipos  = mx::reshape(kin[3], {B, nb, 3});
@@ -2364,6 +2461,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qfrc_actuator_out = mx::zeros({1});
 
             if (use_metal_fwd) {
+#if defined(MJMLX_BACKEND_MLX)
                 // ── Phase 2a: Metal forward kernel (all-Metal path for nv > 80) ──
                 auto xmat = mx::reshape(kin[2], {B, nb, 3, 3});
                 int scratchSz = ctx->fwd_scratch_per_env;
@@ -2429,6 +2527,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 } else {
                     qfrc_constraint_flat = mx::zeros({B * nv});
                 }
+#endif // MJMLX_BACKEND_MLX -- use_metal_fwd is always false on MKX (see BatchedStepContext construction)
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
                 auto xquat = mx::reshape(kin[1], {B, nb, 4});
@@ -2458,10 +2557,20 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 mx::astype(mx::flatten(qvel_batch), mx::float32),
                 mx::astype(mx::flatten(qpos_batch), mx::float32)
             };
+            std::vector<mx::array> euler;
+#if defined(MJMLX_BACKEND_MKX)
+            auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
+            auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
+            if (ctx->euler_kernel.has_value()) {
+                auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
+                euler = mx::fast::kernel_outputs(raw);
+            } else {
+                auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup);
+                euler = mx::fast::kernel_outputs(raw);
+            }
+#else
             auto grid = std::make_tuple(B, 1, 1);
             auto tgroup = std::make_tuple(1, 1, 1);
-
-            std::vector<mx::array> euler;
             if (ctx->euler_kernel.has_value()) {
                 euler = (*ctx->euler_kernel)(
                     euler_inputs,
@@ -2477,6 +2586,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     grid, tgroup, {}, std::nullopt, false, {}
                 );
             }
+#endif
 
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
@@ -2563,24 +2673,42 @@ MJMLX_API void cpu_sync_state(MjmlxBatchedSim* handle) {
     }
 }
 
-// CPU batched: step all environments in parallel using GCD dispatch_apply.
+// CPU batched: step all environments in parallel (GCD dispatch_apply on Apple, std::thread elsewhere).
 MJMLX_API void cpu_batched_step(MjmlxBatchedSim* handle, const float* ctrl_flat, int frame_skip) {
     int B = handle->sim.num_envs;
     mjModel* m = handle->cpu_model;
     int nu = m->nu;
 
+    auto step_one = [&](size_t i) {
+        mjData* d = handle->cpu_datas[i];
+        if (ctrl_flat && nu > 0) {
+            for (int j = 0; j < nu; j++)
+                d->ctrl[j] = (double)ctrl_flat[i * nu + j];
+        }
+        for (int fs = 0; fs < frame_skip; fs++)
+            mj_step(m, d);
+    };
+
+#if defined(__APPLE__)
     dispatch_apply((size_t)B,
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-        ^(size_t i) {
-            mjData* d = handle->cpu_datas[i];
-            if (ctrl_flat && nu > 0) {
-                for (int j = 0; j < nu; j++)
-                    d->ctrl[j] = (double)ctrl_flat[i * nu + j];
-            }
-            for (int fs = 0; fs < frame_skip; fs++)
-                mj_step(m, d);
-        }
+        ^(size_t i) { step_one(i); }
     );
+#else
+    unsigned n_threads = std::min<unsigned>(std::thread::hardware_concurrency(), (unsigned)B);
+    if (n_threads <= 1) {
+        for (size_t i = 0; i < (size_t)B; i++) step_one(i);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(n_threads);
+        for (unsigned t = 0; t < n_threads; t++) {
+            pool.emplace_back([&, t]() {
+                for (size_t i = t; i < (size_t)B; i += n_threads) step_one(i);
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+#endif
 }
 
 // ── C API ────────────────────────────────────────────────────────────────────
