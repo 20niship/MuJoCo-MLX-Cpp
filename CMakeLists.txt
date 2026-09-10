@@ -9,31 +9,65 @@ option(MJMLX_BUILD_BENCHMARKS "Build benchmark executables" ON)
 option(MJMLX_BUILD_PYTHON "Build Python bindings via nanobind" OFF)
 option(MJMLX_BUILD_EXAMPLES "Build example programs" ON)
 
-# ── Find MLX ──────────────────────────────────────────────────
-set(MLX_ROOT "" CACHE PATH "Path to MLX installation (e.g. site-packages/mlx)")
+# ── Tensor backend selection (MLX on Apple, MKX/Vulkan elsewhere) ──
+if(NOT DEFINED MJMLX_TENSOR_BACKEND)
+    if(APPLE)
+        set(MJMLX_TENSOR_BACKEND "MLX")
+    else()
+        set(MJMLX_TENSOR_BACKEND "MKX")
+    endif()
+endif()
+set(MJMLX_TENSOR_BACKEND "${MJMLX_TENSOR_BACKEND}" CACHE STRING "Tensor backend: MLX or MKX")
+set_property(CACHE MJMLX_TENSOR_BACKEND PROPERTY STRINGS MLX MKX)
+message(STATUS "MJMLX_TENSOR_BACKEND: ${MJMLX_TENSOR_BACKEND}")
 
-if(NOT MLX_ROOT)
-    execute_process(
-        COMMAND python3 -c "import mlx, os; print(os.path.dirname(mlx.__file__))"
-        OUTPUT_VARIABLE MLX_ROOT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
+if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
+    # ── Find MLX ──────────────────────────────────────────────────
+    set(MLX_ROOT "" CACHE PATH "Path to MLX installation (e.g. site-packages/mlx)")
+
+    if(NOT MLX_ROOT)
+        execute_process(
+            COMMAND python3 -c "import mlx, os; print(os.path.dirname(mlx.__file__))"
+            OUTPUT_VARIABLE MLX_ROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+    endif()
+
+    if(NOT MLX_ROOT OR NOT EXISTS "${MLX_ROOT}/include/mlx/mlx.h")
+        message(FATAL_ERROR
+            "Cannot find MLX. Set -DMLX_ROOT=/path/to/mlx or ensure 'pip install mlx' is in PATH.\n"
+            "  Tried: ${MLX_ROOT}")
+    endif()
+
+    message(STATUS "MLX_ROOT: ${MLX_ROOT}")
+
+    add_library(mlx_imported SHARED IMPORTED)
+    set_target_properties(mlx_imported PROPERTIES
+        IMPORTED_LOCATION "${MLX_ROOT}/lib/libmlx.dylib"
+        INTERFACE_INCLUDE_DIRECTORIES "${MLX_ROOT}/include"
     )
+
+    add_library(tensor_backend INTERFACE)
+    target_link_libraries(tensor_backend INTERFACE mlx_imported)
+    target_compile_definitions(tensor_backend INTERFACE MJMLX_BACKEND_MLX=1)
+    set(MJMLX_RPATH_DIR "${MLX_ROOT}/lib")
+else()
+    # ── Fetch MKX (Vulkan-based cross-platform MLX-alike) ──────────
+    include(FetchContent)
+    find_package(Vulkan REQUIRED)
+    set(MKX_GIT_TAG "3202339e12231f3a68f9ee67e0b6085a33c52286" CACHE STRING "mlx-cross-platform commit/tag to fetch")
+    FetchContent_Declare(mkx
+        GIT_REPOSITORY git@github.com:20niship/mlx-cross-platform.git
+        GIT_TAG ${MKX_GIT_TAG}
+    )
+    FetchContent_MakeAvailable(mkx)
+
+    add_library(tensor_backend INTERFACE)
+    target_link_libraries(tensor_backend INTERFACE mkx)
+    target_compile_definitions(tensor_backend INTERFACE MJMLX_BACKEND_MKX=1)
+    set(MJMLX_RPATH_DIR "")
 endif()
-
-if(NOT MLX_ROOT OR NOT EXISTS "${MLX_ROOT}/include/mlx/mlx.h")
-    message(FATAL_ERROR
-        "Cannot find MLX. Set -DMLX_ROOT=/path/to/mlx or ensure 'pip install mlx' is in PATH.\n"
-        "  Tried: ${MLX_ROOT}")
-endif()
-
-message(STATUS "MLX_ROOT: ${MLX_ROOT}")
-
-add_library(mlx_imported SHARED IMPORTED)
-set_target_properties(mlx_imported PROPERTIES
-    IMPORTED_LOCATION "${MLX_ROOT}/lib/libmlx.dylib"
-    INTERFACE_INCLUDE_DIRECTORIES "${MLX_ROOT}/include"
-)
 
 # ── Find MuJoCo ──────────────────────────────────────────────
 set(MUJOCO_ROOT "" CACHE PATH "Path to MuJoCo installation")
@@ -144,15 +178,15 @@ target_include_directories(mjmlx
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(mjmlx PRIVATE mlx_imported mujoco_imported)
+target_link_libraries(mjmlx PRIVATE tensor_backend mujoco_imported)
 set_target_properties(mjmlx PROPERTIES
     C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     VERSION ${PROJECT_VERSION}
     SOVERSION 0
-    BUILD_RPATH "${MLX_ROOT}/lib"
-    INSTALL_RPATH "${MLX_ROOT}/lib"
+    BUILD_RPATH "${MJMLX_RPATH_DIR}"
+    INSTALL_RPATH "${MJMLX_RPATH_DIR}"
 )
 
 # Fix MuJoCo's framework-style install name for pip installs.
@@ -193,8 +227,8 @@ set_target_properties(mjb PROPERTIES
     VISIBILITY_INLINES_HIDDEN ON
     VERSION ${PROJECT_VERSION}
     SOVERSION 0
-    BUILD_RPATH "${MLX_ROOT}/lib"
-    INSTALL_RPATH "${MLX_ROOT}/lib"
+    BUILD_RPATH "${MJMLX_RPATH_DIR}"
+    INSTALL_RPATH "${MJMLX_RPATH_DIR}"
 )
 
 # Fix MuJoCo dylib reference for libmjb
@@ -224,21 +258,21 @@ if(MJMLX_BUILD_TESTS)
     target_link_libraries(test_batched PRIVATE mjmlx)
 
     add_executable(test_batched_diag tests/test_batched_diag.cpp)
-    target_link_libraries(test_batched_diag PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_link_libraries(test_batched_diag PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_batched_diag PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
     add_executable(test_math_full tests/test_math_full.cpp src/math.cpp)
-    target_link_libraries(test_math_full PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_link_libraries(test_math_full PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_math_full PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
     add_executable(test_linalg_full tests/test_linalg_full.cpp src/smooth_vmap.cpp src/math.cpp)
-    target_link_libraries(test_linalg_full PRIVATE mjmlx mujoco_imported mlx_imported)
+    target_link_libraries(test_linalg_full PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_linalg_full PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -263,20 +297,29 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME linalg_full COMMAND test_linalg_full)
     set_tests_properties(math_full linalg_full PROPERTIES LABELS "correctness")
 
-    add_executable(test_metal_synth tests/test_metal_synth.cpp)
-    target_link_libraries(test_metal_synth PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(test_metal_synth PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        add_custom_command(TARGET test_metal_synth POST_BUILD
-            COMMAND install_name_tool -change
-                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                "$<TARGET_FILE:test_metal_synth>"
-            COMMENT "Fixing MuJoCo dylib for test_metal_synth"
+    # test_metal_synth exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
+    if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
+        add_executable(test_metal_synth tests/test_metal_synth.cpp)
+        target_link_libraries(test_metal_synth PRIVATE mjmlx mujoco_imported tensor_backend)
+        target_include_directories(test_metal_synth PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
+
+        if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+            add_custom_command(TARGET test_metal_synth POST_BUILD
+                COMMAND install_name_tool -change
+                    "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                    "$<TARGET_FILE:test_metal_synth>"
+                COMMENT "Fixing MuJoCo dylib for test_metal_synth"
+            )
+        endif()
+
+        set(MJMLX_SYNTH_MODEL "" CACHE FILEPATH "Path to synth_humanoid.xml for Synth Metal tests")
+        if(MJMLX_SYNTH_MODEL)
+            add_test(NAME metal_synth COMMAND test_metal_synth ${MJMLX_SYNTH_MODEL})
+            set_tests_properties(metal_synth PROPERTIES LABELS "correctness")
+        endif()
     endif()
 
     if(MJMLX_TEST_MODEL)
@@ -284,12 +327,6 @@ if(MJMLX_BUILD_TESTS)
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
         add_test(NAME batched_diag COMMAND test_batched_diag ${MJMLX_TEST_MODEL})
         set_tests_properties(io batched batched_diag PROPERTIES LABELS "correctness")
-    endif()
-
-    set(MJMLX_SYNTH_MODEL "" CACHE FILEPATH "Path to synth_humanoid.xml for Synth Metal tests")
-    if(MJMLX_SYNTH_MODEL)
-        add_test(NAME metal_synth COMMAND test_metal_synth ${MJMLX_SYNTH_MODEL})
-        set_tests_properties(metal_synth PROPERTIES LABELS "correctness")
     endif()
 endif()
 
@@ -323,20 +360,22 @@ if(MJMLX_BUILD_BENCHMARKS AND MJMLX_BUILD_TESTS)
     endif()
     set_tests_properties(bench_baseline PROPERTIES LABELS "benchmark")
 
-    # Synth benchmark
-    add_executable(bench_synth tests/bench_synth.cpp)
-    target_link_libraries(bench_synth PRIVATE mjmlx mujoco_imported mlx_imported)
-    target_include_directories(bench_synth PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        add_custom_command(TARGET bench_synth POST_BUILD
-            COMMAND install_name_tool -change
-                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                "$<TARGET_FILE:bench_synth>"
-            COMMENT "Fixing MuJoCo dylib for bench_synth"
+    # Synth benchmark exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
+    if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
+        add_executable(bench_synth tests/bench_synth.cpp)
+        target_link_libraries(bench_synth PRIVATE mjmlx mujoco_imported tensor_backend)
+        target_include_directories(bench_synth PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
+        if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+            add_custom_command(TARGET bench_synth POST_BUILD
+                COMMAND install_name_tool -change
+                    "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                    "$<TARGET_FILE:bench_synth>"
+                COMMENT "Fixing MuJoCo dylib for bench_synth"
+            )
+        endif()
     endif()
 
     # Copy benchmark model files to build directory for easy access
@@ -362,7 +401,7 @@ if(MJMLX_BUILD_PYTHON)
         NB_DOMAIN mlx
         python/bindings.cpp
     )
-    target_link_libraries(_mjmlx_native PRIVATE mjmlx mlx_imported mujoco_imported)
+    target_link_libraries(_mjmlx_native PRIVATE mjmlx tensor_backend mujoco_imported)
     target_include_directories(_mjmlx_native PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
