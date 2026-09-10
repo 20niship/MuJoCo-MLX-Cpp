@@ -11,6 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Install just
         run: brew install just
 
@@ -19,7 +23,7 @@ jobs:
 
       - name: Install MuJoCo (Python)
         run: |
-          pip3 install --user --break-system-packages mujoco==3.5.0
+          pip install mujoco==3.5.0
           echo "MUJOCO_ROOT=$(python3 -c 'import mujoco, os; print(os.path.dirname(mujoco.__file__))')" >> "$GITHUB_ENV"
 
       - name: Build
@@ -37,19 +41,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Set up SSH deploy key for mlx-cross-platform (private repo)
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.MKX_DEPLOY_KEY }}
 
-      - name: Install just, Vulkan (lavapipe) and glslang
+      - name: Install Vulkan (lavapipe) and glslang
         run: |
           sudo apt-get update
-          sudo apt-get install -y just vulkan-tools mesa-vulkan-drivers libvulkan-dev glslang-tools
+          sudo apt-get install -y vulkan-tools mesa-vulkan-drivers libvulkan-dev glslang-tools
+
+      - name: Install just
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
       - name: Install MuJoCo (Python)
         run: |
-          pip3 install --user --break-system-packages mujoco==3.5.0
+          pip install mujoco==3.5.0
           echo "MUJOCO_ROOT=$(python3 -c 'import mujoco, os; print(os.path.dirname(mujoco.__file__))')" >> "$GITHUB_ENV"
 
       - name: Run tests
