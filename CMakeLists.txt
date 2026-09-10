@@ -121,11 +121,11 @@ if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
     if(EXISTS "${MUJOCO_ROOT}/lib/libmujoco.dylib")
         set(_MJ_DYLIB_PATH "${MUJOCO_ROOT}/lib/libmujoco.dylib")
     else()
-        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/libmujoco*.dylib")
+        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/libmujoco*.dylib" "${MUJOCO_ROOT}/libmujoco*.so*")
         if(_MJ_DYLIB)
             list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
         else()
-            message(FATAL_ERROR "Found MuJoCo headers at ${MUJOCO_ROOT} but no libmujoco dylib")
+            message(FATAL_ERROR "Found MuJoCo headers at ${MUJOCO_ROOT} but no libmujoco dylib/so")
         endif()
     endif()
     # Record the original dylib filename for install_name_tool fixups
@@ -137,11 +137,11 @@ if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
     message(STATUS "MUJOCO_ROOT: ${MUJOCO_ROOT} -> ${_MJ_DYLIB_PATH}")
 elseif(MUJOCO_PKG_DIR AND EXISTS "${MUJOCO_PKG_DIR}/include/mujoco/mujoco.h")
     add_library(mujoco_imported SHARED IMPORTED)
-    file(GLOB _MJ_DYLIB "${MUJOCO_PKG_DIR}/libmujoco*.dylib")
+    file(GLOB _MJ_DYLIB "${MUJOCO_PKG_DIR}/libmujoco*.dylib" "${MUJOCO_PKG_DIR}/libmujoco*.so*")
     if(_MJ_DYLIB)
         list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
     else()
-        file(GLOB _MJ_DYLIB "${MUJOCO_PKG_DIR}/*.dylib")
+        file(GLOB _MJ_DYLIB "${MUJOCO_PKG_DIR}/*.dylib" "${MUJOCO_PKG_DIR}/*.so*")
         if(_MJ_DYLIB)
             list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
         endif()
@@ -192,7 +192,7 @@ set_target_properties(mjmlx PROPERTIES
 # Fix MuJoCo's framework-style install name for pip installs.
 # The pip mujoco dylib uses @rpath/mujoco.framework/Versions/A/libmujoco.X.Y.Z.dylib
 # but the actual file is a flat dylib. Rewrite the reference to an absolute path.
-if(_MJ_DYLIB_PATH)
+if(APPLE AND _MJ_DYLIB_PATH)
     execute_process(
         COMMAND otool -D "${_MJ_DYLIB_PATH}"
         OUTPUT_VARIABLE _MJ_INSTALL_NAME
