@@ -61,6 +61,8 @@ else()
         GIT_REPOSITORY https://github.com/20niship/mlx_vulkan.git
         GIT_TAG ${MKX_GIT_TAG}
     )
+    # mkx's own CMakeLists builds a plain STATIC lib (no PIC); linking that into our .so needs -fPIC on Linux.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     FetchContent_MakeAvailable(mkx)
 
     add_library(tensor_backend INTERFACE)
