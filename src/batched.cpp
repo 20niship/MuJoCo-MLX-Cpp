@@ -2193,9 +2193,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 #endif
     }
 
-    // ponytail: MKX has no GLSL port of the forward/collision/solver Metal kernels yet, so nv > 80 falls back to the slower (still correct) vmap path; add GLSL versions in src/compat/mkx_kernels/ to restore the large-model speedup on MKX.
+    // ponytail: MKX has no GLSL port of the forward/collision/solver Metal kernels yet (falls back to vmap); scratch here is device memory not thread-local stack, so the old nv>80 gate (copied from euler's stack tier) was wrongly excluding mesh-heavy mid-size robots (Go2/H1) — build whenever there's anything to collide.
 #if defined(MJMLX_BACKEND_MLX)
-    if (m.nv > 80) {
+    {
         auto fwd_source = make_forward_source(m);
         ctx->fwd_scratch_per_env = forward_scratch_per_env(m);
 
@@ -2223,8 +2223,8 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         ctx->uses_metal_forward = true;
     }
 
-    // Build Metal collision kernel for large models (replaces vmap collision)
-    if (m.nv > 80 && m.cache.collision_pairs.size() > 0) {
+    // Build Metal collision kernel (replaces vmap collision)
+    if (m.cache.collision_pairs.size() > 0) {
         auto coll_source = make_collision_source(m);
         ctx->num_collision_pairs = (int)m.cache.collision_pairs.size();
 
@@ -2252,11 +2252,11 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
     }
 
     // Build Metal solver kernel (constraint construction + Newton solver)
-    if (m.nv > 80 && m.cache.collision_pairs.size() > 0) {
+    if (m.cache.collision_pairs.size() > 0) {
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
-        // GPU CG solver: cap at 1 for large models (100 default is for CPU exact Cholesky)
-        int si = (m.nv > 80) ? std::min(raw_si, 3) : raw_si;
-        int cgi = (m.nv > 80) ? 20 : 50;
+        // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
+        int si = std::min(raw_si, 3);
+        int cgi = 20;
         auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_scratch_size = solver_scratch_per_env(m);
         ctx->solver_pair_props = build_solver_pair_props(m);
