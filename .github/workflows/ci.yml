@@ -28,6 +28,6 @@ jobs:
           MLX_ROOT: /opt/homebrew/opt/mlx
 
       - name: Run tests
-        run: just check
+        run: just check-ci
         env:
           MLX_ROOT: /opt/homebrew/opt/mlx

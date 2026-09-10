@@ -12,6 +12,10 @@ build:
 check: build
     ./run_tests.sh
 
+# Build then run only the tests that don't depend on the removed single-env pipeline (for CI)
+check-ci: build
+    cd build && ./test_math_full && ./test_linalg_full
+
 # Remove build directory
 clean:
     /bin/rm -rf build
