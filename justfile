@@ -31,6 +31,10 @@ check-ci-mkx: build-mkx
 bench: build
     ./scripts/bench_check.sh
 
+# Build the MKX backend then run the same benchmarks (separate history file, for MLX-vs-MKX comparison)
+bench-mkx: build-mkx
+    BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_check.sh
+
 # Remove build directory
 clean:
     /bin/rm -rf build

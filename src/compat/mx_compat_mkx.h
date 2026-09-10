@@ -19,6 +19,7 @@
 #include <functional>
 #include <initializer_list>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -55,7 +56,14 @@ inline Shape broadcast_shapes(const Shape& a, const Shape& b) {
     for (size_t i = 0; i < n; i++) {
         int ai = (i < n - a.size()) ? 1 : a[i - (n - a.size())];
         int bi = (i < n - b.size()) ? 1 : b[i - (n - b.size())];
-        if (ai != 1 && bi != 1 && ai != bi) throw std::runtime_error("mx_compat_mkx: incompatible shapes for broadcast");
+        if (ai != 1 && bi != 1 && ai != bi) {
+            std::string msg = "mx_compat_mkx: incompatible shapes for broadcast: [";
+            for (size_t k = 0; k < a.size(); k++) msg += std::to_string(a[k]) + ",";
+            msg += "] vs [";
+            for (size_t k = 0; k < b.size(); k++) msg += std::to_string(b[k]) + ",";
+            msg += "]";
+            throw std::runtime_error(msg);
+        }
         out[i] = std::max(ai, bi);
     }
     return out;
