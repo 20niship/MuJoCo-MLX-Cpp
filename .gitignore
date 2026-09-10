@@ -10,3 +10,5 @@ build/
 *.swo
 *~
 .DS_Store
+MUJOCO_LOG.TXT
+*.TXT

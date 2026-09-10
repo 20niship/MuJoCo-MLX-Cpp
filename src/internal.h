@@ -63,13 +63,13 @@ struct Option {
     float ls_tolerance = 0.01f;
     int iterations = 100;
     int ls_iterations = 50;
-    mx::array gravity{mx::array({0.0f, 0.0f, -9.81f})};
+    mx::array gravity = mx::array({0.0f, 0.0f, -9.81f});
     IntegratorType integrator = IntegratorType::EULER;
     SolverType solver = SolverType::NEWTON;
     ConeType cone = ConeType::PYRAMIDAL;
     int disableflags = 0;
     float impratio = 1.0f;
-    mx::array wind{mx::zeros({3})};
+    mx::array wind = mx::zeros({3});
     float viscosity = 0.0f;
     float density = 0.0f;
 };
@@ -81,23 +81,23 @@ struct Statistic {
     float meanmass = 1.0f;
     float meansize = 0.1f;
     float extent = 1.0f;
-    mx::array center{mx::zeros({3})};
+    mx::array center = mx::zeros({3});
 };
 
 // ── Contact ──────────────────────────────────────────────────
 
 struct Contact {
-    mx::array dist{mx::array({})};          // (ncon,)
-    mx::array pos{mx::array({})};           // (ncon, 3)
-    mx::array frame{mx::array({})};         // (ncon, 3, 3)
-    mx::array dim{mx::array({}, mx::int32)};
-    mx::array friction{mx::array({})};
-    mx::array solref{mx::array({})};        // (ncon, 2)
-    mx::array solimp{mx::array({})};        // (ncon, 5)
-    mx::array includemargin{mx::array({})};
-    mx::array solreffriction{mx::array({})};
-    mx::array geom{mx::array({})};          // (ncon, 2)
-    mx::array efc_address{mx::array({}, mx::int32)};
+    mx::array dist = mx::array({});          // (ncon,)
+    mx::array pos = mx::array({});           // (ncon, 3)
+    mx::array frame = mx::array({});         // (ncon, 3, 3)
+    mx::array dim = mx::array({}, mx::int32);
+    mx::array friction = mx::array({});
+    mx::array solref = mx::array({});        // (ncon, 2)
+    mx::array solimp = mx::array({});        // (ncon, 5)
+    mx::array includemargin = mx::array({});
+    mx::array solreffriction = mx::array({});
+    mx::array geom = mx::array({});          // (ncon, 2)
+    mx::array efc_address = mx::array({}, mx::int32);
 };
 
 // ── Model ────────────────────────────────────────────────────
@@ -113,152 +113,152 @@ struct Model {
     Statistic stat;
 
     // Reference configuration
-    mx::array qpos0{mx::array({})};
-    mx::array qpos_spring{mx::array({})};
+    mx::array qpos0 = mx::array({});
+    mx::array qpos_spring = mx::array({});
 
     // Body properties
-    mx::array body_parentid{mx::array({})};
-    mx::array body_rootid{mx::array({})};
-    mx::array body_weldid{mx::array({})};
-    mx::array body_jntadr{mx::array({})};
-    mx::array body_jntnum{mx::array({})};
-    mx::array body_dofadr{mx::array({})};
-    mx::array body_dofnum{mx::array({})};
-    mx::array body_geomadr{mx::array({})};
-    mx::array body_geomnum{mx::array({})};
-    mx::array body_pos{mx::array({})};
-    mx::array body_quat{mx::array({})};
-    mx::array body_mass{mx::array({})};
-    mx::array body_subtreemass{mx::array({})};
-    mx::array body_inertia{mx::array({})};
-    mx::array body_ipos{mx::array({})};
-    mx::array body_iquat{mx::array({})};
-    mx::array body_invweight0{mx::array({})};
-    mx::array body_gravcomp{mx::array({})};
-    mx::array body_mocapid{mx::array({})};
+    mx::array body_parentid = mx::array({});
+    mx::array body_rootid = mx::array({});
+    mx::array body_weldid = mx::array({});
+    mx::array body_jntadr = mx::array({});
+    mx::array body_jntnum = mx::array({});
+    mx::array body_dofadr = mx::array({});
+    mx::array body_dofnum = mx::array({});
+    mx::array body_geomadr = mx::array({});
+    mx::array body_geomnum = mx::array({});
+    mx::array body_pos = mx::array({});
+    mx::array body_quat = mx::array({});
+    mx::array body_mass = mx::array({});
+    mx::array body_subtreemass = mx::array({});
+    mx::array body_inertia = mx::array({});
+    mx::array body_ipos = mx::array({});
+    mx::array body_iquat = mx::array({});
+    mx::array body_invweight0 = mx::array({});
+    mx::array body_gravcomp = mx::array({});
+    mx::array body_mocapid = mx::array({});
 
     // Joint properties
-    mx::array jnt_type{mx::array({})};
-    mx::array jnt_bodyid{mx::array({})};
-    mx::array jnt_qposadr{mx::array({})};
-    mx::array jnt_dofadr{mx::array({})};
-    mx::array jnt_range{mx::array({})};
-    mx::array jnt_limited{mx::array({})};
-    mx::array jnt_axis{mx::array({})};
-    mx::array jnt_pos{mx::array({})};
-    mx::array jnt_stiffness{mx::array({})};
-    mx::array jnt_margin{mx::array({})};
-    mx::array jnt_solref{mx::array({})};
-    mx::array jnt_solimp{mx::array({})};
+    mx::array jnt_type = mx::array({});
+    mx::array jnt_bodyid = mx::array({});
+    mx::array jnt_qposadr = mx::array({});
+    mx::array jnt_dofadr = mx::array({});
+    mx::array jnt_range = mx::array({});
+    mx::array jnt_limited = mx::array({});
+    mx::array jnt_axis = mx::array({});
+    mx::array jnt_pos = mx::array({});
+    mx::array jnt_stiffness = mx::array({});
+    mx::array jnt_margin = mx::array({});
+    mx::array jnt_solref = mx::array({});
+    mx::array jnt_solimp = mx::array({});
 
     // DOF properties
-    mx::array dof_bodyid{mx::array({})};
-    mx::array dof_jntid{mx::array({})};
-    mx::array dof_parentid{mx::array({})};
-    mx::array dof_Madr{mx::array({})};
-    mx::array dof_armature{mx::array({})};
-    mx::array dof_damping{mx::array({})};
-    mx::array dof_invweight0{mx::array({})};
-    mx::array dof_frictionloss{mx::array({})};
-    mx::array dof_solref{mx::array({})};   // (nv, 2) solver reference params for friction loss
-    mx::array dof_solimp{mx::array({})};   // (nv, 5) solver impedance params for friction loss
+    mx::array dof_bodyid = mx::array({});
+    mx::array dof_jntid = mx::array({});
+    mx::array dof_parentid = mx::array({});
+    mx::array dof_Madr = mx::array({});
+    mx::array dof_armature = mx::array({});
+    mx::array dof_damping = mx::array({});
+    mx::array dof_invweight0 = mx::array({});
+    mx::array dof_frictionloss = mx::array({});
+    mx::array dof_solref = mx::array({});   // (nv, 2) solver reference params for friction loss
+    mx::array dof_solimp = mx::array({});   // (nv, 5) solver impedance params for friction loss
 
     // Site properties
-    mx::array site_bodyid{mx::array({})};
-    mx::array site_pos{mx::array({})};
-    mx::array site_quat{mx::array({})};
+    mx::array site_bodyid = mx::array({});
+    mx::array site_pos = mx::array({});
+    mx::array site_quat = mx::array({});
 
     // Actuator properties
-    mx::array actuator_trntype{mx::array({})};
-    mx::array actuator_trnid{mx::array({})};
-    mx::array actuator_gaintype{mx::array({})};
-    mx::array actuator_gainprm{mx::array({})};
-    mx::array actuator_biastype{mx::array({})};
-    mx::array actuator_biasprm{mx::array({})};
-    mx::array actuator_dyntype{mx::array({})};
-    mx::array actuator_dynprm{mx::array({})};
-    mx::array actuator_gear{mx::array({})};
-    mx::array actuator_ctrllimited{mx::array({})};
-    mx::array actuator_ctrlrange{mx::array({})};
-    mx::array actuator_forcelimited{mx::array({})};
-    mx::array actuator_forcerange{mx::array({})};
-    mx::array actuator_actadr{mx::array({})};      // (nu,) int: first activation address (-1 = stateless)
-    mx::array actuator_actnum{mx::array({})};      // (nu,) int: number of activation variables
-    mx::array actuator_actlimited{mx::array({})};  // (nu,) byte: has activation limits
-    mx::array actuator_actrange{mx::array({})};    // (nu, 2) float: activation limits
+    mx::array actuator_trntype = mx::array({});
+    mx::array actuator_trnid = mx::array({});
+    mx::array actuator_gaintype = mx::array({});
+    mx::array actuator_gainprm = mx::array({});
+    mx::array actuator_biastype = mx::array({});
+    mx::array actuator_biasprm = mx::array({});
+    mx::array actuator_dyntype = mx::array({});
+    mx::array actuator_dynprm = mx::array({});
+    mx::array actuator_gear = mx::array({});
+    mx::array actuator_ctrllimited = mx::array({});
+    mx::array actuator_ctrlrange = mx::array({});
+    mx::array actuator_forcelimited = mx::array({});
+    mx::array actuator_forcerange = mx::array({});
+    mx::array actuator_actadr = mx::array({});      // (nu,) int: first activation address (-1 = stateless)
+    mx::array actuator_actnum = mx::array({});      // (nu,) int: number of activation variables
+    mx::array actuator_actlimited = mx::array({});  // (nu,) byte: has activation limits
+    mx::array actuator_actrange = mx::array({});    // (nu, 2) float: activation limits
 
     // Tendon properties
-    mx::array tendon_adr{mx::array({})};        // (ntendon,) int: start index in wrap arrays
-    mx::array tendon_num{mx::array({})};        // (ntendon,) int: number of wrap objects
-    mx::array tendon_limited{mx::array({})};    // (ntendon,) byte: has length limits
-    mx::array tendon_range{mx::array({})};      // (ntendon, 2) float: length limits
-    mx::array tendon_stiffness{mx::array({})};  // (ntendon,) float: spring stiffness
-    mx::array tendon_damping{mx::array({})};    // (ntendon,) float: damping
-    mx::array tendon_frictionloss{mx::array({})}; // (ntendon,) float: friction loss
-    mx::array tendon_lengthspring{mx::array({})}; // (ntendon, 2) float: spring rest length range
-    mx::array tendon_length0{mx::array({})};    // (ntendon,) float: length at qpos0
-    mx::array tendon_invweight0{mx::array({})};  // (ntendon,) float: inverse weight at qpos0
-    mx::array tendon_margin{mx::array({})};       // (ntendon,) float: min distance for limit detection
-    mx::array tendon_solref_lim{mx::array({})};   // (ntendon, 2) float: solver reference for limits
-    mx::array tendon_solimp_lim{mx::array({})};   // (ntendon, 5) float: solver impedance for limits
-    mx::array tendon_solref_fri{mx::array({})};   // (ntendon, 2) float: solver reference for friction
-    mx::array tendon_solimp_fri{mx::array({})};   // (ntendon, 5) float: solver impedance for friction
+    mx::array tendon_adr = mx::array({});        // (ntendon,) int: start index in wrap arrays
+    mx::array tendon_num = mx::array({});        // (ntendon,) int: number of wrap objects
+    mx::array tendon_limited = mx::array({});    // (ntendon,) byte: has length limits
+    mx::array tendon_range = mx::array({});      // (ntendon, 2) float: length limits
+    mx::array tendon_stiffness = mx::array({});  // (ntendon,) float: spring stiffness
+    mx::array tendon_damping = mx::array({});    // (ntendon,) float: damping
+    mx::array tendon_frictionloss = mx::array({}); // (ntendon,) float: friction loss
+    mx::array tendon_lengthspring = mx::array({}); // (ntendon, 2) float: spring rest length range
+    mx::array tendon_length0 = mx::array({});    // (ntendon,) float: length at qpos0
+    mx::array tendon_invweight0 = mx::array({});  // (ntendon,) float: inverse weight at qpos0
+    mx::array tendon_margin = mx::array({});       // (ntendon,) float: min distance for limit detection
+    mx::array tendon_solref_lim = mx::array({});   // (ntendon, 2) float: solver reference for limits
+    mx::array tendon_solimp_lim = mx::array({});   // (ntendon, 5) float: solver impedance for limits
+    mx::array tendon_solref_fri = mx::array({});   // (ntendon, 2) float: solver reference for friction
+    mx::array tendon_solimp_fri = mx::array({});   // (ntendon, 5) float: solver impedance for friction
 
     // Wrap object properties
-    mx::array wrap_type{mx::array({})};         // (nwrap,) int: wrap object type
-    mx::array wrap_objid{mx::array({})};        // (nwrap,) int: object id (joint/geom/site)
-    mx::array wrap_prm{mx::array({})};          // (nwrap,) float: coefficient/parameter
+    mx::array wrap_type = mx::array({});         // (nwrap,) int: wrap object type
+    mx::array wrap_objid = mx::array({});        // (nwrap,) int: object id (joint/geom/site)
+    mx::array wrap_prm = mx::array({});          // (nwrap,) float: coefficient/parameter
 
     // Geom properties (for collision)
-    mx::array geom_type{mx::array({})};
-    mx::array geom_bodyid{mx::array({})};
-    mx::array geom_pos{mx::array({})};
-    mx::array geom_quat{mx::array({})};
-    mx::array geom_size{mx::array({})};
-    mx::array geom_friction{mx::array({})};
-    mx::array geom_solmix{mx::array({})};
-    mx::array geom_solref{mx::array({})};
-    mx::array geom_solimp{mx::array({})};
-    mx::array geom_margin{mx::array({})};
-    mx::array geom_gap{mx::array({})};
-    mx::array geom_contype{mx::array({})};
-    mx::array geom_conaffinity{mx::array({})};
-    mx::array geom_condim{mx::array({})};
+    mx::array geom_type = mx::array({});
+    mx::array geom_bodyid = mx::array({});
+    mx::array geom_pos = mx::array({});
+    mx::array geom_quat = mx::array({});
+    mx::array geom_size = mx::array({});
+    mx::array geom_friction = mx::array({});
+    mx::array geom_solmix = mx::array({});
+    mx::array geom_solref = mx::array({});
+    mx::array geom_solimp = mx::array({});
+    mx::array geom_margin = mx::array({});
+    mx::array geom_gap = mx::array({});
+    mx::array geom_contype = mx::array({});
+    mx::array geom_conaffinity = mx::array({});
+    mx::array geom_condim = mx::array({});
 
     // Mesh data (for GJK/EPA convex collision)
-    mx::array geom_dataid{mx::array({})};     // (ngeom,) int: mesh/hfield id for mesh/hfield geoms, -1 otherwise
-    mx::array mesh_vertadr{mx::array({})};    // (nmesh,) int: start index of vertices for each mesh
-    mx::array mesh_vertnum{mx::array({})};    // (nmesh,) int: number of vertices for each mesh
-    mx::array mesh_vert{mx::array({})};       // (total_verts, 3) float: all mesh vertices
+    mx::array geom_dataid = mx::array({});     // (ngeom,) int: mesh/hfield id for mesh/hfield geoms, -1 otherwise
+    mx::array mesh_vertadr = mx::array({});    // (nmesh,) int: start index of vertices for each mesh
+    mx::array mesh_vertnum = mx::array({});    // (nmesh,) int: number of vertices for each mesh
+    mx::array mesh_vert = mx::array({});       // (total_verts, 3) float: all mesh vertices
 
     // Hfield data (for height field collision)
     int nhfield = 0;
-    mx::array hfield_nrow{mx::array({})};     // (nhfield,) int: grid rows
-    mx::array hfield_ncol{mx::array({})};     // (nhfield,) int: grid columns
-    mx::array hfield_size{mx::array({})};     // (nhfield, 4) float: (x_half, y_half, z_top, z_bottom)
-    mx::array hfield_adr{mx::array({})};      // (nhfield,) int: start index in hfield_data
-    mx::array hfield_data{mx::array({})};     // (nhfielddata,) float: normalized elevation [0,1]
+    mx::array hfield_nrow = mx::array({});     // (nhfield,) int: grid rows
+    mx::array hfield_ncol = mx::array({});     // (nhfield,) int: grid columns
+    mx::array hfield_size = mx::array({});     // (nhfield, 4) float: (x_half, y_half, z_top, z_bottom)
+    mx::array hfield_adr = mx::array({});      // (nhfield,) int: start index in hfield_data
+    mx::array hfield_data = mx::array({});     // (nhfielddata,) float: normalized elevation [0,1]
 
     // Pair properties
-    mx::array pair_geom1{mx::array({})};
-    mx::array pair_geom2{mx::array({})};
-    mx::array pair_dim{mx::array({})};
-    mx::array pair_margin{mx::array({})};
-    mx::array pair_gap{mx::array({})};
-    mx::array pair_friction{mx::array({})};
-    mx::array pair_solref{mx::array({})};
-    mx::array pair_solimp{mx::array({})};
+    mx::array pair_geom1 = mx::array({});
+    mx::array pair_geom2 = mx::array({});
+    mx::array pair_dim = mx::array({});
+    mx::array pair_margin = mx::array({});
+    mx::array pair_gap = mx::array({});
+    mx::array pair_friction = mx::array({});
+    mx::array pair_solref = mx::array({});
+    mx::array pair_solimp = mx::array({});
 
     // Equality constraint properties
-    mx::array eq_type{mx::array({})};
-    mx::array eq_obj1id{mx::array({})};
-    mx::array eq_obj2id{mx::array({})};
-    mx::array eq_data{mx::array({})};
-    mx::array eq_solref{mx::array({})};
-    mx::array eq_solimp{mx::array({})};
+    mx::array eq_type = mx::array({});
+    mx::array eq_obj1id = mx::array({});
+    mx::array eq_obj2id = mx::array({});
+    mx::array eq_data = mx::array({});
+    mx::array eq_solref = mx::array({});
+    mx::array eq_solimp = mx::array({});
 
     // Exclude
-    mx::array exclude_signature{mx::array({})};
+    mx::array exclude_signature = mx::array({});
 
     // ── Precomputed cache (for vmap-compatible pipeline) ─────
     // Populated once at load time. All data is read eagerly so
@@ -283,11 +283,11 @@ struct Model {
             float size1[3], size2[3];
             int condim;
             int dataid1 = -1, dataid2 = -1;
-            mx::array mesh_verts1{mx::zeros({0})};
-            mx::array mesh_verts2{mx::zeros({0})};
+            mx::array mesh_verts1 = mx::zeros({0});
+            mx::array mesh_verts2 = mx::zeros({0});
             int hf_nrow = 0, hf_ncol = 0;
             float hf_size[4] = {0,0,0,0};
-            mx::array hf_data{mx::zeros({0})};
+            mx::array hf_data = mx::zeros({0});
             float invweight_t = 0.0f;  // precomputed translational body invweight
             float invweight_r = 0.0f;  // precomputed rotational body invweight
         };
@@ -303,7 +303,7 @@ struct Model {
             float solimp[5];
             float margin;
             float invweight;
-            mx::array J_row{mx::zeros({0})};  // (nv,) one-hot Jacobian row
+            mx::array J_row = mx::zeros({0});  // (nv,) one-hot Jacobian row
         };
         std::vector<LimitInfo> limits;
 
@@ -316,7 +316,7 @@ struct Model {
             float margin;
             float invweight;
             std::vector<float> tenJ_row;  // (nv,) raw data (used by scalar path)
-            mx::array J_row_arr{mx::zeros({0})};  // (nv,) prebuilt mx::array for vmap
+            mx::array J_row_arr = mx::zeros({0});  // (nv,) prebuilt mx::array for vmap
         };
         std::vector<TendonLimitInfo> tendon_limits;
 
@@ -328,7 +328,7 @@ struct Model {
             float solimp[5];
             float invweight;
             std::vector<float> tenJ_row;  // (nv,) raw data (used by scalar path)
-            mx::array J_row_arr{mx::zeros({0})};  // (nv,) prebuilt mx::array for vmap
+            mx::array J_row_arr = mx::zeros({0});  // (nv,) prebuilt mx::array for vmap
         };
         std::vector<TendonFrictionInfo> tendon_frictions;
 
@@ -363,37 +363,37 @@ struct Model {
             float gain;
         };
         std::vector<ActuatorInfo> actuator_info;
-        mx::array act_moment_const{mx::array(0.0f)};
-        mx::array act_qpos_idxs{mx::array(0.0f)};
-        mx::array act_gear{mx::array(0.0f)};
+        mx::array act_moment_const = mx::array(0.0f);
+        mx::array act_qpos_idxs = mx::array(0.0f);
+        mx::array act_gear = mx::array(0.0f);
 
         // Activation dynamics cache (vmap-compatible, precomputed at model load)
-        mx::array act_is_stateful{mx::array(0.0f)};   // (nu,) float: 1.0 if actuator has activation state
-        mx::array act_adr_safe{mx::array(0.0f)};       // (nu,) int: max(actadr, 0) for safe gather
-        mx::array act_tau{mx::array(0.0f)};             // (nu,) float: dynprm[0] clamped to MIN_TAU
-        mx::array act_is_filter{mx::array(0.0f)};       // (nu,) float: 1.0 if FILTER or FILTEREXACT
-        mx::array act_is_integrator{mx::array(0.0f)};   // (nu,) float: 1.0 if INTEGRATOR
-        mx::array act_is_filterexact{mx::array(0.0f)};  // (nu,) float: 1.0 if FILTEREXACT
-        mx::array act_is_limited{mx::array(0.0f)};      // (nu,) float: 1.0 if activation limited
-        mx::array act_range_lo{mx::array(0.0f)};         // (nu,) float: actrange lower
-        mx::array act_range_hi{mx::array(0.0f)};         // (nu,) float: actrange upper
+        mx::array act_is_stateful = mx::array(0.0f);   // (nu,) float: 1.0 if actuator has activation state
+        mx::array act_adr_safe = mx::array(0.0f);       // (nu,) int: max(actadr, 0) for safe gather
+        mx::array act_tau = mx::array(0.0f);             // (nu,) float: dynprm[0] clamped to MIN_TAU
+        mx::array act_is_filter = mx::array(0.0f);       // (nu,) float: 1.0 if FILTER or FILTEREXACT
+        mx::array act_is_integrator = mx::array(0.0f);   // (nu,) float: 1.0 if INTEGRATOR
+        mx::array act_is_filterexact = mx::array(0.0f);  // (nu,) float: 1.0 if FILTEREXACT
+        mx::array act_is_limited = mx::array(0.0f);      // (nu,) float: 1.0 if activation limited
+        mx::array act_range_lo = mx::array(0.0f);         // (nu,) float: actrange lower
+        mx::array act_range_hi = mx::array(0.0f);         // (nu,) float: actrange upper
 
         // Tendon cache (for zero-eval vmap tendon computation)
-        mx::array ten_J_const{mx::array(0.0f)};        // (ntendon, nv) constant Jacobian
-        mx::array ten_qpos_idxs{mx::array(0.0f)};      // (nwrap_joints,) int: qpos indices
-        mx::array ten_qpos_coefs{mx::array(0.0f)};     // (nwrap_joints,) float: coefficients
-        mx::array ten_scatter_mat{mx::array(0.0f)};    // (nwrap_joints, ntendon) one-hot scatter
+        mx::array ten_J_const = mx::array(0.0f);        // (ntendon, nv) constant Jacobian
+        mx::array ten_qpos_idxs = mx::array(0.0f);      // (nwrap_joints,) int: qpos indices
+        mx::array ten_qpos_coefs = mx::array(0.0f);     // (nwrap_joints,) float: coefficients
+        mx::array ten_scatter_mat = mx::array(0.0f);    // (nwrap_joints, ntendon) one-hot scatter
         bool ten_has_wraps = false;
 
         // Tendon-actuator cache (for zero-eval vmap transmission)
         bool ten_has_tendon_actuator = false;
-        mx::array ten_act_is_tendon{mx::array(0.0f)};      // (nu,) float: 1.0 if tendon transmission
-        mx::array ten_act_tendon_idx{mx::array(0.0f)};     // (nu,) int: tendon index (0 for non-tendon)
-        mx::array ten_act_tendon_gear{mx::array(0.0f)};    // (nu,) float: gear for tendon actuators
+        mx::array ten_act_is_tendon = mx::array(0.0f);      // (nu,) float: 1.0 if tendon transmission
+        mx::array ten_act_tendon_idx = mx::array(0.0f);     // (nu,) int: tendon index (0 for non-tendon)
+        mx::array ten_act_tendon_gear = mx::array(0.0f);    // (nu,) float: gear for tendon actuators
 
         // Precomputed passive force arrays
-        mx::array passive_stiffness{mx::array(0.0f)};
-        mx::array passive_qpos_idxs{mx::array(0.0f)};  
+        mx::array passive_stiffness = mx::array(0.0f);
+        mx::array passive_qpos_idxs = mx::array(0.0f);  
 
         // Plain C++ vectors for loop indexing (no eval needed)
         std::vector<int> body_parentid_vec;
@@ -402,18 +402,18 @@ struct Model {
 
         // CDoF plan (for vectorized cdof computation)
         struct CdofPlan {
-            mx::array bids{mx::zeros({1}, mx::int32)};
-            mx::array jidxs{mx::zeros({1}, mx::int32)};
-            mx::array root_bids{mx::zeros({1}, mx::int32)};  // rootid[bids]
-            mx::array is_hinge{mx::zeros({1})};
-            mx::array is_slide{mx::zeros({1})};
-            mx::array is_free_trans{mx::zeros({1})};
-            mx::array is_free_rot{mx::zeros({1})};
-            mx::array is_ball{mx::zeros({1})};
-            mx::array free_trans_unit{mx::zeros({1})};
-            mx::array rot_col0_mask{mx::zeros({1})};
-            mx::array rot_col1_mask{mx::zeros({1})};
-            mx::array rot_col2_mask{mx::zeros({1})};
+            mx::array bids = mx::zeros({1}, mx::int32);
+            mx::array jidxs = mx::zeros({1}, mx::int32);
+            mx::array root_bids = mx::zeros({1}, mx::int32);  // rootid[bids]
+            mx::array is_hinge = mx::zeros({1});
+            mx::array is_slide = mx::zeros({1});
+            mx::array is_free_trans = mx::zeros({1});
+            mx::array is_free_rot = mx::zeros({1});
+            mx::array is_ball = mx::zeros({1});
+            mx::array free_trans_unit = mx::zeros({1});
+            mx::array rot_col0_mask = mx::zeros({1});
+            mx::array rot_col1_mask = mx::zeros({1});
+            mx::array rot_col2_mask = mx::zeros({1});
         };
         CdofPlan cdof_plan;
 
@@ -422,18 +422,18 @@ struct Model {
         std::vector<mx::array> body_dof_masks;
 
         // Dense mass matrix tree mask: (nv, nv) float
-        mx::array make_m_mask{mx::zeros({1})};
+        mx::array make_m_mask = mx::zeros({1});
 
         // Tree scatter cache (zero-alloc backward accumulation in vmap_com_pos/crb/rne)
         struct ScatterLevel {
-            mx::array child_ids{mx::zeros({0}, mx::int32)};
-            mx::array scatter_mat{mx::zeros({0})};
+            mx::array child_ids = mx::zeros({0}, mx::int32);
+            mx::array scatter_mat = mx::zeros({0});
         };
         std::vector<ScatterLevel> tree_scatter_levels;
 
         // Precomputed body/dof index arrays (avoid raw pointer mx::array construction per step)
-        mx::array body_rootid_arr{mx::zeros({0}, mx::int32)};
-        mx::array dof_bodyid_arr{mx::zeros({0}, mx::int32)};
+        mx::array body_rootid_arr = mx::zeros({0}, mx::int32);
+        mx::array dof_bodyid_arr = mx::zeros({0}, mx::int32);
 
         // DOF friction cache (for zero-eval vmap constraint)
         struct DofFrictionCache {
@@ -442,7 +442,7 @@ struct Model {
             float solref[2];
             float solimp[5];
             float frictionloss;
-            mx::array J_row{mx::zeros({0})};  // (nv,) one-hot
+            mx::array J_row = mx::zeros({0});  // (nv,) one-hot
         };
         std::vector<DofFrictionCache> dof_frictions;
 
@@ -456,13 +456,13 @@ struct Model {
             float invweight;
             int da1 = -1, da2 = -1;  // DOF addresses for JOINT type
             float qpos0_ref1 = 0, qpos0_ref2 = 0;
-            mx::array J_row{mx::zeros({0})};   // (nv,) one-hot at da1
-            mx::array J2_row{mx::zeros({0})};  // (nv,) one-hot at da2
+            mx::array J_row = mx::zeros({0});   // (nv,) one-hot at da1
+            mx::array J2_row = mx::zeros({0});  // (nv,) one-hot at da2
         };
         std::vector<EqualityCache> equality_cache;
 
         // Precomputed MLX arrays (model constants in the vmap graph)
-        mx::array gravity_6d{mx::zeros({6})};
+        mx::array gravity_6d = mx::zeros({6});
     };
 
     mutable ModelCache cache;
@@ -475,71 +475,71 @@ struct Model {
 
 struct Data {
     // State
-    mx::array qpos{mx::array({})};
-    mx::array qvel{mx::array({})};
-    mx::array qacc{mx::array({})};
-    mx::array ctrl{mx::array({})};
-    mx::array act{mx::array({})};
+    mx::array qpos = mx::array({});
+    mx::array qvel = mx::array({});
+    mx::array qacc = mx::array({});
+    mx::array ctrl = mx::array({});
+    mx::array act = mx::array({});
 
     // Derived quantities (computed by forward/step)
-    mx::array xpos{mx::array({})};       // (nbody, 3) body positions
-    mx::array xquat{mx::array({})};      // (nbody, 4) body quaternions
-    mx::array xmat{mx::array({})};       // (nbody, 3, 3) body rotation matrices
-    mx::array xipos{mx::array({})};      // (nbody, 3) body COM positions
-    mx::array ximat{mx::array({})};      // (nbody, 3, 3) body COM rotations
-    mx::array geom_xpos{mx::array({})};  // (ngeom, 3) geom positions
-    mx::array geom_xmat{mx::array({})};  // (ngeom, 3, 3) geom rotations
-    mx::array site_xpos{mx::array({})};  // (nsite, 3) site positions
-    mx::array site_xmat{mx::array({})};  // (nsite, 3, 3) site rotations
+    mx::array xpos = mx::array({});       // (nbody, 3) body positions
+    mx::array xquat = mx::array({});      // (nbody, 4) body quaternions
+    mx::array xmat = mx::array({});       // (nbody, 3, 3) body rotation matrices
+    mx::array xipos = mx::array({});      // (nbody, 3) body COM positions
+    mx::array ximat = mx::array({});      // (nbody, 3, 3) body COM rotations
+    mx::array geom_xpos = mx::array({});  // (ngeom, 3) geom positions
+    mx::array geom_xmat = mx::array({});  // (ngeom, 3, 3) geom rotations
+    mx::array site_xpos = mx::array({});  // (nsite, 3) site positions
+    mx::array site_xmat = mx::array({});  // (nsite, 3, 3) site rotations
 
     // Joint anchors/axes (computed by kinematics)
-    mx::array xanchor{mx::array({})};    // (njnt, 3) joint anchors
-    mx::array xaxis{mx::array({})};      // (njnt, 3) joint axes
+    mx::array xanchor = mx::array({});    // (njnt, 3) joint anchors
+    mx::array xaxis = mx::array({});      // (njnt, 3) joint axes
 
     // Applied forces
-    mx::array xfrc_applied{mx::array({})};  // (nbody, 6) external forces
-    mx::array qfrc_applied{mx::array({})};  // (nv,) applied joint forces
+    mx::array xfrc_applied = mx::array({});  // (nbody, 6) external forces
+    mx::array qfrc_applied = mx::array({});  // (nv,) applied joint forces
 
     // Tendon
-    mx::array ten_length{mx::array({})};     // (ntendon,) tendon lengths
-    mx::array ten_velocity{mx::array({})};   // (ntendon,) tendon velocities
-    mx::array ten_J{mx::array({})};          // (ntendon, nv) tendon Jacobian
+    mx::array ten_length = mx::array({});     // (ntendon,) tendon lengths
+    mx::array ten_velocity = mx::array({});   // (ntendon,) tendon velocities
+    mx::array ten_J = mx::array({});          // (ntendon, nv) tendon Jacobian
 
     // Actuator
-    mx::array actuator_length{mx::array({})};    // (nu,)
-    mx::array actuator_moment{mx::array({})};    // (nu, nv)
-    mx::array actuator_velocity{mx::array({})};  // (nu,)
-    mx::array actuator_force{mx::array({})};     // (nu,)
-    mx::array act_dot{mx::array({})};            // (na,)
+    mx::array actuator_length = mx::array({});    // (nu,)
+    mx::array actuator_moment = mx::array({});    // (nu, nv)
+    mx::array actuator_velocity = mx::array({});  // (nu,)
+    mx::array actuator_force = mx::array({});     // (nu,)
+    mx::array act_dot = mx::array({});            // (na,)
 
     // Dynamics
-    mx::array subtree_com{mx::array({})};    // (nbody, 3)
-    mx::array cinert{mx::array({})};         // (nbody, 10)
-    mx::array crb{mx::array({})};            // (nbody, 10)
-    mx::array cdof{mx::array({})};           // (nv, 6)
-    mx::array cvel{mx::array({})};           // (nbody, 6)
-    mx::array cdof_dot{mx::array({})};       // (nv, 6)
-    mx::array qM{mx::array({})};             // (nv, nv) or sparse
-    mx::array qLD{mx::array({})};            // factored mass matrix
-    mx::array qM_inv{mx::array({})};         // precomputed M^{-1} for GPU solves
-    mx::array qLDiagInv{mx::array({})};      // inverse diagonal
-    mx::array qfrc_bias{mx::array({})};      // (nv,) Coriolis + gravity
-    mx::array qfrc_passive{mx::array({})};   // (nv,) spring/damper
-    mx::array qfrc_actuator{mx::array({})};  // (nv,) actuator forces
-    mx::array qfrc_gravcomp{mx::array({})};   // (nv,) gravity compensation
-    mx::array qfrc_smooth{mx::array({})};    // (nv,) smooth forces (bias+passive+actuator)
-    mx::array qacc_smooth{mx::array({})};    // (nv,) acceleration from smooth forces
+    mx::array subtree_com = mx::array({});    // (nbody, 3)
+    mx::array cinert = mx::array({});         // (nbody, 10)
+    mx::array crb = mx::array({});            // (nbody, 10)
+    mx::array cdof = mx::array({});           // (nv, 6)
+    mx::array cvel = mx::array({});           // (nbody, 6)
+    mx::array cdof_dot = mx::array({});       // (nv, 6)
+    mx::array qM = mx::array({});             // (nv, nv) or sparse
+    mx::array qLD = mx::array({});            // factored mass matrix
+    mx::array qM_inv = mx::array({});         // precomputed M^{-1} for GPU solves
+    mx::array qLDiagInv = mx::array({});      // inverse diagonal
+    mx::array qfrc_bias = mx::array({});      // (nv,) Coriolis + gravity
+    mx::array qfrc_passive = mx::array({});   // (nv,) spring/damper
+    mx::array qfrc_actuator = mx::array({});  // (nv,) actuator forces
+    mx::array qfrc_gravcomp = mx::array({});   // (nv,) gravity compensation
+    mx::array qfrc_smooth = mx::array({});    // (nv,) smooth forces (bias+passive+actuator)
+    mx::array qacc_smooth = mx::array({});    // (nv,) acceleration from smooth forces
 
     // Solver
-    mx::array qfrc_constraint{mx::array({})};  // (nv,) constraint forces
-    mx::array qacc_warmstart{mx::array({})};   // (nv,) warmstart acceleration
+    mx::array qfrc_constraint = mx::array({});  // (nv,) constraint forces
+    mx::array qacc_warmstart = mx::array({});   // (nv,) warmstart acceleration
 
     // Constraint
-    mx::array efc_J{mx::array({})};
-    mx::array efc_D{mx::array({})};
-    mx::array efc_aref{mx::array({})};
-    mx::array efc_force{mx::array({})};
-    mx::array efc_frictionloss{mx::array({})};
+    mx::array efc_J = mx::array({});
+    mx::array efc_D = mx::array({});
+    mx::array efc_aref = mx::array({});
+    mx::array efc_force = mx::array({});
+    mx::array efc_frictionloss = mx::array({});
     int nefc = 0;
     int ne = 0, nf = 0, nl = 0;  // equality, friction, limit counts
     int ncon = 0;
@@ -548,10 +548,10 @@ struct Data {
     Contact contact;
 
     // Contact forces (per-body external forces from constraints)
-    mx::array cfrc_ext{mx::array({})};   // (nbody, 6)
+    mx::array cfrc_ext = mx::array({});   // (nbody, 6)
 
     // Time
-    mx::array time{mx::array(0.0f)};
+    mx::array time = mx::array(0.0f);
 };
 
 // ── BatchedSim ───────────────────────────────────────────────
@@ -562,16 +562,16 @@ struct BatchedSim {
     MjmlxBatchedConfig config;
 
     // Batched state: [num_envs, ...] arrays
-    mx::array qpos{mx::array({})};
-    mx::array qvel{mx::array({})};
-    mx::array xpos{mx::array({})};
+    mx::array qpos = mx::array({});
+    mx::array qvel = mx::array({});
+    mx::array xpos = mx::array({});
 
     // Observation fields: [num_envs, ...] arrays
-    mx::array subtree_com{mx::array({})};   // (B, nbody, 3)
-    mx::array cinert{mx::array({})};        // (B, nbody, 10)
-    mx::array cvel{mx::array({})};          // (B, nbody, 6)
-    mx::array qfrc_actuator{mx::array({})}; // (B, nv)
-    mx::array cfrc_ext{mx::array({})};      // (B, nbody, 6)
+    mx::array subtree_com = mx::array({});   // (B, nbody, 3)
+    mx::array cinert = mx::array({});        // (B, nbody, 10)
+    mx::array cvel = mx::array({});          // (B, nbody, 6)
+    mx::array qfrc_actuator = mx::array({}); // (B, nv)
+    mx::array cfrc_ext = mx::array({});      // (B, nbody, 6)
 
     // Compiled+vmapped step function
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step;

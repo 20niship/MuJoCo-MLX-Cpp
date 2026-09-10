@@ -115,7 +115,7 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 
 ```bash
 # Full suite (237 tests across 28 suites)
-./run_tests.sh /path/to/humanoid.xml
+./scripts/run_tests.sh /path/to/humanoid.xml
 
 # Or via CTest
 cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure

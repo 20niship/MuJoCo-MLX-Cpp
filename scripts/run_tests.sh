@@ -8,7 +8,7 @@
 set -e
 
 MODEL="${1:-${HUMANOID:-}}"
-BUILD_DIR="build"
+BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build"
 
 if [ ! -d "$BUILD_DIR" ]; then
     echo "ERROR: build/ directory not found. Run cmake --build build first."

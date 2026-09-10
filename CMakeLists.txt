@@ -158,7 +158,7 @@ set_target_properties(mjmlx PROPERTIES
 # Fix MuJoCo's framework-style install name for pip installs.
 # The pip mujoco dylib uses @rpath/mujoco.framework/Versions/A/libmujoco.X.Y.Z.dylib
 # but the actual file is a flat dylib. Rewrite the reference to an absolute path.
-if(MUJOCO_PKG_DIR AND _MJ_DYLIB_PATH)
+if(_MJ_DYLIB_PATH)
     execute_process(
         COMMAND otool -D "${_MJ_DYLIB_PATH}"
         OUTPUT_VARIABLE _MJ_INSTALL_NAME
@@ -198,7 +198,7 @@ set_target_properties(mjb PROPERTIES
 )
 
 # Fix MuJoCo dylib reference for libmjb
-if(MUJOCO_PKG_DIR AND _MJ_DYLIB_PATH AND _MJ_OLD_NAME)
+if(_MJ_DYLIB_PATH AND _MJ_OLD_NAME)
     add_custom_command(TARGET mjb POST_BUILD
         COMMAND install_name_tool -change
             "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
