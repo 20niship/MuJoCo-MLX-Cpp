@@ -1,6 +1,42 @@
 # [P0] MKXバックエンドのbatched(vmap)経路がbroadcast不整合でクラッシュし、現状のベースライン計測すらできない
 
-## 背景
+## 解決済み(Issue 01 + 02の副作用)
+
+Issue 01(PR #4)でforward Metalカーネルの構築を`nv > 80`ゲートから無条件化したことで、
+`src/batched.cpp`のbatchedパイプラインは`use_metal_fwd`(=`ctx->uses_metal_forward`)が
+常にtrueになり、本Issueが問題にしていた`vmapped_fwd`(`vmap_forward`/`vmap_gjk_collision`
+経由の汎用vmapホストループ)が実行時に一切呼ばれなくなった。Issue 02(PR #5)でMKX側にも
+forward/collision/solver GLSLカーネルを接続したことで、この経路はMKXバックエンドでも
+同様に無条件で有効になっている。
+
+`vmapped_fwd`のクロージャ自体は`build_context`内で今も構築されるが(未使用のまま)、
+呼び出されることがないため、本Issueが報告していた`mx_compat_mkx: incompatible shapes
+for broadcast: [2,3,3,] vs [2,1,]`は発生し得ない状態になった。
+
+**検証**: 実機Vulkan(MoltenVK)、コミット`6135453`(Issue 01+02適用後)で`just bench-mkx`を
+実行し、`batched/t_shape`(本Issueがクラッシュを報告していたモデル)・`batched/go2`・
+`batched/h1`・`batched/pendulum`・`batched/high_dof_tree`の全batchedベンチマークが
+クラッシュせず完走することを確認した:
+
+| ベンチマーク | steps/sec |
+|---|---|
+| batched/pendulum | 22,436 |
+| batched/t_shape | 11,807 |
+| batched/go2 | 2,939 |
+| batched/h1 | 1,674 |
+| batched/high_dof_tree | 897 |
+
+定量目標「`just bench-mkx`が`batched/t_shape`・`batched/go2`・`batched/h1`を含め、
+クラッシュせず完走すること」は達成済み。精度についても`test_batched_diag`でMLX
+バックエンドと同一の数値一致を確認済み(PR #5参照)。
+
+根本原因(mkx shimのbroadcastチェックの厳密さとこのリポジトリのvmapコードのどちらに
+問題があったか)自体は未特定のままだが、実行時にそのコードパスへ到達しなくなったため、
+実害はない。将来nv<=80かつMKXで新たにvmap経路を使うモデル/設定(例: forwardカーネルの
+構築に失敗した場合のフォールバック等)を追加する際は、このIssueの記録を参照して
+broadcast不整合を再検証すること。
+
+## 背景(オリジナル、Issue 01/02着手前の状況)
 
 MLX→mkx(Vulkan)バックエンド移植後、`just bench-mkx`でGo2/H1を含むベンチマークを実行したところ、batched(GPU)経路が例外またはセグメンテーションフォルトで停止し、**現状(Issue 01/02の改善前)のMKXバッチ性能を一切計測できていない。**
 
