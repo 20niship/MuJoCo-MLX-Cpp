@@ -39,6 +39,30 @@ bench-mkx: build-mkx
 fetch-models:
     ./scripts/fetch_models.sh
 
+# Build the RL Python extension (MLX backend) into build/ using the uv-managed venv
+build-python: _venv
+    mkdir -p build
+    cmake -S . -B build \
+        -DMLX_ROOT=.venv/lib/python3.10/site-packages/mlx \
+        -DMUJOCO_ROOT=.venv/lib/python3.10/site-packages/mujoco \
+        -DMJMLX_BUILD_PYTHON=ON -DPython_EXECUTABLE=.venv/bin/python
+    cmake --build build --target _mjmlx_rl_native -j
+
+# Build the RL Python extension (MKX/Vulkan backend) into build-mkx/
+build-python-mkx: _venv
+    mkdir -p build-mkx
+    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX \
+        -DMUJOCO_ROOT=.venv/lib/python3.10/site-packages/mujoco \
+        -DMJMLX_BUILD_PYTHON=ON -DPython_EXECUTABLE=.venv/bin/python
+    cmake --build build-mkx --target _mjmlx_rl_native -j
+
+# Train PPO on HalfCheetah via the batched GPU physics. Run build-python (MLX) or build-python-mkx first; pass --build-dir build-mkx to use the latter.
+train-ppo *ARGS: _venv
+    .venv/bin/python scripts/train_ppo.py {{ARGS}}
+
+_venv:
+    uv sync --group build
+
 # Remove build directory
 clean:
     /bin/rm -rf build

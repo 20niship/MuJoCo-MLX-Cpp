@@ -56,7 +56,7 @@ else()
     # ── Fetch MKX (Vulkan-based cross-platform MLX-alike) ──────────
     include(FetchContent)
     find_package(Vulkan REQUIRED)
-    set(MKX_GIT_TAG "04d9c8407cd9ba75b8098b96636930cab4295580" CACHE STRING "mlx_vulkan commit/tag to fetch")
+    set(MKX_GIT_TAG "3eed470f7ed3c36e6d32aeacd15863cae1f7e1c6" CACHE STRING "mlx_vulkan commit/tag to fetch")
     FetchContent_Declare(mkx
         GIT_REPOSITORY https://github.com/20niship/mlx_vulkan.git
         GIT_TAG ${MKX_GIT_TAG}
@@ -419,6 +419,27 @@ if(MJMLX_BUILD_PYTHON)
                 "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
                 "$<TARGET_FILE:_mjmlx_native>"
             COMMENT "Fixing MuJoCo dylib for _mjmlx_native"
+        )
+    endif()
+
+    # Numpy-facing RL bindings (mjmlx.h only, no mlx.core NB_DOMAIN sharing -- see python/rl_bindings.cpp)
+    nanobind_add_module(_mjmlx_rl_native
+        NB_STATIC STABLE_ABI LTO NOMINSIZE
+        python/rl_bindings.cpp
+    )
+    target_link_libraries(_mjmlx_rl_native PRIVATE mjmlx)
+    target_include_directories(_mjmlx_rl_native PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    set_target_properties(_mjmlx_rl_native PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET _mjmlx_rl_native POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:_mjmlx_rl_native>"
+            COMMENT "Fixing MuJoCo dylib for _mjmlx_rl_native"
         )
     endif()
 endif()

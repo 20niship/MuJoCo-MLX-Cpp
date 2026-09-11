@@ -46,6 +46,24 @@ SPS parity maintained via comprehensive zero-eval caching across two optimizatio
 
 The entire vmap pipeline (smooth, constraint, solver, forward) is zero `mx::eval()`, zero `.data<>()`, zero CPU-GPU sync.
 
+### Self-contained PPO example (HalfCheetah-v4, this repo only)
+
+`scripts/train_ppo.py` trains PPO (stable-baselines3) on Gymnasium's `HalfCheetah-v4` MJCF (`half_cheetah.xml`) using this repo's own batched physics as the vector env (`scripts/mjmlx_halfcheetah_vec_env.py` replicates HalfCheetah-v4's reward/observation/reset-noise/episode-length exactly, for comparability with published baselines), via a small numpy-facing nanobind module (`python/rl_bindings.cpp`) rather than the `mlx.core`-sharing bindings in `python/bindings.cpp` (see that file's header comment for why).
+
+Measured on Apple M-series (2048 envs, PPO throughput including gradient updates):
+
+| Backend | env-steps/sec |
+|---|---|
+| MLX (Metal) | 55,000 - 150,000 |
+| MKX (Vulkan) | 18,000 - 26,000 |
+
+```bash
+just build-python && just train-ppo --envs 2048 --timesteps 2000000                          # MLX
+just build-python-mkx && just train-ppo --envs 2048 --timesteps 2000000 --build-dir build-mkx  # MKX
+```
+
+TensorBoard: `uv run tensorboard --logdir runs/`
+
 ## Architecture
 
 ```
