@@ -1,5 +1,35 @@
 # [P1] MKX(mkx/Vulkan)のCPU側グラフ処理・ディスパッチオーバーヘッドを計測・削減する
 
+## 追記2: descriptor poolの使い回し、および新たに発見したGPUバッファのリーク
+
+上記のcommand buffer統合に続き、`dispatch()`が呼び出しごとに`vkCreateDescriptorPool`/
+`vkDestroyDescriptorPool`していたのも、バッチ内で1つのpool(64セット分)を使い切るまで
+使い回す形に変更した(mlx_vulkan側追加コミット、mkx_tests 53/2600全pass)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | command buffer統合後 | pool使い回し後 | MLX比 |
+|---|---|---|---|
+| batched/pendulum | 48,353 steps/sec | 53,203 steps/sec | 約50%(MLX 105,896) |
+| batched/t_shape | 24,517 | 19,473(ノイズ大、stddev±20%程度) | 約52%(MLX 37,584) |
+| batched/go2 | 8,449 | 9,566 | 約67%(MLX 14,353) |
+| batched/h1 | 5,640 | 5,935 | 約76%(MLX 7,824) |
+
+**新たに発見した問題(未修正)**: `Backend::free`がコードベース全体で一度も呼ばれておらず、
+`OpNode`にもデストラクタでの解放処理がない(`gpu_buffer`が backend非依存の`void*`で
+型消去されているため、`OpNode`側からは`Backend::free`を直接呼べない設計になっている)。
+つまり**evalのたびに確保されるVulkanバッファ/メモリが一切解放されずリークし続ける。**
+ベンチマークのような短時間実行では顕在化しないが、長時間のRL学習等では実害(GPUメモリ枯渇)
+が出ると推測される。これを直すには`OpNode`に型消去された解放コールバック(例:
+`std::function<void(void*)>`)を持たせるアーキテクチャ変更が必要で、mlx_vulkan本体の
+メモリ所有権モデルに踏み込む変更になる。
+
+残るMLXとのギャップ(50〜76%)の一因は、このリーク潰しとセットで検討すべき「バッファ
+プーリング(同一サイズのバッファをdispatchごとに新規vkAllocateMemoryせず使い回す)」の
+欠如と推測される。毎eval()で同じ形状のバッファをVulkanに新規確保させ続けている以上、
+`vkAllocateMemory`のコストが積み上がる。この対応はより大きなアーキテクチャ変更(リーク
+修正とセット)になるため、本セッションでは着手せず次の課題として記録するに留めた。
+
 ## 追記: 根本原因を特定、mlx_vulkan本体(upstream)側を修正
 
 batched/go2・pendulum・t_shapeがMLXに対して著しく遅い(15〜25%程度)原因を`VulkanBackend::dispatch`
