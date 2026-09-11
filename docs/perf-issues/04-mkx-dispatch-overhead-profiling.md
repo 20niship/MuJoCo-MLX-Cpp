@@ -1,5 +1,37 @@
 # [P1] MKX(mkx/Vulkan)のCPU側グラフ処理・ディスパッチオーバーヘッドを計測・削減する
 
+## 追記3: GPUバッファリークの修正+プーリングで一段の改善(MLX比50〜81%)
+
+追記2で発見したリークを修正した(`OpNode`に型消去された解放コールバック`free_gpu_buffer`を
+追加、バッファ所有ノードでのみ設定、`View`/`CustomKernelOutput`のような別名ノードは未設定の
+ため二重解放なし。shared_ptrの参照カウントが0になった時点で正しく1回解放される)。あわせて
+`VulkanBackend::alloc`/`free`をサイズ別free-listでプーリングし、同一形状バッファを毎eval()で
+`vkCreateBuffer`/`vkAllocateMemory`し直さず使い回すようにした(mlx_vulkan側、
+https://github.com/20niship/mlx_vulkan/pull/1 、mkx_tests 53/2600全pass)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | pool使い回し後 | リーク修正+プーリング後 | MLX比 |
+|---|---|---|---|
+| batched/pendulum | 53,203 steps/sec | 53,211 steps/sec | 約50%(MLX 105,896) |
+| batched/t_shape | 19,473 | 27,511 | 約73%(MLX 37,584) |
+| batched/go2 | 9,566 | 10,899 | 約76%(MLX 14,353) |
+| batched/h1 | 5,935 | 6,349 | 約81%(MLX 7,824) |
+| batched/high_dof_tree | 1,047 | 1,067 | 約135%(既にMLX超え、変化小) |
+
+command buffer統合(追記1)からの累計で見ると、go2は3,128→10,899(**約3.5倍**)、
+t_shapeは9,203→27,511(**約3.0倍**)、h1は3,378→6,349(**約1.9倍**)まで改善した。
+
+**pendulumだけ改善が頭打ちな理由**: nv=1・衝突なしで1ステップあたりの実計算が最小のため、
+残った固定オーバーヘッド(descriptor set割り当て+更新、pipeline barrier、
+`vkCmdBindPipeline`/`vkCmdDispatch`コマンド自体の記録コスト)の比率が他モデルより圧倒的に
+高い。これをさらに削るには複数opを実際に1つのシェーダに融合する(Issue 05で見送った
+fusion実装)が必要で、本セッションのスコープを超える。
+
+**実機Apple Silicon(MLX/Metal)との完全な同等速度(mlxと同等)には未到達**。go2/h1/t_shapeは
+70〜80%程度まで到達したが、pendulumのような極小モデルはfusionなしでは頭打ち。これ以上の
+改善はmlx_vulkan本体へのより大きなアーキテクチャ投資(op fusion)が必要と判断する。
+
 ## 追記2: descriptor poolの使い回し、および新たに発見したGPUバッファのリーク
 
 上記のcommand buffer統合に続き、`dispatch()`が呼び出しごとに`vkCreateDescriptorPool`/
