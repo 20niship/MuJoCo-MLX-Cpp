@@ -1,5 +1,48 @@
 # [P1] MKX(mkx/Vulkan)のCPU側グラフ処理・ディスパッチオーバーヘッドを計測・削減する
 
+## 追記: 根本原因を特定、mlx_vulkan本体(upstream)側を修正
+
+batched/go2・pendulum・t_shapeがMLXに対して著しく遅い(15〜25%程度)原因を`VulkanBackend::dispatch`
+(`mlx_vulkan`本体、`src/mkx/vulkan/vulkan_backend.cpp`)のソースを直接確認して特定した。
+
+**原因**: `dispatch()`が呼び出しごとに独立してcommand buffer/descriptor poolのalloc+begin、
+`vkQueueSubmit`、**`vkQueueWaitIdle`**、free/destroyを行っていた。`mkx::eval<Backend,
+Arrays...>`は複数ノードをトポロジカルソートして順にdispatchする設計だが、dispatchのたびに
+`vkQueueWaitIdle`でGPU完了を待ってしまうため、1回のeval()内にdispatchがN個あれば同期がN回
+発生し、CPU-GPUパイプライニングが完全に阻害されていた(CPU側は次のcommand buffer構築すら
+GPU完了を待ってからしか始められない)。`bench_utils.h`のベンチ実装は複数ステップを走らせた
+後に1回だけ`get_xpos`でevalする設計だが、compile()がno-op(Issue 05)なため各ステップの
+custom kernel(kin/forward/collision/solver/euler、最大5個)がそのままdispatch数として
+積み上がる。1ステップあたりの実計算が小さいモデル(pendulum、go2のnv=18等)ほど固定オーバー
+ヘッドの比率が大きく、逆に計算量が大きいhigh_dof_tree(nv≈69)はMLXと同等以上だったことも
+この説明と整合する。
+
+**修正**: `mlx_vulkan`(20niship/mlx_vulkan)本体を修正し、同一eval()内の複数dispatchを1つの
+command bufferに積み、次の`wait_idle()`でまとめて1回`vkQueueSubmit`+`vkQueueWaitIdle`する形に
+変更した(PR: https://github.com/20niship/mlx_vulkan/pull/1 )。dispatch間はchained op向けの
+保守的なshader write→readバリアで正しさを保っている。`eval<Backend, Arrays...>`/
+`ComputeBackend` conceptのシグネチャは変更していないため、このリポジトリ側の呼び出しコードの
+変更は不要で、`CMakeLists.txt`の`MKX_GIT_TAG`を更新するのみで取り込める。
+
+**検証**: `mkx_tests`(mlx_vulkan本体の53 test cases/2600 assertions)全pass。このリポジトリの
+`test_batched_diag`(Go2/H1)・`test_math_full`・`test_linalg_full`も変更前と完全に同一の
+pass/fail・同一の数値を維持(回帰なし)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | mx::eval統合後(このIssueの対応方針1) | command buffer統合後 | 倍率 |
+|---|---|---|---|
+| batched/pendulum | 16,460 steps/sec | 48,353 steps/sec | ×2.9 |
+| batched/t_shape | 9,203 | 24,517 | ×2.7 |
+| batched/go2 | 3,128 | 8,449 | ×2.7 |
+| batched/h1 | 3,378 | 5,640 | ×1.7 |
+| batched/high_dof_tree | 905 | 1,050 | ×1.2 |
+
+MLX比も大幅に改善した(pendulum 16%→46%、t_shape 24%→65%、go2 22%→59%、h1 43%→72%)。
+定量目標「env数に依存しないCPU側オーバーヘッドを500us未満」の直接検証は依然未実施だが、
+支配的要因(dispatchごとの同期待ち)は解消したため、残るギャップは主にGLSL側のGJK/EPA
+カーネル自体の実行時間(MSLとの実装差・コンパイラ差)と推測される(未計測)。
+
 ## 対応状況(対応方針1のみ実施、2・3は未着手)
 
 `src/compat/mx_compat_mkx.h`の`mx::eval(Arrays&... arrs)`(複数配列を1回の呼び出しで渡す形)を、
