@@ -558,6 +558,127 @@ static std::string make_euler_devmem_source(
 //   crb[nb*10], cdof[nv*6], cdof_dot[nv*6], cacc[nb*6], cfrc[nb*6],
 //   sub_pos[nb*3], sub_mass[nb], qfrc_bias[nv], qfrc_passive[nv]
 
+#if defined(MJMLX_BACKEND_MKX)
+// Host-side model constants for mkx_kernels::make_forward_kernel; mirrors what make_forward_source() below extracts to bake into MSL source text instead.
+struct ForwardHostConsts {
+    std::array<float, 3> gravity{0, 0, 0};
+    std::vector<int> body_parentid, body_rootid, dof_bodyid, dof_parentid;
+    std::vector<float> body_mass, body_inertia, dof_damping, dof_armature, dof_stiffness;
+    std::vector<int> dof_qposadr;
+    std::vector<float> qpos_spring, act_gain0, act_bias0;
+    std::vector<int> dof_jtype, dof_rotaxis, dof_jid;
+    std::vector<std::vector<int>> body_dofs;
+    int jnt_dofadr0 = 0;
+};
+
+static ForwardHostConsts extract_forward_host_consts(const Model& m) {
+    m.init_cache();
+    int nb = m.nbody, nv = m.nv, nq = m.nq, nu = m.nu, njnt = m.njnt;
+
+    mx::eval(m.body_parentid, m.body_mass, m.body_inertia, m.dof_damping);
+    mx::eval(m.jnt_type, m.jnt_dofadr, m.jnt_qposadr, m.body_jntadr, m.body_jntnum);
+    mx::eval(m.dof_bodyid);
+    if (m.dof_armature.size() > 0) mx::eval(m.dof_armature);
+    if (m.dof_parentid.size() > 0) mx::eval(m.dof_parentid);
+    mx::eval(m.body_rootid);
+
+    auto bpar_ptr = m.body_parentid.data<int>();
+    auto bmass_ptr = m.body_mass.data<float>();
+    auto binert_ptr = m.body_inertia.data<float>();
+    auto jt_ptr = m.jnt_type.data<int>();
+    auto jda_ptr = m.jnt_dofadr.data<int>();
+    auto jqa_ptr = m.jnt_qposadr.data<int>();
+    auto dbid_ptr = m.dof_bodyid.data<int>();
+    auto ddamp_ptr = m.dof_damping.data<float>();
+    auto dpar_ptr = m.dof_parentid.data<int>();
+    auto broot_ptr = m.body_rootid.data<int>();
+
+    ForwardHostConsts k;
+    k.body_parentid.assign(bpar_ptr, bpar_ptr + nb);
+    k.body_rootid.assign(broot_ptr, broot_ptr + nb);
+    k.body_mass.assign(bmass_ptr, bmass_ptr + nb);
+    k.body_inertia.assign(binert_ptr, binert_ptr + nb * 3);
+    k.dof_bodyid.assign(dbid_ptr, dbid_ptr + nv);
+    k.dof_parentid.assign(dpar_ptr, dpar_ptr + nv);
+    k.dof_damping.assign(ddamp_ptr, ddamp_ptr + nv);
+
+    k.dof_armature.assign(nv, 0.0f);
+    if (m.dof_armature.size() > 0) {
+        auto arm_ptr = m.dof_armature.data<float>();
+        for (int i = 0; i < nv; i++) k.dof_armature[i] = arm_ptr[i];
+    }
+
+    k.dof_stiffness.assign(nv, 0.0f);
+    if (m.jnt_stiffness.size() > 0) {
+        mx::eval(m.jnt_stiffness);
+        auto jstiff_ptr = m.jnt_stiffness.data<float>();
+        for (int j = 0; j < njnt; j++) {
+            int jt = jt_ptr[j], da = jda_ptr[j];
+            if (jt == (int)JointType::HINGE || jt == (int)JointType::SLIDE) k.dof_stiffness[da] = jstiff_ptr[j];
+        }
+    }
+
+    k.qpos_spring.assign(nq, 0.0f);
+    if (m.qpos_spring.size() > 0) {
+        mx::eval(m.qpos_spring);
+        auto qsp_ptr = m.qpos_spring.data<float>();
+        for (int i = 0; i < nq; i++) k.qpos_spring[i] = qsp_ptr[i];
+    }
+
+    k.act_gain0.assign(std::max(nu, 1), 0.0f);
+    k.act_bias0.assign(std::max(nu, 1), 0.0f);
+    if (nu > 0 && m.actuator_gainprm.size() > 0) {
+        mx::eval(m.actuator_gainprm, m.actuator_biasprm);
+        auto gp = m.actuator_gainprm.data<float>();
+        auto bp = m.actuator_biasprm.data<float>();
+        int ncol = (int)m.actuator_gainprm.shape(1);
+        for (int i = 0; i < nu; i++) { k.act_gain0[i] = gp[i * ncol]; k.act_bias0[i] = bp[i * ncol]; }
+    }
+
+    std::vector<int> dof_jntid(nv, -1);
+    for (int j = 0; j < njnt; j++) {
+        int jt = jt_ptr[j], da = jda_ptr[j];
+        int ndof = (jt == 0) ? 6 : (jt == 1) ? 3 : 1;
+        for (int di = 0; di < ndof; di++) dof_jntid[da + di] = j;
+    }
+
+    k.dof_qposadr.assign(nv, 0);
+    for (int j = 0; j < njnt; j++) {
+        int jt = jt_ptr[j], da = jda_ptr[j], qa = jqa_ptr[j];
+        int ndof = (jt == 0) ? 6 : (jt == 1) ? 3 : 1;
+        for (int di = 0; di < ndof; di++) k.dof_qposadr[da + di] = qa + di;
+    }
+
+    k.body_dofs.assign(nb, {});
+    for (int di = 0; di < nv; di++) k.body_dofs[dbid_ptr[di]].push_back(di);
+
+    k.dof_jtype.assign(nv, -1);
+    k.dof_rotaxis.assign(nv, -1);
+    k.dof_jid.assign(nv, -1);
+    for (int i = 0; i < nv; i++) {
+        int ji = dof_jntid[i];
+        k.dof_jid[i] = ji;
+        k.dof_jtype[i] = (ji >= 0) ? jt_ptr[ji] : -1;
+        int da = (ji >= 0) ? jda_ptr[ji] : 0;
+        int jt = (ji >= 0) ? jt_ptr[ji] : -1;
+        int sub = i - da;
+        int rotax = -1;
+        if (jt == 0 && sub >= 3) rotax = sub - 3;
+        if (jt == 1) rotax = sub;
+        k.dof_rotaxis[i] = rotax;
+    }
+
+    if (m.opt.gravity.size() > 0) {
+        mx::eval(m.opt.gravity);
+        auto gp = m.opt.gravity.data<float>();
+        k.gravity = {gp[0], gp[1], gp[2]};
+    }
+
+    k.jnt_dofadr0 = (njnt > 0) ? jda_ptr[0] : 0;
+    return k;
+}
+#endif // MJMLX_BACKEND_MKX
+
 static std::string make_forward_source(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
@@ -1118,6 +1239,108 @@ static int forward_scratch_per_env(const Model& m) {
     return nb*10 + nv*6 + nv*6 + nb*6 + nb*6 + nb*3 + nb + nv + nv;
 }
 
+// ── Backend-agnostic host data builders shared by MSL (metal_kernel) and GLSL (mkx_kernels) collision/solver dispatch ──
+static const int CONTACT_STRIDE = 8;
+static const int MAX_CONTACTS_PER_ENV = 128;
+static const int MAX_EFC = 256;
+
+static mx::array build_collision_pair_data(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int npairs = (int)c.collision_pairs.size();
+
+    mx::eval(m.geom_type, m.geom_size, m.geom_dataid,
+             m.mesh_vertadr, m.mesh_vertnum, m.mesh_vert);
+    auto gt = m.geom_type.data<int>();
+    auto gs = m.geom_size.data<float>();
+    auto gdi = m.geom_dataid.data<int>();
+
+    // Compute per-geom bounding radius
+    std::vector<float> geom_rb(m.ngeom, 0.0f);
+    for (int g = 0; g < m.ngeom; g++) {
+        int t = gt[g];
+        if (t == 0) { geom_rb[g] = 1e6f; continue; }
+        if (t == 2) { geom_rb[g] = gs[g*3]; continue; }
+        if (t == 3) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1]); continue; }
+        if (t == 6) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1] + gs[g*3+2]*gs[g*3+2]); continue; }
+        if (t == 7 && gdi[g] >= 0) {
+            auto mva = m.mesh_vertadr.data<int>();
+            auto mvn = m.mesh_vertnum.data<int>();
+            auto mv = m.mesh_vert.data<float>();
+            int mid = gdi[g], adr = mva[mid], nverts = mvn[mid];
+            float maxr = 0;
+            for (int v = 0; v < nverts; v++) {
+                float x = mv[(adr+v)*3], y = mv[(adr+v)*3+1], z = mv[(adr+v)*3+2];
+                float r = std::sqrt(x*x + y*y + z*z);
+                if (r > maxr) maxr = r;
+            }
+            geom_rb[g] = maxr;
+        }
+    }
+
+    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
+    std::vector<float> data(npairs * 6);
+    for (int p = 0; p < npairs; p++) {
+        const auto& cp = c.collision_pairs[p];
+        data[p*6+0] = (float)cp.g1;
+        data[p*6+1] = (float)cp.g2;
+        data[p*6+2] = (float)cp.type1;
+        data[p*6+3] = (float)cp.type2;
+        data[p*6+4] = cp.margin + cp.gap;
+        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
+    }
+    return mx::array(data.data(), {npairs * 6}, mx::float32);
+}
+
+static int solver_scratch_per_env(const Model& m) {
+    int nv = m.nv;
+    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+}
+
+// Build solver pair properties buffer (18 floats per pair)
+static mx::array build_solver_pair_props(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int npairs = (int)c.collision_pairs.size();
+    std::vector<float> data(npairs * 18, 0.0f);
+    for (int p = 0; p < npairs; p++) {
+        const auto& cp = c.collision_pairs[p];
+        data[p*18+0] = (float)cp.body1;
+        data[p*18+1] = (float)cp.body2;
+        data[p*18+2] = (float)cp.condim;
+        data[p*18+3] = cp.margin + cp.gap;
+        for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
+        data[p*18+9] = cp.solref[0];
+        data[p*18+10] = cp.solref[1];
+        for (int k = 0; k < 5; k++) data[p*18+11+k] = cp.solimp[k];
+        data[p*18+16] = cp.invweight_t;
+        data[p*18+17] = cp.invweight_r;
+    }
+    return mx::array(data.data(), {npairs * 18}, mx::float32);
+}
+
+// Build body_dof_masks buffer (nb × nv flat)
+static mx::array build_body_dof_masks(const Model& m) {
+    m.init_cache();
+    int nb = m.nbody, nv = m.nv;
+    std::vector<float> data(nb * nv, 0.0f);
+    for (int b = 0; b < nb; b++) {
+        mx::eval(m.cache.body_dof_masks[b]);
+        auto ptr = m.cache.body_dof_masks[b].data<float>();
+        for (int d = 0; d < nv; d++) data[b * nv + d] = ptr[d];
+    }
+    return mx::array(data.data(), {nb * nv}, mx::float32);
+}
+
+// Build body_rootid buffer
+static mx::array build_body_rootid(const Model& m) {
+    m.init_cache();
+    int nb = m.nbody;
+    std::vector<float> data(nb);
+    for (int b = 0; b < nb; b++) data[b] = (float)m.cache.body_rootid_vec[b];
+    return mx::array(data.data(), {nb}, mx::float32);
+}
+
 // ── MSL header for forward kernel (spatial algebra helpers) ──────────────────
 
 static const std::string FORWARD_HEADER = R"(
@@ -1187,8 +1410,6 @@ MJMLX_API MetalForwardResult test_metal_forward(
 }
 
 // Forward declarations for collision helpers
-static const int CONTACT_STRIDE = 8;
-static const int MAX_CONTACTS_PER_ENV = 128;
 static const std::string COLLISION_HEADER_FWD = R"(
 inline float3 msl_cross(float3 a, float3 b) {
     return float3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
@@ -1201,7 +1422,6 @@ inline float3 msl_norm(float3 a) {
 }
 )";
 static std::string make_collision_source(const Model& m);
-static mx::array build_collision_pair_data(const Model& m);
 
 // ── Test helper: dispatch Metal collision kernel for 1 env ──────────────────
 
@@ -1469,58 +1689,7 @@ contact_count[bid] = (float)ncon;
     return ss.str();
 }
 
-// Helper: build collision pair data buffer
-static mx::array build_collision_pair_data(const Model& m) {
-    m.init_cache();
-    const auto& c = m.cache;
-    int npairs = (int)c.collision_pairs.size();
-
-    mx::eval(m.geom_type, m.geom_size, m.geom_dataid,
-             m.mesh_vertadr, m.mesh_vertnum, m.mesh_vert);
-    auto gt = m.geom_type.data<int>();
-    auto gs = m.geom_size.data<float>();
-    auto gdi = m.geom_dataid.data<int>();
-
-    // Compute per-geom bounding radius
-    std::vector<float> geom_rb(m.ngeom, 0.0f);
-    for (int g = 0; g < m.ngeom; g++) {
-        int t = gt[g];
-        if (t == 0) { geom_rb[g] = 1e6f; continue; }
-        if (t == 2) { geom_rb[g] = gs[g*3]; continue; }
-        if (t == 3) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1]); continue; }
-        if (t == 6) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1] + gs[g*3+2]*gs[g*3+2]); continue; }
-        if (t == 7 && gdi[g] >= 0) {
-            auto mva = m.mesh_vertadr.data<int>();
-            auto mvn = m.mesh_vertnum.data<int>();
-            auto mv = m.mesh_vert.data<float>();
-            int mid = gdi[g], adr = mva[mid], nverts = mvn[mid];
-            float maxr = 0;
-            for (int v = 0; v < nverts; v++) {
-                float x = mv[(adr+v)*3], y = mv[(adr+v)*3+1], z = mv[(adr+v)*3+2];
-                float r = std::sqrt(x*x + y*y + z*z);
-                if (r > maxr) maxr = r;
-            }
-            geom_rb[g] = maxr;
-        }
-    }
-
-    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
-    std::vector<float> data(npairs * 6);
-    for (int p = 0; p < npairs; p++) {
-        const auto& cp = c.collision_pairs[p];
-        data[p*6+0] = (float)cp.g1;
-        data[p*6+1] = (float)cp.g2;
-        data[p*6+2] = (float)cp.type1;
-        data[p*6+3] = (float)cp.type2;
-        data[p*6+4] = cp.margin + cp.gap;
-        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
-    }
-    return mx::array(data.data(), {npairs * 6}, mx::float32);
-}
-
 // ── Metal constraint + Newton solver kernel ──────────────────────────────────
-
-static const int MAX_EFC = 256;
 
 static std::string make_solver_source(const Model& m, int solver_iters = 1, int cg_iters = 15) {
     m.init_cache();
@@ -1907,55 +2076,6 @@ for (int iter = 0; iter < NSOLVE; iter++) {
     return ss.str();
 }
 
-static int solver_scratch_per_env(const Model& m) {
-    int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
-}
-
-// Build solver pair properties buffer (18 floats per pair)
-static mx::array build_solver_pair_props(const Model& m) {
-    m.init_cache();
-    const auto& c = m.cache;
-    int npairs = (int)c.collision_pairs.size();
-    std::vector<float> data(npairs * 18, 0.0f);
-    for (int p = 0; p < npairs; p++) {
-        const auto& cp = c.collision_pairs[p];
-        data[p*18+0] = (float)cp.body1;
-        data[p*18+1] = (float)cp.body2;
-        data[p*18+2] = (float)cp.condim;
-        data[p*18+3] = cp.margin + cp.gap;
-        for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
-        data[p*18+9] = cp.solref[0];
-        data[p*18+10] = cp.solref[1];
-        for (int k = 0; k < 5; k++) data[p*18+11+k] = cp.solimp[k];
-        data[p*18+16] = cp.invweight_t;
-        data[p*18+17] = cp.invweight_r;
-    }
-    return mx::array(data.data(), {npairs * 18}, mx::float32);
-}
-
-// Build body_dof_masks buffer (nb × nv flat)
-static mx::array build_body_dof_masks(const Model& m) {
-    m.init_cache();
-    int nb = m.nbody, nv = m.nv;
-    std::vector<float> data(nb * nv, 0.0f);
-    for (int b = 0; b < nb; b++) {
-        mx::eval(m.cache.body_dof_masks[b]);
-        auto ptr = m.cache.body_dof_masks[b].data<float>();
-        for (int d = 0; d < nv; d++) data[b * nv + d] = ptr[d];
-    }
-    return mx::array(data.data(), {nb * nv}, mx::float32);
-}
-
-// Build body_rootid buffer
-static mx::array build_body_rootid(const Model& m) {
-    m.init_cache();
-    int nb = m.nbody;
-    std::vector<float> data(nb);
-    for (int b = 0; b < nb; b++) data[b] = (float)m.cache.body_rootid_vec[b];
-    return mx::array(data.data(), {nb}, mx::float32);
-}
-
 // Test helper for solver kernel
 MJMLX_API MetalCollisionResult test_metal_solver(
     const Model& m,
@@ -2193,16 +2313,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 #endif
     }
 
-    // ponytail: MKX has no GLSL port of the forward/collision/solver Metal kernels yet (falls back to vmap); scratch here is device memory not thread-local stack, so the old nv>80 gate (copied from euler's stack tier) was wrongly excluding mesh-heavy mid-size robots (Go2/H1) — build whenever there's anything to collide.
-#if defined(MJMLX_BACKEND_MLX)
+    // Build all-Metal/GLSL forward kernel whenever there's anything to collide (see ponytail note above the collision/solver gates below for why nv alone no longer excludes this path).
     {
-        auto fwd_source = make_forward_source(m);
         ctx->fwd_scratch_per_env = forward_scratch_per_env(m);
-
-        // Prepare model constant buffers
-        ctx->make_m_mask = mx::astype(mx::flatten(m.cache.make_m_mask), mx::float32);
-        mx::eval(ctx->make_m_mask);
-
         if (m.nu > 0 && m.cache.act_moment_const.size() > 0) {
             ctx->act_moment = mx::astype(mx::flatten(m.cache.act_moment_const), mx::float32);
         } else {
@@ -2210,6 +2323,20 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         }
         mx::eval(ctx->act_moment);
 
+#if defined(MJMLX_BACKEND_MKX)
+        ForwardHostConsts fc = extract_forward_host_consts(m);
+        ctx->forward_kernel = mkx_kernels::make_forward_kernel(
+            m.nbody, m.nv, m.nq, m.nu, m.njnt, m.opt.timestep, fc.gravity,
+            fc.body_parentid, fc.body_rootid, fc.body_mass, fc.body_inertia,
+            fc.dof_bodyid, fc.dof_parentid, fc.dof_damping, fc.dof_armature,
+            fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
+            fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0);
+#else
+        // Prepare model constant buffers
+        ctx->make_m_mask = mx::astype(mx::flatten(m.cache.make_m_mask), mx::float32);
+        mx::eval(ctx->make_m_mask);
+
+        auto fwd_source = make_forward_source(m);
         ctx->forward_kernel = mx::fast::metal_kernel(
             "mjmlx_forward_" + std::to_string(m.nbody) + "_" + std::to_string(m.nv),
             {"xipos", "ximat", "xanchor", "xaxis", "xmat",
@@ -2220,12 +2347,12 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fwd_source,
             FORWARD_HEADER
         );
+#endif
         ctx->uses_metal_forward = true;
     }
 
-    // Build Metal collision kernel (replaces vmap collision)
+    // Build collision kernel (replaces vmap collision) whenever there's anything to collide.
     if (m.cache.collision_pairs.size() > 0) {
-        auto coll_source = make_collision_source(m);
         ctx->num_collision_pairs = (int)m.cache.collision_pairs.size();
 
         ctx->coll_pair_data = build_collision_pair_data(m);
@@ -2239,6 +2366,11 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
                  ctx->coll_mesh_vertnum, ctx->coll_geom_dataid);
 
+#if defined(MJMLX_BACKEND_MKX)
+        ctx->collision_kernel = mkx_kernels::make_collision_kernel(
+            m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV);
+#else
+        auto coll_source = make_collision_source(m);
         ctx->collision_kernel = mx::fast::metal_kernel(
             "mjmlx_collision_" + std::to_string(m.ngeom),
             {"geom_xpos", "geom_xmat",
@@ -2248,22 +2380,29 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             coll_source,
             COLLISION_HEADER_FWD
         );
+#endif
         ctx->uses_metal_collision = true;
     }
 
-    // Build Metal solver kernel (constraint construction + Newton solver)
+    // Build solver kernel (constraint construction + Newton solver) whenever there's anything to collide.
     if (m.cache.collision_pairs.size() > 0) {
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
         int si = std::min(raw_si, 3);
         int cgi = 20;
-        auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_scratch_size = solver_scratch_per_env(m);
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);
         mx::eval(ctx->solver_pair_props, ctx->solver_body_dof_masks, ctx->solver_body_rootid);
 
+#if defined(MJMLX_BACKEND_MKX)
+        bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
+        bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
+        ctx->solver_kernel = mkx_kernels::make_solver_kernel(
+            m.nbody, m.nv, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi);
+#else
+        auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_kernel = mx::fast::metal_kernel(
             "mjmlx_solver_" + std::to_string(m.nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
             {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
@@ -2273,9 +2412,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             solver_source,
             COLLISION_HEADER_FWD
         );
+#endif
         ctx->uses_metal_solver = true;
     }
-#endif // MJMLX_BACKEND_MLX
 
     return ctx;
 }
@@ -2461,12 +2600,27 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qfrc_actuator_out = mx::zeros({1});
 
             if (use_metal_fwd) {
-#if defined(MJMLX_BACKEND_MLX)
-                // ── Phase 2a: Metal forward kernel (all-Metal path for nv > 80) ──
+                // ── Phase 2a: all-Metal/GLSL forward kernel (whenever there's anything to collide) ──
                 auto xmat = mx::reshape(kin[2], {B, nb, 3, 3});
                 int scratchSz = ctx->fwd_scratch_per_env;
 
-                auto fwd = (*ctx->forward_kernel)(
+                std::vector<mx::array> fwd;
+#if defined(MJMLX_BACKEND_MKX)
+                {
+                    auto fwd_raw = (*ctx->forward_kernel)(
+                        mx::fast::kernel_inputs({mx::flatten(xipos), mx::flatten(ximat),
+                         mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
+                         mx::flatten(qpos_batch), mx::flatten(qvel_batch), mx::flatten(ctrl_batch),
+                         ctx->act_moment}),
+                        mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
+                         {B * nb * 10}, {B * nb * 6}, {B * nv},
+                         {B * scratchSz}, {B * nv * 6}}),
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                    );
+                    fwd = mx::fast::kernel_outputs(fwd_raw);
+                }
+#else
+                fwd = (*ctx->forward_kernel)(
                     {mx::flatten(xipos), mx::flatten(ximat),
                      mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
                      mx::flatten(qpos_batch), mx::flatten(qvel_batch), mx::flatten(ctrl_batch),
@@ -2479,6 +2633,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
                     {}, std::nullopt, false, {}
                 );
+#endif
 
                 qM_flat = fwd[0];
                 qfrc_smooth_flat = fwd[1];
@@ -2488,14 +2643,28 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
                 auto cdof_flat = fwd[7]; // (B * nv * 6)
 
-                // ── Collision + Solver for nv > 80 ──
+                // ── Collision + Solver ──
                 if (ctx->uses_metal_collision) {
                     // Collision kernel: detect contacts from geom transforms
                     auto geom_xpos_flat = mx::flatten(mx::reshape(kin[7], {B, ng, 3}));
                     auto geom_xmat_flat = mx::flatten(mx::reshape(kin[8], {B, ng, 3, 3}));
 
                     int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
-                    auto coll = (*ctx->collision_kernel)(
+                    std::vector<mx::array> coll;
+#if defined(MJMLX_BACKEND_MKX)
+                    {
+                        auto coll_raw = (*ctx->collision_kernel)(
+                            mx::fast::kernel_inputs({geom_xpos_flat, geom_xmat_flat,
+                             ctx->coll_mesh_verts, ctx->coll_pair_data,
+                             ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
+                             ctx->coll_geom_dataid}),
+                            mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                        );
+                        coll = mx::fast::kernel_outputs(coll_raw);
+                    }
+#else
+                    coll = (*ctx->collision_kernel)(
                         {geom_xpos_flat, geom_xmat_flat,
                          ctx->coll_mesh_verts, ctx->coll_pair_data,
                          ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
@@ -2505,10 +2674,27 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
                         {}, std::nullopt, false, {}
                     );
+#endif
 
                     if (ctx->uses_metal_solver) {
                         int scratch_sz = ctx->solver_scratch_size;
-                        auto solver = (*ctx->solver_kernel)(
+                        std::vector<mx::array> solver;
+#if defined(MJMLX_BACKEND_MKX)
+                        {
+                            auto solver_raw = (*ctx->solver_kernel)(
+                                mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
+                                 mx::flatten(subtree_com_out),
+                                 mx::astype(mx::flatten(qvel_batch), mx::float32),
+                                 coll[0], coll[1],
+                                 ctx->solver_pair_props, ctx->solver_body_dof_masks,
+                                 ctx->solver_body_rootid}),
+                                mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
+                                std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
+                            );
+                            solver = mx::fast::kernel_outputs(solver_raw);
+                        }
+#else
+                        solver = (*ctx->solver_kernel)(
                             {qM_flat, qfrc_smooth_flat, cdof_flat,
                              mx::flatten(subtree_com_out),
                              mx::astype(mx::flatten(qvel_batch), mx::float32),
@@ -2520,6 +2706,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),
                             {}, std::nullopt, false, {}
                         );
+#endif
                         qfrc_constraint_flat = solver[0];
                     } else {
                         qfrc_constraint_flat = mx::zeros({B * nv});
@@ -2527,7 +2714,6 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 } else {
                     qfrc_constraint_flat = mx::zeros({B * nv});
                 }
-#endif // MJMLX_BACKEND_MLX -- use_metal_fwd is always false on MKX (see BatchedStepContext construction)
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
                 auto xquat = mx::reshape(kin[1], {B, nb, 4});
