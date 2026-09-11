@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -391,12 +392,23 @@ inline array astype(const array& a, Dtype dt) {
 
 inline array arange(float start, float stop, float step, Dtype dtype) { return astype(arange(start, stop, step), dtype); }
 
+// mkx::eval<Backend, Arrays...> shares one topo_sort + one Backend::wait_idle() across the whole pack; calling it per-array (as this shim used to) turned every mx::eval(a,b,c) into N GPU syncs instead of MLX's one.
 template <class... Arrays> void eval(Arrays&... arrs) {
-    std::vector<Raw<float>> proxies{Raw<float>(arrs.node())...};
-    for (auto& p : proxies) mkx::eval<Backend>(p);
+    auto proxies = std::make_tuple(Raw<float>(arrs.node())...);
+    std::apply([](auto&... ps) { mkx::eval<Backend>(ps...); }, proxies);
 }
 inline void eval(std::initializer_list<array> arrs) {
-    for (const auto& a : arrs) { Raw<float> p(a.node()); mkx::eval<Backend>(p); }
+    std::vector<Raw<float>> proxies;
+    proxies.reserve(arrs.size());
+    for (const auto& a : arrs) proxies.emplace_back(a.node());
+
+    std::unordered_set<mkx::OpNode*> visited;
+    std::vector<mkx::NodePtr> order;
+    for (auto& p : proxies) mkx::detail::topo_sort(p.node(), visited, order);
+
+    static std::unordered_map<size_t, Backend::Pipeline> pipeline_cache;
+    for (auto& node : order) mkx::detail::eval_node<Backend>(*node, pipeline_cache);
+    Backend::wait_idle();
 }
 
 template <class Fn> auto compile(Fn fn) { return fn; }
