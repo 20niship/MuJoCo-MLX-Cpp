@@ -56,6 +56,7 @@ else()
     # ── Fetch MKX (Vulkan-based cross-platform MLX-alike) ──────────
     include(FetchContent)
     find_package(Vulkan REQUIRED)
+    # set(MKX_GIT_TAG "e87ffe8282a7157ac400485d75c7cf08212bb505" CACHE STRING "mlx_vulkan commit/tag to fetch")
     set(MKX_GIT_TAG "3eed470f7ed3c36e6d32aeacd15863cae1f7e1c6" CACHE STRING "mlx_vulkan commit/tag to fetch")
     FetchContent_Declare(mkx
         GIT_REPOSITORY https://github.com/20niship/mlx_vulkan.git
@@ -278,9 +279,18 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Self-contained (embeds its own XML fixtures) GPU-vs-CPU batched collision parity test --
+    # no MJMLX_TEST_MODEL needed, so it always runs in CI.
+    add_executable(test_batched_collision_primitives tests/test_batched_collision_primitives.cpp)
+    target_link_libraries(test_batched_collision_primitives PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_batched_collision_primitives PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_math_full test_batched_diag test_linalg_full)
+        foreach(_test test_math_full test_batched_diag test_linalg_full test_batched_collision_primitives)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -295,7 +305,8 @@ if(MJMLX_BUILD_TESTS)
 
     add_test(NAME math_full COMMAND test_math_full)
     add_test(NAME linalg_full COMMAND test_linalg_full)
-    set_tests_properties(math_full linalg_full PROPERTIES LABELS "correctness")
+    add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
+    set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
 
     # test_metal_synth exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
     if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
@@ -419,6 +430,27 @@ if(MJMLX_BUILD_PYTHON)
                 "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
                 "$<TARGET_FILE:_mjmlx_native>"
             COMMENT "Fixing MuJoCo dylib for _mjmlx_native"
+        )
+    endif()
+
+    # Numpy-facing RL bindings (mjmlx.h only, no mlx.core NB_DOMAIN sharing -- see python/rl_bindings.cpp)
+    nanobind_add_module(_mjmlx_rl_native
+        NB_STATIC STABLE_ABI LTO NOMINSIZE
+        python/rl_bindings.cpp
+    )
+    target_link_libraries(_mjmlx_rl_native PRIVATE mjmlx)
+    target_include_directories(_mjmlx_rl_native PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    set_target_properties(_mjmlx_rl_native PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
+        add_custom_command(TARGET _mjmlx_rl_native POST_BUILD
+            COMMAND install_name_tool -change
+                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
+                "$<TARGET_FILE:_mjmlx_rl_native>"
+            COMMENT "Fixing MuJoCo dylib for _mjmlx_rl_native"
         )
     endif()
 endif()

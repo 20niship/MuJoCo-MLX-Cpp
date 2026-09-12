@@ -1420,6 +1420,50 @@ inline float3 msl_norm(float3 a) {
     float l = msl_len(a);
     return l > 1e-12f ? a / l : float3(0, 0, 1);
 }
+
+// Generic GJK/EPA support point so plane-X and X-Y contact detection work for any geom-type pair, not just mesh. MuJoCo local-frame convention: sphere size=(radius,_,_), capsule size=(radius,halflength,_) axis along local +z, box size=(halfx,halfy,halfz).
+template <typename MeshVertsPtr>
+inline float3 mjmlx_support(int gtype, float3 pos, thread const float* R, float3 size,
+                             MeshVertsPtr mesh_verts, int mesh_adr, int mesh_nverts,
+                             float3 dir_world) {
+    float3 ld = float3(R[0]*dir_world.x+R[3]*dir_world.y+R[6]*dir_world.z,
+                        R[1]*dir_world.x+R[4]*dir_world.y+R[7]*dir_world.z,
+                        R[2]*dir_world.x+R[5]*dir_world.y+R[8]*dir_world.z);
+    float3 lp;
+    if (gtype == 2) { // sphere
+        lp = msl_norm(ld) * size.x;
+    } else if (gtype == 4) { // ellipsoid, semi-axes = size; support(d) = (a^2 dx, b^2 dy, c^2 dz) / |(a dx, b dy, c dz)|
+        float3 scaled = float3(size.x*ld.x, size.y*ld.y, size.z*ld.z);
+        float denom = msl_len(scaled);
+        lp = (denom > 1e-12f) ? float3(size.x*scaled.x, size.y*scaled.y, size.z*scaled.z) / denom : float3(0, 0, size.z);
+    } else if (gtype == 3) { // capsule
+        float3 n = msl_norm(ld);
+        float capz = (ld.z >= 0.0f) ? size.y : -size.y;
+        lp = float3(n.x*size.x, n.y*size.x, capz + n.z*size.x);
+    } else if (gtype == 5) { // cylinder: disk (xy) x interval (z), support = sum of each factor's own support point
+        float2 xy = float2(ld.x, ld.y);
+        float xyl = sqrt(xy.x*xy.x + xy.y*xy.y);
+        float2 xyn = (xyl > 1e-12f) ? xy / xyl : float2(1, 0);
+        lp = float3(xyn.x*size.x, xyn.y*size.x, (ld.z >= 0.0f) ? size.y : -size.y);
+    } else if (gtype == 6) { // box
+        lp = float3(ld.x >= 0.0f ? size.x : -size.x,
+                    ld.y >= 0.0f ? size.y : -size.y,
+                    ld.z >= 0.0f ? size.z : -size.z);
+    } else if (gtype == 7) { // mesh: linear scan over vertices
+        float bd = -1e30f; int bi = 0;
+        for (int vi = 0; vi < mesh_nverts; vi++) {
+            float3 v = float3(mesh_verts[(mesh_adr+vi)*3], mesh_verts[(mesh_adr+vi)*3+1], mesh_verts[(mesh_adr+vi)*3+2]);
+            float dd = msl_dot(v, ld);
+            if (dd > bd) { bd = dd; bi = vi; }
+        }
+        lp = float3(mesh_verts[(mesh_adr+bi)*3], mesh_verts[(mesh_adr+bi)*3+1], mesh_verts[(mesh_adr+bi)*3+2]);
+    } else {
+        lp = float3(0, 0, 0);
+    }
+    return float3(R[0]*lp.x+R[1]*lp.y+R[2]*lp.z+pos.x,
+                  R[3]*lp.x+R[4]*lp.y+R[5]*lp.z+pos.y,
+                  R[6]*lp.x+R[7]*lp.y+R[8]*lp.z+pos.z);
+}
 )";
 static std::string make_collision_source(const Model& m);
 
@@ -1440,13 +1484,14 @@ MJMLX_API MetalCollisionResult test_metal_collision(
     auto mesh_vertadr = mx::astype(mx::flatten(m.mesh_vertadr), mx::float32);
     auto mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
     auto geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
-    mx::eval(mesh_verts, mesh_vertadr, mesh_vertnum, geom_dataid);
+    auto geom_size = mx::astype(mx::flatten(m.geom_size), mx::float32);
+    mx::eval(mesh_verts, mesh_vertadr, mesh_vertnum, geom_dataid, geom_size);
 
     auto kernel = mx::fast::metal_kernel(
         "mjmlx_test_collision_" + std::to_string(ng),
         {"geom_xpos", "geom_xmat",
          "mesh_verts", "pair_data",
-         "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf"},
+         "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"},
         {"contact_data", "contact_count"},
         coll_source,
         COLLISION_HEADER_FWD
@@ -1458,7 +1503,7 @@ MJMLX_API MetalCollisionResult test_metal_collision(
         {mx::astype(mx::flatten(geom_xpos), mx::float32),
          mx::astype(mx::flatten(geom_xmat), mx::float32),
          mesh_verts, pair_data,
-         mesh_vertadr, mesh_vertnum, geom_dataid},
+         mesh_vertadr, mesh_vertnum, geom_dataid, geom_size},
         {{con_buf_sz}, {B}},
         {mx::float32, mx::float32},
         std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
@@ -1517,26 +1562,23 @@ for (int p = 0; p < NUM_PAIRS; p++) {
     float c_pos[3], c_norm[3], c_dist;
     bool has_contact = false;
 
-    if (t1 == 0 && t2 == 7) {
-        // Plane-mesh collision
-        int plane_g = g1, mesh_g = g2;
+    if (t1 == 0 || t2 == 0) {
+        // Plane-X: deepest point of X along -normal (X = mesh/sphere/capsule/box)
+        int plane_g = (t1 == 0) ? g1 : g2;
+        int xg = (t1 == 0) ? g2 : g1;
+        int xt = (t1 == 0) ? t2 : t1;
         float3 ppos = float3(geom_xpos[gx_off+plane_g*3], geom_xpos[gx_off+plane_g*3+1], geom_xpos[gx_off+plane_g*3+2]);
         float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[gm_off+plane_g*9+k];
         float3 normal = float3(pR[2], pR[5], pR[8]);
-        float3 mpos = float3(geom_xpos[gx_off+mesh_g*3], geom_xpos[gx_off+mesh_g*3+1], geom_xpos[gx_off+mesh_g*3+2]);
-        float mR[9]; for (int k=0;k<9;k++) mR[k] = geom_xmat[gm_off+mesh_g*9+k];
-        int mesh_id = (int)geom_dataid_buf[mesh_g];
-        int adr = (int)mesh_vertadr_buf[mesh_id];
-        int nverts = (int)mesh_vertnum_buf[mesh_id];
-        float best_d = 1e30f; float3 best_w;
-        for (int i = 0; i < nverts; i++) {
-            float3 lv = float3(mesh_verts[adr*3+i*3], mesh_verts[adr*3+i*3+1], mesh_verts[adr*3+i*3+2]);
-            float3 wv = float3(mR[0]*lv.x+mR[1]*lv.y+mR[2]*lv.z+mpos.x,
-                                mR[3]*lv.x+mR[4]*lv.y+mR[5]*lv.z+mpos.y,
-                                mR[6]*lv.x+mR[7]*lv.y+mR[8]*lv.z+mpos.z);
-            float d = msl_dot(wv - ppos, normal);
-            if (d < best_d) { best_d = d; best_w = wv; }
-        }
+        float3 xpos_ = float3(geom_xpos[gx_off+xg*3], geom_xpos[gx_off+xg*3+1], geom_xpos[gx_off+xg*3+2]);
+        thread float xR[9]; for (int k=0;k<9;k++) xR[k] = geom_xmat[gm_off+xg*9+k];
+        float3 xsize = float3(geom_size_buf[xg*3], geom_size_buf[xg*3+1], geom_size_buf[xg*3+2]);
+        int mesh_id = (xt == 7) ? (int)geom_dataid_buf[xg] : 0;
+        int adr = (xt == 7) ? (int)mesh_vertadr_buf[mesh_id] : 0;
+        int nverts = (xt == 7) ? (int)mesh_vertnum_buf[mesh_id] : 0;
+
+        float3 best_w = mjmlx_support(xt, xpos_, xR, xsize, mesh_verts, adr, nverts, -normal);
+        float best_d = msl_dot(best_w - ppos, normal);
         if (best_d < pair_margin) {
             float3 cp = best_w - normal * best_d;
             c_pos[0]=cp.x; c_pos[1]=cp.y; c_pos[2]=cp.z;
@@ -1544,50 +1586,39 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             c_dist = best_d;
             has_contact = true;
         }
-    } else if (t1 == 7 && t2 == 7) {
-        // Mesh-mesh GJK collision
+    } else {
+        // X-Y GJK/EPA (X, Y = mesh/sphere/capsule/box, any combination)
         float3 pos1 = float3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
         float3 pos2 = float3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
-        float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[gm_off+g1*9+k];
-        float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[gm_off+g2*9+k];
-        int mid1 = (int)geom_dataid_buf[g1], mid2 = (int)geom_dataid_buf[g2];
-        int adr1=(int)mesh_vertadr_buf[mid1], nv1=(int)mesh_vertnum_buf[mid1];
-        int adr2=(int)mesh_vertadr_buf[mid2], nv2=(int)mesh_vertnum_buf[mid2];
+        thread float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[gm_off+g1*9+k];
+        thread float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[gm_off+g2*9+k];
+        float3 size1 = float3(geom_size_buf[g1*3], geom_size_buf[g1*3+1], geom_size_buf[g1*3+2]);
+        float3 size2 = float3(geom_size_buf[g2*3], geom_size_buf[g2*3+1], geom_size_buf[g2*3+2]);
+        int mid1 = (t1 == 7) ? (int)geom_dataid_buf[g1] : 0;
+        int mid2 = (t2 == 7) ? (int)geom_dataid_buf[g2] : 0;
+        int adr1 = (t1 == 7) ? (int)mesh_vertadr_buf[mid1] : 0;
+        int adr2 = (t2 == 7) ? (int)mesh_vertadr_buf[mid2] : 0;
+        int nv1 = (t1 == 7) ? (int)mesh_vertnum_buf[mid1] : 0;
+        int nv2 = (t2 == 7) ? (int)mesh_vertnum_buf[mid2] : 0;
 
-        // Inline mesh support lambda
-        #define SUPPORT_MESH(MID, ADR, NV, GPOS, ROT, DIR, OUT) { \
-            float3 ld = float3(ROT[0]*DIR.x+ROT[3]*DIR.y+ROT[6]*DIR.z, \
-                                ROT[1]*DIR.x+ROT[4]*DIR.y+ROT[7]*DIR.z, \
-                                ROT[2]*DIR.x+ROT[5]*DIR.y+ROT[8]*DIR.z); \
-            float bd = -1e30f; int bi = 0; \
-            for (int vi=0;vi<NV;vi++) { \
-                float3 v=float3(mesh_verts[ADR*3+vi*3],mesh_verts[ADR*3+vi*3+1],mesh_verts[ADR*3+vi*3+2]); \
-                float dd=msl_dot(v,ld); if(dd>bd){bd=dd;bi=vi;} \
-            } \
-            float3 lp=float3(mesh_verts[ADR*3+bi*3],mesh_verts[ADR*3+bi*3+1],mesh_verts[ADR*3+bi*3+2]); \
-            OUT=float3(ROT[0]*lp.x+ROT[1]*lp.y+ROT[2]*lp.z+GPOS.x, \
-                        ROT[3]*lp.x+ROT[4]*lp.y+ROT[5]*lp.z+GPOS.y, \
-                        ROT[6]*lp.x+ROT[7]*lp.y+ROT[8]*lp.z+GPOS.z); \
-        }
+        #define SUPPORT1(DIR) mjmlx_support(t1, pos1, R1, size1, mesh_verts, adr1, nv1, DIR)
+        #define SUPPORT2(DIR) mjmlx_support(t2, pos2, R2, size2, mesh_verts, adr2, nv2, DIR)
 
         float3 dir = pos2 - pos1;
         if (msl_len(dir) < 1e-12f) dir = float3(1,0,0);
 
         float3 sdiff[4], sa_pts[4], sb_pts[4];
         int sn = 0;
-        float3 sup_a, sup_b;
-        SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
-        float3 neg_dir = -dir;
-        SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+        float3 sup_a = SUPPORT1(dir);
+        float3 sup_b = SUPPORT2(-dir);
         sdiff[0] = sup_a - sup_b; sa_pts[0] = sup_a; sb_pts[0] = sup_b;
         sn = 1; dir = -sdiff[0];
         if (msl_len(dir) < 1e-12f) dir = float3(1,0,0);
         bool gjk_overlap = false;
 
         for (int iter = 0; iter < 32; iter++) {
-            SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
-            neg_dir = -dir;
-            SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+            sup_a = SUPPORT1(dir);
+            sup_b = SUPPORT2(-dir);
             float3 new_sd = sup_a - sup_b;
             if (msl_dot(new_sd, dir) < 0) break;
             sdiff[sn] = new_sd; sa_pts[sn] = sup_a; sb_pts[sn] = sup_b;
@@ -1639,10 +1670,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
                 float3(D,D,D),float3(-D,D,D),float3(D,-D,D),float3(D,D,-D),
                 float3(-D,-D,D),float3(-D,D,-D),float3(D,-D,-D),float3(-D,-D,-D)};
             for (int si=0;si<14;si++) {
-                float3 d=sd[si],pa,pb;
-                SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
-                float3 nd=-d;
-                SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                float3 d=sd[si];
+                float3 pa=SUPPORT1(d), pb=SUPPORT2(-d);
                 float w=msl_dot(pa-pb,d);
                 if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
             }
@@ -1656,10 +1685,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
                 if(msl_len(fn)<1e-8f)continue;
                 fn=msl_norm(fn);
                 for(int s=-1;s<=1;s+=2){
-                    float3 d=fn*(float)s,pa,pb;
-                    SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
-                    float3 nd=-d;
-                    SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                    float3 d=fn*(float)s;
+                    float3 pa=SUPPORT1(d), pb=SUPPORT2(-d);
                     float w=msl_dot(pa-pb,d);
                     if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
                 }
@@ -1670,7 +1697,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             c_norm[0]=bn.x;c_norm[1]=bn.y;c_norm[2]=bn.z;
             c_dist=-pen; has_contact=true;
         }
-        #undef SUPPORT_MESH
+        #undef SUPPORT1
+        #undef SUPPORT2
     }
 
     if (has_contact && ncon < MAX_CON) {
@@ -2177,6 +2205,7 @@ struct BatchedStepContext {
     mx::array coll_mesh_vertadr = mx::zeros({1});
     mx::array coll_mesh_vertnum = mx::zeros({1});
     mx::array coll_geom_dataid = mx::zeros({1});
+    mx::array coll_geom_size = mx::zeros({1});
     int num_collision_pairs = 0;
 
     // Solver kernel
@@ -2363,8 +2392,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         ctx->coll_mesh_vertadr = mx::astype(mx::flatten(m.mesh_vertadr), mx::float32);
         ctx->coll_mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
         ctx->coll_geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
+        ctx->coll_geom_size = mx::astype(mx::flatten(m.geom_size), mx::float32);
         mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
-                 ctx->coll_mesh_vertnum, ctx->coll_geom_dataid);
+                 ctx->coll_mesh_vertnum, ctx->coll_geom_dataid, ctx->coll_geom_size);
 
 #if defined(MJMLX_BACKEND_MKX)
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
@@ -2375,7 +2405,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             "mjmlx_collision_" + std::to_string(m.ngeom),
             {"geom_xpos", "geom_xmat",
              "mesh_verts", "pair_data",
-             "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf"},
+             "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"},
             {"contact_data", "contact_count"},
             coll_source,
             COLLISION_HEADER_FWD
@@ -2657,7 +2687,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             mx::fast::kernel_inputs({geom_xpos_flat, geom_xmat_flat,
                              ctx->coll_mesh_verts, ctx->coll_pair_data,
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
-                             ctx->coll_geom_dataid}),
+                             ctx->coll_geom_dataid, ctx->coll_geom_size}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
                             std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                         );
@@ -2668,7 +2698,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         {geom_xpos_flat, geom_xmat_flat,
                          ctx->coll_mesh_verts, ctx->coll_pair_data,
                          ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
-                         ctx->coll_geom_dataid},
+                         ctx->coll_geom_dataid, ctx->coll_geom_size},
                         {{con_buf_sz}, {B}},
                         {mx::float32, mx::float32},
                         std::make_tuple(B, 1, 1), std::make_tuple(1, 1, 1),
@@ -2994,7 +3024,7 @@ MJMLX_API void mjmlx_batched_get_state(
 {
     if (!sim) return;
     auto& s = sim->sim;
-    mx::eval(s.qpos); mx::eval(s.qvel);
+    mx::eval(s.qpos, s.qvel);
 
     if (nq_out) *nq_out = s.model->nq;
     if (nv_out) *nv_out = s.model->nv;
@@ -3007,6 +3037,26 @@ MJMLX_API void mjmlx_batched_get_state(
         auto v = s.qvel.data<float>();
         std::memcpy(qvel_out, v, s.num_envs * s.model->nv * sizeof(float));
     }
+}
+
+MJMLX_API void mjmlx_batched_set_state(MjmlxBatchedSim* sim, const float* qpos, const float* qvel) {
+    if (!sim) return;
+
+    if (sim->cpu_mode) {
+        int nq = sim->cpu_model->nq, nv = sim->cpu_model->nv;
+        for (int i = 0; i < sim->sim.num_envs; i++) {
+            mjData* d = sim->cpu_datas[i];
+            if (qpos) for (int j = 0; j < nq; j++) d->qpos[j] = (double)qpos[i * nq + j];
+            if (qvel) for (int j = 0; j < nv; j++) d->qvel[j] = (double)qvel[i * nv + j];
+        }
+        cpu_gather_state(sim);
+        return;
+    }
+
+    auto& s = sim->sim;
+    int B = s.num_envs;
+    if (qpos) s.qpos = mx::reshape(mx::array(qpos, {B * s.model->nq}, mx::float32), {B, s.model->nq});
+    if (qvel) s.qvel = mx::reshape(mx::array(qvel, {B * s.model->nv}, mx::float32), {B, s.model->nv});
 }
 
 MJMLX_API const float* mjmlx_batched_get_qpos(const MjmlxBatchedSim* sim, int* n_out) {
@@ -3087,7 +3137,7 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
     int B = s.num_envs;
     int nq = s.model->nq, nv = s.model->nv;
 
-    mx::eval(s.qpos); mx::eval(s.qvel);
+    mx::eval(s.qpos, s.qvel);
     std::vector<float> qp(s.qpos.data<float>(), s.qpos.data<float>() + B * nq);
     std::vector<float> qv(s.qvel.data<float>(), s.qvel.data<float>() + B * nv);
 

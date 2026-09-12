@@ -1,6 +1,12 @@
 build/
 build-mkx/
 benchmarks/models/external/
+.venv/
+uv.lock
+runs/
+wandb/
+__pycache__/
+*.pyc
 *.o
 *.dylib
 *.so
