@@ -158,6 +158,42 @@ int main(int argc, char** argv) {
     }
     TEST_END();
 
+    TEST_BEGIN("gpu_cpu_qpos_match_100steps");
+    {
+        // Issue 06: exercises the fast collision kernel's GJK/EPA over real mesh vertex counts (dozens), unlike test_collision_mesh.cpp's 8-vertex cubes.
+        MjmlxBatchedConfig cfg_cpu = {};
+        cfg_cpu.num_envs = 1; cfg_cpu.use_gpu = 0;
+        cfg_cpu.integrator = MJMLX_INTEGRATOR_EULER;
+        auto* sim_cpu = mjmlx_batched_create(model, &cfg_cpu);
+        for (int s = 0; s < 100; s++) mjmlx_batched_step(sim_cpu, nullptr);
+        int n;
+        auto* cpu_qpos = mjmlx_batched_get_qpos(sim_cpu, &n);
+        std::vector<float> cpu_qpos_copy(cpu_qpos, cpu_qpos + nq);
+
+        MjmlxBatchedConfig cfg_gpu = {};
+        cfg_gpu.num_envs = 1; cfg_gpu.use_gpu = 1;
+        cfg_gpu.integrator = MJMLX_INTEGRATOR_EULER;
+        auto* sim_gpu = mjmlx_batched_create(model, &cfg_gpu);
+        for (int s = 0; s < 100; s++) mjmlx_batched_step(sim_gpu, nullptr);
+        auto* gpu_qpos = mjmlx_batched_get_qpos(sim_gpu, &n);
+        auto* gpu_qvel = mjmlx_batched_get_qvel(sim_gpu, &n);
+
+        CHECK_NO_NAN(gpu_qpos, nq, "no NaN/Inf in qpos after 100 GPU steps");
+        CHECK_NO_NAN(gpu_qvel, nv, "no NaN/Inf in qvel after 100 GPU steps");
+
+        float max_diff = 0;
+        for (int i = 0; i < nq; i++) {
+            float d = std::abs(cpu_qpos_copy[i] - gpu_qpos[i]);
+            if (d > max_diff) max_diff = d;
+        }
+        // Coarse bound only: contact-rich trajectories diverge chaotically over many steps (same GPU-CG-vs-CPU-Cholesky solver gap as the 1-step qvel check above).
+        CHECK_LT(max_diff, 2.0f, "qpos: GPU roughly tracks CPU over 100 steps");
+
+        mjmlx_batched_free(sim_cpu);
+        mjmlx_batched_free(sim_gpu);
+    }
+    TEST_END();
+
     // ── Determinism ──────────────────────────────────────────────
 
     TEST_SECTION("Determinism");
