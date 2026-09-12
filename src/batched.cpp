@@ -2994,7 +2994,7 @@ MJMLX_API void mjmlx_batched_get_state(
 {
     if (!sim) return;
     auto& s = sim->sim;
-    mx::eval(s.qpos); mx::eval(s.qvel);
+    mx::eval(s.qpos, s.qvel);
 
     if (nq_out) *nq_out = s.model->nq;
     if (nv_out) *nv_out = s.model->nv;

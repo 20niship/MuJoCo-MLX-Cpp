@@ -2,6 +2,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 
@@ -10,6 +11,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace nb = nanobind;
@@ -64,6 +66,14 @@ struct RlBatchedSim {
     void set_env_qpos(int env_idx, FloatArray qpos_row) { mjmlx_batched_set_env_qpos(handle, env_idx, qpos_row.data(), static_cast<int>(qpos_row.shape(0))); }
     void set_env_qvel(int env_idx, FloatArray qvel_row) { mjmlx_batched_set_env_qvel(handle, env_idx, qvel_row.data(), static_cast<int>(qvel_row.shape(0))); }
 
+    std::pair<FloatArray, FloatArray> state() {
+        std::vector<float> qp(static_cast<size_t>(num_envs) * nq);
+        std::vector<float> qv(static_cast<size_t>(num_envs) * nv);
+        mjmlx_batched_get_state(handle, qp.data(), qv.data(), nullptr, nullptr);
+        return {copy_out(qp.data(), static_cast<int>(qp.size()), num_envs),
+                copy_out(qv.data(), static_cast<int>(qv.size()), num_envs)};
+    }
+
     FloatArray qpos() { int n; auto* p = mjmlx_batched_get_qpos(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray qvel() { int n; auto* p = mjmlx_batched_get_qvel(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray xpos() { int n; auto* p = mjmlx_batched_get_xpos(handle, &n); return copy_out(p, n, num_envs); }
@@ -88,6 +98,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("reset", &RlBatchedSim::reset, nb::arg("mask"))
         .def("set_env_qpos", &RlBatchedSim::set_env_qpos, nb::arg("env_idx"), nb::arg("qpos"))
         .def("set_env_qvel", &RlBatchedSim::set_env_qvel, nb::arg("env_idx"), nb::arg("qvel"))
+        .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)
         .def("xpos", &RlBatchedSim::xpos)

@@ -172,6 +172,11 @@ MJMLX_API void mjmlx_batched_reset(
     MjmlxBatchedSim* sim,
     const int* reset_mask);
 
+// Copies qpos+qvel out in one eval()/sync; cheaper than get_qpos+get_qvel since each mjmlx_batched_get_* call is its own Vulkan submit+wait on MKX.
+MJMLX_API void mjmlx_batched_get_state(
+    const MjmlxBatchedSim* sim, float* qpos_out, float* qvel_out,
+    int* nq_out, int* nv_out);
+
 // Get batched state pointers (zero-copy into MLX unified memory).
 // Returns float[num_envs * dim] for each quantity.
 MJMLX_API const float* mjmlx_batched_get_qpos(const MjmlxBatchedSim* sim, int* n_out);

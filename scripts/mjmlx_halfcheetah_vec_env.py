@@ -46,8 +46,7 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
 
     def _reset_envs(self, mask: np.ndarray) -> None:
         self._sim.reset(mask)
-        base_qpos = self._sim.qpos()
-        base_qvel = self._sim.qvel()
+        base_qpos, base_qvel = self._sim.state()
         idx = np.nonzero(mask)[0]
         for i in idx:
             qpos = base_qpos[i] + self._rng.uniform(-RESET_NOISE_SCALE, RESET_NOISE_SCALE, self.nq).astype(np.float32)
@@ -55,7 +54,7 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
             self._sim.set_env_qpos(int(i), qpos)
             self._sim.set_env_qvel(int(i), qvel)
         self._elapsed[idx] = 0
-        qpos_after = self._sim.qpos()
+        qpos_after, _ = self._sim.state()
         self._prev_x[idx] = qpos_after[idx, 0]
 
     def _obs(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
@@ -66,7 +65,7 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
     def reset(self):
         mask = np.ones(self.num_envs, dtype=np.int32)
         self._reset_envs(mask)
-        qpos, qvel = self._sim.qpos(), self._sim.qvel()
+        qpos, qvel = self._sim.state()
         return self._obs(qpos, qvel)
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -77,7 +76,7 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
         x_before = self._prev_x.copy()
         for _ in range(FRAME_SKIP):
             self._sim.step(self._actions)
-        qpos, qvel = self._sim.qpos(), self._sim.qvel()
+        qpos, qvel = self._sim.state()
 
         x_after = qpos[:, 0]
         forward_vel = (x_after - x_before) / DT
@@ -100,7 +99,7 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
         if len(done_idx) > 0:
             mask = dones.astype(np.int32)
             self._reset_envs(mask)
-            reset_qpos, reset_qvel = self._sim.qpos(), self._sim.qvel()
+            reset_qpos, reset_qvel = self._sim.state()
             reset_obs = self._obs(reset_qpos, reset_qvel)
             obs = obs.copy()
             obs[done_idx] = reset_obs[done_idx]
