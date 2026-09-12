@@ -82,7 +82,8 @@ if(NOT MUJOCO_ROOT)
         "/opt/homebrew"
         "$ENV{HOME}/.mujoco/mujoco-3.0.0"
         "$ENV{HOME}/miniconda3")
-        if(EXISTS "${candidate}/include/mujoco/mujoco.h")
+        file(GLOB _MJ_CANDIDATE_LIB "${candidate}/lib/libmujoco*.dylib" "${candidate}/lib/libmujoco*.so*" "${candidate}/libmujoco*.dylib" "${candidate}/libmujoco*.so*")
+        if(EXISTS "${candidate}/include/mujoco/mujoco.h" AND _MJ_CANDIDATE_LIB)
             set(MUJOCO_ROOT "${candidate}")
             break()
         endif()
@@ -124,7 +125,8 @@ if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
     if(EXISTS "${MUJOCO_ROOT}/lib/libmujoco.dylib")
         set(_MJ_DYLIB_PATH "${MUJOCO_ROOT}/lib/libmujoco.dylib")
     else()
-        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/libmujoco*.dylib" "${MUJOCO_ROOT}/libmujoco*.so*")
+        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/lib/libmujoco*.dylib" "${MUJOCO_ROOT}/lib/libmujoco*.so*"
+                             "${MUJOCO_ROOT}/libmujoco*.dylib" "${MUJOCO_ROOT}/libmujoco*.so*")
         if(_MJ_DYLIB)
             list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
         else()
@@ -153,8 +155,17 @@ elseif(MUJOCO_PKG_DIR AND EXISTS "${MUJOCO_PKG_DIR}/include/mujoco/mujoco.h")
     )
     message(STATUS "MuJoCo (pip): ${MUJOCO_PKG_DIR} -> ${_MJ_DYLIB_PATH}")
 else()
-    message(FATAL_ERROR
-        "Cannot find MuJoCo. Set -DMUJOCO_ROOT=/path/to/mujoco or ensure 'pip install mujoco' is in PATH.")
+    message(STATUS "MuJoCo not found locally; fetching static build via FetchContent (20niship/mujoco@static-lib-3.5.0)")
+    include(FetchContent)
+    set(MUJOCO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(MUJOCO_BUILD_SIMULATE OFF CACHE BOOL "" FORCE)
+    set(MUJOCO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(mujoco_fetch
+        GIT_REPOSITORY https://github.com/20niship/mujoco.git
+        GIT_TAG static-lib-3.5.0
+    )
+    FetchContent_MakeAvailable(mujoco_fetch)
+    add_library(mujoco_imported ALIAS mujoco)
 endif()
 
 # ── Core library: libmjmlx ───────────────────────────────────
