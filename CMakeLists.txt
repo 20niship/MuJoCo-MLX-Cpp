@@ -278,9 +278,18 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    # Self-contained (embeds its own XML fixtures) GPU-vs-CPU batched collision parity test --
+    # no MJMLX_TEST_MODEL needed, so it always runs in CI.
+    add_executable(test_batched_collision_primitives tests/test_batched_collision_primitives.cpp)
+    target_link_libraries(test_batched_collision_primitives PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_batched_collision_primitives PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_math_full test_batched_diag test_linalg_full)
+        foreach(_test test_math_full test_batched_diag test_linalg_full test_batched_collision_primitives)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
@@ -295,7 +304,8 @@ if(MJMLX_BUILD_TESTS)
 
     add_test(NAME math_full COMMAND test_math_full)
     add_test(NAME linalg_full COMMAND test_linalg_full)
-    set_tests_properties(math_full linalg_full PROPERTIES LABELS "correctness")
+    add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
+    set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
 
     # test_metal_synth exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
     if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
