@@ -21,6 +21,48 @@ vec3 msl_norm(vec3 a) {
     float l = msl_len(a);
     return l > 1e-12 ? a / l : vec3(0.0, 0.0, 1.0);
 }
+
+// Generic GJK/EPA support point so plane-X and X-Y contact detection work for any geom-type pair, not just mesh. MuJoCo local-frame convention: sphere size=(radius,_,_), capsule/cylinder size=(radius,halflength,_) axis along local +z, box size=(halfx,halfy,halfz), ellipsoid size=semi-axes.
+vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
+                    int mesh_adr, int mesh_nverts, vec3 dir_world) {
+    vec3 ld = vec3(R[0]*dir_world.x+R[3]*dir_world.y+R[6]*dir_world.z,
+                   R[1]*dir_world.x+R[4]*dir_world.y+R[7]*dir_world.z,
+                   R[2]*dir_world.x+R[5]*dir_world.y+R[8]*dir_world.z);
+    vec3 lp;
+    if (gtype == 2) { // sphere
+        lp = msl_norm(ld) * size.x;
+    } else if (gtype == 4) { // ellipsoid: support(d) = (a^2 dx, b^2 dy, c^2 dz) / |(a dx, b dy, c dz)|
+        vec3 scaled = vec3(size.x*ld.x, size.y*ld.y, size.z*ld.z);
+        float denom = msl_len(scaled);
+        lp = (denom > 1e-12) ? vec3(size.x*scaled.x, size.y*scaled.y, size.z*scaled.z) / denom : vec3(0.0, 0.0, size.z);
+    } else if (gtype == 3) { // capsule
+        vec3 n = msl_norm(ld);
+        float capz = (ld.z >= 0.0) ? size.y : -size.y;
+        lp = vec3(n.x*size.x, n.y*size.x, capz + n.z*size.x);
+    } else if (gtype == 5) { // cylinder: disk (xy) x interval (z)
+        vec2 xy = vec2(ld.x, ld.y);
+        float xyl = length(xy);
+        vec2 xyn = (xyl > 1e-12) ? xy / xyl : vec2(1.0, 0.0);
+        lp = vec3(xyn.x*size.x, xyn.y*size.x, (ld.z >= 0.0) ? size.y : -size.y);
+    } else if (gtype == 6) { // box
+        lp = vec3(ld.x >= 0.0 ? size.x : -size.x,
+                  ld.y >= 0.0 ? size.y : -size.y,
+                  ld.z >= 0.0 ? size.z : -size.z);
+    } else if (gtype == 7) { // mesh: linear scan over vertices
+        float bd = -1e30; int bi = 0;
+        for (int vi = 0; vi < mesh_nverts; vi++) {
+            vec3 v = vec3(mesh_verts[(mesh_adr+vi)*3], mesh_verts[(mesh_adr+vi)*3+1], mesh_verts[(mesh_adr+vi)*3+2]);
+            float dd = msl_dot(v, ld);
+            if (dd > bd) { bd = dd; bi = vi; }
+        }
+        lp = vec3(mesh_verts[(mesh_adr+bi)*3], mesh_verts[(mesh_adr+bi)*3+1], mesh_verts[(mesh_adr+bi)*3+2]);
+    } else {
+        lp = vec3(0.0, 0.0, 0.0);
+    }
+    return vec3(R[0]*lp.x+R[1]*lp.y+R[2]*lp.z+pos.x,
+                R[3]*lp.x+R[4]*lp.y+R[5]*lp.z+pos.y,
+                R[6]*lp.x+R[7]*lp.y+R[8]*lp.z+pos.z);
+}
 )GLSL";
 
   std::ostringstream ss;
@@ -53,25 +95,22 @@ for (int p = 0; p < NUM_PAIRS; p++) {
     float c_pos[3], c_norm[3], c_dist;
     bool has_contact = false;
 
-    if (t1 == 0 && t2 == 7) {
-        int plane_g = g1, mesh_g = g2;
+    if (t1 == 0 || t2 == 0) {
+        int plane_g = (t1 == 0) ? g1 : g2;
+        int xg = (t1 == 0) ? g2 : g1;
+        int xt = (t1 == 0) ? t2 : t1;
         vec3 ppos = vec3(geom_xpos[gx_off+plane_g*3], geom_xpos[gx_off+plane_g*3+1], geom_xpos[gx_off+plane_g*3+2]);
         float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[gm_off+plane_g*9+k];
         vec3 normal = vec3(pR[2], pR[5], pR[8]);
-        vec3 mpos = vec3(geom_xpos[gx_off+mesh_g*3], geom_xpos[gx_off+mesh_g*3+1], geom_xpos[gx_off+mesh_g*3+2]);
-        float mR[9]; for (int k=0;k<9;k++) mR[k] = geom_xmat[gm_off+mesh_g*9+k];
-        int mesh_id = int(geom_dataid_buf[mesh_g]);
-        int adr = int(mesh_vertadr_buf[mesh_id]);
-        int nverts = int(mesh_vertnum_buf[mesh_id]);
-        float best_d = 1e30f; vec3 best_w;
-        for (int i = 0; i < nverts; i++) {
-            vec3 lv = vec3(mesh_verts[adr*3+i*3], mesh_verts[adr*3+i*3+1], mesh_verts[adr*3+i*3+2]);
-            vec3 wv = vec3(mR[0]*lv.x+mR[1]*lv.y+mR[2]*lv.z+mpos.x,
-                                mR[3]*lv.x+mR[4]*lv.y+mR[5]*lv.z+mpos.y,
-                                mR[6]*lv.x+mR[7]*lv.y+mR[8]*lv.z+mpos.z);
-            float d = msl_dot(wv - ppos, normal);
-            if (d < best_d) { best_d = d; best_w = wv; }
-        }
+        vec3 xpos_ = vec3(geom_xpos[gx_off+xg*3], geom_xpos[gx_off+xg*3+1], geom_xpos[gx_off+xg*3+2]);
+        float xR[9]; for (int k=0;k<9;k++) xR[k] = geom_xmat[gm_off+xg*9+k];
+        vec3 xsize = vec3(geom_size_buf[xg*3], geom_size_buf[xg*3+1], geom_size_buf[xg*3+2]);
+        int mesh_id = (xt == 7) ? int(geom_dataid_buf[xg]) : 0;
+        int adr = (xt == 7) ? int(mesh_vertadr_buf[mesh_id]) : 0;
+        int nverts = (xt == 7) ? int(mesh_vertnum_buf[mesh_id]) : 0;
+
+        vec3 best_w = mjmlx_support(xt, xpos_, xR, xsize, adr, nverts, -normal);
+        float best_d = msl_dot(best_w - ppos, normal);
         if (best_d < pair_margin) {
             vec3 cp = best_w - normal * best_d;
             c_pos[0]=cp.x; c_pos[1]=cp.y; c_pos[2]=cp.z;
@@ -79,48 +118,38 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             c_dist = best_d;
             has_contact = true;
         }
-    } else if (t1 == 7 && t2 == 7) {
+    } else {
         vec3 pos1 = vec3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
         vec3 pos2 = vec3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
         float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[gm_off+g1*9+k];
         float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[gm_off+g2*9+k];
-        int mid1 = int(geom_dataid_buf[g1]), mid2 = int(geom_dataid_buf[g2]);
-        int adr1=int(mesh_vertadr_buf[mid1]), nv1=int(mesh_vertnum_buf[mid1]);
-        int adr2=int(mesh_vertadr_buf[mid2]), nv2=int(mesh_vertnum_buf[mid2]);
+        vec3 size1 = vec3(geom_size_buf[g1*3], geom_size_buf[g1*3+1], geom_size_buf[g1*3+2]);
+        vec3 size2 = vec3(geom_size_buf[g2*3], geom_size_buf[g2*3+1], geom_size_buf[g2*3+2]);
+        int mid1 = (t1 == 7) ? int(geom_dataid_buf[g1]) : 0;
+        int mid2 = (t2 == 7) ? int(geom_dataid_buf[g2]) : 0;
+        int adr1 = (t1 == 7) ? int(mesh_vertadr_buf[mid1]) : 0;
+        int adr2 = (t2 == 7) ? int(mesh_vertadr_buf[mid2]) : 0;
+        int nv1 = (t1 == 7) ? int(mesh_vertnum_buf[mid1]) : 0;
+        int nv2 = (t2 == 7) ? int(mesh_vertnum_buf[mid2]) : 0;
 
-        #define SUPPORT_MESH(MID, ADR, NV, GPOS, ROT, DIR, OUT) { \
-            vec3 ld = vec3(ROT[0]*DIR.x+ROT[3]*DIR.y+ROT[6]*DIR.z, \
-                                ROT[1]*DIR.x+ROT[4]*DIR.y+ROT[7]*DIR.z, \
-                                ROT[2]*DIR.x+ROT[5]*DIR.y+ROT[8]*DIR.z); \
-            float bd = -1e30f; int bi = 0; \
-            for (int vi=0;vi<NV;vi++) { \
-                vec3 v=vec3(mesh_verts[ADR*3+vi*3],mesh_verts[ADR*3+vi*3+1],mesh_verts[ADR*3+vi*3+2]); \
-                float dd=msl_dot(v,ld); if(dd>bd){bd=dd;bi=vi;} \
-            } \
-            vec3 lp=vec3(mesh_verts[ADR*3+bi*3],mesh_verts[ADR*3+bi*3+1],mesh_verts[ADR*3+bi*3+2]); \
-            OUT=vec3(ROT[0]*lp.x+ROT[1]*lp.y+ROT[2]*lp.z+GPOS.x, \
-                        ROT[3]*lp.x+ROT[4]*lp.y+ROT[5]*lp.z+GPOS.y, \
-                        ROT[6]*lp.x+ROT[7]*lp.y+ROT[8]*lp.z+GPOS.z); \
-        }
+        #define SUPPORT1(DIR) mjmlx_support(t1, pos1, R1, size1, adr1, nv1, DIR)
+        #define SUPPORT2(DIR) mjmlx_support(t2, pos2, R2, size2, adr2, nv2, DIR)
 
         vec3 dir = pos2 - pos1;
         if (msl_len(dir) < 1e-12f) dir = vec3(1,0,0);
 
         vec3 sdiff[4], sa_pts[4], sb_pts[4];
         int sn = 0;
-        vec3 sup_a, sup_b;
-        SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
-        vec3 neg_dir = -dir;
-        SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+        vec3 sup_a = SUPPORT1(dir);
+        vec3 sup_b = SUPPORT2(-dir);
         sdiff[0] = sup_a - sup_b; sa_pts[0] = sup_a; sb_pts[0] = sup_b;
         sn = 1; dir = -sdiff[0];
         if (msl_len(dir) < 1e-12f) dir = vec3(1,0,0);
         bool gjk_overlap = false;
 
         for (int iter = 0; iter < 32; iter++) {
-            SUPPORT_MESH(mid1, adr1, nv1, pos1, R1, dir, sup_a);
-            neg_dir = -dir;
-            SUPPORT_MESH(mid2, adr2, nv2, pos2, R2, neg_dir, sup_b);
+            sup_a = SUPPORT1(dir);
+            sup_b = SUPPORT2(-dir);
             vec3 new_sd = sup_a - sup_b;
             if (msl_dot(new_sd, dir) < 0.0) break;
             sdiff[sn] = new_sd; sa_pts[sn] = sup_a; sb_pts[sn] = sup_b;
@@ -171,10 +200,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
                 vec3(D,D,D),vec3(-D,D,D),vec3(D,-D,D),vec3(D,D,-D),
                 vec3(-D,-D,D),vec3(-D,D,-D),vec3(D,-D,-D),vec3(-D,-D,-D));
             for (int si=0;si<14;si++) {
-                vec3 d=sd[si],pa,pb;
-                SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
-                vec3 nd=-d;
-                SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                vec3 d=sd[si];
+                vec3 pa=SUPPORT1(d), pb=SUPPORT2(-d);
                 float w=msl_dot(pa-pb,d);
                 if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
             }
@@ -188,10 +215,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
                 if(msl_len(fn)<1e-8f)continue;
                 fn=msl_norm(fn);
                 for(int s=-1;s<=1;s+=2){
-                    vec3 d=fn*float(s),pa,pb;
-                    SUPPORT_MESH(mid1,adr1,nv1,pos1,R1,d,pa);
-                    vec3 nd=-d;
-                    SUPPORT_MESH(mid2,adr2,nv2,pos2,R2,nd,pb);
+                    vec3 d=fn*float(s);
+                    vec3 pa=SUPPORT1(d), pb=SUPPORT2(-d);
                     float w=msl_dot(pa-pb,d);
                     if(w<bw){bw=w;bn=d;bpa=pa;bpb=pb;}
                 }
@@ -202,7 +227,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             c_norm[0]=bn.x;c_norm[1]=bn.y;c_norm[2]=bn.z;
             c_dist=-pen; has_contact=true;
         }
-        #undef SUPPORT_MESH
+        #undef SUPPORT1
+        #undef SUPPORT2
     }
 
     if (has_contact && ncon < MAX_CON) {
@@ -218,7 +244,7 @@ for (int p = 0; p < NUM_PAIRS; p++) {
 contact_count[bid] = float(ncon);
 )GLSLBODY";
 
-  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf"}, {"contact_data", "contact_count"}, ss.str(), header);
+  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"}, {"contact_data", "contact_count"}, ss.str(), header);
 }
 
 } // namespace mjmlx::mkx_kernels

@@ -14,7 +14,7 @@ check: build
 
 # Build then run only the tests that don't depend on the removed single-env pipeline (for CI)
 check-ci: build
-    cd build && ./test_math_full && ./test_linalg_full
+    cd build && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives
 
 # Configure + build the MKX (Vulkan) backend into build-mkx/
 build-mkx:
@@ -25,7 +25,7 @@ build-mkx:
 
 # Build the MKX backend then run its tests (requires a working Vulkan device)
 check-ci-mkx: build-mkx
-    cd build-mkx && ./test_math_full && ./test_linalg_full
+    cd build-mkx && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives
 
 # Build then run the benchmark regression check
 bench: build
