@@ -1,5 +1,110 @@
 # [P1] MKX(mkx/Vulkan)のCPU側グラフ処理・ディスパッチオーバーヘッドを計測・削減する
 
+## 追記3: GPUバッファリークの修正+プーリングで一段の改善(MLX比50〜81%)
+
+追記2で発見したリークを修正した(`OpNode`に型消去された解放コールバック`free_gpu_buffer`を
+追加、バッファ所有ノードでのみ設定、`View`/`CustomKernelOutput`のような別名ノードは未設定の
+ため二重解放なし。shared_ptrの参照カウントが0になった時点で正しく1回解放される)。あわせて
+`VulkanBackend::alloc`/`free`をサイズ別free-listでプーリングし、同一形状バッファを毎eval()で
+`vkCreateBuffer`/`vkAllocateMemory`し直さず使い回すようにした(mlx_vulkan側、
+https://github.com/20niship/mlx_vulkan/pull/1 、mkx_tests 53/2600全pass)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | pool使い回し後 | リーク修正+プーリング後 | MLX比 |
+|---|---|---|---|
+| batched/pendulum | 53,203 steps/sec | 53,211 steps/sec | 約50%(MLX 105,896) |
+| batched/t_shape | 19,473 | 27,511 | 約73%(MLX 37,584) |
+| batched/go2 | 9,566 | 10,899 | 約76%(MLX 14,353) |
+| batched/h1 | 5,935 | 6,349 | 約81%(MLX 7,824) |
+| batched/high_dof_tree | 1,047 | 1,067 | 約135%(既にMLX超え、変化小) |
+
+command buffer統合(追記1)からの累計で見ると、go2は3,128→10,899(**約3.5倍**)、
+t_shapeは9,203→27,511(**約3.0倍**)、h1は3,378→6,349(**約1.9倍**)まで改善した。
+
+**pendulumだけ改善が頭打ちな理由**: nv=1・衝突なしで1ステップあたりの実計算が最小のため、
+残った固定オーバーヘッド(descriptor set割り当て+更新、pipeline barrier、
+`vkCmdBindPipeline`/`vkCmdDispatch`コマンド自体の記録コスト)の比率が他モデルより圧倒的に
+高い。これをさらに削るには複数opを実際に1つのシェーダに融合する(Issue 05で見送った
+fusion実装)が必要で、本セッションのスコープを超える。
+
+**実機Apple Silicon(MLX/Metal)との完全な同等速度(mlxと同等)には未到達**。go2/h1/t_shapeは
+70〜80%程度まで到達したが、pendulumのような極小モデルはfusionなしでは頭打ち。これ以上の
+改善はmlx_vulkan本体へのより大きなアーキテクチャ投資(op fusion)が必要と判断する。
+
+## 追記2: descriptor poolの使い回し、および新たに発見したGPUバッファのリーク
+
+上記のcommand buffer統合に続き、`dispatch()`が呼び出しごとに`vkCreateDescriptorPool`/
+`vkDestroyDescriptorPool`していたのも、バッチ内で1つのpool(64セット分)を使い切るまで
+使い回す形に変更した(mlx_vulkan側追加コミット、mkx_tests 53/2600全pass)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | command buffer統合後 | pool使い回し後 | MLX比 |
+|---|---|---|---|
+| batched/pendulum | 48,353 steps/sec | 53,203 steps/sec | 約50%(MLX 105,896) |
+| batched/t_shape | 24,517 | 19,473(ノイズ大、stddev±20%程度) | 約52%(MLX 37,584) |
+| batched/go2 | 8,449 | 9,566 | 約67%(MLX 14,353) |
+| batched/h1 | 5,640 | 5,935 | 約76%(MLX 7,824) |
+
+**新たに発見した問題(未修正)**: `Backend::free`がコードベース全体で一度も呼ばれておらず、
+`OpNode`にもデストラクタでの解放処理がない(`gpu_buffer`が backend非依存の`void*`で
+型消去されているため、`OpNode`側からは`Backend::free`を直接呼べない設計になっている)。
+つまり**evalのたびに確保されるVulkanバッファ/メモリが一切解放されずリークし続ける。**
+ベンチマークのような短時間実行では顕在化しないが、長時間のRL学習等では実害(GPUメモリ枯渇)
+が出ると推測される。これを直すには`OpNode`に型消去された解放コールバック(例:
+`std::function<void(void*)>`)を持たせるアーキテクチャ変更が必要で、mlx_vulkan本体の
+メモリ所有権モデルに踏み込む変更になる。
+
+残るMLXとのギャップ(50〜76%)の一因は、このリーク潰しとセットで検討すべき「バッファ
+プーリング(同一サイズのバッファをdispatchごとに新規vkAllocateMemoryせず使い回す)」の
+欠如と推測される。毎eval()で同じ形状のバッファをVulkanに新規確保させ続けている以上、
+`vkAllocateMemory`のコストが積み上がる。この対応はより大きなアーキテクチャ変更(リーク
+修正とセット)になるため、本セッションでは着手せず次の課題として記録するに留めた。
+
+## 追記: 根本原因を特定、mlx_vulkan本体(upstream)側を修正
+
+batched/go2・pendulum・t_shapeがMLXに対して著しく遅い(15〜25%程度)原因を`VulkanBackend::dispatch`
+(`mlx_vulkan`本体、`src/mkx/vulkan/vulkan_backend.cpp`)のソースを直接確認して特定した。
+
+**原因**: `dispatch()`が呼び出しごとに独立してcommand buffer/descriptor poolのalloc+begin、
+`vkQueueSubmit`、**`vkQueueWaitIdle`**、free/destroyを行っていた。`mkx::eval<Backend,
+Arrays...>`は複数ノードをトポロジカルソートして順にdispatchする設計だが、dispatchのたびに
+`vkQueueWaitIdle`でGPU完了を待ってしまうため、1回のeval()内にdispatchがN個あれば同期がN回
+発生し、CPU-GPUパイプライニングが完全に阻害されていた(CPU側は次のcommand buffer構築すら
+GPU完了を待ってからしか始められない)。`bench_utils.h`のベンチ実装は複数ステップを走らせた
+後に1回だけ`get_xpos`でevalする設計だが、compile()がno-op(Issue 05)なため各ステップの
+custom kernel(kin/forward/collision/solver/euler、最大5個)がそのままdispatch数として
+積み上がる。1ステップあたりの実計算が小さいモデル(pendulum、go2のnv=18等)ほど固定オーバー
+ヘッドの比率が大きく、逆に計算量が大きいhigh_dof_tree(nv≈69)はMLXと同等以上だったことも
+この説明と整合する。
+
+**修正**: `mlx_vulkan`(20niship/mlx_vulkan)本体を修正し、同一eval()内の複数dispatchを1つの
+command bufferに積み、次の`wait_idle()`でまとめて1回`vkQueueSubmit`+`vkQueueWaitIdle`する形に
+変更した(PR: https://github.com/20niship/mlx_vulkan/pull/1 )。dispatch間はchained op向けの
+保守的なshader write→readバリアで正しさを保っている。`eval<Backend, Arrays...>`/
+`ComputeBackend` conceptのシグネチャは変更していないため、このリポジトリ側の呼び出しコードの
+変更は不要で、`CMakeLists.txt`の`MKX_GIT_TAG`を更新するのみで取り込める。
+
+**検証**: `mkx_tests`(mlx_vulkan本体の53 test cases/2600 assertions)全pass。このリポジトリの
+`test_batched_diag`(Go2/H1)・`test_math_full`・`test_linalg_full`も変更前と完全に同一の
+pass/fail・同一の数値を維持(回帰なし)。
+
+**ベンチマーク(実機Vulkan/MoltenVK、64 envs)**:
+
+| ベンチマーク | mx::eval統合後(このIssueの対応方針1) | command buffer統合後 | 倍率 |
+|---|---|---|---|
+| batched/pendulum | 16,460 steps/sec | 48,353 steps/sec | ×2.9 |
+| batched/t_shape | 9,203 | 24,517 | ×2.7 |
+| batched/go2 | 3,128 | 8,449 | ×2.7 |
+| batched/h1 | 3,378 | 5,640 | ×1.7 |
+| batched/high_dof_tree | 905 | 1,050 | ×1.2 |
+
+MLX比も大幅に改善した(pendulum 16%→46%、t_shape 24%→65%、go2 22%→59%、h1 43%→72%)。
+定量目標「env数に依存しないCPU側オーバーヘッドを500us未満」の直接検証は依然未実施だが、
+支配的要因(dispatchごとの同期待ち)は解消したため、残るギャップは主にGLSL側のGJK/EPA
+カーネル自体の実行時間(MSLとの実装差・コンパイラ差)と推測される(未計測)。
+
 ## 対応状況(対応方針1のみ実施、2・3は未着手)
 
 `src/compat/mx_compat_mkx.h`の`mx::eval(Arrays&... arrs)`(複数配列を1回の呼び出しで渡す形)を、

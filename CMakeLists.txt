@@ -56,7 +56,7 @@ else()
     # ── Fetch MKX (Vulkan-based cross-platform MLX-alike) ──────────
     include(FetchContent)
     find_package(Vulkan REQUIRED)
-    set(MKX_GIT_TAG "04d9c8407cd9ba75b8098b96636930cab4295580" CACHE STRING "mlx_vulkan commit/tag to fetch")
+    set(MKX_GIT_TAG "3eed470f7ed3c36e6d32aeacd15863cae1f7e1c6" CACHE STRING "mlx_vulkan commit/tag to fetch")
     FetchContent_Declare(mkx
         GIT_REPOSITORY https://github.com/20niship/mlx_vulkan.git
         GIT_TAG ${MKX_GIT_TAG}
