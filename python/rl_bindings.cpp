@@ -66,6 +66,14 @@ struct RlBatchedSim {
     void set_env_qpos(int env_idx, FloatArray qpos_row) { mjmlx_batched_set_env_qpos(handle, env_idx, qpos_row.data(), static_cast<int>(qpos_row.shape(0))); }
     void set_env_qvel(int env_idx, FloatArray qvel_row) { mjmlx_batched_set_env_qvel(handle, env_idx, qvel_row.data(), static_cast<int>(qvel_row.shape(0))); }
 
+    void set_state(FloatArray qpos_full, FloatArray qvel_full) {
+        if (static_cast<int>(qpos_full.shape(0)) != num_envs || static_cast<int>(qpos_full.shape(1)) != nq)
+            throw std::runtime_error("mjmlx_rl: qpos must have shape (num_envs, nq)");
+        if (static_cast<int>(qvel_full.shape(0)) != num_envs || static_cast<int>(qvel_full.shape(1)) != nv)
+            throw std::runtime_error("mjmlx_rl: qvel must have shape (num_envs, nv)");
+        mjmlx_batched_set_state(handle, qpos_full.data(), qvel_full.data());
+    }
+
     std::pair<FloatArray, FloatArray> state() {
         std::vector<float> qp(static_cast<size_t>(num_envs) * nq);
         std::vector<float> qv(static_cast<size_t>(num_envs) * nv);
@@ -98,6 +106,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("reset", &RlBatchedSim::reset, nb::arg("mask"))
         .def("set_env_qpos", &RlBatchedSim::set_env_qpos, nb::arg("env_idx"), nb::arg("qpos"))
         .def("set_env_qvel", &RlBatchedSim::set_env_qvel, nb::arg("env_idx"), nb::arg("qvel"))
+        .def("set_state", &RlBatchedSim::set_state, nb::arg("qpos"), nb::arg("qvel"))
         .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)

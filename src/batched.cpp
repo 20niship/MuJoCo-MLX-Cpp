@@ -3039,6 +3039,26 @@ MJMLX_API void mjmlx_batched_get_state(
     }
 }
 
+MJMLX_API void mjmlx_batched_set_state(MjmlxBatchedSim* sim, const float* qpos, const float* qvel) {
+    if (!sim) return;
+
+    if (sim->cpu_mode) {
+        int nq = sim->cpu_model->nq, nv = sim->cpu_model->nv;
+        for (int i = 0; i < sim->sim.num_envs; i++) {
+            mjData* d = sim->cpu_datas[i];
+            if (qpos) for (int j = 0; j < nq; j++) d->qpos[j] = (double)qpos[i * nq + j];
+            if (qvel) for (int j = 0; j < nv; j++) d->qvel[j] = (double)qvel[i * nv + j];
+        }
+        cpu_gather_state(sim);
+        return;
+    }
+
+    auto& s = sim->sim;
+    int B = s.num_envs;
+    if (qpos) s.qpos = mx::reshape(mx::array(qpos, {B * s.model->nq}, mx::float32), {B, s.model->nq});
+    if (qvel) s.qvel = mx::reshape(mx::array(qvel, {B * s.model->nv}, mx::float32), {B, s.model->nv});
+}
+
 MJMLX_API const float* mjmlx_batched_get_qpos(const MjmlxBatchedSim* sim, int* n_out) {
     if (!sim) return nullptr;
     mx::eval(sim->sim.qpos);
@@ -3117,7 +3137,7 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
     int B = s.num_envs;
     int nq = s.model->nq, nv = s.model->nv;
 
-    mx::eval(s.qpos); mx::eval(s.qvel);
+    mx::eval(s.qpos, s.qvel);
     std::vector<float> qp(s.qpos.data<float>(), s.qpos.data<float>() + B * nq);
     std::vector<float> qv(s.qvel.data<float>(), s.qvel.data<float>() + B * nv);
 

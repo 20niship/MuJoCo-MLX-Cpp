@@ -46,16 +46,18 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
 
     def _reset_envs(self, mask: np.ndarray) -> None:
         self._sim.reset(mask)
-        base_qpos, base_qvel = self._sim.state()
+        qpos, qvel = self._sim.state()
         idx = np.nonzero(mask)[0]
-        for i in idx:
-            qpos = base_qpos[i] + self._rng.uniform(-RESET_NOISE_SCALE, RESET_NOISE_SCALE, self.nq).astype(np.float32)
-            qvel = base_qvel[i] + (self._rng.standard_normal(self.nv).astype(np.float32) * RESET_NOISE_SCALE)
-            self._sim.set_env_qpos(int(i), qpos)
-            self._sim.set_env_qvel(int(i), qvel)
+        n = len(idx)
+        if n > 0:
+            # One set_state() call: looping set_env_qpos/qvel per env instead rebuilds+re-syncs the whole B*nq/B*nv array every call, which was killing MKX runs after a few thousand resets.
+            qpos = qpos.copy()
+            qvel = qvel.copy()
+            qpos[idx] += self._rng.uniform(-RESET_NOISE_SCALE, RESET_NOISE_SCALE, (n, self.nq)).astype(np.float32)
+            qvel[idx] += self._rng.standard_normal((n, self.nv)).astype(np.float32) * RESET_NOISE_SCALE
+            self._sim.set_state(qpos, qvel)
         self._elapsed[idx] = 0
-        qpos_after, _ = self._sim.state()
-        self._prev_x[idx] = qpos_after[idx, 0]
+        self._prev_x[idx] = qpos[idx, 0]
 
     def _obs(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
         return np.concatenate([qpos[:, 1:], qvel], axis=1).astype(np.float32)
@@ -78,21 +80,26 @@ class MjmlxHalfCheetahVecEnv(VecEnv):
             self._sim.step(self._actions)
         qpos, qvel = self._sim.state()
 
-        x_after = qpos[:, 0]
-        forward_vel = (x_after - x_before) / DT
+        not_finite = ~np.isfinite(qpos).all(axis=1) | ~np.isfinite(qvel).all(axis=1)
+        # Also terminate on physically-absurd but still-finite state: our approximate (single Newton iteration) solver can ramp a stiff contact up over a few steps before it actually overflows to inf/nan.
+        finite_qpos = np.where(np.isfinite(qpos), qpos, 0.0)
+        finite_qvel = np.where(np.isfinite(qvel), qvel, 0.0)
+        blew_up = not_finite | (np.abs(finite_qpos).max(axis=1) > 100.0) | (np.abs(finite_qvel).max(axis=1) > 1000.0)
+
+        x_after = np.where(blew_up, x_before, qpos[:, 0])
+        forward_vel = np.clip((x_after - x_before) / DT, -50.0, 50.0)
         ctrl_cost = CTRL_COST_WEIGHT * np.sum(np.square(self._actions), axis=1)
-        rewards = (FORWARD_REWARD_WEIGHT * forward_vel - ctrl_cost).astype(np.float32)
+        rewards = np.where(blew_up, 0.0, FORWARD_REWARD_WEIGHT * forward_vel - ctrl_cost).astype(np.float32)
 
         self._elapsed += 1
         truncated = self._elapsed >= MAX_EPISODE_STEPS
-        not_finite = ~np.isfinite(qpos).all(axis=1) | ~np.isfinite(qvel).all(axis=1)
-        dones = truncated | not_finite
+        dones = truncated | blew_up
 
         obs = self._obs(qpos, qvel)
         infos = [{} for _ in range(self.num_envs)]
         done_idx = np.nonzero(dones)[0]
         for i in done_idx:
-            infos[i]["TimeLimit.truncated"] = bool(truncated[i] and not not_finite[i])
+            infos[i]["TimeLimit.truncated"] = bool(truncated[i] and not blew_up[i])
             infos[i]["terminal_observation"] = obs[i].copy()
 
         self._prev_x = x_after.copy()

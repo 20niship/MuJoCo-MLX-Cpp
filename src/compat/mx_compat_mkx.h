@@ -142,6 +142,9 @@ private:
         Backend::upload(buf, data, count * sizeof(float));
         node->gpu_buffer = buf;
         node->evaluated = true;
+        // eval_node() (mlx_vulkan) sets free_gpu_buffer for its own allocations, but this constructor bypasses it entirely -- without this every host-constructed mx::array leaked its GPU buffer.
+        auto* raw_buf = buf;
+        node->free_gpu_buffer = [raw_buf]() { Backend::free(raw_buf); };
         return node;
     }
 
