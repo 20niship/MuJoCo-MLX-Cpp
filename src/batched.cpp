@@ -2626,8 +2626,16 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 mx::fast::kernel_shapes(kin_shapes),
                 std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
             );
-            // xpos(index0)はBatchedSimのstateへ毎step再代入されるため永続バッファ化(issue #14: alloc/free churn削減)。
+            // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
             MX_MARK_PERSISTENT(kin_raw[0], owner);
+            MX_MARK_PERSISTENT(kin_raw[1], owner);
+            MX_MARK_PERSISTENT(kin_raw[2], owner);
+            MX_MARK_PERSISTENT(kin_raw[3], owner);
+            MX_MARK_PERSISTENT(kin_raw[4], owner);
+            MX_MARK_PERSISTENT(kin_raw[5], owner);
+            MX_MARK_PERSISTENT(kin_raw[6], owner);
+            MX_MARK_PERSISTENT(kin_raw[7], owner);
+            MX_MARK_PERSISTENT(kin_raw[8], owner);
             auto kin = mx::fast::kernel_outputs(kin_raw);
 #else
             auto kin = (*ctx->kin_kernel)(
@@ -2677,11 +2685,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                          {B * scratchSz}, {B * nv * 6}}),
                         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                     );
-                    // stateへ再代入されるsubtree_com/cinert/cvel/qfrc_actuator(index2..5)のみ永続化(issue #14)、他は同step内限りの中間値。
+                    // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
+                    MX_MARK_PERSISTENT(fwd_raw[0], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[1], owner);
                     MX_MARK_PERSISTENT(fwd_raw[2], owner);
                     MX_MARK_PERSISTENT(fwd_raw[3], owner);
                     MX_MARK_PERSISTENT(fwd_raw[4], owner);
                     MX_MARK_PERSISTENT(fwd_raw[5], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[6], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[7], owner);
                     fwd = mx::fast::kernel_outputs(fwd_raw);
                 }
 #else
@@ -2726,6 +2738,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
                             std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                         );
+                        // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
+                        MX_MARK_PERSISTENT(coll_raw[0], owner);
+                        MX_MARK_PERSISTENT(coll_raw[1], owner);
                         coll = mx::fast::kernel_outputs(coll_raw);
                     }
 #else
@@ -2756,6 +2771,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
+                            // shapeは毎step固定のため永続化(issue #14)。
+                            MX_MARK_PERSISTENT(solver_raw[0], owner);
+                            MX_MARK_PERSISTENT(solver_raw[1], owner);
                             solver = mx::fast::kernel_outputs(solver_raw);
                         }
 #else
@@ -2812,16 +2830,19 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 #if defined(MJMLX_BACKEND_MKX)
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
             auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
-            // qpos/qvel(index0,1)はstateへ再代入されるため永続化(issue #14)、devmemのL scratch(index3)は対象外。
+            // shapeは毎step固定のため全出力永続化(issue #14)。
             if (ctx->euler_kernel.has_value()) {
                 auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
                 MX_MARK_PERSISTENT(raw[0], owner);
                 MX_MARK_PERSISTENT(raw[1], owner);
+                MX_MARK_PERSISTENT(raw[2], owner);
                 euler = mx::fast::kernel_outputs(raw);
             } else {
                 auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup);
                 MX_MARK_PERSISTENT(raw[0], owner);
                 MX_MARK_PERSISTENT(raw[1], owner);
+                MX_MARK_PERSISTENT(raw[2], owner);
+                MX_MARK_PERSISTENT(raw[3], owner);
                 euler = mx::fast::kernel_outputs(raw);
             }
 #else
