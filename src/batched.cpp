@@ -2491,7 +2491,7 @@ static std::vector<mx::array> mkx_vmap_batch0(
 #endif
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override) {
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override, const void* owner) {
     m.init_cache();
     auto ctx = build_context(m, solver_iterations_override);
     int B = num_envs;
@@ -2568,7 +2568,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
         }
 
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
-            [ctx, vmapped_fwd, model_override, use_metal_fwd, B, nq, nv, nu, nb, nj, ng](
+            [ctx, vmapped_fwd, model_override, use_metal_fwd, B, nq, nv, nu, nb, nj, ng, owner](
                 const std::vector<mx::array>& state) -> std::vector<mx::array>
         {
             auto qpos_batch = state[0];
@@ -2586,6 +2586,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},
             };
 #if defined(MJMLX_BACKEND_MKX)
+            // xpos(index0)はBatchedSimのstateへ毎step再代入されるため永続バッファ化(issue #14: alloc/free churn削減)。
+            std::vector<void*> kin_prealloc(kin_shapes.size(), nullptr);
+            kin_prealloc[0] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 3) * sizeof(float));
             auto kin_raw = (*ctx->kin_kernel)(
                 mx::fast::kernel_inputs({ctx->body_parentid, ctx->body_pos, ctx->body_quat,
                  ctx->body_ipos, ctx->body_iquat,
@@ -2596,7 +2599,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1},
+                kin_prealloc
             );
             auto kin = mx::fast::kernel_outputs(kin_raw);
 #else
@@ -2637,6 +2641,12 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 std::vector<mx::array> fwd;
 #if defined(MJMLX_BACKEND_MKX)
                 {
+                    // stateへ再代入されるsubtree_com/cinert/cvel/qfrc_actuator(index2..5)のみ永続化(issue #14)、他は同step内限りの中間値。
+                    std::vector<void*> fwd_prealloc(8, nullptr);
+                    fwd_prealloc[2] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 3) * sizeof(float));
+                    fwd_prealloc[3] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 10) * sizeof(float));
+                    fwd_prealloc[4] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 6) * sizeof(float));
+                    fwd_prealloc[5] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nv) * sizeof(float));
                     auto fwd_raw = (*ctx->forward_kernel)(
                         mx::fast::kernel_inputs({mx::flatten(xipos), mx::flatten(ximat),
                          mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
@@ -2645,7 +2655,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1},
+                        fwd_prealloc
                     );
                     fwd = mx::fast::kernel_outputs(fwd_raw);
                 }
@@ -2777,11 +2788,16 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 #if defined(MJMLX_BACKEND_MKX)
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
             auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
+            // qpos/qvel(index0,1)はstateへ再代入されるため永続化(issue #14)、devmemのL scratch(index3)は対象外。
+            void* euler_qpos_buf = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nq) * sizeof(float));
+            void* euler_qvel_buf = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nv) * sizeof(float));
             if (ctx->euler_kernel.has_value()) {
-                auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
+                std::vector<void*> prealloc = {euler_qpos_buf, euler_qvel_buf, nullptr};
+                auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup, prealloc);
                 euler = mx::fast::kernel_outputs(raw);
             } else {
-                auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup);
+                std::vector<void*> prealloc = {euler_qpos_buf, euler_qvel_buf, nullptr, nullptr};
+                auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup, prealloc);
                 euler = mx::fast::kernel_outputs(raw);
             }
 #else
@@ -2978,7 +2994,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             handle->sim.qvel = mx::stack(qvel_list);
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
-                model->model, B, config->use_gpu, config->solver_iterations);
+                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
         }
 
         return handle;
@@ -3202,6 +3218,9 @@ MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx,
 }
 
 MJMLX_API void mjmlx_batched_free(MjmlxBatchedSim* sim) {
+#if defined(MJMLX_BACKEND_MKX)
+    if (sim) mx::release_persistent_for_owner(&sim->sim);
+#endif
     delete sim;
 }
 
