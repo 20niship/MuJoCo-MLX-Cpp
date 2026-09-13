@@ -2452,8 +2452,36 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 // ── Hybrid batched step ──────────────────────────────────────────────────────
 
 #if defined(MJMLX_BACKEND_MKX)
-// mkx::vmap only supports one input/output; this generalizes its own slice/reshape/concatenate loop (mkx/ops/transforms.hpp) to forward_fn's 12 inputs/9 outputs, all batched on axis 0.
+// mkx::vmap(fn, batched_inputs)相当(issue #14): fnをグラフ複製なしで1回だけ呼ぶ。mx_compat_mkx.hのsum/sum_axis/matmul/reshape等はvmap-awareなmkx::側へ委譲済みなのでfn自体(forward_fn)は書き換え不要。
 static std::vector<mx::array> mkx_vmap_batch0(
+    const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>& fn,
+    const std::vector<mx::array>& batched_inputs, int batch_size)
+{
+    std::function<std::vector<mx::Raw<float>>(const std::vector<mx::Raw<float>>&)> raw_fn =
+        [&fn](const std::vector<mx::Raw<float>>& raw_in) -> std::vector<mx::Raw<float>> {
+        std::vector<mx::array> mx_in;
+        mx_in.reserve(raw_in.size());
+        for (auto& r : raw_in) mx_in.push_back(mx::from_raw(r.node(), mx::Dtype::Float32));
+        auto mx_out = fn(mx_in);
+        std::vector<mx::Raw<float>> raw_out;
+        raw_out.reserve(mx_out.size());
+        for (auto& o : mx_out) raw_out.push_back(mx::to_raw(o));
+        return raw_out;
+    };
+    std::vector<mx::Raw<float>> raw_inputs;
+    raw_inputs.reserve(batched_inputs.size());
+    for (auto& in : batched_inputs) raw_inputs.push_back(mx::to_raw(in));
+
+    auto raw_results = mkx::vmap<mx::Backend>(raw_fn, raw_inputs);
+
+    std::vector<mx::array> results;
+    results.reserve(raw_results.size());
+    for (auto& r : raw_results) results.push_back(mx::from_raw(r.node(), mx::Dtype::Float32));
+    return results;
+}
+
+// 旧実装(1envずつslice->fn呼び出し->concatenate、グラフをbatch_size分複製する)。比較用に残す。
+static std::vector<mx::array> mkx_vmap_batch0_slice_loop(
     const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>& fn,
     const std::vector<mx::array>& batched_inputs, int batch_size)
 {
