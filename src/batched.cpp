@@ -2165,7 +2165,7 @@ MJMLX_API MetalCollisionResult test_metal_solver(
 #if defined(MJMLX_BACKEND_MLX)
 using KernelFn = mx::fast::CustomKernelFunction;
 #else
-using KernelFn = mkx::fast::Kernel;
+using KernelFn = mkx::fast::Kernel<>;
 #endif
 
 struct BatchedStepContext {
@@ -2586,9 +2586,6 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},
             };
 #if defined(MJMLX_BACKEND_MKX)
-            // xpos(index0)はBatchedSimのstateへ毎step再代入されるため永続バッファ化(issue #14: alloc/free churn削減)。
-            std::vector<void*> kin_prealloc(kin_shapes.size(), nullptr);
-            kin_prealloc[0] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 3) * sizeof(float));
             auto kin_raw = (*ctx->kin_kernel)(
                 mx::fast::kernel_inputs({ctx->body_parentid, ctx->body_pos, ctx->body_quat,
                  ctx->body_ipos, ctx->body_iquat,
@@ -2599,9 +2596,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1},
-                kin_prealloc
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
             );
+            // xpos(index0)はBatchedSimのstateへ毎step再代入されるため永続バッファ化(issue #14: alloc/free churn削減)。
+            MX_MARK_PERSISTENT(kin_raw[0], owner);
             auto kin = mx::fast::kernel_outputs(kin_raw);
 #else
             auto kin = (*ctx->kin_kernel)(
@@ -2641,12 +2639,6 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 std::vector<mx::array> fwd;
 #if defined(MJMLX_BACKEND_MKX)
                 {
-                    // stateへ再代入されるsubtree_com/cinert/cvel/qfrc_actuator(index2..5)のみ永続化(issue #14)、他は同step内限りの中間値。
-                    std::vector<void*> fwd_prealloc(8, nullptr);
-                    fwd_prealloc[2] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 3) * sizeof(float));
-                    fwd_prealloc[3] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 10) * sizeof(float));
-                    fwd_prealloc[4] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nb * 6) * sizeof(float));
-                    fwd_prealloc[5] = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nv) * sizeof(float));
                     auto fwd_raw = (*ctx->forward_kernel)(
                         mx::fast::kernel_inputs({mx::flatten(xipos), mx::flatten(ximat),
                          mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
@@ -2655,9 +2647,13 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1},
-                        fwd_prealloc
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                     );
+                    // stateへ再代入されるsubtree_com/cinert/cvel/qfrc_actuator(index2..5)のみ永続化(issue #14)、他は同step内限りの中間値。
+                    MX_MARK_PERSISTENT(fwd_raw[2], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[3], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[4], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[5], owner);
                     fwd = mx::fast::kernel_outputs(fwd_raw);
                 }
 #else
@@ -2789,15 +2785,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
             auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
             // qpos/qvel(index0,1)はstateへ再代入されるため永続化(issue #14)、devmemのL scratch(index3)は対象外。
-            void* euler_qpos_buf = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nq) * sizeof(float));
-            void* euler_qvel_buf = MX_PERSISTENT_BUF(owner, static_cast<size_t>(B * nv) * sizeof(float));
             if (ctx->euler_kernel.has_value()) {
-                std::vector<void*> prealloc = {euler_qpos_buf, euler_qvel_buf, nullptr};
-                auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup, prealloc);
+                auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
+                MX_MARK_PERSISTENT(raw[0], owner);
+                MX_MARK_PERSISTENT(raw[1], owner);
                 euler = mx::fast::kernel_outputs(raw);
             } else {
-                std::vector<void*> prealloc = {euler_qpos_buf, euler_qvel_buf, nullptr, nullptr};
-                auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup, prealloc);
+                auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup);
+                MX_MARK_PERSISTENT(raw[0], owner);
+                MX_MARK_PERSISTENT(raw[1], owner);
                 euler = mx::fast::kernel_outputs(raw);
             }
 #else
