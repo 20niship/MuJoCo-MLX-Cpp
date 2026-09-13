@@ -626,7 +626,7 @@ Data rne_post_constraint(const Model& m, Data d);
 
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0);
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0, const void* owner = nullptr);
 
 // ── Vmap-compatible functions (pure MLX graph, no eval/data) ──
 
