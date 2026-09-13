@@ -5,6 +5,7 @@
 #include <mkx/core/eval.hpp>
 #include <mkx/core/fuse.hpp>
 #include <mkx/core/op_node.hpp>
+#include <mkx/core/persistent.hpp>
 #include <mkx/core/types.hpp>
 #include <mkx/ops/creation.hpp>
 #include <mkx/ops/elementwise.hpp>
@@ -416,57 +417,11 @@ inline void eval(std::initializer_list<array> arrs) {
     Backend::wait_idle();
 }
 
-namespace detail {
+// mlx_vulkan本体のpersistent_buffer<Backend>()/release_persistent_for_owner<Backend>()への薄いラッパー(issue #14)。
+inline void* persistent_buffer(const void* owner, uint64_t loc_id, size_t nbytes) { return mkx::persistent_buffer<Backend>(owner, loc_id, nbytes); }
+inline void release_persistent_for_owner(const void* owner) { mkx::release_persistent_for_owner<Backend>(owner); }
 
-struct PersistentKey {
-    uint64_t loc_id;
-    const void* owner;
-    bool operator==(const PersistentKey& o) const { return loc_id == o.loc_id && owner == o.owner; }
-};
-struct PersistentKeyHash {
-    size_t operator()(const PersistentKey& k) const {
-        return std::hash<uint64_t>{}(k.loc_id) ^ (std::hash<const void*>{}(k.owner) << 1);
-    }
-};
-// (呼び出し場所, owner)単位でBackend::Buffer*を使い回すレジストリ(issue #14: 毎stepのalloc/free churn削減)。
-inline std::unordered_map<PersistentKey, Backend::Buffer*, PersistentKeyHash>& persistent_registry() {
-    static std::unordered_map<PersistentKey, Backend::Buffer*, PersistentKeyHash> reg;
-    return reg;
-}
-
-} // namespace detail
-
-inline uint64_t persistent_location_hash(const char* file, int line) {
-    return std::hash<std::string>{}(std::string(file) + ":" + std::to_string(line));
-}
-
-// 同じ(loc_id, owner)の2回目以降の呼び出しはalloc/freeせず既存Bufferを返す(mkx::fast::Kernelのpreallocated_outputsに渡す用)。
-inline void* persistent_buffer(const void* owner, uint64_t loc_id, size_t nbytes) {
-    detail::PersistentKey key{loc_id, owner};
-    auto& reg = detail::persistent_registry();
-    auto it = reg.find(key);
-    if (it != reg.end()) return it->second;
-    auto* buf = Backend::alloc(nbytes);
-    Backend::register_persistent(buf);
-    reg.emplace(key, buf);
-    return buf;
-}
-
-// ownerに紐づく永続バッファを全解放する(mjmlx_batched_free()から1回呼ぶ)。
-inline void release_persistent_for_owner(const void* owner) {
-    auto& reg = detail::persistent_registry();
-    for (auto it = reg.begin(); it != reg.end();) {
-        if (it->first.owner == owner) {
-            Backend::unregister_persistent(it->second);
-            Backend::free(it->second);
-            it = reg.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-#define MX_PERSISTENT_BUF(owner, nbytes) mx::persistent_buffer((owner), mx::persistent_location_hash(__FILE__, __LINE__), (nbytes))
+#define MX_PERSISTENT_BUF(owner, nbytes) MKX_PERSISTENT_BUF(mx::Backend, (owner), (nbytes))
 
 // 要素単位演算+形状変換をoperator fusionする(mkx::eval_fused、他は従来通り個別dispatch)。
 template <class Fn> auto compile(Fn fn) {
