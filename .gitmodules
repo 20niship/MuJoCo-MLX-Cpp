@@ -1,0 +1,3 @@
+[submodule "extern/mlx_vulkan"]
+	path = extern/mlx_vulkan
+	url = https://github.com/20niship/mlx_vulkan.git
