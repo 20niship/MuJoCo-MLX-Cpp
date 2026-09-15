@@ -1,0 +1,29 @@
+# CI(build-mkx job, .github/workflows/ci.yml)のubuntu-latest + lavapipe環境を再現するDockerfile。
+# test_linalg_fullのセグフォ(既知・本ブランチと無関係)をローカルUbuntuで再現・調査する用途。
+#
+# 使い方:
+#   docker build -f Dockerfile.ci-mkx -t mkx-ci-repro .
+#   docker run --rm mkx-ci-repro
+#
+# コンテナに入って手動デバッグする場合:
+#   docker run --rm -it --entrypoint bash mkx-ci-repro
+#   (コンテナ内で) cd build-mkx && gdb -batch -ex run -ex bt --args ./test_linalg_full
+
+FROM ubuntu:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    vulkan-tools mesa-vulkan-drivers libvulkan-dev glslang-tools \
+    cmake g++ git curl python3-pip python3-venv ca-certificates gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+
+WORKDIR /work
+COPY . /work
+
+RUN pip install --break-system-packages mujoco==3.5.0
+ENV MUJOCO_ROOT=/usr/lib/python3/dist-packages/mujoco
+
+CMD ["just", "check-ci-mkx"]

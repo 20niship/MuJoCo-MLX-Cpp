@@ -2,16 +2,25 @@
 // Run this ONCE before starting conformance work to capture starting metrics.
 // Subsequent phase benchmarks compare against these baselines.
 //
-// Usage: bench_baseline [humanoid.xml] [csv_path] [go2.xml] [h1.xml] -- any model path may be "".
+// Usage: bench_baseline [humanoid.xml] [csv_path] [go2.xml] [h1.xml] -- omitted go2/h1 fall back to fetch_models.sh's default paths.
 
 #include "test_utils.h"
 #include "bench_utils.h"
 #include "test_models.h"
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
+
+// Env counts swept for every batched benchmark below.
+static const std::vector<int> kEnvSweep = {64, 128, 256, 512, 1024, 2048, 4096};
+
+// Fallback path when the model isn't passed on argv, relative to this file's repo root.
+static std::string default_bench_path(const char* rel_to_repo_root) {
+    return (std::filesystem::path(__FILE__).parent_path() / ".." / rel_to_repo_root).string();
+}
 
 int main(int argc, char** argv) {
     const char* humanoid_path = nullptr;
@@ -19,8 +28,14 @@ int main(int argc, char** argv) {
         humanoid_path = argv[1];
     }
     const char* csv_path = (argc >= 3) ? argv[2] : "benchmarks/baseline.csv";
-    const char* go2_path = (argc >= 4 && strlen(argv[3]) > 0) ? argv[3] : nullptr;
-    const char* h1_path = (argc >= 5 && strlen(argv[4]) > 0) ? argv[4] : nullptr;
+
+    static const std::string kGo2Default =
+        default_bench_path("benchmarks/models/external/mujoco_menagerie/unitree_go2/scene.xml");
+    static const std::string kH1Default =
+        default_bench_path("benchmarks/models/external/mujoco_menagerie/unitree_h1/scene.xml");
+
+    const char* go2_path = (argc >= 4 && strlen(argv[3]) > 0) ? argv[3] : kGo2Default.c_str();
+    const char* h1_path = (argc >= 5 && strlen(argv[4]) > 0) ? argv[4] : kH1Default.c_str();
 
     printf("=== MuJoCo-MLX-Cpp Baseline Benchmarks ===\n");
     printf("Git: %s\n\n", bench_git_hash().c_str());
@@ -75,47 +90,58 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── Batched benchmarks (GPU path, 64 envs) ──────────────────────────────
+    // ── Batched benchmarks (GPU path, env sweep) ────────────────────────────
 
-    printf("\n--- Batched Benchmarks (64 envs, GPU) ---\n");
+    printf("\n--- Batched Benchmarks (env sweep %d..%d, GPU) ---\n", kEnvSweep.front(), kEnvSweep.back());
 
     // try/catch per benchmark: one throwing (e.g. Metal resource-limit error) must not lose results already collected.
-    try {
-        auto s = bench_batched_step("batched/pendulum", "pendulum", SIMPLE_PENDULUM_XML, 64, 20, 1, 3);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/pendulum: %s\n", e.what());
-    }
-
-    try {
-        auto s = bench_batched_step("batched/t_shape", "t_shape", T_SHAPE_XML, 64, 20, 1, 3);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/t_shape: %s\n", e.what());
-    }
-
-    for (auto& mp : std::vector<std::pair<const char*, const char*>>{
-             {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
-        std::string name = std::string("batched/") + mp.first;
+    for (int num_envs : kEnvSweep) {
+        std::string name = "batched/pendulum/" + std::to_string(num_envs);
         try {
-            auto s = bench_batched_step_file(name.c_str(), mp.first, mp.second, 32, 20, 1, 3);
-            if (s.steps_per_sec > 0) {
-                _bench_results.push_back(s);
-                bench_print_stats(s);
-            }
+            auto s = bench_batched_step(name.c_str(), "pendulum", SIMPLE_PENDULUM_XML, num_envs, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
         } catch (const std::exception& e) {
             printf("  CRASH %s: %s\n", name.c_str(), e.what());
         }
     }
 
-    try {
-        auto s = bench_batched_step("batched/high_dof_tree", "high_dof_tree", HIGH_DOF_TREE_XML, 16, 10, 1, 2);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/high_dof_tree: %s\n", e.what());
+    for (int num_envs : kEnvSweep) {
+        std::string name = "batched/t_shape/" + std::to_string(num_envs);
+        try {
+            auto s = bench_batched_step(name.c_str(), "t_shape", T_SHAPE_XML, num_envs, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
+    }
+
+    for (auto& mp : std::vector<std::pair<const char*, const char*>>{
+             {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
+        for (int num_envs : kEnvSweep) {
+            std::string name = std::string("batched/") + mp.first + "/" + std::to_string(num_envs);
+            try {
+                auto s = bench_batched_step_file(name.c_str(), mp.first, mp.second, num_envs, 20, 1, 3);
+                if (s.steps_per_sec > 0) {
+                    _bench_results.push_back(s);
+                    bench_print_stats(s);
+                }
+            } catch (const std::exception& e) {
+                printf("  CRASH %s: %s\n", name.c_str(), e.what());
+            }
+        }
+    }
+
+    for (int num_envs : kEnvSweep) {
+        std::string name = "batched/high_dof_tree/" + std::to_string(num_envs);
+        try {
+            auto s = bench_batched_step(name.c_str(), "high_dof_tree", HIGH_DOF_TREE_XML, num_envs, 10, 1, 2);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
     }
 
     // ── Summary and CSV output ───────────────────────────────────────────────
