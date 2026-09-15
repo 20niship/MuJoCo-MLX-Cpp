@@ -2479,43 +2479,6 @@ static std::vector<mx::array> mkx_vmap_batch0(
     for (auto& r : raw_results) results.push_back(mx::from_raw(r.node(), mx::Dtype::Float32));
     return results;
 }
-
-// 旧実装(1envずつslice->fn呼び出し->concatenate、グラフをbatch_size分複製する)。比較用に残す。
-static std::vector<mx::array> mkx_vmap_batch0_slice_loop(
-    const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>& fn,
-    const std::vector<mx::array>& batched_inputs, int batch_size)
-{
-    std::vector<std::vector<mx::array>> per_env(static_cast<size_t>(batch_size));
-    for (int b = 0; b < batch_size; b++) {
-        std::vector<mx::array> sliced;
-        sliced.reserve(batched_inputs.size());
-        for (auto& in : batched_inputs) {
-            mx::Shape shp = in.shape();
-            mx::Shape starts(shp.size(), 0), stops = shp;
-            starts[0] = b;
-            stops[0] = b + 1;
-            mx::array s = mx::slice(in, starts, stops);
-            mx::Shape squeezed(shp.begin() + 1, shp.end());
-            sliced.push_back(mx::reshape(s, squeezed));
-        }
-        per_env[static_cast<size_t>(b)] = fn(sliced);
-    }
-    size_t num_outputs = per_env[0].size();
-    std::vector<mx::array> result;
-    result.reserve(num_outputs);
-    for (size_t o = 0; o < num_outputs; o++) {
-        std::vector<mx::array> pieces;
-        pieces.reserve(static_cast<size_t>(batch_size));
-        for (int b = 0; b < batch_size; b++) {
-            mx::Shape shp = per_env[static_cast<size_t>(b)][o].shape();
-            mx::Shape unsq = shp;
-            unsq.insert(unsq.begin(), 1);
-            pieces.push_back(mx::reshape(per_env[static_cast<size_t>(b)][o], unsq));
-        }
-        result.push_back(mx::concatenate(pieces, 0));
-    }
-    return result;
-}
 #endif
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
