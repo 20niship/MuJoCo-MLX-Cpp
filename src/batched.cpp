@@ -1292,9 +1292,24 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
+// S_*オフセット計算はmake_solver_source()/make_solver_kernel()と完全一致させる(MAX_EFC区画は5でなく6個: D/AREF/FORCE/JAREF/ACTIVE/JVで、以前はここが1区画分小さくGPUバッファ範囲外書き込みを起こしていた)。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+    int S_H = 0;
+    int S_J = S_H + nv * nv;
+    int S_D = S_J + MAX_EFC * nv;
+    int S_AREF = S_D + MAX_EFC;
+    int S_FORCE = S_AREF + MAX_EFC;
+    int S_GRAD = S_FORCE + MAX_EFC;
+    int S_SEARCH = S_GRAD + nv;
+    int S_QACC = S_SEARCH + nv;
+    int S_MA = S_QACC + nv;
+    int S_JAREF = S_MA + nv;
+    int S_ACTIVE = S_JAREF + MAX_EFC;
+    int S_MV = S_ACTIVE + MAX_EFC;
+    int S_JV = S_MV + nv;
+    int S_JACP = S_JV + MAX_EFC;
+    return S_JACP + nv * 3;
 }
 
 // Build solver pair properties buffer (18 floats per pair)

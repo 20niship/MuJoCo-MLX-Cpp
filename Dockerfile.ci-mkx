@@ -9,7 +9,7 @@
 #   docker run --rm -it --entrypoint bash mkx-ci-repro
 #   (コンテナ内で) cd build-mkx && gdb -batch -ex run -ex bt --args ./test_linalg_full
 
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
