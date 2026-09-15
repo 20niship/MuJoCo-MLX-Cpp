@@ -2165,7 +2165,7 @@ MJMLX_API MetalCollisionResult test_metal_solver(
 #if defined(MJMLX_BACKEND_MLX)
 using KernelFn = mx::fast::CustomKernelFunction;
 #else
-using KernelFn = mkx::fast::Kernel;
+using KernelFn = mkx::fast::Kernel<>;
 #endif
 
 struct BatchedStepContext {
@@ -2452,46 +2452,37 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 // ── Hybrid batched step ──────────────────────────────────────────────────────
 
 #if defined(MJMLX_BACKEND_MKX)
-// mkx::vmap only supports one input/output; this generalizes its own slice/reshape/concatenate loop (mkx/ops/transforms.hpp) to forward_fn's 12 inputs/9 outputs, all batched on axis 0.
+// mkx::vmap(fn, batched_inputs)相当(issue #14): fnをグラフ複製なしで1回だけ呼ぶ。mx_compat_mkx.hのsum/sum_axis/matmul/reshape等はvmap-awareなmkx::側へ委譲済みなのでfn自体(forward_fn)は書き換え不要。
 static std::vector<mx::array> mkx_vmap_batch0(
     const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>& fn,
     const std::vector<mx::array>& batched_inputs, int batch_size)
 {
-    std::vector<std::vector<mx::array>> per_env(static_cast<size_t>(batch_size));
-    for (int b = 0; b < batch_size; b++) {
-        std::vector<mx::array> sliced;
-        sliced.reserve(batched_inputs.size());
-        for (auto& in : batched_inputs) {
-            mx::Shape shp = in.shape();
-            mx::Shape starts(shp.size(), 0), stops = shp;
-            starts[0] = b;
-            stops[0] = b + 1;
-            mx::array s = mx::slice(in, starts, stops);
-            mx::Shape squeezed(shp.begin() + 1, shp.end());
-            sliced.push_back(mx::reshape(s, squeezed));
-        }
-        per_env[static_cast<size_t>(b)] = fn(sliced);
-    }
-    size_t num_outputs = per_env[0].size();
-    std::vector<mx::array> result;
-    result.reserve(num_outputs);
-    for (size_t o = 0; o < num_outputs; o++) {
-        std::vector<mx::array> pieces;
-        pieces.reserve(static_cast<size_t>(batch_size));
-        for (int b = 0; b < batch_size; b++) {
-            mx::Shape shp = per_env[static_cast<size_t>(b)][o].shape();
-            mx::Shape unsq = shp;
-            unsq.insert(unsq.begin(), 1);
-            pieces.push_back(mx::reshape(per_env[static_cast<size_t>(b)][o], unsq));
-        }
-        result.push_back(mx::concatenate(pieces, 0));
-    }
-    return result;
+    std::function<std::vector<mx::Raw<float>>(const std::vector<mx::Raw<float>>&)> raw_fn =
+        [&fn](const std::vector<mx::Raw<float>>& raw_in) -> std::vector<mx::Raw<float>> {
+        std::vector<mx::array> mx_in;
+        mx_in.reserve(raw_in.size());
+        for (auto& r : raw_in) mx_in.push_back(mx::from_raw(r.node(), mx::Dtype::Float32));
+        auto mx_out = fn(mx_in);
+        std::vector<mx::Raw<float>> raw_out;
+        raw_out.reserve(mx_out.size());
+        for (auto& o : mx_out) raw_out.push_back(mx::to_raw(o));
+        return raw_out;
+    };
+    std::vector<mx::Raw<float>> raw_inputs;
+    raw_inputs.reserve(batched_inputs.size());
+    for (auto& in : batched_inputs) raw_inputs.push_back(mx::to_raw(in));
+
+    auto raw_results = mkx::vmap<mx::Backend>(raw_fn, raw_inputs);
+
+    std::vector<mx::array> results;
+    results.reserve(raw_results.size());
+    for (auto& r : raw_results) results.push_back(mx::from_raw(r.node(), mx::Dtype::Float32));
+    return results;
 }
 #endif
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override) {
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override, const void* owner) {
     m.init_cache();
     auto ctx = build_context(m, solver_iterations_override);
     int B = num_envs;
@@ -2568,7 +2559,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
         }
 
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> pipeline =
-            [ctx, vmapped_fwd, model_override, use_metal_fwd, B, nq, nv, nu, nb, nj, ng](
+            [ctx, vmapped_fwd, model_override, use_metal_fwd, B, nq, nv, nu, nb, nj, ng, owner](
                 const std::vector<mx::array>& state) -> std::vector<mx::array>
         {
             auto qpos_batch = state[0];
@@ -2598,6 +2589,16 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 mx::fast::kernel_shapes(kin_shapes),
                 std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
             );
+            // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
+            MX_MARK_PERSISTENT(kin_raw[0], owner);
+            MX_MARK_PERSISTENT(kin_raw[1], owner);
+            MX_MARK_PERSISTENT(kin_raw[2], owner);
+            MX_MARK_PERSISTENT(kin_raw[3], owner);
+            MX_MARK_PERSISTENT(kin_raw[4], owner);
+            MX_MARK_PERSISTENT(kin_raw[5], owner);
+            MX_MARK_PERSISTENT(kin_raw[6], owner);
+            MX_MARK_PERSISTENT(kin_raw[7], owner);
+            MX_MARK_PERSISTENT(kin_raw[8], owner);
             auto kin = mx::fast::kernel_outputs(kin_raw);
 #else
             auto kin = (*ctx->kin_kernel)(
@@ -2647,6 +2648,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                          {B * scratchSz}, {B * nv * 6}}),
                         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                     );
+                    // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
+                    MX_MARK_PERSISTENT(fwd_raw[0], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[1], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[2], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[3], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[4], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[5], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[6], owner);
+                    MX_MARK_PERSISTENT(fwd_raw[7], owner);
                     fwd = mx::fast::kernel_outputs(fwd_raw);
                 }
 #else
@@ -2691,6 +2701,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
                             std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
                         );
+                        // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
+                        MX_MARK_PERSISTENT(coll_raw[0], owner);
+                        MX_MARK_PERSISTENT(coll_raw[1], owner);
                         coll = mx::fast::kernel_outputs(coll_raw);
                     }
 #else
@@ -2721,6 +2734,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
+                            // shapeは毎step固定のため永続化(issue #14)。
+                            MX_MARK_PERSISTENT(solver_raw[0], owner);
+                            MX_MARK_PERSISTENT(solver_raw[1], owner);
                             solver = mx::fast::kernel_outputs(solver_raw);
                         }
 #else
@@ -2777,11 +2793,19 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 #if defined(MJMLX_BACKEND_MKX)
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
             auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
+            // shapeは毎step固定のため全出力永続化(issue #14)。
             if (ctx->euler_kernel.has_value()) {
                 auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
+                MX_MARK_PERSISTENT(raw[0], owner);
+                MX_MARK_PERSISTENT(raw[1], owner);
+                MX_MARK_PERSISTENT(raw[2], owner);
                 euler = mx::fast::kernel_outputs(raw);
             } else {
                 auto raw = (*ctx->euler_devmem_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}, {B * nv * nv}}), grid, tgroup);
+                MX_MARK_PERSISTENT(raw[0], owner);
+                MX_MARK_PERSISTENT(raw[1], owner);
+                MX_MARK_PERSISTENT(raw[2], owner);
+                MX_MARK_PERSISTENT(raw[3], owner);
                 euler = mx::fast::kernel_outputs(raw);
             }
 #else
@@ -2978,7 +3002,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             handle->sim.qvel = mx::stack(qvel_list);
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
-                model->model, B, config->use_gpu, config->solver_iterations);
+                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
         }
 
         return handle;
@@ -3202,6 +3226,9 @@ MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx,
 }
 
 MJMLX_API void mjmlx_batched_free(MjmlxBatchedSim* sim) {
+#if defined(MJMLX_BACKEND_MKX)
+    if (sim) mx::release_persistent_for_owner(&sim->sim);
+#endif
     delete sim;
 }
 

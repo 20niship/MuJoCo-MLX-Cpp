@@ -10,7 +10,7 @@
 
 namespace mjmlx::mkx_kernels {
 
-inline mkx::fast::Kernel make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128) {
+inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128) {
   const int contact_stride = 8;
 
   std::string header = R"GLSL(

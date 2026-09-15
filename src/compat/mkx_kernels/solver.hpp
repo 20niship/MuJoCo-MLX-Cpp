@@ -21,7 +21,7 @@ inline std::string solver_fmt_float(float x) {
 }
 } // namespace detail_solver
 
-inline mkx::fast::Kernel make_solver_kernel(int nb, int nv, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters) {
   using namespace detail_solver;
   const int max_efc              = 256;
   const int contact_stride       = 8;

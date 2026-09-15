@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -74,19 +73,19 @@ inline Shape broadcast_shapes(const Shape& a, const Shape& b) {
 
 class array {
 public:
-    array() : node_(alloc_from_host(nullptr, mkx::Shape{0})), dtype_(Dtype::Float32) {}
+    array() : node_(alloc_from_host({}, mkx::Shape{0})), dtype_(Dtype::Float32) {}
 
-    explicit array(float scalar) : node_(alloc_from_host(&scalar, mkx::Shape{}, 1)), dtype_(Dtype::Float32) {}
+    explicit array(float scalar) : node_(alloc_from_host({scalar}, mkx::Shape{})), dtype_(Dtype::Float32) {}
     explicit array(double scalar) : array(static_cast<float>(scalar)) {}
-    explicit array(int scalar) : node_(alloc_from_host_val(static_cast<float>(scalar))), dtype_(Dtype::Int32) {}
-    explicit array(bool scalar) : node_(alloc_from_host_val(scalar ? 1.0f : 0.0f)), dtype_(Dtype::Bool) {}
+    explicit array(int scalar) : node_(alloc_from_host({static_cast<float>(scalar)}, mkx::Shape{})), dtype_(Dtype::Int32) {}
+    explicit array(bool scalar) : node_(alloc_from_host({scalar ? 1.0f : 0.0f}, mkx::Shape{})), dtype_(Dtype::Bool) {}
 
     template <class T = float>
     array(std::initializer_list<T> vals, Dtype dtype = default_dtype<T>()) : dtype_(dtype) {
         std::vector<float> host(vals.size());
         size_t i = 0;
         for (auto v : vals) host[i++] = static_cast<float>(v);
-        node_ = alloc_from_host(host.data(), mkx::Shape{static_cast<int64_t>(vals.size())}, vals.size());
+        node_ = alloc_from_host(std::move(host), mkx::Shape{static_cast<int64_t>(vals.size())});
     }
 
     template <class T>
@@ -95,10 +94,10 @@ public:
         size_t n = static_cast<size_t>(mkx::shape_size(ms));
         std::vector<float> host(n);
         for (size_t i = 0; i < n; i++) host[i] = static_cast<float>(data[i]);
-        node_ = alloc_from_host(host.data(), ms, n);
+        node_ = alloc_from_host(std::move(host), ms);
     }
 
-    explicit array(mkx::NodePtr node, Dtype dtype = Dtype::Float32) : node_(std::move(node)), dtype_(dtype) {}
+    explicit array(mkx::NodePtr<Backend> node, Dtype dtype = Dtype::Float32) : node_(std::move(node)), dtype_(dtype) {}
 
     Shape shape() const { return detail::from_mkx_shape(node_->shape); }
     int shape(int axis) const {
@@ -109,8 +108,8 @@ public:
     size_t ndim() const { return node_->shape.size(); }
     int64_t size() const { return mkx::shape_size(node_->shape); }
 
-    mkx::NodePtr& node() { return node_; }
-    const mkx::NodePtr& node() const { return node_; }
+    mkx::NodePtr<Backend>& node() { return node_; }
+    const mkx::NodePtr<Backend>& node() const { return node_; }
 
     template <class T> const T* data() const {
         ensure_readback();
@@ -130,33 +129,22 @@ private:
         else return Dtype::Float32;
     }
 
-    static mkx::NodePtr alloc_from_host_val(float v) { return alloc_from_host(&v, mkx::Shape{}, 1); }
-
-    static mkx::NodePtr alloc_from_host(const float* data, mkx::Shape shape, size_t n = 0) {
-        auto node = mkx::make_node(mkx::OpType::Const, shape, mkx::Dtype::Float32);
+    // ホストデータはNodeにmemcpyされるだけで、GPU upload自体はeval時にBackend::get_or_allocateが確保したバッファへ行われる。
+    static mkx::NodePtr<Backend> alloc_from_host(std::vector<float> data, mkx::Shape shape) {
         size_t count = static_cast<size_t>(mkx::shape_size(shape));
-        size_t alloc_count = std::max<size_t>(count, 1); // Vulkan/MoltenVK rejects a 0-byte vkAllocateMemory
-        auto* buf = Backend::alloc(alloc_count * sizeof(float));
-        std::vector<float> zeros;
-        if (data == nullptr) { zeros.assign(alloc_count, 0.0f); data = zeros.data(); }
-        Backend::upload(buf, data, count * sizeof(float));
-        node->gpu_buffer = buf;
-        node->evaluated = true;
-        // eval_node() (mlx_vulkan) sets free_gpu_buffer for its own allocations, but this constructor bypasses it entirely -- without this every host-constructed mx::array leaked its GPU buffer.
-        auto* raw_buf = buf;
-        node->free_gpu_buffer = [raw_buf]() { Backend::free(raw_buf); };
-        return node;
+        if (data.empty()) data.assign(std::max<size_t>(count, 1), 0.0f);
+        return Raw<float>(std::move(data), shape).node();
     }
 
     void ensure_readback() const {
         if (cached_) return;
         Raw<float> proxy(node_);
         mkx::eval<Backend>(proxy);
-        cache_f_ = proxy.template to_vector<Backend>();
+        cache_f_ = proxy.to_vector();
         cached_ = true;
     }
 
-    mkx::NodePtr node_;
+    mkx::NodePtr<Backend> node_;
     Dtype dtype_;
     mutable bool cached_ = false;
     mutable std::vector<float> cache_f_;
@@ -164,7 +152,7 @@ private:
 };
 
 inline Raw<float> to_raw(const array& a) { return Raw<float>(a.node()); }
-inline array from_raw(mkx::NodePtr n, Dtype dt) { return array(std::move(n), dt); }
+inline array from_raw(mkx::NodePtr<Backend> n, Dtype dt) { return array(std::move(n), dt); }
 
 namespace fast {
 // Bridges mx::array/mx::Shape to the raw mkx::fast::Kernel::operator() call shape for the vendored kernels in src/compat/mkx_kernels/.
@@ -401,20 +389,27 @@ template <class... Arrays> void eval(Arrays&... arrs) {
     std::apply([](auto&... ps) { mkx::eval<Backend>(ps...); }, proxies);
 }
 inline void eval(std::initializer_list<array> arrs) {
-    std::vector<Raw<float>> proxies;
-    proxies.reserve(arrs.size());
-    for (const auto& a : arrs) proxies.emplace_back(a.node());
-
-    std::unordered_set<mkx::OpNode*> visited;
-    std::vector<mkx::NodePtr> order;
-    for (auto& p : proxies) mkx::detail::topo_sort(p.node(), visited, order);
-
-    static std::unordered_map<size_t, Backend::Pipeline> pipeline_cache;
-    for (auto& node : order) mkx::detail::eval_node<Backend>(*node, pipeline_cache);
-    Backend::wait_idle();
+    std::vector<mkx::NodePtr<Backend>> roots;
+    roots.reserve(arrs.size());
+    for (const auto& a : arrs) roots.push_back(a.node());
+    mkx::eval_nodes<Backend>(roots);
 }
 
-template <class Fn> auto compile(Fn fn) { return fn; }
+// (loc_id, owner)単位でBufferを使い回すようマークする(issue #14)。evalする前に呼ぶこと。
+#define MX_MARK_PERSISTENT(arr, owner) mkx::mark_permanent<mx::Backend>((arr).node(), mkx::persistent_location_hash(__FILE__, __LINE__), (owner))
+inline void release_persistent_for_owner(const void* owner) { Backend::release_persistent_for_owner(owner); }
+
+// 要素単位演算+形状変換をoperator fusionする(mkx::eval一本化済み、他は従来通り個別dispatch)。
+template <class Fn> auto compile(Fn fn) {
+    return [fn](const std::vector<array>& inputs) -> std::vector<array> {
+        std::vector<array> outputs = fn(inputs);
+        std::vector<mkx::NodePtr<Backend>> roots;
+        roots.reserve(outputs.size());
+        for (auto& o : outputs) roots.push_back(o.node());
+        mkx::eval_nodes<Backend>(roots);
+        return outputs;
+    };
+}
 
 namespace linalg {
 

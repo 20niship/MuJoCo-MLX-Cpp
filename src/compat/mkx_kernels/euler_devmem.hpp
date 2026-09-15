@@ -22,7 +22,7 @@ inline std::string euler_devmem_fmt_float(float x) {
   return s;
 }
 
-inline mkx::fast::Kernel make_euler_devmem_kernel(int nv, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints, const std::vector<float>& dof_damping_vals) {
+inline mkx::fast::Kernel<> make_euler_devmem_kernel(int nv, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints, const std::vector<float>& dof_damping_vals) {
   int n              = nv;
   std::string dt_str = euler_devmem_fmt_float(dt);
   std::ostringstream ss;

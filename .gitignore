@@ -1,5 +1,6 @@
 build/
 build-mkx/
+build-mlx/
 benchmarks/models/external/
 .venv/
 uv.lock

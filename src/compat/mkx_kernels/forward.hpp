@@ -42,7 +42,7 @@ inline std::string float_array_literal(const std::vector<float>& v) {
 
 } // namespace detail_forward
 
-inline mkx::fast::Kernel make_forward_kernel(int nb, int nv, int nq, int nu, int njnt, float dt, std::array<float, 3> gravity, const std::vector<int>& body_parentid, const std::vector<int>& body_rootid, const std::vector<float>& body_mass, const std::vector<float>& body_inertia,
+inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, int njnt, float dt, std::array<float, 3> gravity, const std::vector<int>& body_parentid, const std::vector<int>& body_rootid, const std::vector<float>& body_mass, const std::vector<float>& body_inertia,
                                              const std::vector<int>& dof_bodyid, const std::vector<int>& dof_parentid, const std::vector<float>& dof_damping, const std::vector<float>& dof_armature, const std::vector<float>& dof_stiffness, const std::vector<int>& dof_qposadr,
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
                                              const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0) {
