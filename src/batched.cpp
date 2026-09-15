@@ -2724,10 +2724,12 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         std::vector<mx::array> solver;
 #if defined(MJMLX_BACKEND_MKX)
                         {
+                            auto solver_qvel_f32 = mx::astype(mx::flatten(qvel_batch), mx::float32);
+                            MX_MARK_PERSISTENT(solver_qvel_f32, owner); // shapeは毎step固定のため永続化(issue #14: 残りのtransient中間ノード)。
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
                                  mx::flatten(subtree_com_out),
-                                 mx::astype(mx::flatten(qvel_batch), mx::float32),
+                                 solver_qvel_f32,
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
                                  ctx->solver_body_rootid}),
@@ -2782,13 +2784,20 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             }
 
             // ── Phase 3: Metal Euler ──
-            std::vector<mx::array> euler_inputs = {
-                mx::astype(qM_flat, mx::float32),
-                mx::astype(qfrc_smooth_flat, mx::float32),
-                mx::astype(qfrc_constraint_flat, mx::float32),
-                mx::astype(mx::flatten(qvel_batch), mx::float32),
-                mx::astype(mx::flatten(qpos_batch), mx::float32)
-            };
+            auto euler_in0 = mx::astype(qM_flat, mx::float32);
+            auto euler_in1 = mx::astype(qfrc_smooth_flat, mx::float32);
+            auto euler_in2 = mx::astype(qfrc_constraint_flat, mx::float32);
+            auto euler_in3 = mx::astype(mx::flatten(qvel_batch), mx::float32);
+            auto euler_in4 = mx::astype(mx::flatten(qpos_batch), mx::float32);
+#if defined(MJMLX_BACKEND_MKX)
+            // shapeは毎step固定のため永続化(issue #14: 残りのtransient中間ノード)。
+            MX_MARK_PERSISTENT(euler_in0, owner);
+            MX_MARK_PERSISTENT(euler_in1, owner);
+            MX_MARK_PERSISTENT(euler_in2, owner);
+            MX_MARK_PERSISTENT(euler_in3, owner);
+            MX_MARK_PERSISTENT(euler_in4, owner);
+#endif
+            std::vector<mx::array> euler_inputs = {euler_in0, euler_in1, euler_in2, euler_in3, euler_in4};
             std::vector<mx::array> euler;
 #if defined(MJMLX_BACKEND_MKX)
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
@@ -2832,6 +2841,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
             auto cfrc_ext_out = mx::zeros({B, nb, 6});
+#if defined(MJMLX_BACKEND_MKX)
+            MX_MARK_PERSISTENT(cfrc_ext_out, owner); // shapeは毎step固定のため永続化(issue #14)。
+#endif
 
             return {new_qpos, new_qvel, xpos_out,
                     subtree_com_out, cinert_out, cvel_out,
