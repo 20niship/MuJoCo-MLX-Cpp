@@ -2858,6 +2858,54 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto compiled = mx::compile(pipeline);
             return compiled;
         }
+#if defined(MJMLX_BACKEND_MKX)
+        {
+            // Phase C/D: 初回のみpipeline()を呼びグラフ構築+command buffer記録、以降はreplayのみで再実行する。
+            auto qpos_loc = mkx::persistent_location_hash("mkx_replay_qpos_state", 0);
+            auto qvel_loc = mkx::persistent_location_hash("mkx_replay_qvel_state", 0);
+            auto ctrl_loc = mkx::persistent_location_hash("mkx_replay_ctrl_state", 0);
+            auto ctrl_node_holder = std::make_shared<mkx::NodePtr<mx::Backend>>();
+
+            return [pipeline, owner, qpos_loc, qvel_loc, ctrl_loc, ctrl_node_holder](const std::vector<mx::array>& state) -> std::vector<mx::array> {
+                if (!mx::Backend::has_replay(owner)) {
+                    auto qpos_p = state[0];
+                    auto qvel_p = state[1];
+                    auto ctrl_p = state[2];
+                    mkx::mark_permanent<mx::Backend>(qpos_p.node(), qpos_loc, owner);
+                    mkx::mark_permanent<mx::Backend>(qvel_p.node(), qvel_loc, owner);
+                    mkx::mark_permanent<mx::Backend>(ctrl_p.node(), ctrl_loc, owner);
+                    *ctrl_node_holder = ctrl_p.node();
+
+                    auto builder = [&]() -> std::vector<mkx::NodePtr<mx::Backend>> {
+                        auto out = pipeline({qpos_p, qvel_p, ctrl_p});
+                        auto qpos_cb = mx::copy(out[0]);
+                        auto qvel_cb = mx::copy(out[1]);
+                        mkx::mark_permanent<mx::Backend>(qpos_cb.node(), qpos_loc, owner);
+                        mkx::mark_permanent<mx::Backend>(qvel_cb.node(), qvel_loc, owner);
+                        return {out[0].node(), out[1].node(), out[2].node(), out[3].node(),
+                                out[4].node(), out[5].node(), out[6].node(), out[7].node(),
+                                qpos_cb.node(), qvel_cb.node()};
+                    };
+                    auto& roots = mkx::eval_cached<mx::Backend>(owner, builder);
+                    std::vector<mx::array> result;
+                    for (int i = 0; i < 8; i++) result.push_back(mx::array(roots[i], mx::Dtype::Float32));
+                    return result;
+                }
+
+                // ctrlはmx::reshape(Const)のためdata<float>()だとGPU往復が発生する。未評価Constのhost_dataを直接読んで回避する。
+                mkx::NodePtr<mx::Backend> ctrl_src_node = state[2].node();
+                while (!ctrl_src_node->inputs.empty() && ctrl_src_node->host_data.empty()) ctrl_src_node = ctrl_src_node->inputs[0];
+                size_t ctrl_n = ctrl_src_node->host_data.size() / sizeof(float);
+                const float* ctrl_host = reinterpret_cast<const float*>(ctrl_src_node->host_data.data());
+                mx::Backend::upload(mx::Backend::get_or_allocate(ctrl_node_holder->get(), ctrl_n * sizeof(float)),
+                                     ctrl_host, ctrl_n * sizeof(float));
+                auto& roots = mkx::eval_cached<mx::Backend>(owner, std::function<std::vector<mkx::NodePtr<mx::Backend>>()>{});
+                std::vector<mx::array> result;
+                for (int i = 0; i < 8; i++) result.push_back(mx::array(roots[i], mx::Dtype::Float32));
+                return result;
+            };
+        }
+#endif
         return pipeline;
     }
 
@@ -3239,7 +3287,11 @@ MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx,
 
 MJMLX_API void mjmlx_batched_free(MjmlxBatchedSim* sim) {
 #if defined(MJMLX_BACKEND_MKX)
-    if (sim) mx::release_persistent_for_owner(&sim->sim);
+    if (sim) {
+        mx::release_persistent_for_owner(&sim->sim);
+        // &sim->simはdelete後に別simへ再利用され得るため、replay cacheも無効化する(放置すると新simがhas_replay()を誤って引き継ぎクラッシュする)。
+        mx::Backend::invalidate_replay(&sim->sim);
+    }
 #endif
     delete sim;
 }
