@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
+
+# 未指定時はReleaseをデフォルトにする(素のcmake -B buildだと最適化なしになり、batched等のCPU側オーバーヘッドがベンチマークで数十%重く出る)。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 project(mjmlx VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
