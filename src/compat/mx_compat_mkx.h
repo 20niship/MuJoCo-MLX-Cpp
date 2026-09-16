@@ -81,20 +81,20 @@ public:
     explicit array(bool scalar) : node_(alloc_from_host({scalar ? 1.0f : 0.0f}, mkx::Shape{})), dtype_(Dtype::Bool) {}
 
     template <class T = float>
-    array(std::initializer_list<T> vals, Dtype dtype = default_dtype<T>()) : dtype_(dtype) {
+    array(std::initializer_list<T> vals, Dtype dtype = default_dtype<T>(), bool use_fp16 = false) : dtype_(dtype) {
         std::vector<float> host(vals.size());
         size_t i = 0;
         for (auto v : vals) host[i++] = static_cast<float>(v);
-        node_ = alloc_from_host(std::move(host), mkx::Shape{static_cast<int64_t>(vals.size())});
+        node_ = alloc_from_host(std::move(host), mkx::Shape{static_cast<int64_t>(vals.size())}, use_fp16);
     }
 
     template <class T>
-    array(const T* data, Shape shape, Dtype dtype = Dtype::Float32) : dtype_(dtype) {
+    array(const T* data, Shape shape, Dtype dtype = Dtype::Float32, bool use_fp16 = false) : dtype_(dtype) {
         mkx::Shape ms = detail::to_mkx_shape(shape);
         size_t n = static_cast<size_t>(mkx::shape_size(ms));
         std::vector<float> host(n);
         for (size_t i = 0; i < n; i++) host[i] = static_cast<float>(data[i]);
-        node_ = alloc_from_host(std::move(host), ms);
+        node_ = alloc_from_host(std::move(host), ms, use_fp16);
     }
 
     explicit array(mkx::NodePtr<Backend> node, Dtype dtype = Dtype::Float32) : node_(std::move(node)), dtype_(dtype) {}
@@ -129,11 +129,12 @@ private:
         else return Dtype::Float32;
     }
 
-    // ホストデータはNodeにmemcpyされるだけで、GPU upload自体はeval時にBackend::get_or_allocateが確保したバッファへ行われる。
-    static mkx::NodePtr<Backend> alloc_from_host(std::vector<float> data, mkx::Shape shape) {
+    // ホストデータはNodeにmemcpyされるだけで、GPU upload自体はeval時にBackend::get_or_allocateが確保したバッファへ行われる。use_fp16はこのファイルのみのbool切り替え口。
+    static mkx::NodePtr<Backend> alloc_from_host(std::vector<float> data, mkx::Shape shape, bool use_fp16 = false) {
         size_t count = static_cast<size_t>(mkx::shape_size(shape));
         if (data.empty()) data.assign(std::max<size_t>(count, 1), 0.0f);
-        return Raw<float>(std::move(data), shape).node();
+        mkx::Dtype dt = use_fp16 ? mkx::Dtype::Float16 : mkx::Dtype::Float32;
+        return Raw<float>(std::move(data), shape, dt).node();
     }
 
     void ensure_readback() const {
