@@ -215,6 +215,7 @@ MJB_API void mjb_batched_reset(MjbBatchedSim* sim, const int* reset_mask);
 MJB_API const float* mjb_batched_get_qpos(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_qvel(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out);
+MJB_API const float* mjb_batched_get_xquat(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cinert(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out);

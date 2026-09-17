@@ -566,6 +566,9 @@ struct ForwardHostConsts {
     std::vector<float> body_mass, body_inertia, dof_damping, dof_armature, dof_stiffness;
     std::vector<int> dof_qposadr;
     std::vector<float> qpos_spring, act_gain0, act_bias0;
+    // AFFINE gain/bias(length/velocity項)算出用。JOINT/JOINTINPARENT伝達のみ対応、他はgear=0でlength=0扱い。
+    std::vector<float> act_gain1, act_gain2, act_bias1, act_bias2, act_gear;
+    std::vector<int> act_qposadr, act_dofadr;
     std::vector<int> dof_jtype, dof_rotaxis, dof_jid;
     std::vector<std::vector<int>> body_dofs;
     int jnt_dofadr0 = 0;
@@ -627,12 +630,43 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
 
     k.act_gain0.assign(std::max(nu, 1), 0.0f);
     k.act_bias0.assign(std::max(nu, 1), 0.0f);
+    k.act_gain1.assign(std::max(nu, 1), 0.0f);
+    k.act_gain2.assign(std::max(nu, 1), 0.0f);
+    k.act_bias1.assign(std::max(nu, 1), 0.0f);
+    k.act_bias2.assign(std::max(nu, 1), 0.0f);
     if (nu > 0 && m.actuator_gainprm.size() > 0) {
         mx::eval(m.actuator_gainprm, m.actuator_biasprm);
         auto gp = m.actuator_gainprm.data<float>();
         auto bp = m.actuator_biasprm.data<float>();
         int ncol = (int)m.actuator_gainprm.shape(1);
-        for (int i = 0; i < nu; i++) { k.act_gain0[i] = gp[i * ncol]; k.act_bias0[i] = bp[i * ncol]; }
+        for (int i = 0; i < nu; i++) {
+            k.act_gain0[i] = gp[i * ncol];
+            k.act_bias0[i] = bp[i * ncol];
+            if (ncol > 1) { k.act_gain1[i] = gp[i * ncol + 1]; k.act_bias1[i] = bp[i * ncol + 1]; }
+            if (ncol > 2) { k.act_gain2[i] = gp[i * ncol + 2]; k.act_bias2[i] = bp[i * ncol + 2]; }
+        }
+    }
+
+    k.act_gear.assign(std::max(nu, 1), 0.0f);
+    k.act_qposadr.assign(std::max(nu, 1), 0);
+    k.act_dofadr.assign(std::max(nu, 1), 0);
+    if (nu > 0 && m.actuator_trntype.size() > 0) {
+        mx::eval(m.actuator_trntype, m.actuator_trnid, m.actuator_gear);
+        auto trnt_ptr = m.actuator_trntype.data<int>();
+        auto trnid_ptr = m.actuator_trnid.data<int>();
+        auto gear_ptr = m.actuator_gear.data<float>();
+        int gear_ncol = (int)m.actuator_gear.shape(1);
+        for (int ai = 0; ai < nu; ai++) {
+            int trnt = trnt_ptr[ai];
+            if (trnt == 0 || trnt == 1) {  // JOINT (0) or JOINTINPARENT (1)
+                int ji = trnid_ptr[ai * 2];
+                if (ji >= 0 && ji < njnt) {
+                    k.act_gear[ai] = gear_ptr[ai * gear_ncol];
+                    k.act_qposadr[ai] = jqa_ptr[ji];
+                    k.act_dofadr[ai] = jda_ptr[ji];
+                }
+            }
+        }
     }
 
     std::vector<int> dof_jntid(nv, -1);
@@ -2304,6 +2338,35 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
     auto damp_ptr = m.dof_damping.data<float>();
     std::vector<float> damp_vals(damp_ptr, damp_ptr + m.nv);
 
+    // mujoco本家のimplicit/implicitfast(mj_implicitSkip https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_forward.c#L1799 がactuatorVelDeriv https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_derivative.c#L2503 でd(qfrc_actuator)/d(qvel)を陰的に畳み込む)相当をdof_dampingと同じ機構に便乗させて再現(本カーネルはintegrator設定無視でexplicitのままだったためUR5eのimplicitfast前提PDゲインが発散していた)。
+    if (m.nu > 0 && m.actuator_biastype.size() > 0) {
+        mx::eval(m.actuator_biastype, m.actuator_biasprm, m.actuator_gaintype, m.actuator_gainprm,
+                 m.actuator_trntype, m.actuator_trnid, m.actuator_gear);
+        auto biastype_ptr = m.actuator_biastype.data<int32_t>();
+        auto biasprm_ptr = m.actuator_biasprm.data<float>();
+        auto gaintype_ptr = m.actuator_gaintype.data<int32_t>();
+        auto gainprm_ptr = m.actuator_gainprm.data<float>();
+        auto atrntype_ptr = m.actuator_trntype.data<int32_t>();
+        auto atrnid_ptr = m.actuator_trnid.data<int32_t>();
+        auto agear_ptr = m.actuator_gear.data<float>();
+        int bias_ncol = (int)m.actuator_biasprm.shape(1);
+        int gain_ncol = (int)m.actuator_gainprm.shape(1);
+        int gear_ncol = (int)m.actuator_gear.shape(1);
+        for (int ai = 0; ai < m.nu; ai++) {
+            int trnt = atrntype_ptr[ai];
+            if (trnt != 0 && trnt != 1) continue;  // JOINT/JOINTINPARENT以外(TENDON/SITE)は対象外
+            int ji = atrnid_ptr[ai * 2];
+            if (ji < 0 || ji >= m.njnt) continue;
+            float bias_vel = (biastype_ptr[ai] == 1) ? biasprm_ptr[ai * bias_ncol + 2] : 0.0f;  // 1=AFFINE
+            float gain_vel = (gaintype_ptr[ai] == 1) ? gainprm_ptr[ai * gain_ncol + 2] : 0.0f;   // 1=AFFINE
+            if (gain_vel != 0.0f) continue;  // gain2利用時はctrl依存になり定数補正では表現不可、未対応のまま安全側にスキップ
+            if (bias_vel == 0.0f) continue;
+            float gear = agear_ptr[ai * gear_ncol];
+            int da = da_ptr[ji];
+            damp_vals[da] += -bias_vel * gear * gear;
+        }
+    }
+
     // Build Euler kernel — two tiers:
     //   nv ≤ 80:   thread-local kernel (fastest, everything in registers/stack)
     //   nv ≤ 2048: device-memory kernel (L in global GPU memory, vectors thread-local)
@@ -2359,7 +2422,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fc.body_parentid, fc.body_rootid, fc.body_mass, fc.body_inertia,
             fc.dof_bodyid, fc.dof_parentid, fc.dof_damping, fc.dof_armature,
             fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
-            fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0);
+            fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0,
+            fc.act_gain1, fc.act_gain2, fc.act_bias1, fc.act_bias2,
+            fc.act_gear, fc.act_qposadr, fc.act_dofadr);
 #else
         // Prepare model constant buffers
         ctx->make_m_mask = mx::astype(mx::flatten(m.cache.make_m_mask), mx::float32);
@@ -2831,9 +2896,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
+            auto xquat_out = mx::reshape(kin[1], {B, nb, 4});
             auto cfrc_ext_out = mx::zeros({B, nb, 6});
 
-            return {new_qpos, new_qvel, xpos_out,
+            return {new_qpos, new_qvel, xpos_out, xquat_out,
                     subtree_com_out, cinert_out, cvel_out,
                     qfrc_actuator_out, cfrc_ext_out};
         };
@@ -2870,6 +2936,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
 
     std::vector<float> qp(B * nq), qv(B * nv);
     std::vector<float> xp(B * nb * 3), sc(B * nb * 3);
+    std::vector<float> xq(B * nb * 4);
     std::vector<float> ci(B * nb * 10), cv(B * nb * 6);
     std::vector<float> qa(B * nv), ce(B * nb * 6);
 
@@ -2878,6 +2945,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
         for (int j = 0; j < nq; j++) qp[i*nq + j] = (float)d->qpos[j];
         for (int j = 0; j < nv; j++) qv[i*nv + j] = (float)d->qvel[j];
         for (int j = 0; j < nb*3; j++) xp[i*nb*3 + j] = (float)d->xpos[j];
+        for (int j = 0; j < nb*4; j++) xq[i*nb*4 + j] = (float)d->xquat[j];
         for (int j = 0; j < nb*3; j++) sc[i*nb*3 + j] = (float)d->subtree_com[j];
         for (int j = 0; j < nb*10; j++) ci[i*nb*10 + j] = (float)d->cinert[j];
         for (int j = 0; j < nb*6; j++) cv[i*nb*6 + j] = (float)d->cvel[j];
@@ -2888,6 +2956,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
     s.qpos = mx::reshape(mx::array(qp.data(), {B*nq}, mx::float32), {B, nq});
     s.qvel = mx::reshape(mx::array(qv.data(), {B*nv}, mx::float32), {B, nv});
     s.xpos = mx::reshape(mx::array(xp.data(), {B*nb*3}, mx::float32), {B, nb, 3});
+    s.xquat = mx::reshape(mx::array(xq.data(), {B*nb*4}, mx::float32), {B, nb, 4});
     s.subtree_com = mx::reshape(mx::array(sc.data(), {B*nb*3}, mx::float32), {B, nb, 3});
     s.cinert = mx::reshape(mx::array(ci.data(), {B*nb*10}, mx::float32), {B, nb, 10});
     s.cvel = mx::reshape(mx::array(cv.data(), {B*nb*6}, mx::float32), {B, nb, 6});
@@ -2991,6 +3060,19 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
             handle->sim.qpos = mx::stack(qpos_list);
             handle->sim.qvel = mx::stack(qvel_list);
+            {
+                // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
+                int nb = model->model.nbody;
+                std::vector<float> xq0(static_cast<size_t>(B) * nb * 4, 0.0f);
+                for (size_t i = 0; i < xq0.size(); i += 4) xq0[i] = 1.0f;  // wxyz恒等クォータニオン
+                handle->sim.xpos = mx::zeros({B, nb, 3});
+                handle->sim.xquat = mx::reshape(mx::array(xq0.data(), {static_cast<int>(xq0.size())}, mx::float32), {B, nb, 4});
+                handle->sim.subtree_com = mx::zeros({B, nb, 3});
+                handle->sim.cinert = mx::zeros({B, nb, 10});
+                handle->sim.cvel = mx::zeros({B, nb, 6});
+                handle->sim.qfrc_actuator = mx::zeros({B, nv});
+                handle->sim.cfrc_ext = mx::zeros({B, nb, 6});
+            }
         } else {
             // GPU path: compiled + vmapped MLX step function
             std::vector<mx::array> qpos_list, qvel_list;
@@ -3000,6 +3082,19 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
             handle->sim.qpos = mx::stack(qpos_list);
             handle->sim.qvel = mx::stack(qvel_list);
+            {
+                // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
+                int nb = model->model.nbody;
+                std::vector<float> xq0(static_cast<size_t>(B) * nb * 4, 0.0f);
+                for (size_t i = 0; i < xq0.size(); i += 4) xq0[i] = 1.0f;  // wxyz恒等クォータニオン
+                handle->sim.xpos = mx::zeros({B, nb, 3});
+                handle->sim.xquat = mx::reshape(mx::array(xq0.data(), {static_cast<int>(xq0.size())}, mx::float32), {B, nb, 4});
+                handle->sim.subtree_com = mx::zeros({B, nb, 3});
+                handle->sim.cinert = mx::zeros({B, nb, 10});
+                handle->sim.cvel = mx::zeros({B, nb, 6});
+                handle->sim.qfrc_actuator = mx::zeros({B, nv});
+                handle->sim.cfrc_ext = mx::zeros({B, nb, 6});
+            }
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
                 model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
@@ -3035,11 +3130,12 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     s.qpos = results[0];
     s.qvel = results[1];
     if (results.size() > 2) s.xpos = results[2];
-    if (results.size() > 3) s.subtree_com = results[3];
-    if (results.size() > 4) s.cinert = results[4];
-    if (results.size() > 5) s.cvel = results[5];
-    if (results.size() > 6) s.qfrc_actuator = results[6];
-    if (results.size() > 7) s.cfrc_ext = results[7];
+    if (results.size() > 3) s.xquat = results[3];
+    if (results.size() > 4) s.subtree_com = results[4];
+    if (results.size() > 5) s.cinert = results[5];
+    if (results.size() > 6) s.cvel = results[6];
+    if (results.size() > 7) s.qfrc_actuator = results[7];
+    if (results.size() > 8) s.cfrc_ext = results[8];
 }
 
 MJMLX_API void mjmlx_batched_get_state(
@@ -3102,6 +3198,13 @@ MJMLX_API const float* mjmlx_batched_get_xpos(const MjmlxBatchedSim* sim, int* n
     mx::eval(sim->sim.xpos);
     if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 3;
     return sim->sim.xpos.data<float>();
+}
+
+MJMLX_API const float* mjmlx_batched_get_xquat(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.xquat);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 4;
+    return sim->sim.xquat.data<float>();
 }
 
 MJMLX_API const float* mjmlx_batched_get_subtree_com(const MjmlxBatchedSim* sim, int* n_out) {

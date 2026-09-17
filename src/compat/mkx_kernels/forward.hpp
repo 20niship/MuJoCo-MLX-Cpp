@@ -45,7 +45,9 @@ inline std::string float_array_literal(const std::vector<float>& v) {
 inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, int njnt, float dt, std::array<float, 3> gravity, const std::vector<int>& body_parentid, const std::vector<int>& body_rootid, const std::vector<float>& body_mass, const std::vector<float>& body_inertia,
                                              const std::vector<int>& dof_bodyid, const std::vector<int>& dof_parentid, const std::vector<float>& dof_damping, const std::vector<float>& dof_armature, const std::vector<float>& dof_stiffness, const std::vector<int>& dof_qposadr,
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
-                                             const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0) {
+                                             const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0,
+                                             const std::vector<float>& act_gain1, const std::vector<float>& act_gain2, const std::vector<float>& act_bias1, const std::vector<float>& act_bias2,
+                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr) {
   using namespace detail_forward;
 
   int off_crb          = 0;
@@ -110,6 +112,13 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   if(nu > 0) {
     ss << "const float act_g0[" << nu << "] = " << float_array_literal(act_gain0) << ";\n";
     ss << "const float act_b0[" << nu << "] = " << float_array_literal(act_bias0) << ";\n";
+    ss << "const float act_g1[" << nu << "] = " << float_array_literal(act_gain1) << ";\n";
+    ss << "const float act_g2[" << nu << "] = " << float_array_literal(act_gain2) << ";\n";
+    ss << "const float act_b1[" << nu << "] = " << float_array_literal(act_bias1) << ";\n";
+    ss << "const float act_b2[" << nu << "] = " << float_array_literal(act_bias2) << ";\n";
+    ss << "const float act_gear[" << nu << "] = " << float_array_literal(act_gear) << ";\n";
+    ss << "const int act_qa[" << nu << "] = " << int_array_literal(act_qposadr) << ";\n";
+    ss << "const int act_da[" << nu << "] = " << int_array_literal(act_dofadr) << ";\n";
   }
 
   ss << "const int dof_jtype[" << nv << "] = " << int_array_literal(dof_jtype) << ";\n";
@@ -364,7 +373,11 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
        << "  for (int ai=0;ai<NU;ai++) {\n"
        << "    float mom = act_moment[ai*NV+di];\n"
        << "    if (mom != 0.0f) {\n"
-       << "      float force = act_g0[ai] * ctrl[u_off+ai] + act_b0[ai];\n"
+       << "      float len = qpos[q_off+act_qa[ai]] * act_gear[ai];\n"
+       << "      float vel = qvel[v_off+act_da[ai]] * act_gear[ai];\n"
+       << "      float gain = act_g0[ai] + act_g1[ai]*len + act_g2[ai]*vel;\n"
+       << "      float bias = act_b0[ai] + act_b1[ai]*len + act_b2[ai]*vel;\n"
+       << "      float force = gain * ctrl[u_off+ai] + bias;\n"
        << "      fa += mom * force;\n"
        << "    }\n"
        << "  }\n"
