@@ -562,6 +562,7 @@ struct BatchedSim {
     mx::array qpos = mx::array({});
     mx::array qvel = mx::array({});
     mx::array xpos = mx::array({});
+    mx::array xquat = mx::array({});
 
     // Observation fields: [num_envs, ...] arrays
     mx::array subtree_com = mx::array({});   // (B, nbody, 3)

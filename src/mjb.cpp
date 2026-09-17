@@ -75,6 +75,7 @@ struct MjbBatchedSim {
     // CPU backend: N independent mjData* + contiguous float buffers
     std::vector<mjData*> cpu_datas;
     mutable std::vector<float> qpos_buf, qvel_buf, xpos_buf;
+    mutable std::vector<float> xquat_buf;
     mutable std::vector<float> subtree_com_buf, cinert_buf, cvel_buf;
     mutable std::vector<float> qfrc_actuator_buf, cfrc_ext_buf;
 
@@ -943,6 +944,15 @@ MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out) 
         return CPU_BATCHED_GET(xpos, m->nbody * 3);
     }
     return mjmlx_batched_get_xpos(sim->mlx_sim, n_out);
+}
+
+MJB_API const float* mjb_batched_get_xquat(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(xquat, m->nbody * 4);
+    }
+    return mjmlx_batched_get_xquat(sim->mlx_sim, n_out);
 }
 
 MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out) {
