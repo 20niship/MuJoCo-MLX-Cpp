@@ -2831,9 +2831,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
+            auto xquat_out = mx::reshape(kin[1], {B, nb, 4});
             auto cfrc_ext_out = mx::zeros({B, nb, 6});
 
-            return {new_qpos, new_qvel, xpos_out,
+            return {new_qpos, new_qvel, xpos_out, xquat_out,
                     subtree_com_out, cinert_out, cvel_out,
                     qfrc_actuator_out, cfrc_ext_out};
         };
@@ -2870,6 +2871,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
 
     std::vector<float> qp(B * nq), qv(B * nv);
     std::vector<float> xp(B * nb * 3), sc(B * nb * 3);
+    std::vector<float> xq(B * nb * 4);
     std::vector<float> ci(B * nb * 10), cv(B * nb * 6);
     std::vector<float> qa(B * nv), ce(B * nb * 6);
 
@@ -2878,6 +2880,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
         for (int j = 0; j < nq; j++) qp[i*nq + j] = (float)d->qpos[j];
         for (int j = 0; j < nv; j++) qv[i*nv + j] = (float)d->qvel[j];
         for (int j = 0; j < nb*3; j++) xp[i*nb*3 + j] = (float)d->xpos[j];
+        for (int j = 0; j < nb*4; j++) xq[i*nb*4 + j] = (float)d->xquat[j];
         for (int j = 0; j < nb*3; j++) sc[i*nb*3 + j] = (float)d->subtree_com[j];
         for (int j = 0; j < nb*10; j++) ci[i*nb*10 + j] = (float)d->cinert[j];
         for (int j = 0; j < nb*6; j++) cv[i*nb*6 + j] = (float)d->cvel[j];
@@ -2888,6 +2891,7 @@ MJMLX_API void cpu_gather_state(MjmlxBatchedSim* handle) {
     s.qpos = mx::reshape(mx::array(qp.data(), {B*nq}, mx::float32), {B, nq});
     s.qvel = mx::reshape(mx::array(qv.data(), {B*nv}, mx::float32), {B, nv});
     s.xpos = mx::reshape(mx::array(xp.data(), {B*nb*3}, mx::float32), {B, nb, 3});
+    s.xquat = mx::reshape(mx::array(xq.data(), {B*nb*4}, mx::float32), {B, nb, 4});
     s.subtree_com = mx::reshape(mx::array(sc.data(), {B*nb*3}, mx::float32), {B, nb, 3});
     s.cinert = mx::reshape(mx::array(ci.data(), {B*nb*10}, mx::float32), {B, nb, 10});
     s.cvel = mx::reshape(mx::array(cv.data(), {B*nb*6}, mx::float32), {B, nb, 6});
@@ -2991,6 +2995,19 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
             handle->sim.qpos = mx::stack(qpos_list);
             handle->sim.qvel = mx::stack(qvel_list);
+            {
+                // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
+                int nb = model->model.nbody;
+                std::vector<float> xq0(static_cast<size_t>(B) * nb * 4, 0.0f);
+                for (size_t i = 0; i < xq0.size(); i += 4) xq0[i] = 1.0f;  // wxyz恒等クォータニオン
+                handle->sim.xpos = mx::zeros({B, nb, 3});
+                handle->sim.xquat = mx::reshape(mx::array(xq0.data(), {static_cast<int>(xq0.size())}, mx::float32), {B, nb, 4});
+                handle->sim.subtree_com = mx::zeros({B, nb, 3});
+                handle->sim.cinert = mx::zeros({B, nb, 10});
+                handle->sim.cvel = mx::zeros({B, nb, 6});
+                handle->sim.qfrc_actuator = mx::zeros({B, nv});
+                handle->sim.cfrc_ext = mx::zeros({B, nb, 6});
+            }
         } else {
             // GPU path: compiled + vmapped MLX step function
             std::vector<mx::array> qpos_list, qvel_list;
@@ -3000,6 +3017,19 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
             handle->sim.qpos = mx::stack(qpos_list);
             handle->sim.qvel = mx::stack(qvel_list);
+            {
+                // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
+                int nb = model->model.nbody;
+                std::vector<float> xq0(static_cast<size_t>(B) * nb * 4, 0.0f);
+                for (size_t i = 0; i < xq0.size(); i += 4) xq0[i] = 1.0f;  // wxyz恒等クォータニオン
+                handle->sim.xpos = mx::zeros({B, nb, 3});
+                handle->sim.xquat = mx::reshape(mx::array(xq0.data(), {static_cast<int>(xq0.size())}, mx::float32), {B, nb, 4});
+                handle->sim.subtree_com = mx::zeros({B, nb, 3});
+                handle->sim.cinert = mx::zeros({B, nb, 10});
+                handle->sim.cvel = mx::zeros({B, nb, 6});
+                handle->sim.qfrc_actuator = mx::zeros({B, nv});
+                handle->sim.cfrc_ext = mx::zeros({B, nb, 6});
+            }
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
                 model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
@@ -3035,11 +3065,12 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     s.qpos = results[0];
     s.qvel = results[1];
     if (results.size() > 2) s.xpos = results[2];
-    if (results.size() > 3) s.subtree_com = results[3];
-    if (results.size() > 4) s.cinert = results[4];
-    if (results.size() > 5) s.cvel = results[5];
-    if (results.size() > 6) s.qfrc_actuator = results[6];
-    if (results.size() > 7) s.cfrc_ext = results[7];
+    if (results.size() > 3) s.xquat = results[3];
+    if (results.size() > 4) s.subtree_com = results[4];
+    if (results.size() > 5) s.cinert = results[5];
+    if (results.size() > 6) s.cvel = results[6];
+    if (results.size() > 7) s.qfrc_actuator = results[7];
+    if (results.size() > 8) s.cfrc_ext = results[8];
 }
 
 MJMLX_API void mjmlx_batched_get_state(
@@ -3102,6 +3133,13 @@ MJMLX_API const float* mjmlx_batched_get_xpos(const MjmlxBatchedSim* sim, int* n
     mx::eval(sim->sim.xpos);
     if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 3;
     return sim->sim.xpos.data<float>();
+}
+
+MJMLX_API const float* mjmlx_batched_get_xquat(const MjmlxBatchedSim* sim, int* n_out) {
+    if (!sim) return nullptr;
+    mx::eval(sim->sim.xquat);
+    if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 4;
+    return sim->sim.xquat.data<float>();
 }
 
 MJMLX_API const float* mjmlx_batched_get_subtree_com(const MjmlxBatchedSim* sim, int* n_out) {
