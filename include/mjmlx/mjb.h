@@ -213,6 +213,8 @@ MJB_API void mjb_batched_reset(MjbBatchedSim* sim, const int* reset_mask);
 
 // Batched state access: float[num_envs * dim].
 MJB_API const float* mjb_batched_get_qpos(const MjbBatchedSim* sim, int* n_out);
+MJB_API void mjb_batched_get_state(const MjbBatchedSim* sim, float* qpos_out, float* qvel_out, int* nq_out, int* nv_out);
+MJB_API void mjb_batched_set_state(MjbBatchedSim* sim, const float* qpos, const float* qvel);
 MJB_API const float* mjb_batched_get_qvel(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_xquat(const MjbBatchedSim* sim, int* n_out);

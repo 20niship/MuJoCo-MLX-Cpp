@@ -1026,6 +1026,39 @@ MJB_API void mjb_batched_set_env_qvel(MjbBatchedSim* sim, int env_idx,
     }
 }
 
+MJB_API void mjb_batched_get_state(const MjbBatchedSim* sim, float* qpos_out, float* qvel_out,
+                                   int* nq_out, int* nv_out) {
+    if (!sim) return;
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        int nq = m->nq, nv = m->nv;
+        if (nq_out) *nq_out = nq;
+        if (nv_out) *nv_out = nv;
+        for (int i = 0; i < sim->num_envs; i++) {
+            const mjData* d = sim->cpu_datas[i];
+            if (qpos_out) for (int j = 0; j < nq; j++) qpos_out[i * nq + j] = (float)d->qpos[j];
+            if (qvel_out) for (int j = 0; j < nv; j++) qvel_out[i * nv + j] = (float)d->qvel[j];
+        }
+        return;
+    }
+    mjmlx_batched_get_state(sim->mlx_sim, qpos_out, qvel_out, nq_out, nv_out);
+}
+
+MJB_API void mjb_batched_set_state(MjbBatchedSim* sim, const float* qpos, const float* qvel) {
+    if (!sim) return;
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        int nq = m->nq, nv = m->nv;
+        for (int i = 0; i < sim->num_envs; i++) {
+            mjData* d = sim->cpu_datas[i];
+            if (qpos) for (int j = 0; j < nq; j++) d->qpos[j] = (double)qpos[i * nq + j];
+            if (qvel) for (int j = 0; j < nv; j++) d->qvel[j] = (double)qvel[i * nv + j];
+        }
+        return;
+    }
+    mjmlx_batched_set_state(sim->mlx_sim, qpos, qvel);
+}
+
 MJB_API void mjb_batched_eval_state(const MjbBatchedSim* sim) {
     if (!sim) return;
     if (sim->type != MJB_BACKEND_CPU && sim->mlx_sim)
