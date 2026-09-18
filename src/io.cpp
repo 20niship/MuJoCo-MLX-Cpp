@@ -246,6 +246,7 @@ static Model convert_model(mjModel* m) {
         model.geom_solmix = to_mx_f(m->geom_solmix, (int)m->ngeom);
         model.geom_solref = to_mx_f2(m->geom_solref, (int)m->ngeom, 2);
         model.geom_solimp = to_mx_f2(m->geom_solimp, (int)m->ngeom, 5);
+        model.geom_priority = to_mx_i(m->geom_priority, (int)m->ngeom);
         model.geom_margin = to_mx_f(m->geom_margin, (int)m->ngeom);
         model.geom_gap = to_mx_f(m->geom_gap, (int)m->ngeom);
         model.geom_contype = to_mx_i(m->geom_contype, (int)m->ngeom);
@@ -711,6 +712,53 @@ void Model::init_cache() const {
     }
 
     // ── Collision pairs (pre-computed from model topology) ──
+    // Contact param mixing (MuJoCo C mj_contactParam): priority差があれば高priority側を採用、同priorityのみsolmix混合。旧実装はpriority無視で常に平均/maxしていた。
+    bool has_priority = (geom_priority.size() > 0);
+    bool has_solmix = (geom_solmix.size() > 0);
+    if (has_priority) mx::eval(geom_priority);
+    if (has_solmix) mx::eval(geom_solmix);
+    auto gprio_ptr = has_priority ? geom_priority.data<int>() : nullptr;
+    auto gsolmix_ptr = has_solmix ? geom_solmix.data<float>() : nullptr;
+
+    auto mix_contact_param = [&](int g1_, int g2_, int cdim1, int cdim2,
+                                  const float* fr1, const float* fr2,
+                                  const float* sr1, const float* sr2,
+                                  const float* si1, const float* si2,
+                                  int& out_condim, float* out_friction /*[3]*/,
+                                  float* out_solref /*[2]*/, float* out_solimp /*[5]*/) {
+        int prio1 = gprio_ptr ? gprio_ptr[g1_] : 0;
+        int prio2 = gprio_ptr ? gprio_ptr[g2_] : 0;
+        if (prio1 != prio2) {
+            bool use1 = prio1 > prio2;
+            out_condim = use1 ? cdim1 : cdim2;
+            const float* fr = use1 ? fr1 : fr2;
+            const float* sr = use1 ? sr1 : sr2;
+            const float* si = use1 ? si1 : si2;
+            for (int k = 0; k < 3; k++) out_friction[k] = fr[k];
+            for (int k = 0; k < 2; k++) out_solref[k] = sr[k];
+            for (int k = 0; k < 5; k++) out_solimp[k] = si[k];
+            return;
+        }
+        // same priority
+        out_condim = std::max(cdim1, cdim2);
+        float mix1 = gsolmix_ptr ? gsolmix_ptr[g1_] : 1.0f;
+        float mix2 = gsolmix_ptr ? gsolmix_ptr[g2_] : 1.0f;
+        float mix;
+        constexpr float kMinVal = 1e-15f;
+        if (mix1 >= kMinVal && mix2 >= kMinVal) mix = mix1 / (mix1 + mix2);
+        else if (mix1 < kMinVal && mix2 < kMinVal) mix = 0.5f;
+        else if (mix1 < kMinVal) mix = 0.0f;
+        else mix = 1.0f;
+
+        if (sr1[0] > 0 && sr2[0] > 0) {
+            for (int k = 0; k < 2; k++) out_solref[k] = mix * sr1[k] + (1 - mix) * sr2[k];
+        } else {
+            for (int k = 0; k < 2; k++) out_solref[k] = std::min(sr1[k], sr2[k]);
+        }
+        for (int k = 0; k < 5; k++) out_solimp[k] = mix * si1[k] + (1 - mix) * si2[k];
+        for (int k = 0; k < 3; k++) out_friction[k] = std::max(fr1[k], fr2[k]);
+    };
+
     if (ngeom > 0) {
         mx::eval(geom_type); mx::eval(geom_bodyid);
         mx::eval(geom_contype); mx::eval(geom_conaffinity);
@@ -775,41 +823,47 @@ void Model::init_cache() const {
                     cp.dataid1 = gdid[g1_];
                     cp.dataid2 = gdid[g2_];
                 }
-                // Friction: max of both geoms
-                if (geom_friction.size() > 0) {
-                    mx::eval(geom_friction);
-                    auto gf = geom_friction.data<float>();
-                    float f0 = std::max(gf[g1_*3], gf[g2_*3]);
-                    cp.friction[0] = f0; cp.friction[1] = f0;
-                    cp.friction[2] = std::max(gf[g1_*3+1], gf[g2_*3+1]);
-                    cp.friction[3] = std::max(gf[g1_*3+2], gf[g2_*3+2]);
-                    cp.friction[4] = cp.friction[3];
-                }
-                // Solref: average
-                if (geom_solref.size() > 0) {
-                    mx::eval(geom_solref);
-                    auto sr = geom_solref.data<float>();
-                    cp.solref[0] = 0.5f * (sr[g1_*2] + sr[g2_*2]);
-                    cp.solref[1] = 0.5f * (sr[g1_*2+1] + sr[g2_*2+1]);
-                } else {
-                    cp.solref[0] = 0.02f; cp.solref[1] = 1.0f;
-                }
-                // Solimp: average
-                if (geom_solimp.size() > 0) {
-                    mx::eval(geom_solimp);
-                    auto si = geom_solimp.data<float>();
-                    for (int k = 0; k < 5; k++)
-                        cp.solimp[k] = 0.5f * (si[g1_*5+k] + si[g2_*5+k]);
-                } else {
-                    float def[] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
-                    for (int k = 0; k < 5; k++) cp.solimp[k] = def[k];
-                }
-                // Condim
-                cp.condim = 1;
-                if (geom_condim.size() > 0) {
-                    mx::eval(geom_condim);
-                    auto cdp = geom_condim.data<int>();
-                    cp.condim = std::max(cdp[g1_], cdp[g2_]);
+                {
+                    const float def_fr[3] = {1.0f, 0.005f, 0.0001f};
+                    const float def_sr[2] = {0.02f, 1.0f};
+                    const float def_si[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+                    float fr1[3], fr2[3], sr1[2], sr2[2], si1[5], si2[5];
+                    if (geom_friction.size() > 0) {
+                        mx::eval(geom_friction);
+                        auto gf = geom_friction.data<float>();
+                        for (int k = 0; k < 3; k++) { fr1[k] = gf[g1_*3+k]; fr2[k] = gf[g2_*3+k]; }
+                    } else {
+                        for (int k = 0; k < 3; k++) { fr1[k] = def_fr[k]; fr2[k] = def_fr[k]; }
+                    }
+                    if (geom_solref.size() > 0) {
+                        mx::eval(geom_solref);
+                        auto sr = geom_solref.data<float>();
+                        for (int k = 0; k < 2; k++) { sr1[k] = sr[g1_*2+k]; sr2[k] = sr[g2_*2+k]; }
+                    } else {
+                        for (int k = 0; k < 2; k++) { sr1[k] = def_sr[k]; sr2[k] = def_sr[k]; }
+                    }
+                    if (geom_solimp.size() > 0) {
+                        mx::eval(geom_solimp);
+                        auto si = geom_solimp.data<float>();
+                        for (int k = 0; k < 5; k++) { si1[k] = si[g1_*5+k]; si2[k] = si[g2_*5+k]; }
+                    } else {
+                        for (int k = 0; k < 5; k++) { si1[k] = def_si[k]; si2[k] = def_si[k]; }
+                    }
+                    int cdim1 = 3, cdim2 = 3;
+                    if (geom_condim.size() > 0) {
+                        mx::eval(geom_condim);
+                        auto cdp = geom_condim.data<int>();
+                        cdim1 = cdp[g1_]; cdim2 = cdp[g2_];
+                    }
+
+                    float mixed_friction[3], mixed_solref[2], mixed_solimp[5];
+                    mix_contact_param(g1_, g2_, cdim1, cdim2, fr1, fr2, sr1, sr2, si1, si2,
+                                       cp.condim, mixed_friction, mixed_solref, mixed_solimp);
+                    cp.friction[0] = mixed_friction[0]; cp.friction[1] = mixed_friction[0];
+                    cp.friction[2] = mixed_friction[1];
+                    cp.friction[3] = mixed_friction[2]; cp.friction[4] = mixed_friction[2];
+                    cp.solref[0] = mixed_solref[0]; cp.solref[1] = mixed_solref[1];
+                    for (int k = 0; k < 5; k++) cp.solimp[k] = mixed_solimp[k];
                 }
 
                 cache.collision_pairs.push_back(cp);

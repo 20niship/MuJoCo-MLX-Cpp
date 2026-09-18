@@ -216,6 +216,7 @@ struct Model {
     mx::array geom_solmix = mx::array({});
     mx::array geom_solref = mx::array({});
     mx::array geom_solimp = mx::array({});
+    mx::array geom_priority = mx::array({});  // MuJoCo C: geom_priority (contact param mixing rule)
     mx::array geom_margin = mx::array({});
     mx::array geom_gap = mx::array({});
     mx::array geom_contype = mx::array({});
