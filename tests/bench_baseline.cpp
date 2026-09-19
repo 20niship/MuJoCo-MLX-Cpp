@@ -75,47 +75,82 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── Batched benchmarks (GPU path, 64 envs) ──────────────────────────────
+    // ── Batched benchmarks (GPU path, B=64/256/2048 envs) ──────────────────
 
-    printf("\n--- Batched Benchmarks (64 envs, GPU) ---\n");
+    const int kBatchSizes[] = {64, 256, 2048};
+
+    printf("\n--- Batched Benchmarks (B=64/256/2048, GPU) ---\n");
 
     // try/catch per benchmark: one throwing (e.g. Metal resource-limit error) must not lose results already collected.
-    try {
-        auto s = bench_batched_step("batched/pendulum", "pendulum", SIMPLE_PENDULUM_XML, 64, 20, 1, 3);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/pendulum: %s\n", e.what());
-    }
-
-    try {
-        auto s = bench_batched_step("batched/t_shape", "t_shape", T_SHAPE_XML, 64, 20, 1, 3);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/t_shape: %s\n", e.what());
-    }
-
-    for (auto& mp : std::vector<std::pair<const char*, const char*>>{
-             {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
-        std::string name = std::string("batched/") + mp.first;
+    for (int b : kBatchSizes) {
+        std::string name = std::string("batched/pendulum/B") + std::to_string(b);
         try {
-            auto s = bench_batched_step_file(name.c_str(), mp.first, mp.second, 32, 20, 1, 3);
-            if (s.steps_per_sec > 0) {
-                _bench_results.push_back(s);
-                bench_print_stats(s);
-            }
+            auto s = bench_batched_step(name.c_str(), "pendulum", SIMPLE_PENDULUM_XML, b, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
         } catch (const std::exception& e) {
             printf("  CRASH %s: %s\n", name.c_str(), e.what());
         }
     }
 
-    try {
-        auto s = bench_batched_step("batched/high_dof_tree", "high_dof_tree", HIGH_DOF_TREE_XML, 16, 10, 1, 2);
-        _bench_results.push_back(s);
-        bench_print_stats(s);
-    } catch (const std::exception& e) {
-        printf("  CRASH batched/high_dof_tree: %s\n", e.what());
+    for (int b : kBatchSizes) {
+        std::string name = std::string("batched/t_shape/B") + std::to_string(b);
+        try {
+            auto s = bench_batched_step(name.c_str(), "t_shape", T_SHAPE_XML, b, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
+    }
+
+    for (int b : kBatchSizes) {
+        std::string name = std::string("batched/cfrc_ext/B") + std::to_string(b);
+        try {
+            auto s = bench_batched_step(name.c_str(), "cfrc_ext", CFRC_EXT_XML, b, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
+    }
+
+    for (int b : kBatchSizes) {
+        std::string name = std::string("batched/exclude/B") + std::to_string(b);
+        try {
+            auto s = bench_batched_step(name.c_str(), "exclude", EXCLUDE_XML, b, 20, 1, 3);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
+    }
+
+    for (int b : kBatchSizes) {
+        for (auto& mp : std::vector<std::pair<const char*, const char*>>{
+                 {"humanoid", humanoid_path}, {"go2", go2_path}, {"h1", h1_path}}) {
+            std::string name = std::string("batched/") + mp.first + "/B" + std::to_string(b);
+            try {
+                auto s = bench_batched_step_file(name.c_str(), mp.first, mp.second, b, 20, 1, 3);
+                if (s.steps_per_sec > 0) {
+                    _bench_results.push_back(s);
+                    bench_print_stats(s);
+                }
+            } catch (const std::exception& e) {
+                printf("  CRASH %s: %s\n", name.c_str(), e.what());
+            }
+        }
+    }
+
+    for (int b : kBatchSizes) {
+        std::string name = std::string("batched/high_dof_tree/B") + std::to_string(b);
+        try {
+            auto s = bench_batched_step(name.c_str(), "high_dof_tree", HIGH_DOF_TREE_XML, b, 10, 1, 2);
+            _bench_results.push_back(s);
+            bench_print_stats(s);
+        } catch (const std::exception& e) {
+            printf("  CRASH %s: %s\n", name.c_str(), e.what());
+        }
     }
 
     // ── Summary and CSV output ───────────────────────────────────────────────
