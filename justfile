@@ -35,6 +35,14 @@ bench: build
 bench-mkx: build-mkx
     BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_check.sh
 
+# Build then run each benchmark 5x, report min/max/avg (smooths out occasional slow runs)
+bench-repeat *ARGS: build
+    ./scripts/bench_repeat.sh {{ARGS}}
+
+# Same as bench-repeat but for the MKX backend
+bench-repeat-mkx *ARGS: build-mkx
+    BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_repeat.sh {{ARGS}}
+
 # Download external benchmark robot models (Go2, H1); bench/bench-mkx already do this automatically
 fetch-models:
     ./scripts/fetch_models.sh
