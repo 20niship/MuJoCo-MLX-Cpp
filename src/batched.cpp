@@ -1328,13 +1328,70 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
-// solverカーネル(MSL版・GLSL版とも)のscratchレイアウトと1floatも違ってはいけない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
+// solverカーネルのscratchレイアウト(GLSL版はefc長の配列7本、MSL版は6本)以上でなければならない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 6*MAX_EFC + 5*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
+// 関節リミット拘束の静的テーブル(1関節13float): dof, qposadr, lo, hi, margin, solref(2), solimp(5), invweight。hinge/slideのlimited関節のみ。
+static std::vector<float> build_solver_limit_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::LIMIT) || m.jnt_limited.size() == 0) return tab;
+    mx::eval(m.jnt_limited, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, m.jnt_range, m.dof_invweight0);
+    auto limited = m.jnt_limited.data<int>();
+    auto jtypes = m.jnt_type.data<int>();
+    auto jqpa = m.jnt_qposadr.data<int>();
+    auto jda = m.jnt_dofadr.data<int>();
+    auto jrange = m.jnt_range.data<float>();
+    auto iw = m.dof_invweight0.data<float>();
+    const float* margin = nullptr; const float* sref = nullptr; const float* simp = nullptr;
+    if (m.jnt_margin.size() > 0) { mx::eval(m.jnt_margin); margin = m.jnt_margin.data<float>(); }
+    if (m.jnt_solref.size() > 0) { mx::eval(m.jnt_solref); sref = m.jnt_solref.data<float>(); }
+    if (m.jnt_solimp.size() > 0) { mx::eval(m.jnt_solimp); simp = m.jnt_solimp.data<float>(); }
+    for (int j = 0; j < m.njnt; j++) {
+        if (!limited[j]) continue;
+        if (jtypes[j] != (int)JointType::SLIDE && jtypes[j] != (int)JointType::HINGE) continue;
+        tab.push_back((float)jda[j]);
+        tab.push_back((float)jqpa[j]);
+        tab.push_back(jrange[j*2]);
+        tab.push_back(jrange[j*2+1]);
+        tab.push_back(margin ? margin[j] : 0.0f);
+        tab.push_back(sref ? sref[j*2] : 0.02f);
+        tab.push_back(sref ? sref[j*2+1] : 1.0f);
+        const float dsi[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+        for (int k = 0; k < 5; k++) tab.push_back(simp ? simp[j*5+k] : dsi[k]);
+        tab.push_back(iw[jda[j]]);
+        n_out++;
+    }
+    return tab;
+}
+
+// DOF摩擦損失(frictionloss)拘束の静的テーブル(1dofあたり10float): dof, frictionloss, solref(2), solimp(5), invweight。
+static std::vector<float> build_solver_friction_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::FRICTIONLOSS) || m.dof_frictionloss.size() == 0) return tab;
+    mx::eval(m.dof_frictionloss, m.dof_invweight0, m.dof_solref, m.dof_solimp);
+    auto fl = m.dof_frictionloss.data<float>();
+    auto iw = m.dof_invweight0.data<float>();
+    auto sr = m.dof_solref.data<float>();
+    auto si = m.dof_solimp.data<float>();
+    for (int i = 0; i < m.nv; i++) {
+        if (fl[i] <= 0.0f) continue;
+        tab.push_back((float)i);
+        tab.push_back(fl[i]);
+        tab.push_back(sr[i*2]);
+        tab.push_back(sr[i*2+1]);
+        for (int k = 0; k < 5; k++) tab.push_back(si[i*5+k]);
+        tab.push_back(iw[i]);
+        n_out++;
+    }
+    return tab;
+}
+
 static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
@@ -2251,6 +2308,10 @@ struct BatchedStepContext {
     mx::array solver_pair_props = mx::zeros({1});
     mx::array solver_body_dof_masks = mx::zeros({1});
     mx::array solver_body_rootid = mx::zeros({1});
+    mx::array solver_limit_tab = mx::zeros({1});
+    mx::array solver_fric_tab = mx::zeros({1});
+    int solver_nlim = 0;
+    int solver_nfl = 0;
     int solver_scratch_size = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
@@ -2484,10 +2545,23 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 
     // Build solver kernel (constraint construction + Newton solver) whenever there's anything to collide.
     if (m.cache.collision_pairs.size() > 0) {
+        {
+            auto lt = build_solver_limit_table(m, ctx->solver_nlim);
+            auto ft = build_solver_friction_table(m, ctx->solver_nfl);
+            if (lt.empty()) lt.push_back(0.0f);
+            if (ft.empty()) ft.push_back(0.0f);
+            ctx->solver_limit_tab = mx::array(lt.data(), {(int)lt.size()}, mx::float32);
+            ctx->solver_fric_tab = mx::array(ft.data(), {(int)ft.size()}, mx::float32);
+            mx::eval(ctx->solver_limit_tab, ctx->solver_fric_tab);
+        }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
         int si = std::min(raw_si, 3);
         int cgi = 20;
+#if defined(MJMLX_BACKEND_MKX)
+        // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、接触・リミットだけの3回では収束しない。
+        if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 5));
+#endif
         ctx->solver_scratch_size = solver_scratch_per_env(m);
 #if defined(MJMLX_BACKEND_MKX)
         if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
@@ -2501,7 +2575,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi);
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
 #else
         auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_kernel = mx::fast::metal_kernel(
@@ -2801,7 +2875,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
-                                 ctx->solver_body_rootid}),
+                                 ctx->solver_body_rootid,
+                                 mx::astype(mx::flatten(qpos_batch), mx::float32),
+                                 ctx->solver_limit_tab, ctx->solver_fric_tab}),
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
