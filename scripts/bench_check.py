@@ -153,11 +153,12 @@ def main() -> int:
     print(bold(f"--- Running bench_baseline ({repeats}x per benchmark, 1 process each, for min/max/avg) ---"))
     run_timestamps: set[str] = set()
     crashes: list[tuple[int, str]] = []
-    total = repeats * len(ALL_BENCH_NAMES)
+    bench_names = [n for n in ALL_BENCH_NAMES if humanoid or "humanoid" not in n]
+    total = repeats * len(bench_names)
     done = 0
     env = dict(os.environ)
     for i in range(1, repeats + 1):
-        for name in ALL_BENCH_NAMES:
+        for name in bench_names:
             done += 1
             before = len(read_rows(history_csv))
             env["MJMLX_BENCH_ONLY"] = name
