@@ -3,8 +3,10 @@
 import csv
 import os
 import re
+import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -42,6 +44,30 @@ def read_rows(history_csv: Path) -> list[dict[str, str]]:
         return []
     with open(history_csv, newline="") as f:
         return list(csv.DictReader(f))
+
+
+HUMANOID_URL = "https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/humanoid/humanoid.xml"
+
+
+def fetch_models(models_dir: Path) -> tuple[Path, Path, Path]:
+    menagerie = models_dir / "mujoco_menagerie"
+    go2 = menagerie / "unitree_go2" / "scene.xml"
+    h1 = menagerie / "unitree_h1" / "scene.xml"
+    humanoid = models_dir / "humanoid.xml"
+
+    if not (go2.exists() and h1.exists()):
+        print("fetching mujoco_menagerie (unitree_go2, unitree_h1)...")
+        shutil.rmtree(menagerie, ignore_errors=True)
+        menagerie.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "https://github.com/google-deepmind/mujoco_menagerie.git", str(menagerie)], check=True)
+        subprocess.run(["git", "-C", str(menagerie), "sparse-checkout", "set", "unitree_go2", "unitree_h1"], check=True)
+
+    if not humanoid.exists():
+        print("fetching humanoid.xml...")
+        with urllib.request.urlopen(HUMANOID_URL) as r:
+            humanoid.write_bytes(r.read())
+
+    return humanoid, go2, h1
 
 
 SCALAR_MODELS = ["pendulum", "cfrc_ext", "high_dof_tree", "exclude", "t_shape", "humanoid", "go2", "h1"]
@@ -124,7 +150,6 @@ def main() -> int:
     history_csv = Path(os.environ.get("HISTORY_CSV", project_dir / "benchmarks" / "history.csv"))
     repeats = int(os.environ.get("REPEATS", "5"))
     timeout_sec = float(os.environ.get("BENCH_TIMEOUT_SEC", "120"))
-    humanoid = sys.argv[1] if len(sys.argv) > 1 else ""
     threshold_pct = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
 
     print(bold("=== MuJoCo-MLX-Cpp Benchmark Regression Check ==="))
@@ -139,10 +164,8 @@ def main() -> int:
         return 1
 
     (project_dir / "benchmarks").mkdir(exist_ok=True)
-    subprocess.run([str(script_dir / "fetch_models.sh")], check=True)
-    menagerie_dir = project_dir / "benchmarks" / "models" / "external" / "mujoco_menagerie"
-    go2_model = menagerie_dir / "unitree_go2" / "scene.xml"
-    h1_model = menagerie_dir / "unitree_h1" / "scene.xml"
+    default_humanoid, go2_model, h1_model = fetch_models(project_dir / "benchmarks" / "models" / "external")
+    humanoid = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else str(default_humanoid)
 
     bench_baseline = build_dir / "bench_baseline"
     if not os.access(bench_baseline, os.X_OK):
@@ -153,7 +176,7 @@ def main() -> int:
     print(bold(f"--- Running bench_baseline ({repeats}x per benchmark, 1 process each, for min/max/avg) ---"))
     run_timestamps: set[str] = set()
     crashes: list[tuple[int, str]] = []
-    bench_names = [n for n in ALL_BENCH_NAMES if humanoid or "humanoid" not in n]
+    bench_names = ALL_BENCH_NAMES
     total = repeats * len(bench_names)
     done = 0
     env = dict(os.environ)
@@ -180,7 +203,7 @@ def main() -> int:
                     print(f"    {tail}")
                 continue
             if len(after_rows) <= before:
-                print(yellow(f"  [{done}/{total}] SKIP {name} (model path not given)"))
+                print(yellow(f"  [{done}/{total}] SKIP {name} (no result written)"))
                 continue
             run_timestamps.add(after_rows[-1]["timestamp"])
             line = next((l for l in result.stdout.splitlines() if l.strip().startswith(name)), "")
