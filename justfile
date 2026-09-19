@@ -19,7 +19,7 @@ check-ci: build
 # Configure + build the MKX (Vulkan) backend into build-mkx/
 build-mkx:
     mkdir -p build-mkx
-    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX \
+    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX -DCMAKE_BUILD_TYPE=Release \
         {{ if mujoco_root != "" { "-DMUJOCO_ROOT=" + mujoco_root } else { "" } }}
     cmake --build build-mkx -j
 
@@ -27,9 +27,13 @@ build-mkx:
 check-ci-mkx: build-mkx
     cd build-mkx && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives
 
-# Build then run the benchmark regression check (5 repeats, reports min/max/avg)
-bench: build
-    ./scripts/bench_check.py
+# Build the MLX backend into build-mlx/ (Release forced) then run the benchmark regression check (5 repeats, min/max/avg)
+bench:
+    mkdir -p build-mlx
+    cmake -S . -B build-mlx -DMJMLX_TENSOR_BACKEND=MLX -DCMAKE_BUILD_TYPE=Release -DMLX_ROOT={{mlx_root}} \
+        {{ if mujoco_root != "" { "-DMUJOCO_ROOT=" + mujoco_root } else { "" } }}
+    cmake --build build-mlx -j
+    BUILD_DIR=build-mlx HISTORY_CSV=benchmarks/history.csv ./scripts/bench_check.py
 
 # Build the MKX backend then run the same benchmarks (separate history file, for MLX-vs-MKX comparison)
 bench-mkx: build-mkx
@@ -47,7 +51,7 @@ build-python: _venv
 # Build the RL Python extension (MKX/Vulkan backend) into build-mkx/
 build-python-mkx: _venv
     mkdir -p build-mkx
-    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX \
+    cmake -S . -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX -DCMAKE_BUILD_TYPE=Release \
         -DMUJOCO_ROOT=.venv/lib/python3.10/site-packages/mujoco \
         -DMJMLX_BUILD_PYTHON=ON -DPython_EXECUTABLE=.venv/bin/python
     cmake --build build-mkx --target _mjmlx_rl_native -j
