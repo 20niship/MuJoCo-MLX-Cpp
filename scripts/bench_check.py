@@ -209,7 +209,8 @@ def main() -> int:
         vals = per_bench[name]
         print(f"{name:<32} {len(vals):>3} {min(vals):>12.0f} {sum(vals) / len(vals):>12.0f} {max(vals):>12.0f}")
 
-    maybe_plot(per_bench, rows, project_dir / "benchmarks" / "bench_plot.png")
+    plot_suffix = history_csv.stem.removeprefix("history")  # history.csv->"", history-mkx.csv->"-mkx"
+    maybe_plot(per_bench, rows, project_dir / "benchmarks" / f"bench_plot{plot_suffix}.png")
 
     for bench_exe in sorted(build_dir.glob("bench_*")):
         if bench_exe.name == "bench_baseline" or not os.access(bench_exe, os.X_OK):

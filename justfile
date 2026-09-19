@@ -27,21 +27,13 @@ build-mkx:
 check-ci-mkx: build-mkx
     cd build-mkx && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives
 
-# Build then run the benchmark regression check
+# Build then run the benchmark regression check (5 repeats, reports min/max/avg)
 bench: build
-    ./scripts/bench_check.sh
+    ./scripts/bench_check.py
 
 # Build the MKX backend then run the same benchmarks (separate history file, for MLX-vs-MKX comparison)
 bench-mkx: build-mkx
-    BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_check.sh
-
-# Build then run each benchmark 5x, report min/max/avg (smooths out occasional slow runs)
-bench-repeat *ARGS: build
-    ./scripts/bench_repeat.sh {{ARGS}}
-
-# Same as bench-repeat but for the MKX backend
-bench-repeat-mkx *ARGS: build-mkx
-    BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_repeat.sh {{ARGS}}
+    BUILD_DIR=build-mkx HISTORY_CSV=benchmarks/history-mkx.csv ./scripts/bench_check.py
 
 # Download external benchmark robot models (Go2, H1); bench/bench-mkx already do this automatically
 fetch-models:
