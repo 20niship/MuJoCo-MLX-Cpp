@@ -2669,7 +2669,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
         int si = std::min(raw_si, 3);
-        int cgi = 20;
+        int cgi = 10;
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
