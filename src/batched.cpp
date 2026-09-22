@@ -3269,13 +3269,13 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
         } else {
             // GPU path: compiled + vmapped MLX step function
-            std::vector<mx::array> qpos_list, qvel_list;
-            for (int i = 0; i < B; i++) {
-                qpos_list.push_back(model->model.qpos0);
-                qvel_list.push_back(mx::zeros({nv}));
-            }
-            handle->sim.qpos = mx::stack(qpos_list);
-            handle->sim.qvel = mx::stack(qvel_list);
+            // 全envが同一のqpos0/zero qvelなのでstack()のO(B)回concatenateループを避け、ホスト側でB個複製した1本の配列を直接作る(初期化がO(B)dispatchからO(1)になる)。
+            mx::eval(model->model.qpos0);
+            const float* q0 = model->model.qpos0.data<float>();
+            std::vector<float> qp0(static_cast<size_t>(B) * nq);
+            for (int i = 0; i < B; i++) std::copy(q0, q0 + nq, qp0.begin() + static_cast<size_t>(i) * nq);
+            handle->sim.qpos = mx::reshape(mx::array(qp0.data(), {B * nq}, mx::float32), {B, nq});
+            handle->sim.qvel = mx::zeros({B, nv});
             {
                 // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
                 int nb = model->model.nbody;
