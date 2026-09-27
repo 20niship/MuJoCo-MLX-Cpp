@@ -1328,9 +1328,10 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
+// solverカーネル(MSL版・GLSL版とも)のscratchレイアウトと1floatも違ってはいけない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 6*MAX_EFC + 5*nv + nv*3;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
@@ -2488,6 +2489,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int si = std::min(raw_si, 3);
         int cgi = 20;
         ctx->solver_scratch_size = solver_scratch_per_env(m);
+#if defined(MJMLX_BACKEND_MKX)
+        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
+#endif
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);
