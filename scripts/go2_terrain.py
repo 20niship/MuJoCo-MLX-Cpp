@@ -48,7 +48,15 @@ class StairsTerrain:
 
     def sample_spawn_xy(self, rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
         margin = 0.3
-        x = rng.uniform(margin, self.total_length - margin, size=n)
+        edge_margin = 0.08  # 段差の継ぎ目ちょうどに立たせると足がすり抜けることがある(実測で確認)ので避ける
+        x = np.empty(n)
+        need = np.ones(n, dtype=bool)
+        while need.any():
+            cand = rng.uniform(margin, self.total_length - margin, size=need.sum())
+            near_edge = np.min(np.abs(cand[:, None] - self.edges[None, :]), axis=1) < edge_margin
+            idx = np.nonzero(need)[0]
+            x[idx[~near_edge]] = cand[~near_edge]
+            need[idx[~near_edge]] = False
         y = rng.uniform(-CORRIDOR_WIDTH / 2 + margin, CORRIDOR_WIDTH / 2 - margin, size=n)
         return x, y
 
