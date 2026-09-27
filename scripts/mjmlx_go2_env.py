@@ -280,7 +280,8 @@ class MjmlxGo2Env(VecEnv):
         rewards = (
             r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque
         )
-        rewards = np.where(blew_up, 0.0, rewards).astype(np.float32)
+        # 未知の接触イベント等でどれかの項が想定外に暴れてもvalue関数の発散を防ぐ最終防衛ライン
+        rewards = np.where(blew_up, 0.0, np.clip(rewards, -50.0, 50.0)).astype(np.float32)
 
         self._elapsed += 1
         truncated = self._elapsed >= MAX_EPISODE_STEPS
