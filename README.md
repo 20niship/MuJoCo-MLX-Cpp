@@ -64,6 +64,53 @@ just build-python-mkx && just train-ppo --envs 2048 --timesteps 2000000 --build-
 
 TensorBoard: `uv run tensorboard --logdir runs/`
 
+### Go2階段地形cmd_vel追従学習(`scripts/train_go2_ppo.py`)
+
+Unitree Go2を階段状のBox地形(高さ3〜5cm、奥行き20〜50cmの段)の上でcmd_vel(vx, vy, vyaw)追従させるPPO学習。観測・報酬・PPOハイパーパラメータ・ネットワーク構成・ドメインランダマイズは[IsaacLabのUnitreeGo2RoughEnvCfg / UnitreeGo2RoughPPORunnerCfg](https://github.com/isaac-sim/IsaacLab)を踏襲し、学習ライブラリもIsaacLabと同じ[rsl_rl](https://github.com/leggedrobotics/rsl_rl)を使う(SB3は使わない)。
+
+依存パッケージ(pyproject.tomlには未記載、個別にインストールが必要):
+
+```bash
+pip install rsl-rl-lib tensordict gitpython tensorboard
+```
+
+ビルド(Python拡張、Go2モデルのメッシュ取得込み):
+
+```bash
+# macOS (MLX/Metal backend)
+cmake -B build -DMJMLX_BUILD_PYTHON=ON
+cmake --build build --target _mjmlx_rl_native -j
+
+# Linux (MKX/Vulkan backend, 例: NVIDIA GPU機)
+cmake -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX -DCMAKE_BUILD_TYPE=Release -DMJMLX_BUILD_PYTHON=ON
+cmake --build build-mkx --target _mjmlx_rl_native -j
+
+# unitree_go2のメッシュ/XML(gitignore対象、初回のみ)を取得
+python3 -c "from pathlib import Path; import sys; sys.path.insert(0,'scripts'); from bench_check import fetch_models; fetch_models(Path('benchmarks/models/external'))"
+```
+
+学習実行:
+
+```bash
+python scripts/train_go2_ppo.py --build-dir build-mkx --envs 2048 --max-iterations 1500 --logdir runs/go2_stairs
+# macOSでMLX backendを使う場合は --build-dir build (デフォルト)
+# GPU無し/デバッグ用途なら --cpu を付ける
+```
+
+チェックポイントは`--logdir`配下に`save_interval`(既定50)イテレーションごとに`model_{iteration}.pt`として自動保存される(rsl_rlの`OnPolicyRunner`が管理、学習終了時にも最終モデルを保存)。
+
+学習ログはTensorBoardで確認する:
+
+```bash
+tensorboard --logdir runs/go2_stairs --host 0.0.0.0 --port 6006
+```
+
+エンジンの制約により、IsaacLab版から以下を省略・簡略化している:
+- **height_scanner観測**: 本エンジンにレイキャストAPIが無いため、盲目(proprioception only)方策になる
+- **per-envの物理DR(質量/摩擦/COM)**: batched simが全envで単一モデルを共有するため、env別に質量・摩擦を変えるAPIが無い
+- **地形カリキュラム**: 実装対象外(固定難度の階段地形のみ)
+- **heading_command方式のcmd_vel生成**: `||cmd_vel|| ∈ [--cmd-vel-min, --cmd-vel-max]`の直接サンプリングに簡略化
+
 ## Architecture
 
 ```
