@@ -1328,13 +1328,70 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
-// solverカーネル(MSL版・GLSL版とも)のscratchレイアウトと1floatも違ってはいけない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
+// solverカーネルのscratchレイアウト(GLSL版はefc長の配列7本、MSL版は6本)以上でなければならない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 6*MAX_EFC + 5*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
+// 関節リミット拘束の静的テーブル(1関節13float): dof, qposadr, lo, hi, margin, solref(2), solimp(5), invweight。hinge/slideのlimited関節のみ。
+static std::vector<float> build_solver_limit_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::LIMIT) || m.jnt_limited.size() == 0) return tab;
+    mx::eval(m.jnt_limited, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, m.jnt_range, m.dof_invweight0);
+    auto limited = m.jnt_limited.data<int>();
+    auto jtypes = m.jnt_type.data<int>();
+    auto jqpa = m.jnt_qposadr.data<int>();
+    auto jda = m.jnt_dofadr.data<int>();
+    auto jrange = m.jnt_range.data<float>();
+    auto iw = m.dof_invweight0.data<float>();
+    const float* margin = nullptr; const float* sref = nullptr; const float* simp = nullptr;
+    if (m.jnt_margin.size() > 0) { mx::eval(m.jnt_margin); margin = m.jnt_margin.data<float>(); }
+    if (m.jnt_solref.size() > 0) { mx::eval(m.jnt_solref); sref = m.jnt_solref.data<float>(); }
+    if (m.jnt_solimp.size() > 0) { mx::eval(m.jnt_solimp); simp = m.jnt_solimp.data<float>(); }
+    for (int j = 0; j < m.njnt; j++) {
+        if (!limited[j]) continue;
+        if (jtypes[j] != (int)JointType::SLIDE && jtypes[j] != (int)JointType::HINGE) continue;
+        tab.push_back((float)jda[j]);
+        tab.push_back((float)jqpa[j]);
+        tab.push_back(jrange[j*2]);
+        tab.push_back(jrange[j*2+1]);
+        tab.push_back(margin ? margin[j] : 0.0f);
+        tab.push_back(sref ? sref[j*2] : 0.02f);
+        tab.push_back(sref ? sref[j*2+1] : 1.0f);
+        const float dsi[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+        for (int k = 0; k < 5; k++) tab.push_back(simp ? simp[j*5+k] : dsi[k]);
+        tab.push_back(iw[jda[j]]);
+        n_out++;
+    }
+    return tab;
+}
+
+// DOF摩擦損失(frictionloss)拘束の静的テーブル(1dofあたり10float): dof, frictionloss, solref(2), solimp(5), invweight。
+static std::vector<float> build_solver_friction_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::FRICTIONLOSS) || m.dof_frictionloss.size() == 0) return tab;
+    mx::eval(m.dof_frictionloss, m.dof_invweight0, m.dof_solref, m.dof_solimp);
+    auto fl = m.dof_frictionloss.data<float>();
+    auto iw = m.dof_invweight0.data<float>();
+    auto sr = m.dof_solref.data<float>();
+    auto si = m.dof_solimp.data<float>();
+    for (int i = 0; i < m.nv; i++) {
+        if (fl[i] <= 0.0f) continue;
+        tab.push_back((float)i);
+        tab.push_back(fl[i]);
+        tab.push_back(sr[i*2]);
+        tab.push_back(sr[i*2+1]);
+        for (int k = 0; k < 5; k++) tab.push_back(si[i*5+k]);
+        tab.push_back(iw[i]);
+        n_out++;
+    }
+    return tab;
+}
+
 static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
@@ -1756,7 +1813,42 @@ contact_count[bid] = (float)ncon;
 
 // ── Metal constraint + Newton solver kernel ──────────────────────────────────
 
-static std::string make_solver_source(const Model& m, int solver_iters = 1, int cg_iters = 15) {
+// 拘束コスト(efc_cost)とk/b/imp(efc_kbi)はカーネル本体の外(ヘッダ)でしか関数定義できない。
+static std::string make_solver_header(const Model& m) {
+    bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
+    std::ostringstream hk;
+    hk << R"(
+float efc_cost(float D, float x, float fl) {
+    if (fl > 0.0f) {
+        if (abs(D * x) < fl) return 0.5f * D * x * x;
+        return fl * abs(x) - 0.5f * fl * fl / D;
+    }
+    return (x < 0.0f) ? 0.5f * D * x * x : 0.0f;
+}
+void efc_kbi(float solref0, float solref1, float si0, float si1, float si2, float si3, float si4, float pos, thread float& k_val, thread float& b_val, thread float& imp_val) {
+    float tc = solref0;
+)";
+    if (!refsafe) hk << "    tc = max(tc, 2.0f * " << m.opt.timestep << "f);\n";
+    hk << R"(
+    float dmin = clamp(si0, 0.0001f, 0.9999f);
+    float dmax_v = clamp(si1, 0.0001f, 0.9999f);
+    float width_v = max(si2, 1e-12f);
+    float mid_v = clamp(si3, 0.0001f, 0.9999f);
+    float power_v = max(si4, 1.0f);
+    k_val = (tc > 0) ? 1.0f/(dmax_v*dmax_v*tc*tc*solref1*solref1) : -tc/(dmax_v*dmax_v);
+    b_val = (solref1 > 0) ? 2.0f/(dmax_v*tc) : -solref1/dmax_v;
+    float x = abs(pos) / width_v;
+    float y;
+    if (x < mid_v) y = pow(x, power_v) / pow(mid_v, power_v - 1.0f);
+    else y = 1.0f - pow(1.0f - x, power_v) / pow(1.0f - mid_v, power_v - 1.0f);
+    imp_val = clamp(dmin + y * (dmax_v - dmin), dmin, dmax_v);
+    if (x > 1.0f) imp_val = dmax_v;
+}
+)";
+    return hk.str();
+}
+
+static std::string make_solver_source(const Model& m, int solver_iters, int cg_iters, int nlim, int nfl) {
     m.init_cache();
     const auto& c = m.cache;
     int nb = m.nbody, nv = m.nv, npairs = (int)c.collision_pairs.size();
@@ -1779,7 +1871,8 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
     int S_MV = S_ACTIVE + MAX_EFC;
     int S_JV = S_MV + nv;
     int S_JACP = S_JV + MAX_EFC;
-    int SCRATCH_PER_ENV = S_JACP + nv * 3;
+    int S_FLOSS = S_JACP + nv * 3;
+    int SCRATCH_PER_ENV = S_FLOSS + MAX_EFC;
 
     std::ostringstream ss;
 
@@ -1788,6 +1881,9 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
        << "uint tid = thread_position_in_threadgroup.x;\n"
        << "const int NV = " << nv << ";\n"
        << "const int NB = " << nb << ";\n"
+       << "const int NQ = " << m.nq << ";\n"
+       << "const int NLIM = " << nlim << ";\n"
+       << "const int NFL = " << nfl << ";\n"
        << "const int MAX_EFC_N = " << MAX_EFC << ";\n"
        << "const int NSOLVE = " << solver_iters << ";\n"
        << "const int CON_STRIDE = " << CONTACT_STRIDE << ";\n"
@@ -1811,12 +1907,14 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
        << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
        << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
        << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
+       << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
        << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
        << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n"
        << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + (i)]\n\n";
 
     // State offsets
-    ss << "uint qm_off = bid * NV * NV;\n"
+    ss << "uint qp_off = bid * NQ;\n"
+       << "uint qm_off = bid * NV * NV;\n"
        << "uint qfs_off = bid * NV;\n"
        << "uint cd_off = bid * NV * 6;\n"
        << "uint sc_off = bid * NB * 3;\n"
@@ -1835,6 +1933,10 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
        << "#define cg_p(i)   H(NV + (i))\n"
        << "#define cg_Ap(i)  H(2*NV + (i))\n";
 
+    ss << "#define EFC_REFRESH(r) { float fl_ = efc_floss(r); float jr_ = Jaref(r); "
+       << "if (fl_ > 0.0f) { float fd_ = efc_D(r) * jr_; if (abs(fd_) < fl_) { act(r) = 1.0f; efc_force(r) = -fd_; } else { act(r) = 0.0f; efc_force(r) = (jr_ > 0.0f) ? -fl_ : fl_; } } "
+       << "else { act(r) = (jr_ < 0.0f) ? 1.0f : 0.0f; efc_force(r) = efc_D(r) * (-jr_) * act(r); } }\n";
+
     // CG iterations for inner linear solve
     ss << "const int CG_ITERS = " << cg_iters << ";\n\n";
 
@@ -1846,6 +1948,49 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
     ss << "if (tid == 0) {\n"
        << "int ncon = (int)contact_count_in[bid];\n"
        << "int nefc = 0;\n\n";
+
+    if (nfl > 0) {
+        ss << R"(
+for (int fi = 0; fi < NFL; fi++) {
+    if (nefc >= MAX_EFC_N - 4) break;
+    int fp = fi * 10;
+    int dof = (int)fric_tab[fp+0];
+    float fl = fric_tab[fp+1];
+    float k_f, b_f, imp_f;
+    efc_kbi(fric_tab[fp+2], fric_tab[fp+3], fric_tab[fp+4], fric_tab[fp+5], fric_tab[fp+6], fric_tab[fp+7], fric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
+    float r_f = max(fric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
+    J(nefc, dof) = 1.0f;
+    efc_D(nefc) = 1.0f / r_f;
+    efc_aref(nefc) = -b_f * qvel_in[qv_off + dof];
+    efc_floss(nefc) = fl;
+    nefc++;
+}
+)";
+    }
+    if (nlim > 0) {
+        ss << R"(
+for (int li = 0; li < NLIM; li++) {
+    if (nefc >= MAX_EFC_N - 4) break;
+    int lp = li * 13;
+    int dof = (int)lim_tab[lp+0];
+    int qa = (int)lim_tab[lp+1];
+    float qv_j = qpos_in[qp_off + qa];
+    float dist_lo = qv_j - lim_tab[lp+2];
+    float dist_hi = lim_tab[lp+3] - qv_j;
+    float pos = min(dist_lo, dist_hi) - lim_tab[lp+4];
+    if (pos < 0.0f) {
+        float sgn = (dist_lo < dist_hi) ? 1.0f : -1.0f;
+        float k_l, b_l, imp_l;
+        efc_kbi(lim_tab[lp+5], lim_tab[lp+6], lim_tab[lp+7], lim_tab[lp+8], lim_tab[lp+9], lim_tab[lp+10], lim_tab[lp+11], pos, k_l, b_l, imp_l);
+        float r_l = max(lim_tab[lp+12] * (1.0f - imp_l) / imp_l, MJMINVAL_CV);
+        J(nefc, dof) = sgn;
+        efc_D(nefc) = 1.0f / r_l;
+        efc_aref(nefc) = -b_l * (sgn * qvel_in[qv_off + dof]) - k_l * imp_l * pos;
+        nefc++;
+    }
+}
+)";
+    }
 
     // ── Build constraint rows from contacts ──
     ss << R"(
@@ -2024,8 +2169,7 @@ if (tid == 0) {
         float s = 0; for (int j = 0; j < NV; j++) s += J(r2,j)*qacc(j);
         Jaref(r2) = s - efc_aref(r2);
     }
-    for (int r2 = 0; r2 < nefc; r2++) act(r2) = (Jaref(r2) < 0) ? 1.0f : 0.0f;
-    for (int r2 = 0; r2 < nefc; r2++) efc_force(r2) = efc_D(r2)*(-Jaref(r2))*act(r2);
+    for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
 }
 threadgroup_barrier(mem_flags::mem_device);
 
@@ -2100,24 +2244,41 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         }
         float qg=0,lg=0,qc=0,lc=0;
         for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]); }
-        for (int r2 = 0; r2 < nefc; r2++) { qc += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc += efc_D(r2)*Jv_arr(r2)*Jaref(r2)*act(r2); }
+        for (int r2 = 0; r2 < nefc; r2++) { qc += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc += -efc_force(r2)*Jv_arr(r2); }
         float dnom = 2.0f*(qg+qc);
         float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
-        float als[5] = {an, 0.5f*an, 0.1f*an, 0.01f, 0.001f};
+        float abis = 0.0f;
+        {
+            float lo_a = 0.0f, hi_a = 2.0f;
+            for (int bi = 0; bi < 10; bi++) {
+                float mid = 0.5f*(lo_a+hi_a);
+                float dd = lg + mid*2.0f*qg;
+                for (int r2 = 0; r2 < nefc; r2++) {
+                    float x = Jaref(r2) + mid*Jv_arr(r2);
+                    float fl = efc_floss(r2); float Dd = efc_D(r2);
+                    float dc = 0.0f;
+                    if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
+                    else if (x < 0.0f) { dc = Dd*x; }
+                    dd += dc*Jv_arr(r2);
+                }
+                if (dd > 0.0f) hi_a = mid; else lo_a = mid;
+            }
+            abis = 0.5f*(lo_a+hi_a);
+        }
+        float als[5] = {abis, an, 0.5f*an, 0.1f*an, 0.01f};
         float bc = 1e30f, ba_local = 0;
-        float cc2=0; for (int r2 = 0; r2 < nefc; r2++) cc2 += 0.5f*efc_D(r2)*Jaref(r2)*Jaref(r2)*act(r2);
+        float cc2=0; for (int r2 = 0; r2 < nefc; r2++) cc2 += efc_cost(efc_D(r2), Jaref(r2), efc_floss(r2));
         float cg=0; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*qacc(i);
         bc = cc2+cg;
         for (int ai = 0; ai < 5; ai++) {
             float a = als[ai]; float tc2=0;
-            for (int r2 = 0; r2 < nefc; r2++) { float x = Jaref(r2)+a*Jv_arr(r2); float ar = (x<0)?1.0f:0.0f; tc2 += 0.5f*efc_D(r2)*x*x*ar; }
+            for (int r2 = 0; r2 < nefc; r2++) { float x = Jaref(r2)+a*Jv_arr(r2); tc2 += efc_cost(efc_D(r2), x, efc_floss(r2)); }
             float tg2 = cg + a*lg + 0.5f*a*a*(2.0f*qg); float tt = tc2+tg2;
             if (tt < bc) { bc=tt; ba_local=a; }
         }
         tg_ba = ba_local;
         for (int r2 = 0; r2 < nefc; r2++) Jaref(r2) += ba_local*Jv_arr(r2);
-        for (int r2 = 0; r2 < nefc; r2++) act(r2) = (Jaref(r2)<0)?1.0f:0.0f;
-        for (int r2 = 0; r2 < nefc; r2++) efc_force(r2) = efc_D(r2)*(-Jaref(r2))*act(r2);
+        for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     float ba = tg_ba;
@@ -2156,7 +2317,14 @@ MJMLX_API MetalCollisionResult test_metal_solver(
     // resolution while keeping GPU overhead manageable.
     int si = (nv > 80) ? std::min(std::max(m.opt.iterations, 1), 3) : std::max(m.opt.iterations, 1);
     int cgi = (nv > 80) ? 20 : 50;
-    auto solver_source = make_solver_source(m, si, cgi);
+    int nlim = 0, nfl = 0;
+    auto lt = build_solver_limit_table(m, nlim);
+    auto ft = build_solver_friction_table(m, nfl);
+    if (lt.empty()) lt.push_back(0.0f);
+    if (ft.empty()) ft.push_back(0.0f);
+    auto lim_tab = mx::array(lt.data(), {(int)lt.size()}, mx::float32);
+    auto fric_tab = mx::array(ft.data(), {(int)ft.size()}, mx::float32);
+    auto solver_source = make_solver_source(m, si, cgi, nlim, nfl);
     auto pair_props = build_solver_pair_props(m);
     auto body_dof_masks_buf = build_body_dof_masks(m);
     auto body_rootid_buf = build_body_rootid(m);
@@ -2166,10 +2334,10 @@ MJMLX_API MetalCollisionResult test_metal_solver(
         "mjmlx_test_solver_" + std::to_string(nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
         {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
          "qvel_in", "contact_data_in", "contact_count_in",
-         "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
+         "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"},
         {"qfrc_constraint_out", "solver_scratch"},
         solver_source,
-        COLLISION_HEADER_FWD
+        COLLISION_HEADER_FWD + make_solver_header(m)
     );
 
     int B = 1;
@@ -2182,7 +2350,8 @@ MJMLX_API MetalCollisionResult test_metal_solver(
          mx::astype(mx::flatten(qvel), mx::float32),
          mx::astype(mx::flatten(contact_data), mx::float32),
          mx::astype(mx::flatten(contact_count), mx::float32),
-         pair_props, body_dof_masks_buf, body_rootid_buf},
+         pair_props, body_dof_masks_buf, body_rootid_buf,
+         mx::astype(mx::flatten(m.qpos0), mx::float32), lim_tab, fric_tab},
         {{B * nv}, {B * scratch_sz}},
         {mx::float32, mx::float32},
         std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),
@@ -2251,6 +2420,10 @@ struct BatchedStepContext {
     mx::array solver_pair_props = mx::zeros({1});
     mx::array solver_body_dof_masks = mx::zeros({1});
     mx::array solver_body_rootid = mx::zeros({1});
+    mx::array solver_limit_tab = mx::zeros({1});
+    mx::array solver_fric_tab = mx::zeros({1});
+    int solver_nlim = 0;
+    int solver_nfl = 0;
     int solver_scratch_size = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
@@ -2484,10 +2657,21 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 
     // Build solver kernel (constraint construction + Newton solver) whenever there's anything to collide.
     if (m.cache.collision_pairs.size() > 0) {
+        {
+            auto lt = build_solver_limit_table(m, ctx->solver_nlim);
+            auto ft = build_solver_friction_table(m, ctx->solver_nfl);
+            if (lt.empty()) lt.push_back(0.0f);
+            if (ft.empty()) ft.push_back(0.0f);
+            ctx->solver_limit_tab = mx::array(lt.data(), {(int)lt.size()}, mx::float32);
+            ctx->solver_fric_tab = mx::array(ft.data(), {(int)ft.size()}, mx::float32);
+            mx::eval(ctx->solver_limit_tab, ctx->solver_fric_tab);
+        }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
         int si = std::min(raw_si, 3);
-        int cgi = 20;
+        int cgi = 10;
+        // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
+        if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
 #if defined(MJMLX_BACKEND_MKX)
         if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
@@ -2501,17 +2685,17 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi);
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
 #else
-        auto solver_source = make_solver_source(m, si, cgi);
+        auto solver_source = make_solver_source(m, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
         ctx->solver_kernel = mx::fast::metal_kernel(
             "mjmlx_solver_" + std::to_string(m.nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
             {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
              "qvel_in", "contact_data_in", "contact_count_in",
-             "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
+             "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"},
             {"qfrc_constraint_out", "solver_scratch"},
             solver_source,
-            COLLISION_HEADER_FWD
+            COLLISION_HEADER_FWD + make_solver_header(m)
         );
 #endif
         ctx->uses_metal_solver = true;
@@ -2801,7 +2985,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
-                                 ctx->solver_body_rootid}),
+                                 ctx->solver_body_rootid,
+                                 mx::astype(mx::flatten(qpos_batch), mx::float32),
+                                 ctx->solver_limit_tab, ctx->solver_fric_tab}),
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
@@ -2817,7 +3003,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                              mx::astype(mx::flatten(qvel_batch), mx::float32),
                              coll[0], coll[1],
                              ctx->solver_pair_props, ctx->solver_body_dof_masks,
-                             ctx->solver_body_rootid},
+                             ctx->solver_body_rootid,
+                             mx::astype(mx::flatten(qpos_batch), mx::float32),
+                             ctx->solver_limit_tab, ctx->solver_fric_tab},
                             {{B * nv}, {B * scratch_sz}},
                             {mx::float32, mx::float32},
                             std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),
@@ -3081,13 +3269,13 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
         } else {
             // GPU path: compiled + vmapped MLX step function
-            std::vector<mx::array> qpos_list, qvel_list;
-            for (int i = 0; i < B; i++) {
-                qpos_list.push_back(model->model.qpos0);
-                qvel_list.push_back(mx::zeros({nv}));
-            }
-            handle->sim.qpos = mx::stack(qpos_list);
-            handle->sim.qvel = mx::stack(qvel_list);
+            // 全envが同一のqpos0/zero qvelなのでstack()のO(B)回concatenateループを避け、ホスト側でB個複製した1本の配列を直接作る(初期化がO(B)dispatchからO(1)になる)。
+            mx::eval(model->model.qpos0);
+            const float* q0 = model->model.qpos0.data<float>();
+            std::vector<float> qp0(static_cast<size_t>(B) * nq);
+            for (int i = 0; i < B; i++) std::copy(q0, q0 + nq, qp0.begin() + static_cast<size_t>(i) * nq);
+            handle->sim.qpos = mx::reshape(mx::array(qp0.data(), {B * nq}, mx::float32), {B, nq});
+            handle->sim.qvel = mx::zeros({B, nv});
             {
                 // fix_mjmlx_batched_init_derived: 未初期化mx::array({})読み出し対策でゼロ/恒等クォータニオン初期化。
                 int nb = model->model.nbody;
