@@ -174,7 +174,7 @@ class MjmlxGo2Env(VecEnv):
         qvel = qvel.copy()
 
         x, y = self.terrain.sample_spawn_xy(self._rng, n)
-        z = self.terrain.height_at(x) + 0.35
+        z = self.terrain.height_at(x) + 0.30  # 高すぎるとスポーン直後の落下衝撃でjoint_accが暴れ学習が不安定化する(実測で確認)
         yaw = self._rng.uniform(-np.pi, np.pi, size=n)
         qpos[idx, 0] = x
         qpos[idx, 1] = y
@@ -257,7 +257,7 @@ class MjmlxGo2Env(VecEnv):
         r_track_ang = W_TRACK_ANG * np.exp(-ang_err / TRACK_STD_SQ)
         r_lin_vel_z = W_LIN_VEL_Z * base_lin_vel[:, 2] ** 2
         r_ang_vel_xy = W_ANG_VEL_XY * np.sum(base_ang_vel[:, 0:2] ** 2, axis=1)
-        joint_acc = (joint_vel - self._prev_joint_vel) / CONTROL_DT
+        joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
         r_dof_acc = W_DOF_ACC * np.sum(joint_acc**2, axis=1)
         r_action_rate = W_ACTION_RATE * np.sum((action - self._last_action) ** 2, axis=1)
 
