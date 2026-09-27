@@ -156,42 +156,6 @@ MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path) {
     return m;
 }
 
-MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only) {
-    if (!b || !xml_path) return nullptr;
-    auto* m = new MjbModel();
-    m->type = b->type;
-    try {
-        if (b->type == MJB_BACKEND_CPU) {
-            char error[1000] = "";
-            m->mj = mj_loadXML(xml_path, nullptr, error, sizeof(error));
-            if (!m->mj) {
-                fprintf(stderr, "mjb_load_model_filtered CPU error: %s\n", error);
-                delete m;
-                return nullptr;
-            }
-            if (foot_contacts_only) {
-                // Apply foot-contacts-only filter (same as mjmlx)
-                int floor_id = mj_name2id(m->mj, mjOBJ_GEOM, "floor");
-                int rfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "right_foot");
-                int lfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "left_foot");
-                for (int i = 0; i < m->mj->ngeom; i++) {
-                    if (i != floor_id && i != rfoot_id && i != lfoot_id) {
-                        m->mj->geom_contype[i] = 0;
-                        m->mj->geom_conaffinity[i] = 0;
-                    }
-                }
-            }
-        } else {
-            m->mlx = mjmlx_load_model_filtered(xml_path, foot_contacts_only);
-            if (!m->mlx) { delete m; return nullptr; }
-        }
-    } catch (...) {
-        delete m;
-        return nullptr;
-    }
-    return m;
-}
-
 MJB_API MjbModel* mjb_load_model_from_string(MjbBackend* b, const char* xml_string) {
     if (!b || !xml_string) return nullptr;
     auto* m = new MjbModel();
@@ -797,7 +761,6 @@ MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfi
         } else {
             MjmlxBatchedConfig mlx_config = {};
             mlx_config.num_envs = config->num_envs;
-            mlx_config.foot_contacts_only = config->foot_contacts_only;
             mlx_config.integrator = MJMLX_INTEGRATOR_EULER;
             mlx_config.use_gpu = 1;
             mlx_config.solver_iterations = config->solver_iterations;

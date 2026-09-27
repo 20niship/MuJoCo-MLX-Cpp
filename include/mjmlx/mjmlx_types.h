@@ -81,7 +81,6 @@ typedef struct {
 // Batched simulation config
 typedef struct {
     int num_envs;                     // number of parallel environments
-    int foot_contacts_only;           // 1 = filter to foot contacts (faster)
     MjmlxIntegrator integrator;       // integration method
     int use_gpu;                      // 1 = use Metal GPU, 0 = CPU
     int solver_iterations;            // 0 = use model default, >0 = override solver iterations

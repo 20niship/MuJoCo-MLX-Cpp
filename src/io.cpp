@@ -56,22 +56,6 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
     return mx::array(buf.data(), {n}, mx::int32);
 }
 
-// Apply foot-contacts-only filtering on a MuJoCo C model.
-// Sets contype=0, conaffinity=0 on all geoms except feet and floor,
-// reducing collision pairs from ~126 to 2 for the humanoid.
-static void apply_foot_contacts_only(mjModel* m) {
-    int floor_id = mj_name2id(m, mjOBJ_GEOM, "floor");
-    int rfoot_id = mj_name2id(m, mjOBJ_GEOM, "right_foot");
-    int lfoot_id = mj_name2id(m, mjOBJ_GEOM, "left_foot");
-
-    for (int i = 0; i < m->ngeom; i++) {
-        if (i != floor_id && i != rfoot_id && i != lfoot_id) {
-            m->geom_contype[i] = 0;
-            m->geom_conaffinity[i] = 0;
-        }
-    }
-}
-
 // Convert an mjModel* to our internal Model struct.
 // The mjModel* is NOT freed here -- caller manages its lifetime.
 static Model convert_model(mjModel* m) {
@@ -382,19 +366,6 @@ std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
     return {std::move(model), m};
 }
 
-std::pair<Model, mjModel*> load_model_filtered_pair(const char* xml_path, bool foot_contacts_only) {
-    char error[1000] = "";
-    mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
-    if (!m) {
-        throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
-    }
-    if (foot_contacts_only) {
-        apply_foot_contacts_only(m);
-    }
-    Model model = convert_model(m);
-    return {std::move(model), m};
-}
-
 std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string) {
     char tmppath[] = "/tmp/mjmlx_model_XXXXXX.xml";
     int fd = mkstemps(tmppath, 4);
@@ -419,12 +390,6 @@ std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string) {
 // Legacy load functions (for internal C++ use where mjModel* isn't needed)
 Model load_model(const char* xml_path) {
     auto [model, mj] = load_model_pair(xml_path);
-    mj_deleteModel(mj);
-    return model;
-}
-
-Model load_model_filtered(const char* xml_path, bool foot_contacts_only) {
-    auto [model, mj] = load_model_filtered_pair(xml_path, foot_contacts_only);
     mj_deleteModel(mj);
     return model;
 }
@@ -1563,19 +1528,6 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "mjmlx_load_model error: %s\n", e.what());
-        return nullptr;
-    }
-}
-
-MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_contacts_only) {
-    try {
-        auto* handle = new MjmlxModel();
-        auto [model, mj] = mjmlx::load_model_filtered_pair(xml_path, foot_contacts_only != 0);
-        handle->model = std::move(model);
-        handle->mj_model = mj;
-        return handle;
-    } catch (const std::exception& e) {
-        fprintf(stderr, "mjmlx_load_model_filtered error: %s\n", e.what());
         return nullptr;
     }
 }

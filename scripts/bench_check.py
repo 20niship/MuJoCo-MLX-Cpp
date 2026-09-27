@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -47,6 +48,16 @@ def read_rows(history_csv: Path) -> list[dict[str, str]]:
 
 
 HUMANOID_URL = "https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/humanoid/humanoid.xml"
+HUMANOID_FOOT_GEOMS = {"floor", "foot1_right", "foot2_right", "foot1_left", "foot2_left"}
+
+
+def patch_humanoid_foot_contacts_only(path: Path) -> None:
+    tree = ET.parse(path)
+    for geom in tree.getroot().iter("geom"):
+        if geom.get("name") not in HUMANOID_FOOT_GEOMS:
+            geom.set("contype", "0")
+            geom.set("conaffinity", "0")
+    tree.write(path)
 
 
 def fetch_models(models_dir: Path) -> tuple[Path, Path, Path]:
@@ -66,6 +77,7 @@ def fetch_models(models_dir: Path) -> tuple[Path, Path, Path]:
         print("fetching humanoid.xml...")
         with urllib.request.urlopen(HUMANOID_URL) as r:
             humanoid.write_bytes(r.read())
+        patch_humanoid_foot_contacts_only(humanoid)
 
     return humanoid, go2, h1
 

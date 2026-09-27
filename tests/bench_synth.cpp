@@ -35,7 +35,6 @@ static BenchResult run_bench(MjmlxModel* model, int num_envs, int num_steps,
     MjmlxBatchedConfig config = {};
     config.num_envs = num_envs;
     config.use_gpu = use_gpu ? 1 : 0;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     auto* sim = mjmlx_batched_create(model, &config);

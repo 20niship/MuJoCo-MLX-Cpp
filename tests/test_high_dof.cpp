@@ -201,7 +201,6 @@ int main() {
         config.num_envs = 8;
         config.use_gpu = 1;
         config.solver_iterations = 1;
-        config.foot_contacts_only = 0;
 
         MjmlxBatchedSim* sim = mjmlx_batched_create(mh, &config);
         CHECK(sim != nullptr, "batched sim created for high-DOF model");
