@@ -580,10 +580,8 @@ struct BatchedSim {
 
 // io.cpp
 Model load_model(const char* xml_path);
-Model load_model_filtered(const char* xml_path, bool foot_contacts_only);
 Model load_model_from_string(const char* xml_string);
 std::pair<Model, mjModel*> load_model_pair(const char* xml_path);
-std::pair<Model, mjModel*> load_model_filtered_pair(const char* xml_path, bool foot_contacts_only);
 std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string);
 Data make_data(const Model& model);
 

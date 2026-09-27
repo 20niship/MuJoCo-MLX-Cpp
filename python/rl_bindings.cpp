@@ -124,7 +124,6 @@ NB_MODULE(_mjmlx_rl_native, m) {
                                 bool use_gpu, int solver_iterations) -> std::shared_ptr<RlBatchedSim> {
         MjmlxBatchedConfig cfg{};
         cfg.num_envs           = num_envs;
-        cfg.foot_contacts_only = 0;
         cfg.integrator         = MJMLX_INTEGRATOR_EULER;
         cfg.use_gpu            = use_gpu ? 1 : 0;
         cfg.solver_iterations  = solver_iterations;
