@@ -1354,6 +1354,30 @@ static mx::array build_solver_pair_props(const Model& m) {
     return mx::array(data.data(), {npairs * 18}, mx::float32);
 }
 
+// 13 floats/limited joint: dof_adr,qpos_adr,range_low,range_high,margin,solref[2],solimp[5],invweight
+static mx::array build_solver_joint_limits(const Model& m) {
+    m.init_cache();
+    const auto& c = m.cache;
+    int nlim = (int)c.limits.size();
+    if (nlim == 0) return mx::zeros({1});
+    mx::eval(m.jnt_qposadr);
+    auto qposadr_ptr = m.jnt_qposadr.data<int>();
+    std::vector<float> data(nlim * 13, 0.0f);
+    for (int i = 0; i < nlim; i++) {
+        const auto& li = c.limits[i];
+        data[i*13+0] = (float)li.dof_adr;
+        data[i*13+1] = (float)qposadr_ptr[li.jnt_idx];
+        data[i*13+2] = li.range_low;
+        data[i*13+3] = li.range_high;
+        data[i*13+4] = li.margin;
+        data[i*13+5] = li.solref[0];
+        data[i*13+6] = li.solref[1];
+        for (int k = 0; k < 5; k++) data[i*13+7+k] = li.solimp[k];
+        data[i*13+12] = li.invweight;
+    }
+    return mx::array(data.data(), {nlim * 13}, mx::float32);
+}
+
 // Build body_dof_masks buffer (nb × nv flat)
 static mx::array build_body_dof_masks(const Model& m) {
     m.init_cache();
@@ -1786,6 +1810,8 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
        << "uint tid = thread_position_in_threadgroup.x;\n"
        << "const int NV = " << nv << ";\n"
        << "const int NB = " << nb << ";\n"
+       << "const int NQ = " << m.nq << ";\n"
+       << "const int N_LIMITS = " << (int)c.limits.size() << ";\n"
        << "const int MAX_EFC_N = " << MAX_EFC << ";\n"
        << "const int NSOLVE = " << solver_iters << ";\n"
        << "const int CON_STRIDE = " << CONTACT_STRIDE << ";\n"
@@ -1819,6 +1845,7 @@ static std::string make_solver_source(const Model& m, int solver_iters = 1, int 
        << "uint cd_off = bid * NV * 6;\n"
        << "uint sc_off = bid * NB * 3;\n"
        << "uint qv_off = bid * NV;\n"
+       << "uint qp_off = bid * NQ;\n"
        << "uint con_off = bid * MAX_CON * CON_STRIDE;\n"
        << "uint qfc_off = bid * NV;\n\n";
 
@@ -1992,6 +2019,58 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
         efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
         nefc++;
     }
+}
+
+for (int li = 0; li < N_LIMITS && nefc < MAX_EFC_N - 4; li++) {
+    int lp = li * 13;
+    int dof_adr = (int)limit_props[lp+0];
+    int qpos_adr = (int)limit_props[lp+1];
+    float range_low = limit_props[lp+2];
+    float range_high = limit_props[lp+3];
+    float margin_l = limit_props[lp+4];
+    float solref0_l = limit_props[lp+5];
+    float solref1_l = limit_props[lp+6];
+    float si0_l = limit_props[lp+7], si1_l = limit_props[lp+8];
+    float si2_l = limit_props[lp+9], si3_l = limit_props[lp+10], si4_l = limit_props[lp+11];
+    float invw_l = limit_props[lp+12];
+
+    float qval = qpos_in[qp_off + qpos_adr];
+    float dist_min_l = qval - range_low;
+    float dist_max_l = range_high - qval;
+    float pos_l = min(dist_min_l, dist_max_l) - margin_l;
+    if (pos_l >= 0.0f) continue;
+    float sign_l = (dist_min_l < dist_max_l) ? 1.0f : -1.0f;
+
+    float tc_l = solref0_l;
+)";
+    if(!refsafe) ss << "    tc_l = max(tc_l, 2.0f * TIMESTEP);\n";
+    ss << R"(
+    float dmin_l = clamp(si0_l, MJMINIMP, MJMAXIMP);
+    float dmax_l = clamp(si1_l, MJMINIMP, MJMAXIMP);
+    float width_l = max(si2_l, MJMINVAL_CV);
+    float mid_l = clamp(si3_l, MJMINIMP, MJMAXIMP);
+    float power_l = max(si4_l, 1.0f);
+
+    float k_l = (tc_l > 0.0f) ? 1.0f/(dmax_l*dmax_l*tc_l*tc_l*solref1_l*solref1_l) : -tc_l/(dmax_l*dmax_l);
+    float b_l = (solref1_l > 0.0f) ? 2.0f/(dmax_l*tc_l) : -solref1_l/dmax_l;
+
+    float impx_l = abs(pos_l) / width_l;
+    float impy_l;
+    if (impx_l < mid_l) {
+        impy_l = pow(impx_l, power_l) / pow(mid_l, power_l - 1.0f);
+    } else {
+        impy_l = 1.0f - pow(1.0f - impx_l, power_l) / pow(1.0f - mid_l, power_l - 1.0f);
+    }
+    float imp_l = clamp(dmin_l + impy_l * (dmax_l - dmin_l), dmin_l, dmax_l);
+    if (impx_l > 1.0f) imp_l = dmax_l;
+
+    float r_l = max(invw_l*(1.0f-imp_l)/imp_l, MJMINVAL_CV);
+
+    for (int di = 0; di < NV; di++) J(nefc,di) = (di == dof_adr) ? sign_l : 0.0f;
+    float jdot_l = sign_l * qvel_in[qv_off+dof_adr];
+    efc_D(nefc) = 1.0f/r_l;
+    efc_aref(nefc) = -b_l*jdot_l - k_l*imp_l*pos_l;
+    nefc++;
 }
 tg_nefc = nefc;
 } // end if (tid == 0)
@@ -2249,7 +2328,9 @@ struct BatchedStepContext {
     mx::array solver_pair_props = mx::zeros({1});
     mx::array solver_body_dof_masks = mx::zeros({1});
     mx::array solver_body_rootid = mx::zeros({1});
+    mx::array solver_joint_limits = mx::zeros({1});
     int solver_scratch_size = 0;
+    int num_joint_limits = 0;
 
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
@@ -2486,24 +2567,26 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
         int si = std::min(raw_si, 3);
         int cgi = 20;
+        ctx->num_joint_limits = (int)m.cache.limits.size();
         ctx->solver_scratch_size = solver_scratch_per_env(m);
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);
-        mx::eval(ctx->solver_pair_props, ctx->solver_body_dof_masks, ctx->solver_body_rootid);
+        ctx->solver_joint_limits = build_solver_joint_limits(m);
+        mx::eval(ctx->solver_pair_props, ctx->solver_body_dof_masks, ctx->solver_body_rootid, ctx->solver_joint_limits);
 
 #if defined(MJMLX_BACKEND_MKX)
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi);
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->num_joint_limits);
 #else
         auto solver_source = make_solver_source(m, si, cgi);
         ctx->solver_kernel = mx::fast::metal_kernel(
             "mjmlx_solver_" + std::to_string(m.nv) + "_s" + std::to_string(si) + "_c" + std::to_string(cgi),
             {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in",
-             "qvel_in", "contact_data_in", "contact_count_in",
-             "pair_props", "body_dof_masks_buf", "body_rootid_buf"},
+             "qvel_in", "qpos_in", "contact_data_in", "contact_count_in",
+             "pair_props", "body_dof_masks_buf", "body_rootid_buf", "limit_props"},
             {"qfrc_constraint_out", "solver_scratch"},
             solver_source,
             COLLISION_HEADER_FWD
@@ -2794,9 +2877,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                 mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
                                  mx::flatten(subtree_com_out),
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
+                                 mx::astype(mx::flatten(qpos_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
-                                 ctx->solver_body_rootid}),
+                                 ctx->solver_body_rootid, ctx->solver_joint_limits}),
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
@@ -2810,9 +2894,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             {qM_flat, qfrc_smooth_flat, cdof_flat,
                              mx::flatten(subtree_com_out),
                              mx::astype(mx::flatten(qvel_batch), mx::float32),
+                             mx::astype(mx::flatten(qpos_batch), mx::float32),
                              coll[0], coll[1],
                              ctx->solver_pair_props, ctx->solver_body_dof_masks,
-                             ctx->solver_body_rootid},
+                             ctx->solver_body_rootid, ctx->solver_joint_limits},
                             {{B * nv}, {B * scratch_sz}},
                             {mx::float32, mx::float32},
                             std::make_tuple(B * nv, 1, 1), std::make_tuple(nv, 1, 1),

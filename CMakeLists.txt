@@ -291,6 +291,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(diag_go2_compare tests/diag_go2_compare.cpp)
+    target_link_libraries(diag_go2_compare PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(diag_go2_compare PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
         foreach(_test test_math_full test_batched_diag test_linalg_full test_batched_collision_primitives)
