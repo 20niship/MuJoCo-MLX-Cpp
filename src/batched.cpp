@@ -1326,9 +1326,10 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
+// JVはefcインデックス(nefc<=MAX_EFC)でアクセスされるためMAX_EFC個必要(solver.hppのS_*オフセットと一致させる)。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 6*MAX_EFC + 8*nv;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
