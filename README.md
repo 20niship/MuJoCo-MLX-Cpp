@@ -68,10 +68,10 @@ TensorBoard: `uv run tensorboard --logdir runs/`
 
 Unitree Go2を階段状のBox地形(高さ3〜5cm、奥行き20〜50cmの段)の上でcmd_vel(vx, vy, vyaw)追従させるPPO学習。観測・報酬・PPOハイパーパラメータ・ネットワーク構成・ドメインランダマイズは[IsaacLabのUnitreeGo2RoughEnvCfg / UnitreeGo2RoughPPORunnerCfg](https://github.com/isaac-sim/IsaacLab)を踏襲し、学習ライブラリもIsaacLabと同じ[rsl_rl](https://github.com/leggedrobotics/rsl_rl)を使う(SB3は使わない)。
 
-依存パッケージ(pyproject.tomlには未記載、個別にインストールが必要):
+依存パッケージ(`go2`/`build` dependency groupに定義済み):
 
 ```bash
-pip install rsl-rl-lib tensordict gitpython tensorboard
+uv sync --group build --group go2
 ```
 
 ビルド(Python拡張、Go2モデルのメッシュ取得込み):
@@ -86,13 +86,13 @@ cmake -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX -DCMAKE_BUILD_TYPE=Release -DMJMLX
 cmake --build build-mkx --target _mjmlx_rl_native -j
 
 # unitree_go2のメッシュ/XML(gitignore対象、初回のみ)を取得
-python3 -c "from pathlib import Path; import sys; sys.path.insert(0,'scripts'); from bench_check import fetch_models; fetch_models(Path('benchmarks/models/external'))"
+uv run python3 -c "from pathlib import Path; import sys; sys.path.insert(0,'scripts'); from bench_check import fetch_models; fetch_models(Path('benchmarks/models/external'))"
 ```
 
 学習実行:
 
 ```bash
-python scripts/train_go2_ppo.py --build-dir build-mkx --envs 2048 --max-iterations 1500 --logdir runs/go2_stairs
+uv run python scripts/train_go2_ppo.py --build-dir build-mkx --envs 2048 --max-iterations 1500 --logdir runs/go2_stairs
 # macOSでMLX backendを使う場合は --build-dir build (デフォルト)
 # GPU無し/デバッグ用途なら --cpu を付ける
 ```
