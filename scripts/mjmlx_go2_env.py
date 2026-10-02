@@ -18,7 +18,10 @@ EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
 
 ACTION_SCALE = 0.25  # rough_env_cfgでのgo2上書き値(base既定は0.5)
-DEFAULT_JOINT_POS = np.array([0.0, 0.9, -1.8] * 4, dtype=np.float32)
+# IsaacLabのUNITREE_GO2_CFG.init_state.joint_pos(FL,FR,RL,RRの順): hip=左0.1/右-0.1、thigh=前0.8/後1.0、calf=-1.5
+DEFAULT_JOINT_POS = np.array(
+    [0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5], dtype=np.float32
+)
 CTRL_LOW = np.array([-0.9472, -1.4, -2.6227] * 4, dtype=np.float32)
 CTRL_HIGH = np.array([0.9472, 2.5, -0.84776] * 4, dtype=np.float32)
 FOOT_BODY_IDX = np.array([4, 7, 10, 13])  # FL,FR,RL,RR の calf(=foot)ボディ
@@ -174,7 +177,7 @@ class MjmlxGo2Env(VecEnv):
         qvel = qvel.copy()
 
         x, y = self.terrain.sample_spawn_xy(self._rng, n)
-        z = self.terrain.height_at(x) + 0.30  # 高すぎるとスポーン直後の落下衝撃でjoint_accが暴れ学習が不安定化する(実測で確認)
+        z = self.terrain.height_at(x) + 0.40  # IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
         yaw = self._rng.uniform(-np.pi, np.pi, size=n)
         qpos[idx, 0] = x
         qpos[idx, 1] = y
