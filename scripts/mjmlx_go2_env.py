@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import numpy as np
 import torch
@@ -11,8 +12,8 @@ from tensordict import TensorDict
 
 from go2_terrain import StairsTerrain
 
-PHYSICS_DT = 0.002  # go2_mjx.xmlの<option>省略時のMuJoCoデフォルト
-DECIMATION = 10  # 10*0.002 = 0.02s -> 50Hz制御、IsaacLabのdecimation*dtに合わせる
+PHYSICS_DT = 0.02  # go2_mjx.xmlの<option timestep>。IsaacLab/MJX流に物理step=制御stepの50Hzへ
+DECIMATION = 1
 CONTROL_DT = PHYSICS_DT * DECIMATION
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
@@ -83,6 +84,11 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
     with open(src_path) as f:
         xml = f.read()
     xml = xml.replace('meshdir="assets"', f'meshdir="{assets_dir}"')
+    # go2_mjx.xmlはgitignore対象の外部アセット(再fetchでtimestep指定が消える)なのでここで必ず注入する
+    if 'timestep="' in xml:
+        xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
+    else:
+        xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
     terrain_geoms = f"<body name=\"terrain\">\n    {terrain.to_mjcf_bodies()}\n  </body>\n</worldbody>"
     xml = xml.replace("</worldbody>", terrain_geoms)
     with open(out_path, "w") as f:
