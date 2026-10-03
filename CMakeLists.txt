@@ -127,7 +127,7 @@ if(MUJOCO_ROOT AND EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
     if(EXISTS "${MUJOCO_ROOT}/lib/libmujoco.dylib")
         set(_MJ_DYLIB_PATH "${MUJOCO_ROOT}/lib/libmujoco.dylib")
     else()
-        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/libmujoco*.dylib" "${MUJOCO_ROOT}/libmujoco*.so*")
+        file(GLOB _MJ_DYLIB "${MUJOCO_ROOT}/lib/libmujoco*.so*" "${MUJOCO_ROOT}/libmujoco*.dylib" "${MUJOCO_ROOT}/libmujoco*.so*")
         if(_MJ_DYLIB)
             list(GET _MJ_DYLIB 0 _MJ_DYLIB_PATH)
         else()
@@ -287,6 +287,13 @@ if(MJMLX_BUILD_TESTS)
     add_executable(test_batched_collision_primitives tests/test_batched_collision_primitives.cpp)
     target_link_libraries(test_batched_collision_primitives PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_batched_collision_primitives PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    add_executable(diag_go2_compare tests/diag_go2_compare.cpp)
+    target_link_libraries(diag_go2_compare PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(diag_go2_compare PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )

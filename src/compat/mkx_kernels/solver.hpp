@@ -21,7 +21,7 @@ inline std::string solver_fmt_float(float x) {
 }
 } // namespace detail_solver
 
-inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int n_limits) {
   using namespace detail_solver;
   const int max_efc              = 256;
   const int contact_stride       = 8;
@@ -63,6 +63,8 @@ shared float tg_pAp;
      << "uint tid = gl_LocalInvocationID.x;\n"
      << "const int NV = " << nv << ";\n"
      << "const int NB = " << nb << ";\n"
+     << "const int NQ = " << nq << ";\n"
+     << "const int N_LIMITS = " << n_limits << ";\n"
      << "const int MAX_EFC_N = " << max_efc << ";\n"
      << "const int NSOLVE = " << solver_iters << ";\n"
      << "const int CON_STRIDE = " << contact_stride << ";\n"
@@ -94,6 +96,7 @@ shared float tg_pAp;
      << "uint cd_off = bid * NV * 6;\n"
      << "uint sc_off = bid * NB * 3;\n"
      << "uint qv_off = bid * NV;\n"
+     << "uint qp_off = bid * NQ;\n"
      << "uint con_off = bid * MAX_CON * CON_STRIDE;\n"
      << "uint qfc_off = bid * NV;\n\n";
 
@@ -252,6 +255,58 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
         nefc++;
     }
 }
+
+for (int li = 0; li < N_LIMITS && nefc < MAX_EFC_N - 4; li++) {
+    int lp = li * 13;
+    int dof_adr = int(limit_props[lp+0]);
+    int qpos_adr = int(limit_props[lp+1]);
+    float range_low = limit_props[lp+2];
+    float range_high = limit_props[lp+3];
+    float margin_l = limit_props[lp+4];
+    float solref0_l = limit_props[lp+5];
+    float solref1_l = limit_props[lp+6];
+    float si0_l = limit_props[lp+7], si1_l = limit_props[lp+8];
+    float si2_l = limit_props[lp+9], si3_l = limit_props[lp+10], si4_l = limit_props[lp+11];
+    float invw_l = limit_props[lp+12];
+
+    float qval = qpos_in[qp_off + qpos_adr];
+    float dist_min_l = qval - range_low;
+    float dist_max_l = range_high - qval;
+    float pos_l = min(dist_min_l, dist_max_l) - margin_l;
+    if (pos_l >= 0.0f) continue;
+    float sign_l = (dist_min_l < dist_max_l) ? 1.0f : -1.0f;
+
+    float tc_l = solref0_l;
+)GLSL";
+  if(!refsafe) ss << "    tc_l = max(tc_l, 2.0f * TIMESTEP);\n";
+  ss << R"GLSL(
+    float dmin_l = clamp(si0_l, MJMINIMP, MJMAXIMP);
+    float dmax_l = clamp(si1_l, MJMINIMP, MJMAXIMP);
+    float width_l = max(si2_l, MJMINVAL_CV);
+    float mid_l = clamp(si3_l, MJMINIMP, MJMAXIMP);
+    float power_l = max(si4_l, 1.0f);
+
+    float k_l = (tc_l > 0.0) ? 1.0f/(dmax_l*dmax_l*tc_l*tc_l*solref1_l*solref1_l) : -tc_l/(dmax_l*dmax_l);
+    float b_l = (solref1_l > 0.0) ? 2.0f/(dmax_l*tc_l) : -solref1_l/dmax_l;
+
+    float impx_l = abs(pos_l) / width_l;
+    float impy_l;
+    if (impx_l < mid_l) {
+        impy_l = pow(impx_l, power_l) / pow(mid_l, power_l - 1.0f);
+    } else {
+        impy_l = 1.0f - pow(1.0f - impx_l, power_l) / pow(1.0f - mid_l, power_l - 1.0f);
+    }
+    float imp_l = clamp(dmin_l + impy_l * (dmax_l - dmin_l), dmin_l, dmax_l);
+    if (impx_l > 1.0f) imp_l = dmax_l;
+
+    float r_l = max(invw_l*(1.0f-imp_l)/imp_l, MJMINVAL_CV);
+
+    for (int di = 0; di < NV; di++) J(nefc,di) = (di == dof_adr) ? sign_l : 0.0f;
+    float jdot_l = sign_l * qvel_in[qv_off+dof_adr];
+    efc_D(nefc) = 1.0f/r_l;
+    efc_aref(nefc) = -b_l*jdot_l - k_l*imp_l*pos_l;
+    nefc++;
+}
 tg_nefc = nefc;
 } // end if (tid == 0)
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
@@ -369,7 +424,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
   qfrc_constraint_out[qfc_off + int(tid)] = s; }
 )GLSL";
 
-  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf"}, {"qfrc_constraint_out", "solver_scratch"}, ss.str(), header);
+  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "qpos_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "limit_props"}, {"qfrc_constraint_out", "solver_scratch"}, ss.str(), header);
 }
 
 } // namespace mjmlx::mkx_kernels

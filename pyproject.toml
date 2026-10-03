@@ -8,15 +8,22 @@ dependencies = [
     "mujoco==3.5.0",
     "gymnasium==0.29.1",
     "stable-baselines3==2.3.2",
-    "torch==2.3.1",
+    "torch>=2.3.1",
     "tensorboard==2.16.2",
-    "numpy==1.26.4",
+    "numpy>=1.26.4",
+    "setuptools<81",  # tensorboard==2.16.2がpkg_resourcesに依存(setuptools>=81で削除)
 ]
 
 [dependency-groups]
 build = [
     "nanobind==2.4.0",
     "cmake==3.31.4",
+]
+# rsl-rl-lib>=5はtorch>=2.6.0が必須(mainのtorch>=2.3.1と両立する範囲)
+go2 = [
+    "rsl-rl-lib>=5.0.0,<6",
+    "tensordict>=0.7.0",
+    "gitpython",
 ]
 
 [tool.uv]
