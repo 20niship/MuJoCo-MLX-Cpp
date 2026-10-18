@@ -44,7 +44,6 @@ MJB_API MjbBackendType mjb_backend_type(const MjbBackend* backend);
 // ============================================================
 
 MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path);
-MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only);
 MJB_API MjbModel* mjb_load_model_from_string(MjbBackend* b, const char* xml_string);
 MJB_API void mjb_free_model(MjbModel* model);
 

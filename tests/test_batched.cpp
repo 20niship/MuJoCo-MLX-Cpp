@@ -31,7 +31,6 @@ int main(int argc, char** argv) {
     MjmlxBatchedConfig config;
     config.num_envs = num_envs;
     config.use_gpu = 1;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     std::cout << "\n=== Creating batched sim with " << num_envs << " envs ===" << std::endl;

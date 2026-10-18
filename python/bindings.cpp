@@ -321,13 +321,11 @@ NB_MODULE(_mjmlx_native, m) {
 
     // ── Free functions ───────────────────────────────────────────────────────
 
-    m.def("load_model", [](const std::string& xml_path, bool foot_contacts_only) -> PyModel {
-        MjmlxModel* raw = foot_contacts_only
-            ? mjmlx_load_model_filtered(xml_path.c_str(), 1)
-            : mjmlx_load_model(xml_path.c_str());
+    m.def("load_model", [](const std::string& xml_path) -> PyModel {
+        MjmlxModel* raw = mjmlx_load_model(xml_path.c_str());
         if (!raw) throw std::runtime_error("Failed to load model: " + xml_path);
         return PyModel(std::shared_ptr<MjmlxModel>(raw, mjmlx_free_model));
-    }, nb::arg("xml_path"), nb::arg("foot_contacts_only") = false,
+    }, nb::arg("xml_path"),
        "Load a MuJoCo model from an MJCF XML file.");
 
     m.def("load_model_from_string", [](const std::string& xml_string) -> PyModel {
@@ -359,7 +357,6 @@ NB_MODULE(_mjmlx_native, m) {
         MjmlxBatchedConfig config;
         config.num_envs = num_envs;
         config.use_gpu = use_gpu ? 1 : 0;
-        config.foot_contacts_only = 0;
         config.integrator = static_cast<MjmlxIntegrator>(model.m().opt.integrator);
         config.solver_iterations = solver_iterations;
 

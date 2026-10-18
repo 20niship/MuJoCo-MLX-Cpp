@@ -257,7 +257,6 @@ static inline BenchStats bench_scalar_step(
     MjmlxBatchedConfig config = {};
     config.num_envs = 1;
     config.use_gpu = 0;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
@@ -324,7 +323,6 @@ static inline BenchStats bench_batched_step(
     MjmlxBatchedConfig config;
     config.num_envs = num_envs;
     config.use_gpu = 1;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
@@ -394,7 +392,6 @@ static inline BenchStats bench_scalar_step_file(
     MjmlxBatchedConfig config = {};
     config.num_envs = 1;
     config.use_gpu = 0;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);
@@ -458,7 +455,6 @@ static inline BenchStats bench_batched_step_file(
     MjmlxBatchedConfig config = {};
     config.num_envs = num_envs;
     config.use_gpu = 1;
-    config.foot_contacts_only = 0;
     config.integrator = MJMLX_INTEGRATOR_EULER;
 
     MjmlxBatchedSim* sim = mjmlx_batched_create(model, &config);

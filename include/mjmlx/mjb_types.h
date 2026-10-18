@@ -61,7 +61,6 @@ typedef struct {
 // Batched simulation config
 typedef struct {
     int num_envs;
-    int foot_contacts_only;   // 1 = filter to foot-floor contacts
     int solver_iterations;    // 0 = model default, >0 = override
 } MjbBatchedConfig;
 
