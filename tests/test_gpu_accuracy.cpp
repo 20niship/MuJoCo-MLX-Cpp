@@ -25,10 +25,10 @@ static Stat diff(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: test_gpu_accuracy <model.xml> [num_envs=64] [num_steps=50] [--save f | --compare f] [--lift dz] [--noise s] [--no-gpu-reset]\n");
+        fprintf(stderr, "Usage: test_gpu_accuracy <model.xml> [num_envs=64] [num_steps=50] [--save f | --compare f] [--lift dz] [--noise s] [--no-gpu-reset] [--qpos v0,v1,...]\n");
         return 1;
     }
-    const char* save = nullptr; const char* cmp = nullptr; float lift = 0.f, noise = 1.f; bool gpu_reset = true;
+    const char* save = nullptr; const char* cmp = nullptr; float lift = 0.f, noise = 1.f; bool gpu_reset = true; std::vector<float> qpos_init;
     std::vector<const char*> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--save") && i + 1 < argc) save = argv[++i];
@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lift") && i + 1 < argc) lift = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--noise") && i + 1 < argc) noise = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-gpu-reset")) gpu_reset = false;
+        else if (!strcmp(argv[i], "--qpos") && i + 1 < argc) { char* t = strtok(argv[++i], ","); while (t) { qpos_init.push_back((float)atof(t)); t = strtok(nullptr, ","); } }
         else pos.push_back(argv[i]);
     }
     int B = pos.size() > 1 ? atoi(pos[1]) : 64;
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
     std::vector<float> q(B * nq), v(B * nv);
     int a, b;
     mjmlx_batched_get_state(cpu, q.data(), v.data(), &a, &b);
+    if (!qpos_init.empty()) for (int e = 0; e < B; e++) for (int j = 0; j < nq && j < (int)qpos_init.size(); j++) q[e * nq + j] = qpos_init[j];
     std::mt19937 rng(12345);
     std::uniform_real_distribution<float> u(-1.f, 1.f);
     for (size_t i = 0; i < q.size(); i++) { int k = (int)(i % nq); if (k < 3 || k >= 7) q[i] += noise * 0.02f * u(rng); }
