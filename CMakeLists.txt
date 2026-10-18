@@ -16,64 +16,19 @@ option(MJMLX_BUILD_BENCHMARKS "Build benchmark executables" ON)
 option(MJMLX_BUILD_PYTHON "Build Python bindings via nanobind" OFF)
 option(MJMLX_BUILD_EXAMPLES "Build example programs" ON)
 
-# ── Tensor backend selection (MLX on Apple, MKX/Vulkan elsewhere) ──
-if(NOT DEFINED MJMLX_TENSOR_BACKEND)
-    if(APPLE)
-        set(MJMLX_TENSOR_BACKEND "MLX")
-    else()
-        set(MJMLX_TENSOR_BACKEND "MKX")
-    endif()
+# ── Tensor backend: MKX (Vulkan版MLX相当) ──
+# git submoduleとしてvendor化(FetchContent+MKX_GIT_TAGのpin取り違え事故対策、issue #14)。
+find_package(Vulkan REQUIRED)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/mlx_vulkan/CMakeLists.txt")
+    message(FATAL_ERROR "extern/mlx_vulkan submodule not found. Run: git submodule update --init --recursive")
 endif()
-set(MJMLX_TENSOR_BACKEND "${MJMLX_TENSOR_BACKEND}" CACHE STRING "Tensor backend: MLX or MKX")
-set_property(CACHE MJMLX_TENSOR_BACKEND PROPERTY STRINGS MLX MKX)
-message(STATUS "MJMLX_TENSOR_BACKEND: ${MJMLX_TENSOR_BACKEND}")
+# mkx's own CMakeLists builds a plain STATIC lib (no PIC); linking that into our .so needs -fPIC on Linux.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(extern/mlx_vulkan)
 
-if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
-    # ── Find MLX ──────────────────────────────────────────────────
-    set(MLX_ROOT "" CACHE PATH "Path to MLX installation (e.g. site-packages/mlx)")
-
-    if(NOT MLX_ROOT)
-        execute_process(
-            COMMAND python3 -c "import mlx, os; print(os.path.dirname(mlx.__file__))"
-            OUTPUT_VARIABLE MLX_ROOT
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-    endif()
-
-    if(NOT MLX_ROOT OR NOT EXISTS "${MLX_ROOT}/include/mlx/mlx.h")
-        message(FATAL_ERROR
-            "Cannot find MLX. Set -DMLX_ROOT=/path/to/mlx or ensure 'pip install mlx' is in PATH.\n"
-            "  Tried: ${MLX_ROOT}")
-    endif()
-
-    message(STATUS "MLX_ROOT: ${MLX_ROOT}")
-
-    add_library(mlx_imported SHARED IMPORTED)
-    set_target_properties(mlx_imported PROPERTIES
-        IMPORTED_LOCATION "${MLX_ROOT}/lib/libmlx.dylib"
-        INTERFACE_INCLUDE_DIRECTORIES "${MLX_ROOT}/include"
-    )
-
-    add_library(tensor_backend INTERFACE)
-    target_link_libraries(tensor_backend INTERFACE mlx_imported)
-    target_compile_definitions(tensor_backend INTERFACE MJMLX_BACKEND_MLX=1)
-    set(MJMLX_RPATH_DIR "${MLX_ROOT}/lib")
-else()
-    # MKX(Vulkan版MLX相当)をgit submoduleとしてvendor化(FetchContent+MKX_GIT_TAGのpin取り違え事故対策、issue #14)。
-    find_package(Vulkan REQUIRED)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/mlx_vulkan/CMakeLists.txt")
-        message(FATAL_ERROR "extern/mlx_vulkan submodule not found. Run: git submodule update --init --recursive")
-    endif()
-    # mkx's own CMakeLists builds a plain STATIC lib (no PIC); linking that into our .so needs -fPIC on Linux.
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-    add_subdirectory(extern/mlx_vulkan)
-
-    add_library(tensor_backend INTERFACE)
-    target_link_libraries(tensor_backend INTERFACE mkx)
-    target_compile_definitions(tensor_backend INTERFACE MJMLX_BACKEND_MKX=1)
-    set(MJMLX_RPATH_DIR "")
-endif()
+add_library(tensor_backend INTERFACE)
+target_link_libraries(tensor_backend INTERFACE mkx)
+set(MJMLX_RPATH_DIR "")
 
 # ── Find MuJoCo ──────────────────────────────────────────────
 set(MUJOCO_ROOT "" CACHE PATH "Path to MuJoCo installation")
@@ -318,31 +273,6 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
     set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
 
-    # test_metal_synth exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
-    if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
-        add_executable(test_metal_synth tests/test_metal_synth.cpp)
-        target_link_libraries(test_metal_synth PRIVATE mjmlx mujoco_imported tensor_backend)
-        target_include_directories(test_metal_synth PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-
-        if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-            add_custom_command(TARGET test_metal_synth POST_BUILD
-                COMMAND install_name_tool -change
-                    "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                    "$<TARGET_FILE:test_metal_synth>"
-                COMMENT "Fixing MuJoCo dylib for test_metal_synth"
-            )
-        endif()
-
-        set(MJMLX_SYNTH_MODEL "" CACHE FILEPATH "Path to synth_humanoid.xml for Synth Metal tests")
-        if(MJMLX_SYNTH_MODEL)
-            add_test(NAME metal_synth COMMAND test_metal_synth ${MJMLX_SYNTH_MODEL})
-            set_tests_properties(metal_synth PROPERTIES LABELS "correctness")
-        endif()
-    endif()
-
     if(MJMLX_TEST_MODEL)
         add_test(NAME io COMMAND test_io ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
@@ -381,24 +311,6 @@ if(MJMLX_BUILD_BENCHMARKS AND MJMLX_BUILD_TESTS)
     endif()
     set_tests_properties(bench_baseline PROPERTIES LABELS "benchmark")
 
-    # Synth benchmark exercises raw MSL mx::fast::metal_kernel dispatch directly -- MLX-only.
-    if(MJMLX_TENSOR_BACKEND STREQUAL "MLX")
-        add_executable(bench_synth tests/bench_synth.cpp)
-        target_link_libraries(bench_synth PRIVATE mjmlx mujoco_imported tensor_backend)
-        target_include_directories(bench_synth PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-        if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-            add_custom_command(TARGET bench_synth POST_BUILD
-                COMMAND install_name_tool -change
-                    "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                    "$<TARGET_FILE:bench_synth>"
-                COMMENT "Fixing MuJoCo dylib for bench_synth"
-            )
-        endif()
-    endif()
-
     # Copy benchmark model files to build directory for easy access
     file(COPY tests/models DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/tests)
 endif()
@@ -416,32 +328,6 @@ if(MJMLX_BUILD_PYTHON)
     )
     find_package(nanobind CONFIG REQUIRED)
     message(STATUS "nanobind found: ${nanobind_DIR}")
-
-    nanobind_add_module(_mjmlx_native
-        NB_STATIC STABLE_ABI LTO NOMINSIZE
-        NB_DOMAIN mlx
-        python/bindings.cpp
-    )
-    target_link_libraries(_mjmlx_native PRIVATE mjmlx tensor_backend mujoco_imported)
-    target_include_directories(_mjmlx_native PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    # Put the .so next to libmjmlx in the build dir
-    set_target_properties(_mjmlx_native PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-
-    # Fix MuJoCo dylib reference for the Python extension
-    if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        add_custom_command(TARGET _mjmlx_native POST_BUILD
-            COMMAND install_name_tool -change
-                "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                "$<TARGET_FILE:_mjmlx_native>"
-            COMMENT "Fixing MuJoCo dylib for _mjmlx_native"
-        )
-    endif()
 
     # Numpy-facing RL bindings (mjmlx.h only, no mlx.core NB_DOMAIN sharing -- see python/rl_bindings.cpp)
     nanobind_add_module(_mjmlx_rl_native
