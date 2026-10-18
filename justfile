@@ -16,6 +16,11 @@ check: build
 check-ci: build
     cd {{build_dir}} && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && ctest -R gpu_vs_cpu --output-on-failure
 
+# CIと同じDockerイメージ(lavapipe)でcheck-ciを実行する。GPUで回す場合は `just docker-test --gpus all -e NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility`
+docker-test *ARGS:
+    docker build -f scripts/Dockerfile -t mjmlx-ci .
+    docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/work {{ARGS}} mjmlx-ci
+
 # Build then run the benchmark regression check (5 repeats, min/max/avg)
 bench: build
     BUILD_DIR=build HISTORY_CSV=benchmarks/history.csv ./scripts/bench_check.py
