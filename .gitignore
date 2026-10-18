@@ -2,6 +2,7 @@ build/
 build-mkx/
 build-mlx/
 benchmarks/models/external/
+benchmarks/bench_plot*.png
 .venv/
 uv.lock
 runs/

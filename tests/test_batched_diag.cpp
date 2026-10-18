@@ -1,5 +1,5 @@
 // Batched GPU pipeline accuracy tests (~8 tests)
-// Compares Metal kinematics, Metal Euler, and full GPU batched pipeline
+// Compares GPU kinematics, GPU Euler, and full GPU batched pipeline
 // against scalar CPU reference.
 // Tests: GPU vs CPU match, multi-step stability, determinism, multi-env.
 
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     }
     TEST_END();
 
-    // ── Metal kinematics: xpos match ─────────────────────────────
+    // ── GPU kinematics: xpos match ─────────────────────────────
 
     TEST_BEGIN("gpu_cpu_xpos_match_1step");
     {
@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
             float d = std::abs(cpu_xpos[i] - gpu_xpos[i]);
             if (d > max_diff) max_diff = d;
         }
-        CHECK_LT(max_diff, 0.01f, "xpos: Metal FK matches CPU within 0.01");
+        CHECK_LT(max_diff, 0.01f, "xpos: GPU FK matches CPU within 0.01");
 
         mjmlx_batched_free(sim_cpu);
         mjmlx_batched_free(sim_gpu);

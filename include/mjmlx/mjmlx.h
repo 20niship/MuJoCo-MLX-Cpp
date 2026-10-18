@@ -46,10 +46,6 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path);
 // Load model from MJCF XML string. Returns NULL on error.
 MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string);
 
-// Load model with contact filtering applied. foot_contacts_only=1 keeps only
-// foot-floor contacts (reduces collision pairs from ~126 to 2 for humanoid).
-MJMLX_API MjmlxModel* mjmlx_load_model_filtered(const char* xml_path, int foot_contacts_only);
-
 // Free model and all associated memory.
 MJMLX_API void mjmlx_free_model(MjmlxModel* model);
 
@@ -148,7 +144,7 @@ MJMLX_API int mjmlx_get_nefc(const MjmlxData* data);                            
 MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* data);
 
 // ============================================================
-// Batched simulation (compile + vmap -- Metal GPU)
+// Batched simulation (compile + vmap -- GPU GPU)
 // ============================================================
 
 // Create batched simulation. Compiles and vmaps the step function.
@@ -186,6 +182,7 @@ MJMLX_API void mjmlx_batched_set_state(
 MJMLX_API const float* mjmlx_batched_get_qpos(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_qvel(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_xpos(const MjmlxBatchedSim* sim, int* n_out);
+MJMLX_API const float* mjmlx_batched_get_xquat(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_subtree_com(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_cinert(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n_out);

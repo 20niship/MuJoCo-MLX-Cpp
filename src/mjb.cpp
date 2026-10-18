@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Unified dual-backend implementation.
-// Dispatches to MuJoCo C (CPU) or MuJoCo-MLX (Metal GPU).
+// Dispatches to MuJoCo C (CPU) or MuJoCo-MLX (GPU GPU).
 
 #include "mjmlx/mjb.h"
 #include "mjmlx/mjmlx.h"
@@ -70,11 +70,12 @@ struct MjbBatchedSim {
     MjbBackendType type;
     MjbModel* model_ref = nullptr;
     int num_envs = 0;
-    bool gpu_active = false;  // true only if Metal GPU kernels are actually running
+    bool gpu_active = false;  // true only if GPU GPU kernels are actually running
 
     // CPU backend: N independent mjData* + contiguous float buffers
     std::vector<mjData*> cpu_datas;
     mutable std::vector<float> qpos_buf, qvel_buf, xpos_buf;
+    mutable std::vector<float> xquat_buf;
     mutable std::vector<float> subtree_com_buf, cinert_buf, cvel_buf;
     mutable std::vector<float> qfrc_actuator_buf, cfrc_ext_buf;
 
@@ -146,42 +147,6 @@ MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path) {
             }
         } else {
             m->mlx = mjmlx_load_model(xml_path);
-            if (!m->mlx) { delete m; return nullptr; }
-        }
-    } catch (...) {
-        delete m;
-        return nullptr;
-    }
-    return m;
-}
-
-MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only) {
-    if (!b || !xml_path) return nullptr;
-    auto* m = new MjbModel();
-    m->type = b->type;
-    try {
-        if (b->type == MJB_BACKEND_CPU) {
-            char error[1000] = "";
-            m->mj = mj_loadXML(xml_path, nullptr, error, sizeof(error));
-            if (!m->mj) {
-                fprintf(stderr, "mjb_load_model_filtered CPU error: %s\n", error);
-                delete m;
-                return nullptr;
-            }
-            if (foot_contacts_only) {
-                // Apply foot-contacts-only filter (same as mjmlx)
-                int floor_id = mj_name2id(m->mj, mjOBJ_GEOM, "floor");
-                int rfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "right_foot");
-                int lfoot_id = mj_name2id(m->mj, mjOBJ_GEOM, "left_foot");
-                for (int i = 0; i < m->mj->ngeom; i++) {
-                    if (i != floor_id && i != rfoot_id && i != lfoot_id) {
-                        m->mj->geom_contype[i] = 0;
-                        m->mj->geom_conaffinity[i] = 0;
-                    }
-                }
-            }
-        } else {
-            m->mlx = mjmlx_load_model_filtered(xml_path, foot_contacts_only);
             if (!m->mlx) { delete m; return nullptr; }
         }
     } catch (...) {
@@ -796,7 +761,6 @@ MJB_API MjbBatchedSim* mjb_batched_create(MjbModel* model, const MjbBatchedConfi
         } else {
             MjmlxBatchedConfig mlx_config = {};
             mlx_config.num_envs = config->num_envs;
-            mlx_config.foot_contacts_only = config->foot_contacts_only;
             mlx_config.integrator = MJMLX_INTEGRATOR_EULER;
             mlx_config.use_gpu = 1;
             mlx_config.solver_iterations = config->solver_iterations;
@@ -945,6 +909,15 @@ MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out) 
     return mjmlx_batched_get_xpos(sim->mlx_sim, n_out);
 }
 
+MJB_API const float* mjb_batched_get_xquat(const MjbBatchedSim* sim, int* n_out) {
+    if (!sim) { if (n_out) *n_out = 0; return nullptr; }
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        return CPU_BATCHED_GET(xquat, m->nbody * 4);
+    }
+    return mjmlx_batched_get_xquat(sim->mlx_sim, n_out);
+}
+
 MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out) {
     if (!sim) { if (n_out) *n_out = 0; return nullptr; }
     if (sim->type == MJB_BACKEND_CPU) {
@@ -1014,6 +987,39 @@ MJB_API void mjb_batched_set_env_qvel(MjbBatchedSim* sim, int env_idx,
     } else {
         mjmlx_batched_set_env_qvel(sim->mlx_sim, env_idx, qvel, nv);
     }
+}
+
+MJB_API void mjb_batched_get_state(const MjbBatchedSim* sim, float* qpos_out, float* qvel_out,
+                                   int* nq_out, int* nv_out) {
+    if (!sim) return;
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        int nq = m->nq, nv = m->nv;
+        if (nq_out) *nq_out = nq;
+        if (nv_out) *nv_out = nv;
+        for (int i = 0; i < sim->num_envs; i++) {
+            const mjData* d = sim->cpu_datas[i];
+            if (qpos_out) for (int j = 0; j < nq; j++) qpos_out[i * nq + j] = (float)d->qpos[j];
+            if (qvel_out) for (int j = 0; j < nv; j++) qvel_out[i * nv + j] = (float)d->qvel[j];
+        }
+        return;
+    }
+    mjmlx_batched_get_state(sim->mlx_sim, qpos_out, qvel_out, nq_out, nv_out);
+}
+
+MJB_API void mjb_batched_set_state(MjbBatchedSim* sim, const float* qpos, const float* qvel) {
+    if (!sim) return;
+    if (sim->type == MJB_BACKEND_CPU) {
+        const mjModel* m = get_mj_model(sim->model_ref);
+        int nq = m->nq, nv = m->nv;
+        for (int i = 0; i < sim->num_envs; i++) {
+            mjData* d = sim->cpu_datas[i];
+            if (qpos) for (int j = 0; j < nq; j++) d->qpos[j] = (double)qpos[i * nq + j];
+            if (qvel) for (int j = 0; j < nv; j++) d->qvel[j] = (double)qvel[i * nv + j];
+        }
+        return;
+    }
+    mjmlx_batched_set_state(sim->mlx_sim, qpos, qvel);
 }
 
 MJB_API void mjb_batched_eval_state(const MjbBatchedSim* sim) {

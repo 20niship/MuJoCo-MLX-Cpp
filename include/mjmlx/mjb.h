@@ -16,7 +16,7 @@
 //
 // Provides a single physics API that dispatches to either:
 //   MJB_BACKEND_CPU  -- MuJoCo C (double-precision, CPU thread pool)
-//   MJB_BACKEND_MLX  -- MuJoCo-MLX (float32, Metal GPU via MLX)
+//   MJB_BACKEND_MLX  -- MuJoCo-MLX (float32, GPU GPU via MLX)
 //
 // All state exchange uses float* pointers. The CPU backend converts
 // double <-> float transparently. The MLX backend returns zero-copy
@@ -44,7 +44,6 @@ MJB_API MjbBackendType mjb_backend_type(const MjbBackend* backend);
 // ============================================================
 
 MJB_API MjbModel* mjb_load_model(MjbBackend* b, const char* xml_path);
-MJB_API MjbModel* mjb_load_model_filtered(MjbBackend* b, const char* xml_path, int foot_contacts_only);
 MJB_API MjbModel* mjb_load_model_from_string(MjbBackend* b, const char* xml_string);
 MJB_API void mjb_free_model(MjbModel* model);
 
@@ -194,14 +193,14 @@ MJB_API void mjb_model_set_hfield_data(MjbModel* model, int offset,
 
 // Create batched simulation.
 // CPU backend: internally thread-pools over N mjData* instances.
-// MLX backend: uses compiled+vmapped Metal GPU step.
+// MLX backend: uses compiled+vmapped GPU GPU step.
 MJB_API MjbBatchedSim* mjb_batched_create(
     MjbModel* model,
     const MjbBatchedConfig* config);
 
 MJB_API void mjb_batched_free(MjbBatchedSim* sim);
 
-// Returns 1 if the batched sim is actually running Metal GPU kernels,
+// Returns 1 if the batched sim is actually running GPU GPU kernels,
 // 0 if it fell back to CPU thread pool (e.g. nv > 80).
 MJB_API int mjb_batched_is_gpu(const MjbBatchedSim* sim);
 
@@ -213,8 +212,11 @@ MJB_API void mjb_batched_reset(MjbBatchedSim* sim, const int* reset_mask);
 
 // Batched state access: float[num_envs * dim].
 MJB_API const float* mjb_batched_get_qpos(const MjbBatchedSim* sim, int* n_out);
+MJB_API void mjb_batched_get_state(const MjbBatchedSim* sim, float* qpos_out, float* qvel_out, int* nq_out, int* nv_out);
+MJB_API void mjb_batched_set_state(MjbBatchedSim* sim, const float* qpos, const float* qvel);
 MJB_API const float* mjb_batched_get_qvel(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_xpos(const MjbBatchedSim* sim, int* n_out);
+MJB_API const float* mjb_batched_get_xquat(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_subtree_com(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cinert(const MjbBatchedSim* sim, int* n_out);
 MJB_API const float* mjb_batched_get_cvel(const MjbBatchedSim* sim, int* n_out);

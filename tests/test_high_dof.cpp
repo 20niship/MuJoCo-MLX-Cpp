@@ -15,7 +15,7 @@
 using Clock = std::chrono::high_resolution_clock;
 
 int main() {
-    printf("=== test_high_dof: Phase 1.5 High-DOF Metal Pipeline ===\n\n");
+    printf("=== test_high_dof: Phase 1.5 High-DOF GPU Pipeline ===\n\n");
 
     // ── Test 1: Load HIGH_DOF_TREE_XML and verify dimensions ──
     {
@@ -201,7 +201,6 @@ int main() {
         config.num_envs = 8;
         config.use_gpu = 1;
         config.solver_iterations = 1;
-        config.foot_contacts_only = 0;
 
         MjmlxBatchedSim* sim = mjmlx_batched_create(mh, &config);
         CHECK(sim != nullptr, "batched sim created for high-DOF model");

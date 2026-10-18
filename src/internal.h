@@ -216,6 +216,7 @@ struct Model {
     mx::array geom_solmix = mx::array({});
     mx::array geom_solref = mx::array({});
     mx::array geom_solimp = mx::array({});
+    mx::array geom_priority = mx::array({});  // MuJoCo C: geom_priority (contact param mixing rule)
     mx::array geom_margin = mx::array({});
     mx::array geom_gap = mx::array({});
     mx::array geom_contype = mx::array({});
@@ -345,7 +346,7 @@ struct Model {
         // Body-DOF mapping: for each body, list of its DOF indices
         std::vector<std::vector<int>> body_dofs;
 
-        // Joint integration plan (for Euler / Metal euler)
+        // Joint integration plan (for Euler / GPU euler)
         std::vector<int> simple_qa, simple_da;  // HINGE/SLIDE
         std::vector<std::pair<int,int>> free_joints;   // (qa, da) for FREE
         std::vector<std::pair<int,int>> ball_joints;    // (qa, da) for BALL
@@ -562,6 +563,7 @@ struct BatchedSim {
     mx::array qpos = mx::array({});
     mx::array qvel = mx::array({});
     mx::array xpos = mx::array({});
+    mx::array xquat = mx::array({});
 
     // Observation fields: [num_envs, ...] arrays
     mx::array subtree_com = mx::array({});   // (B, nbody, 3)
@@ -578,10 +580,8 @@ struct BatchedSim {
 
 // io.cpp
 Model load_model(const char* xml_path);
-Model load_model_filtered(const char* xml_path, bool foot_contacts_only);
 Model load_model_from_string(const char* xml_string);
 std::pair<Model, mjModel*> load_model_pair(const char* xml_path);
-std::pair<Model, mjModel*> load_model_filtered_pair(const char* xml_path, bool foot_contacts_only);
 std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string);
 Data make_data(const Model& model);
 
@@ -651,40 +651,8 @@ Data vmap_make_constraint(const Model& m, Data d);
 // solver_vmap.cpp
 Data vmap_solve(const Model& m, Data d);
 
-// forward_vmap.cpp (exported for test_metal_synth diagnostics)
+// forward_vmap.cpp
 MJMLX_API Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
-
-#if defined(MJMLX_BACKEND_MLX)
-// Raw-MSL diagnostic helpers, only exercised by tests/test_metal_synth.cpp (MLX-only target).
-struct MetalForwardResult {
-    mx::array qM{0.0f};
-    mx::array qfrc_smooth{0.0f};
-    mx::array subtree_com{0.0f};
-    mx::array cinert{0.0f};
-    mx::array cvel{0.0f};
-    mx::array qfrc_actuator{0.0f};
-};
-MJMLX_API MetalForwardResult test_metal_forward(
-    const Model& m,
-    const mx::array& xipos, const mx::array& ximat,
-    const mx::array& xanchor, const mx::array& xaxis, const mx::array& xmat,
-    const mx::array& qpos, const mx::array& qvel, const mx::array& ctrl);
-
-struct MetalCollisionResult {
-    mx::array contact_data{0.0f};  // (MAX_CON * STRIDE,) flat
-    mx::array contact_count{0.0f}; // scalar
-};
-MJMLX_API MetalCollisionResult test_metal_collision(
-    const Model& m,
-    const mx::array& geom_xpos, const mx::array& geom_xmat);
-
-MJMLX_API MetalCollisionResult test_metal_solver(
-    const Model& m,
-    const mx::array& qM, const mx::array& qfrc_smooth,
-    const mx::array& cdof, const mx::array& subtree_com,
-    const mx::array& qvel,
-    const mx::array& contact_data, const mx::array& contact_count);
-#endif
 
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);
