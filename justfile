@@ -1,11 +1,12 @@
 mujoco_root := env_var_or_default("MUJOCO_ROOT", "")
+build_dir := env_var_or_default("BUILD_DIR", "build")
 
 # Configure + build (MKX/Vulkan backend)
 build:
-    mkdir -p build
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    mkdir -p {{build_dir}}
+    cmake -S . -B {{build_dir}} -DCMAKE_BUILD_TYPE=Release \
         {{ if mujoco_root != "" { "-DMUJOCO_ROOT=" + mujoco_root } else { "" } }}
-    cmake --build build -j
+    cmake --build {{build_dir}} -j
 
 # Build then run the test suite
 check: build
@@ -13,7 +14,7 @@ check: build
 
 # Build then run only the tests that don't depend on the removed single-env pipeline (for CI; requires a working Vulkan device)
 check-ci: build
-    cd build && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && ctest -R gpu_vs_cpu --output-on-failure
+    cd {{build_dir}} && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && ctest -R gpu_vs_cpu --output-on-failure
 
 # Build then run the benchmark regression check (5 repeats, min/max/avg)
 bench: build
