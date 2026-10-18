@@ -13,7 +13,7 @@ check: build
 
 # Build then run only the tests that don't depend on the removed single-env pipeline (for CI; requires a working Vulkan device)
 check-ci: build
-    cd build && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives
+    cd build && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && ctest -R gpu_vs_cpu --output-on-failure
 
 # Build then run the benchmark regression check (5 repeats, min/max/avg)
 bench: build
