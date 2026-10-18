@@ -288,6 +288,25 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME gpu_vs_cpu_contact_stress COMMAND test_gpu_vs_cpu ${_M}/contact_stress.xml 1e-2 5e-2 0.5)
     set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
 
+    # mesh付き実ロボットMJCFの軌道比較(関節角・body位置/姿勢のCPU-GPU差)。モデルは `just fetch-models` で benchmarks/models/external/ に取得(git管理外)。
+    # 未取得なら登録しない。LABELS=modelsなのでCIの `just check-ci` には含まれず、`just check-models` で実行する。
+    # 閾値は実測(NVIDIA)の約2倍。接触(着地)を含む脚ロボットはCPU/GPUの接触解の差で発散するため、自由落下(接触前)は厳しく、着地後は現状値を少し超える緩い閾値で回帰検知のみ行う(乖離を直したら締める)。
+    set(_EXT "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/models/external")
+    function(mjmlx_add_model_test name model)
+        if(EXISTS "${_EXT}/${model}")
+            add_test(NAME model_gpu_vs_cpu_${name} COMMAND test_gpu_vs_cpu "${_EXT}/${model}" ${ARGN})
+            set_tests_properties(model_gpu_vs_cpu_${name} PROPERTIES LABELS "models" TIMEOUT 1800)
+        endif()
+    endfunction()
+    set(_MG "mujoco_menagerie")
+    mjmlx_add_model_test(piper ${_MG}/agilex_piper/scene.xml --seconds 4 --ctrl sin --bodies base_link,link6,link8 --tol-joint 0.08 --tol-pos 0.08 --tol-rot 0.01)
+    mjmlx_add_model_test(openarm openarm_mujoco/v1/scene.xml --seconds 4 --ctrl sin --bodies openarm_left_link7,openarm_left_hand_tcp,openarm_right_hand_tcp --tol-joint 0.25 --tol-pos 0.06 --tol-rot 0.4)
+    mjmlx_add_model_test(go2_freefall ${_MG}/unitree_go2/scene.xml --seconds 0.6 --lift 3 --ctrl sin --bodies base,FL_calf,FR_calf --tol-joint 1e-3 --tol-pos 1e-2 --tol-rot 5e-3)
+    mjmlx_add_model_test(go2_landing ${_MG}/unitree_go2/scene.xml --seconds 1 --lift 0.3 --ctrl sin --bodies base,FL_calf,FR_calf --tol-joint 0.5 --tol-pos 0.15 --tol-rot 0.6)
+    mjmlx_add_model_test(g1_freefall ${_MG}/unitree_g1/scene.xml --seconds 0.6 --lift 3 --ctrl sin --bodies pelvis,left_ankle_roll_link,right_wrist_yaw_link --tol-joint 1e-3 --tol-pos 1e-2 --tol-rot 2e-2)
+    mjmlx_add_model_test(g1_landing ${_MG}/unitree_g1/scene.xml --seconds 1 --lift 0.1 --ctrl sin --bodies pelvis,left_ankle_roll_link,right_wrist_yaw_link --tol-joint 0.1 --tol-pos 0.15 --tol-rot 0.5)
+    mjmlx_add_model_test(h1_freefall ${_MG}/unitree_h1/scene.xml --seconds 0.6 --lift 3 --ctrl sin --bodies pelvis,left_ankle_link,right_elbow_link --tol-joint 0.35 --tol-pos 0.05 --tol-rot 0.15)
+
     if(MJMLX_TEST_MODEL)
         add_test(NAME io COMMAND test_io ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)

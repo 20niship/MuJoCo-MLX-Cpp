@@ -77,7 +77,7 @@ static const int EULER_DEVMEM_MAX_NV = 2048;
 struct ForwardHostConsts {
     std::array<float, 3> gravity{0, 0, 0};
     std::vector<int> body_parentid, body_rootid, dof_bodyid, dof_parentid;
-    std::vector<float> body_mass, body_inertia, dof_damping, dof_armature, dof_stiffness;
+    std::vector<float> body_gravcomp, body_mass, body_inertia, dof_damping, dof_armature, dof_stiffness;
     std::vector<int> dof_qposadr;
     std::vector<float> qpos_spring, act_gain0, act_bias0;
     // AFFINE gain/bias(length/velocity項)算出用。JOINT/JOINTINPARENT伝達のみ対応、他はgear=0でlength=0扱い。
@@ -114,6 +114,12 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
     k.body_parentid.assign(bpar_ptr, bpar_ptr + nb);
     k.body_rootid.assign(broot_ptr, broot_ptr + nb);
     k.body_mass.assign(bmass_ptr, bmass_ptr + nb);
+    k.body_gravcomp.assign(nb, 0.0f);
+    if (m.ngravcomp > 0 && m.body_gravcomp.size() > 0) {
+        mx::eval(m.body_gravcomp);
+        auto gc_ptr = m.body_gravcomp.data<float>();
+        k.body_gravcomp.assign(gc_ptr, gc_ptr + nb);
+    }
     k.body_inertia.assign(binert_ptr, binert_ptr + nb * 3);
     k.dof_bodyid.assign(dbid_ptr, dbid_ptr + nv);
     k.dof_parentid.assign(dpar_ptr, dpar_ptr + nv);
@@ -577,7 +583,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
             fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0,
             fc.act_gain1, fc.act_gain2, fc.act_bias1, fc.act_bias2,
-            fc.act_gear, fc.act_qposadr, fc.act_dofadr);
+            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp);
         ctx->uses_gpu_forward = true;
     }
 
