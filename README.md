@@ -4,7 +4,7 @@ GPU-accelerated MuJoCo physics on Apple Silicon via [MLX](https://github.com/ml-
 
 Two C++ shared libraries:
 
-- **`libmjmlx.dylib`** -- MuJoCo physics pipeline reimplemented on Metal GPU using MLX C++
+- **`libmjmlx.dylib`** -- MuJoCo physics pipeline reimplemented on GPU using MLX C++
 - **`libmjb.dylib`** -- Unified dual-backend C API that dispatches to either MuJoCo C (CPU) or MuJoCo-MLX (GPU)
 
 Designed for consumption from Python (via nanobind), Unity/C# (via P/Invoke), or any language with C FFI.
@@ -20,7 +20,7 @@ Humanoid stepping throughput on Apple M4 Max (40-core GPU, 64 GB unified memory)
 | 4,096 | 255,362 | |
 | 8,192 | **331,207** | Peak throughput (pure stepping) |
 
-Architecture: `Metal kinematics -> compile(vmap(forward)) -> Metal integration` (Euler in batched, Euler/RK4/ImplicitFast in scalar)
+Architecture: `GPU kinematics -> compile(vmap(forward)) -> GPU integration` (Euler in batched, Euler/RK4/ImplicitFast in scalar)
 
 ### Training benchmarks (Gymnasium Humanoid-v5, 8192 envs, 32M steps)
 
@@ -34,7 +34,7 @@ The Phase 1e result was inflated by missing tendon constraints -- the gymnasium 
 Reproduce benchmarks (requires [MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX) Python package):
 
 ```bash
-python examples/train_humanoid.py --gpu-ceiling   # ~73K SPS (Metal+vmap, 8192 envs)
+python examples/train_humanoid.py --gpu-ceiling   # ~73K SPS (GPU+vmap, 8192 envs)
 python examples/train_humanoid.py --cpu-ceiling   # ~29K SPS (dispatch_apply thread pool, 252 envs)
 ```
 
@@ -54,7 +54,7 @@ Measured on Apple M-series (2048 envs, PPO throughput including gradient updates
 
 | Backend | env-steps/sec |
 |---|---|
-| MLX (Metal) | 55,000 - 150,000 |
+| MKX (Vulkan) | 55,000 - 150,000 |
 | MKX (Vulkan) | 18,000 - 26,000 |
 
 ```bash
@@ -77,7 +77,7 @@ libmjb.dylib (unified dual-backend API)
     |     Batched: GCD thread pool over N independent mjData*
     |
     +-- MLX backend: wraps libmjmlx (mjmlx_step, mjmlx_forward, ...)
-          Batched: compiled vmap Metal GPU pipeline
+          Batched: compiled vmap GPU pipeline
 
 libmjmlx.dylib (GPU physics core)
     |
@@ -90,11 +90,11 @@ libmjmlx.dylib (GPU physics core)
     |     Tendon passive forces, limits, friction
     |     TENDON + SITE actuator transmission (scalar + vmap)
     |
-    +-- Metal kernels
-    |     Kinematics FK, fused Euler (source-generated MSL)
+    +-- GPU kernels
+    |     Kinematics FK, fused Euler (GLSL (mkx_kernels))
     |
     +-- Batched simulation (331K SPS)
-    |     Metal kin -> compile(vmap(forward)) -> Metal euler
+    |     GPU kin -> compile(vmap(forward)) -> GPU euler
     |
     +-- Differentiable step (planned)
     |     grad(step) for empowerment / model-based RL
@@ -119,7 +119,7 @@ This builds both `libmjmlx.dylib` and `libmjb.dylib`. The build auto-detects MLX
 To override paths:
 
 ```bash
-cmake -B build -DMLX_ROOT=/path/to/mlx -DMUJOCO_ROOT=/path/to/mujoco
+cmake -B build -DMUJOCO_ROOT=/path/to/mujoco
 ```
 
 ### Python bindings (nanobind)
@@ -149,7 +149,7 @@ The `mjb_*` API lets you pick a backend at creation time:
 ```c
 #include <mjmlx/mjb.h>
 
-// GPU physics (Metal, float32, 73K+ SPS training)
+// GPU physics (GPU, float32, 73K+ SPS training)
 MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);
 MjbModel* model = mjb_load_model(gpu, "humanoid.xml");
 MjbData* data = mjb_make_data(model);
@@ -240,7 +240,7 @@ All features validated against MuJoCo C reference implementation. **237 tests ac
 - **RK4 (4th-order Runge-Kutta)** -- 4 forward evaluations per step, weighted average; qpos diff ~3e-8 vs MuJoCo C
 - **ImplicitFast** -- implicit velocity integration via velocity derivative (`deriv_smooth_vel`): modified mass matrix M' = M - dt * dqfrc/dqvel, Cholesky solve; qvel diff ~1e-6 vs MuJoCo C
 - Euler, RK4, Implicit, ImplicitFast all supported in scalar path
-- Batched (Metal) pipeline uses Euler only; vmap RK4/Implicit DEFERRED (needs Metal kernel rewrite)
+- Batched (GPU) pipeline uses Euler only; vmap RK4/Implicit DEFERRED (needs GPU kernel rewrite)
 
 ### Deferred Phases
 - **Sensors** (Phase 8) -- ~50 sensor types, large surface area; RL training reads joint/body state directly, not XML sensors

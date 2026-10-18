@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Unified dual-backend implementation.
-// Dispatches to MuJoCo C (CPU) or MuJoCo-MLX (Metal GPU).
+// Dispatches to MuJoCo C (CPU) or MuJoCo-MLX (GPU GPU).
 
 #include "mjmlx/mjb.h"
 #include "mjmlx/mjmlx.h"
@@ -70,7 +70,7 @@ struct MjbBatchedSim {
     MjbBackendType type;
     MjbModel* model_ref = nullptr;
     int num_envs = 0;
-    bool gpu_active = false;  // true only if Metal GPU kernels are actually running
+    bool gpu_active = false;  // true only if GPU GPU kernels are actually running
 
     // CPU backend: N independent mjData* + contiguous float buffers
     std::vector<mjData*> cpu_datas;

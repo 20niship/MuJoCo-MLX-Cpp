@@ -15,7 +15,7 @@
 using Clock = std::chrono::high_resolution_clock;
 
 int main() {
-    printf("=== test_high_dof: Phase 1.5 High-DOF Metal Pipeline ===\n\n");
+    printf("=== test_high_dof: Phase 1.5 High-DOF GPU Pipeline ===\n\n");
 
     // ── Test 1: Load HIGH_DOF_TREE_XML and verify dimensions ──
     {

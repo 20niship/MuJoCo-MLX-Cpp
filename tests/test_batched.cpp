@@ -1,4 +1,4 @@
-// Test batched simulation: Metal kernels + per-env step
+// Test batched simulation: GPU kernels + per-env step
 #include "mjmlx/mjmlx.h"
 #include <iostream>
 #include <cstdlib>

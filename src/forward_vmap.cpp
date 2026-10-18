@@ -3,7 +3,7 @@
 //
 // Vmap-compatible forward dynamics pipeline.
 // Orchestrates smooth_vmap, collision_vmap, constraint_vmap, solver_vmap.
-// skip_kinematics=true (Metal kernel handles FK outside vmap).
+// skip_kinematics=true (GPU kernel handles FK outside vmap).
 // NO eval(), NO data<>(), NO CPU sync.
 
 #include "internal.h"
@@ -182,7 +182,7 @@ Data vmap_forward(const Model& m, Data d, bool skip_contacts) {
     if (skip_contacts) {
         // Contact-free path for large models (nv > 80).
         // Skips collision detection and constraint solving which create O(ngeom² + nv² × iters)
-        // intermediate arrays — easily exceeding Metal's 499K buffer limit for nv=237.
+        // intermediate arrays — easily exceeding GPU's 499K buffer limit for nv=237.
         // For imitation learning, contacts are secondary to pose matching.
         d = vmap_tendon(m, d);
         d = vmap_transmission(m, d);
