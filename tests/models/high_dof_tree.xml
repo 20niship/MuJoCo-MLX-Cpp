@@ -5,13 +5,14 @@
   <option gravity="0 0 -9.81" timestep="0.002"/>
 
   <default>
-    <geom type="capsule" rgba="0.7 0.5 0.3 1"/>
+    <!-- 体同士の自己衝突は無効(初期姿勢で兄弟capsuleが貫通しGPU/CPUのEPA差が支配的になるため)。床とだけ接触する -->
+    <geom type="capsule" rgba="0.7 0.5 0.3 1" contype="1" conaffinity="0"/>
     <joint damping="0.5" armature="0.01"/>
     <motor gear="20"/>
   </default>
 
   <worldbody>
-    <geom name="floor" type="plane" size="10 10 0.1" rgba="0.3 0.3 0.3 1"/>
+    <geom name="floor" type="plane" size="10 10 0.1" rgba="0.3 0.3 0.3 1" conaffinity="1"/>
 
     <!-- Root: pelvis with freejoint -->
     <body name="pelvis" pos="0 0 1.0">
