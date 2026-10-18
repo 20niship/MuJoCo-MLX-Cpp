@@ -82,7 +82,7 @@ typedef struct {
 typedef struct {
     int num_envs;                     // number of parallel environments
     MjmlxIntegrator integrator;       // integration method
-    int use_gpu;                      // 1 = use Metal GPU, 0 = CPU
+    int use_gpu;                      // 1 = use GPU GPU, 0 = CPU
     int solver_iterations;            // 0 = use model default, >0 = override solver iterations
 } MjmlxBatchedConfig;
 

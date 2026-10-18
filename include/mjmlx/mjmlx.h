@@ -144,7 +144,7 @@ MJMLX_API int mjmlx_get_nefc(const MjmlxData* data);                            
 MJMLX_API void mjmlx_rne_post_constraint(const MjmlxModel* model, MjmlxData* data);
 
 // ============================================================
-// Batched simulation (compile + vmap -- Metal GPU)
+// Batched simulation (compile + vmap -- GPU GPU)
 // ============================================================
 
 // Create batched simulation. Compiles and vmaps the step function.

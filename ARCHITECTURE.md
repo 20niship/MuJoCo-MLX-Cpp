@@ -6,7 +6,7 @@ Comprehensive design document for MuJoCo-MLX-Cpp. This documents key architectur
 
 - [High-Level Pipeline](#high-level-pipeline)
 - [Forward Pipeline Detail](#forward-pipeline-detail)
-- [Why Metal + Vmap Hybrid](#why-metal--vmap-hybrid)
+- [Why GPU + Vmap Hybrid](#why-metal--vmap-hybrid)
 - [Computation Graph Rules](#computation-graph-rules)
 - [Key Data Structures](#key-data-structures)
 - [Cholesky Factorization](#cholesky-factorization)
@@ -17,7 +17,7 @@ Comprehensive design document for MuJoCo-MLX-Cpp. This documents key architectur
 - [DOF Friction Loss](#dof-friction-loss)
 - [Tendon System](#tendon-system)
 - [Collision System](#collision-system)
-- [Metal Kernels](#metal-kernels)
+- [GPU Kernels](#metal-kernels)
 - [Performance Characteristics](#performance-characteristics)
 - [Comparison with Python mujoco-mlx and MJX](#comparison-with-python-mujoco-mlx-and-mjx)
 - [Known Issues and Future Work](#known-issues-and-future-work)
@@ -29,11 +29,11 @@ Comprehensive design document for MuJoCo-MLX-Cpp. This documents key architectur
 The batched simulation runs a 3-phase hybrid pipeline for each timestep:
 
 ```
- Phase 1: Metal Kinematics Kernel
+ Phase 1: GPU Kinematics Kernel
  ---------------------------------
  Single GPU dispatch for ALL N environments.
  qpos -> xpos, xquat, xmat, xipos, ximat, xanchor, xaxis, geom_xpos, geom_xmat
- Replaces ~130 separate MLX dispatches with one fused Metal kernel.
+ Replaces ~130 separate MLX dispatches with one fused GPU kernel.
 
          |
          v
@@ -51,12 +51,12 @@ The batched simulation runs a 3-phase hybrid pipeline for each timestep:
          |
          v
 
- Phase 3: Metal Integration Kernel
+ Phase 3: GPU Integration Kernel
  -----------------------------------
  Single GPU dispatch for ALL N environments.
  Built-in Cholesky + solve + velocity update + position integration.
- Currently Euler only in Metal; RK4 and ImplicitFast are supported
- in the scalar pipeline but not yet in the batched Metal kernel.
+ Currently Euler only in GPU; RK4 and ImplicitFast are supported
+ in the scalar pipeline but not yet in the batched GPU kernel.
 ```
 
 The pipeline is orchestrated in `batched.cpp:make_batched_step()`.
@@ -99,19 +99,19 @@ The vmap pipeline mirrors this with `vmap_*` versions of each function. All vmap
 
 ---
 
-## Why Metal + Vmap Hybrid
+## Why GPU + Vmap Hybrid
 
-Metal GPU kernels (written in MSL) operate on raw flat buffers with explicit per-environment indexing via `thread_position_in_grid`. They are **not compatible with `mx::vmap`**, which traces a function over a batch dimension by intercepting MLX array operations.
+GPU GPU kernels (written in GLSL) operate on raw flat buffers with explicit per-environment indexing via `thread_position_in_grid`. They are **not compatible with `mx::vmap`**, which traces a function over a batch dimension by intercepting MLX array operations.
 
 Therefore:
-- **Metal kernels** (Phases 1 and 3) run **outside** the vmap boundary. They process all N environments in a single dispatch by using thread IDs to index into the flat batch arrays.
+- **GPU kernels** (Phases 1 and 3) run **outside** the vmap boundary. They process all N environments in a single dispatch by using thread IDs to index into the flat batch arrays.
 - **Phase 2** (forward dynamics) runs **inside** `mx::vmap`. It must use only pure MLX array ops -- no `eval()`, no `data<>()`, no CPU sync.
 
 This is the same architecture used by:
-- **Python mujoco-mlx**: Custom Metal kernels for kinematics and Euler; pure MLX ops for the vmap'd forward dynamics.
+- **Python mujoco-mlx**: Custom GPU kernels for kinematics and Euler; pure MLX ops for the vmap'd forward dynamics.
 - **Google MJX**: Uses `jax.vmap + jax.jit` over pure JAX ops (no custom GPU kernels).
 
-Our advantage over MJX: custom Metal kernels for the two hottest phases (kinematics and integration) reduce dispatch overhead.
+Our advantage over MJX: custom GPU kernels for the two hottest phases (kinematics and integration) reduce dispatch overhead.
 
 ---
 
@@ -497,18 +497,18 @@ Analytic collision using the ellipsoid-to-sphere transform: scale the world so t
 
 ---
 
-## Metal Kernels
+## GPU Kernels
 
 ### Kinematics Kernel (Phase 1)
 
-Source-generated MSL in `batched.cpp:make_kinematics_source()`. Embeds model topology directly in the shader:
+GLSL kernels (src/compat/mkx_kernels) in `batched.cpp:make_kinematics_source()`. Embeds model topology directly in the shader:
 - Joint types, parent IDs, qpos/qvel addresses are compile-time constants
 - Forward kinematics loop unrolled over joint chain
 - Stack memory: ~7 floats per body (pos, quat). Skip if `nbody * 7 * 4 > 24KB`
 
 ### Integration Kernel (Phase 3)
 
-Source-generated MSL in `batched.cpp:make_euler_source()`. Currently Euler-only in Metal; RK4 and ImplicitFast are supported in the scalar path. Embeds Cholesky factorization and solve inline:
+GLSL kernels (src/compat/mkx_kernels) in `batched.cpp:make_euler_source()`. Currently Euler-only in GPU; RK4 and ImplicitFast are supported in the scalar path. Embeds Cholesky factorization and solve inline:
 - Stack memory: `2*nv*nv + 4*nv + nq` floats. Limited to `nv <= 80`
 - Performs: Cholesky(M) -> solve for qacc -> velocity update -> position integration
 - For humanoid (nv=27): ~5KB stack per thread, well within limits
@@ -551,7 +551,7 @@ The forward dynamics computation graph has ~6,200 nodes (with 1 solver iteration
 | Aspect | MuJoCo-MLX-Cpp | Python mujoco-mlx | MJX (JAX) |
 |--------|---------------|-------------------|-----------|
 | Language | C++ | Python | Python/JAX |
-| GPU backend | Metal (MLX) | Metal (MLX) | XLA (CUDA/TPU) |
+| GPU backend | Vulkan (MKX) | Vulkan (MKX) | XLA (CUDA/TPU) |
 | Custom kernels | Yes (kin + Euler) | Yes (kin + Euler) | No |
 | Batching | mx::vmap | mx.vmap | jax.vmap |
 | Compilation | mx::compile | mx.compile | jax.jit |
@@ -560,7 +560,7 @@ The forward dynamics computation graph has ~6,200 nodes (with 1 solver iteration
 | Training SPS (8192 envs) | 73K | N/A | N/A |
 
 Key differences from Python mujoco-mlx:
-- Same architecture (Metal + vmap hybrid)
+- Same architecture (GPU + vmap hybrid)
 - C++ eliminates Python interpreter overhead
 - Mass matrix mask bug fix (see above) was found during C++ port
 - Solver iteration count now matches XML spec (Python had the same)
@@ -624,8 +624,8 @@ Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched)
 
 | Feature | Scalar | Vmap | Notes |
 |---------|--------|------|-------|
-| Euler integration | Yes | Yes (Metal kernel) | |
-| RK4 integration | Yes | No | Metal kernel is Euler-only; deferred |
+| Euler integration | Yes | Yes (GPU kernel) | |
+| RK4 integration | Yes | No | GPU kernel is Euler-only; deferred |
 | ImplicitFast integration | Yes | No | Needs dense Cholesky in vmap; deferred |
 | Activation dynamics (act_dot) | Yes | Yes | Vectorized via scatter-matmul |
 | Tendon passive forces | Yes | Yes | Vectorized via ten_J^T @ force |
@@ -634,15 +634,15 @@ Not all features are implemented in both the scalar (CPU) and vmap (GPU/batched)
 | Tendon friction loss | Yes | Yes | Precomputed tenJ_row in cache |
 | mesh-* collision | GJK/EPA (64 iter) | GJK + depth est. (32 iter) | Both use proper mesh support |
 
-Remaining gaps: **RK4/ImplicitFast** in batched (needs Metal kernel rewrite or dense Cholesky in vmap), and **gravity compensation** in vmap (needs vmap-compatible body Jacobian computation). All deferred since they affect few RL models.
+Remaining gaps: **RK4/ImplicitFast** in batched (needs GPU kernel rewrite or dense Cholesky in vmap), and **gravity compensation** in vmap (needs vmap-compatible body Jacobian computation). All deferred since they affect few RL models.
 
 ---
 
 ## Known Issues and Future Work
 
 1. **Graph size**: The computation graph (~6,200 nodes) is large. Reducing it would speed up both compilation and execution. Main targets:
-   - Cholesky (945 nodes for 27x27): Could benefit from a custom Metal kernel for batched factorization
-   - Per-body loops in com_vel/rne (~1,800 nodes): Vectorization was attempted and failed (see above), but a custom Metal kernel approach might work
+   - Cholesky (945 nodes for 27x27): Could benefit from a custom GPU kernel for batched factorization
+   - Per-body loops in com_vel/rne (~1,800 nodes): Vectorization was attempted and failed (see above), but a custom GPU kernel approach might work
 
 2. **First-step compilation**: The first batched step triggers `mx::compile`, which takes ~200ms. Subsequent steps are fast.
 
