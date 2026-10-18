@@ -2,6 +2,7 @@
 // Vendored from 20niship/mlx-cross-platform tests/mujoco/solver.hpp at commit 3202339e12231f3a68f9ee67e0b6085a33c52286.
 
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include <mkx/ops/fast_kernel.hpp>
@@ -20,6 +21,9 @@ inline std::string solver_fmt_float(float x) {
   return s;
 }
 } // namespace detail_solver
+
+// ホスト側のscratch確保量(batched.cppのsolver_scratch_per_env)と一致させる責務を持つ、カーネルが1envあたり使うfloat数。
+inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 6 * max_efc + 5 * nv + 3 * nv; }
 
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters) {
   using namespace detail_solver;
@@ -42,6 +46,7 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, float timestep, bo
   int S_JV            = S_MV + nv;
   int S_JACP          = S_JV + max_efc;
   int SCRATCH_PER_ENV = S_JACP + nv * 3;
+  if(SCRATCH_PER_ENV != solver_scratch_floats(nv, max_efc)) throw std::logic_error("mjmlx solver: scratchレイアウトとsolver_scratch_floatsが不一致");
 
   std::string header = R"GLSL(
 vec3 msl_cross(vec3 a, vec3 b) { return cross(a, b); }

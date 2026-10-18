@@ -268,6 +268,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_gpu_accuracy tests/test_gpu_accuracy.cpp)
+    target_link_libraries(test_gpu_accuracy PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_gpu_accuracy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     add_executable(test_math_full tests/test_math_full.cpp src/math.cpp)
     target_link_libraries(test_math_full PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_math_full PRIVATE
@@ -293,7 +300,7 @@ if(MJMLX_BUILD_TESTS)
 
     # Fix MuJoCo dylib reference for test executables that link mujoco_imported
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        foreach(_test test_math_full test_batched_diag test_linalg_full test_batched_collision_primitives)
+        foreach(_test test_math_full test_batched_diag test_gpu_accuracy test_linalg_full test_batched_collision_primitives)
             add_custom_command(TARGET ${_test} POST_BUILD
                 COMMAND install_name_tool -change
                     "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"

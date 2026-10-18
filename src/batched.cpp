@@ -45,6 +45,8 @@
 #include <memory>
 
 #if defined(MJMLX_BACKEND_MKX)
+// SIMD幅(32)を使い切るため、Bが64で割り切れるときだけ1ワークグループに64環境を載せる(割り切れなければ従来の1)。
+static uint32_t env_threadgroup(int B) { return (B % 64 == 0) ? 64u : 1u; }
 #include "compat/mkx_kernels/kinematics.hpp"
 #include "compat/mkx_kernels/euler.hpp"
 #include "compat/mkx_kernels/euler_devmem.hpp"
@@ -1326,9 +1328,10 @@ static mx::array build_collision_pair_data(const Model& m) {
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
 
+// solverカーネル(MSL版・GLSL版とも)のscratchレイアウトと1floatも違ってはいけない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 5*MAX_EFC + 7*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 6*MAX_EFC + 5*nv + nv*3;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
@@ -2486,6 +2489,9 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int si = std::min(raw_si, 3);
         int cgi = 20;
         ctx->solver_scratch_size = solver_scratch_per_env(m);
+#if defined(MJMLX_BACKEND_MKX)
+        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
+#endif
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);
@@ -2652,7 +2658,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
             );
             // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
             MX_MARK_PERSISTENT(kin_raw[0], owner);
@@ -2711,7 +2717,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
                     );
                     // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
                     MX_MARK_PERSISTENT(fwd_raw[0], owner);
@@ -2764,7 +2770,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
                              ctx->coll_geom_dataid, ctx->coll_geom_size}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
-                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{1, 1, 1}
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
                         );
                         // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
                         MX_MARK_PERSISTENT(coll_raw[0], owner);
@@ -2857,7 +2863,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             std::vector<mx::array> euler;
 #if defined(MJMLX_BACKEND_MKX)
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
-            auto tgroup = std::array<uint32_t, 3>{1, 1, 1};
+            auto tgroup = std::array<uint32_t, 3>{env_threadgroup(B), 1, 1};
             // shapeは毎step固定のため全出力永続化(issue #14)。
             if (ctx->euler_kernel.has_value()) {
                 auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
