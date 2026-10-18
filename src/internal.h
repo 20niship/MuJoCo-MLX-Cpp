@@ -346,7 +346,7 @@ struct Model {
         // Body-DOF mapping: for each body, list of its DOF indices
         std::vector<std::vector<int>> body_dofs;
 
-        // Joint integration plan (for Euler / Metal euler)
+        // Joint integration plan (for Euler / GPU euler)
         std::vector<int> simple_qa, simple_da;  // HINGE/SLIDE
         std::vector<std::pair<int,int>> free_joints;   // (qa, da) for FREE
         std::vector<std::pair<int,int>> ball_joints;    // (qa, da) for BALL
@@ -651,40 +651,8 @@ Data vmap_make_constraint(const Model& m, Data d);
 // solver_vmap.cpp
 Data vmap_solve(const Model& m, Data d);
 
-// forward_vmap.cpp (exported for test_metal_synth diagnostics)
+// forward_vmap.cpp
 MJMLX_API Data vmap_forward(const Model& m, Data d, bool skip_contacts = false);
-
-#if defined(MJMLX_BACKEND_MLX)
-// Raw-MSL diagnostic helpers, only exercised by tests/test_metal_synth.cpp (MLX-only target).
-struct MetalForwardResult {
-    mx::array qM{0.0f};
-    mx::array qfrc_smooth{0.0f};
-    mx::array subtree_com{0.0f};
-    mx::array cinert{0.0f};
-    mx::array cvel{0.0f};
-    mx::array qfrc_actuator{0.0f};
-};
-MJMLX_API MetalForwardResult test_metal_forward(
-    const Model& m,
-    const mx::array& xipos, const mx::array& ximat,
-    const mx::array& xanchor, const mx::array& xaxis, const mx::array& xmat,
-    const mx::array& qpos, const mx::array& qvel, const mx::array& ctrl);
-
-struct MetalCollisionResult {
-    mx::array contact_data{0.0f};  // (MAX_CON * STRIDE,) flat
-    mx::array contact_count{0.0f}; // scalar
-};
-MJMLX_API MetalCollisionResult test_metal_collision(
-    const Model& m,
-    const mx::array& geom_xpos, const mx::array& geom_xmat);
-
-MJMLX_API MetalCollisionResult test_metal_solver(
-    const Model& m,
-    const mx::array& qM, const mx::array& qfrc_smooth,
-    const mx::array& cdof, const mx::array& subtree_com,
-    const mx::array& qvel,
-    const mx::array& contact_data, const mx::array& contact_count);
-#endif
 
 // Batched math helpers (math.cpp)
 mx::array batched_cross(const mx::array& a, const mx::array& b);
