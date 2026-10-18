@@ -47,7 +47,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
                                              const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0,
                                              const std::vector<float>& act_gain1, const std::vector<float>& act_gain2, const std::vector<float>& act_bias1, const std::vector<float>& act_bias2,
-                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr) {
+                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp) {
   using namespace detail_forward;
 
   int off_crb          = 0;
@@ -387,8 +387,25 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss << "for (int di=0;di<NV;di++) qfrc_actuator_out[qa_off+di] = 0.0f;\n";
   }
 
+  // 重力補償(MuJoCo mj_gravcomp相当): gravcomp!=0のbodyのCOMに力 -m*gravcomp*gravity を掛け、そのbodyの祖先(自身含む)のdofへcdofで射影してqfrc_smoothへ足す。
+  ss << "float qfrc_gc[NV]; for (int di=0;di<NV;di++) qfrc_gc[di]=0.0f;\n";
+  for(int b = 1; b < nb; b++) {
+    float gc = body_gravcomp[static_cast<size_t>(b)];
+    if(gc == 0.0f) continue;
+    float m = body_mass[static_cast<size_t>(b)] * gc;
+    ss << "{\n"
+       << "  float f[3] = float[](" << fmt_float(-m * gravity[0]) << "f," << fmt_float(-m * gravity[1]) << "f," << fmt_float(-m * gravity[2]) << "f);\n"
+       << "  int rid = body_root[" << b << "];\n"
+       << "  float o[3]; for (int k=0;k<3;k++) o[k] = xipos[xip_off+" << b << "*3+k] - subtree_com_out[sc_off+rid*3+k];\n"
+       << "  float w[6] = float[](o[1]*f[2]-o[2]*f[1], o[2]*f[0]-o[0]*f[2], o[0]*f[1]-o[1]*f[0], f[0], f[1], f[2]);\n";
+    for(int a = b; a > 0; a = body_parentid[static_cast<size_t>(a)])
+      for(int di : body_dofs[static_cast<size_t>(a)])
+        ss << "  { float dt=0.0f; for (int k=0;k<6;k++) dt += scratch[s_off+S_CDOF+" << di << "*6+k]*w[k]; qfrc_gc[" << di << "] += dt; }\n";
+    ss << "}\n";
+  }
+
   ss << "for (int di=0;di<NV;di++) {\n"
-     << "  qfrc_smooth_out[qfs_off+di] = scratch[s_off+S_PASS+di] - scratch[s_off+S_BIAS+di] + qfrc_actuator_out[qa_off+di];\n"
+     << "  qfrc_smooth_out[qfs_off+di] = scratch[s_off+S_PASS+di] - scratch[s_off+S_BIAS+di] + qfrc_actuator_out[qa_off+di] + qfrc_gc[di];\n"
      << "}\n";
 
   ss << "uint cd_off = bid * NV * 6;\n"
