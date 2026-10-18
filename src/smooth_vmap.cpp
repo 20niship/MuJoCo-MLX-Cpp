@@ -267,7 +267,7 @@ Data vmap_crb(const Model& m, Data d) {
 Data vmap_factor_m(const Model& m, Data d) {
     int n = m.nv;
     auto A = mx::add(d.qM, mx::multiply(mx::eye(n), mx::array(1e-6f)));
-    d.qLD = A;  // store regularized M (used by Euler kernel via Metal)
+    d.qLD = A;  // store regularized M (used by Euler kernel via GPU)
 
     // Cholesky factorization: A = L L^T
     // DECISION: d.qM_inv stores the Cholesky factor L, NOT the actual inverse M^{-1}.

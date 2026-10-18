@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "PPO training on MuJoCo-MLX-Cpp's batched physics engine (stable-baselines3 + TensorBoard)"
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "mlx==0.31.2",
     "mujoco==3.5.0",
     "gymnasium==0.29.1",
     "stable-baselines3==2.3.2",

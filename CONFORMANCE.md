@@ -257,15 +257,15 @@ zero-eval vmap execution. TENDON equality constraints are DEFERRED.
 
 | Integrator | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |------------|----------|-----|----------------|
-| Euler (semi-implicit) | `mj_Euler` (engine_forward.c) | Yes | Yes + Metal kernel (scalar + batched) |
+| Euler (semi-implicit) | `mj_Euler` (engine_forward.c) | Yes | Yes + GPU kernel (scalar + batched) |
 | RK4 | `mj_RungeKutta` | Yes | Yes (Phase 7.1, scalar path) |
 | Implicit | `mj_implicit` (with RNE deriv) | In development | Partial (Phase 7.2, scalar path, no RNE deriv) |
 | ImplicitFast | `mj_implicit` (no RNE deriv) | Yes | Yes (Phase 7.2, scalar path) |
 
 ### Scalar vs Batched
 
-All 4 integrators work in the scalar path. The batched Metal pipeline uses Euler only.
-RK4 and ImplicitFast in batched mode are DEFERRED (would require either Metal kernel
+All 4 integrators work in the scalar path. The batched GPU pipeline uses Euler only.
+RK4 and ImplicitFast in batched mode are DEFERRED (would require either GPU kernel
 rewrites or dense Cholesky in the vmap path).
 
 ### ImplicitFast (Phase 7.2)
@@ -446,7 +446,7 @@ which is more resilient to field type changes.
 |-----------|-------|--------------------------|
 | `io.cpp` (model conversion + cache) | 1,598 | **High** -- field-by-field copy + ModelCache init |
 | `internal.h` (Model/Data/Cache structs) | 698 | **High** -- must mirror mjModel fields |
-| `batched.cpp` (Metal kernels) | 915 | Medium -- physics equations in MSL strings |
+| `batched.cpp` (GPU kernels) | 915 | Medium -- physics equations in MSL strings |
 | `collision.cpp` (detection) | 2,135 | Low -- analytic formulas, GJK/EPA |
 | `constraint_vmap.cpp` (vmap constraints) | 1,878 | Medium -- zero-eval constraint pipeline |
 | `constraint.cpp` (scalar constraints) | 848 | Low -- reference implementation |
@@ -466,7 +466,7 @@ Most major features are now implemented. Remaining gaps:
 | Spatial tendons (wrapping geometry) | 3-4 weeks | Geodesic path computation |
 | Muscle model | 2-3 weeks | Muscle activation dynamics |
 | Sensors (~50 types) | 3-4 weeks | Large surface area, low complexity |
-| Batched RK4/ImplicitFast | 2-3 weeks | Metal kernel or vmap Cholesky |
+| Batched RK4/ImplicitFast | 2-3 weeks | GPU kernel or vmap Cholesky |
 | **Total remaining to MJX parity** | **~3-4 months** (1 developer) | |
 
 ---
@@ -482,7 +482,7 @@ The Gymnasium Humanoid-v5 model uses features that are fully supported:
 | Pyramidal friction (condim=3) | Yes (4 rows per contact) |
 | 2 fixed tendons (hip-knee coupling) | Yes (Phase 5) |
 | JOINT transmission, FIXED gain | Yes |
-| Euler integration | Yes (Metal kernel, batched) |
+| Euler integration | Yes (GPU kernel, batched) |
 | No equality constraints | N/A |
 | No MESH/CYLINDER geoms | N/A |
 
@@ -531,7 +531,7 @@ Ranked by impact-to-effort ratio:
 | D1 | Spatial tendons (wrapping geometry) | 3-4 weeks | Anatomical hand models only |
 | D2 | MUSCLE dynamics | 2-3 weeks | Biomechanical models only |
 | D3 | Sensors (~50 types) | 3-4 weeks | RL reads state directly, not sensors |
-| D4 | Batched RK4/ImplicitFast (Metal kernel) | 2-3 weeks | Euler sufficient for most RL |
+| D4 | Batched RK4/ImplicitFast (GPU kernel) | 2-3 weeks | Euler sufficient for most RL |
 | D5 | Vmap gravity compensation | 1 week | Few models use gravcomp in batched |
 | D6 | Differentiable physics (grad(step)) | 8-12 weeks | Separate project |
 | D7 | Inverse dynamics / constraint islands / noslip / sleep | 4-6 weeks | Niche features |
@@ -558,7 +558,7 @@ remaining conformance gap:
     +-----------------+     +------------------+
     | 100% features   |     | ~65-70% features |
     | double precision|     | float32          |
-    | CPU threads     |     | Metal GPU        |
+    | CPU threads     |     | GPU GPU        |
     | ~20K SPS batched|     | ~73K+ SPS batched|
     +-----------------+     +------------------+
 ```
@@ -577,7 +577,7 @@ remaining conformance gap:
 
 | Stage | MuJoCo C Function | MuJoCo-MLX-Cpp | Notes |
 |-------|-------------------|----------------|-------|
-| FK kinematics | `mj_kinematics` | `kinematics()` | Full parity. Metal kernel for batched. |
+| FK kinematics | `mj_kinematics` | `kinematics()` | Full parity. GPU kernel for batched. |
 | COM position | `mj_comPos` | `com_pos()` | Full parity. Cached scatter matrices. |
 | CRB inertia | `mj_crb` | `crb()` | Full parity. Cached scatter matrices. |
 | Mass matrix | `mj_makeM` | `factor_m()` | Dense Cholesky (GPU) or sparse LDL |
@@ -592,7 +592,7 @@ remaining conformance gap:
 | Acceleration | `mj_fwdAcceleration` | `fwd_acceleration()` | Full parity |
 | Solve | `mj_fwdConstraint` | `solve()` | CG + Newton (no PGS) |
 | Post-constraint RNE | `mj_rnePostConstraint` | `rne_post_constraint()` | Computes `cfrc_ext` |
-| Euler | `mj_Euler` | `integrate_euler()` | Full parity + Metal kernel |
+| Euler | `mj_Euler` | `integrate_euler()` | Full parity + GPU kernel |
 | RK4 | `mj_RungeKutta` | `integrate_rk4()` | Full parity (scalar path) |
 | Implicit/Fast | `mj_implicit` | `integrate_implicit()` | Full parity (scalar path) |
 | Flex | `mj_flex` | -- | DEFERRED |
@@ -612,5 +612,5 @@ remaining conformance gap:
 | Sensor types | 49 | ~30 | 0 (DEFERRED) |
 | Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
-| Batched GPU sim | No | Yes (CUDA/TPU) | Yes (Metal, 73K SPS training) |
+| Batched GPU sim | No | Yes (CUDA/TPU) | Yes (GPU, 73K SPS training) |
 | Differentiable | External | Native (JAX) | DEFERRED |

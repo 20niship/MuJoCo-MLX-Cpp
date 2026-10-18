@@ -15,7 +15,7 @@
 // Public type definitions for the MuJoCo Backend (mjb) unified C API.
 // This API provides a single interface that dispatches to either:
 //   - MuJoCo C (CPU, double-precision)
-//   - MuJoCo-MLX (Metal GPU, float32)
+//   - MuJoCo-MLX (GPU GPU, float32)
 
 #ifndef MJB_TYPES_H
 #define MJB_TYPES_H
@@ -33,7 +33,7 @@ extern "C" {
 // Backend types
 typedef enum {
     MJB_BACKEND_CPU = 0,  // MuJoCo C (double, CPU threads)
-    MJB_BACKEND_MLX = 1,  // MuJoCo-MLX (float32, Metal GPU)
+    MJB_BACKEND_MLX = 1,  // MuJoCo-MLX (float32, GPU GPU)
 } MjbBackendType;
 
 // Opaque handles

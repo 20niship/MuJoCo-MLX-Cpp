@@ -297,7 +297,7 @@ static inline BenchStats bench_scalar_step(
 
 // ── Convenience: batched GPU benchmark ───────────────────────────────────────
 
-// Benchmark mjmlx batched stepping: warmup (incl. Metal compile), then measure.
+// Benchmark mjmlx batched stepping: warmup (incl. GPU compile), then measure.
 static inline BenchStats bench_batched_step(
     const char* name,
     const char* model_name,

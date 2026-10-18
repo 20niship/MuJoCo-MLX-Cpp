@@ -1,4 +1,4 @@
-// GPU (fast Metal/GLSL kernel) vs CPU parity for non-mesh geom pairs: the fast kernel used to only detect plane-mesh/mesh-mesh, so plane-capsule etc. (used by HalfCheetah and friends) silently produced zero contacts and fell through the floor.
+// GPU (fast GLSL kernel) vs CPU parity for non-mesh geom pairs: the fast kernel used to only detect plane-mesh/mesh-mesh, so plane-capsule etc. (used by HalfCheetah and friends) silently produced zero contacts and fell through the floor.
 #include "test_utils.h"
 #include <cstring>
 #include <vector>

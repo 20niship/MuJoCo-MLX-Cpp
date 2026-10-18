@@ -16,7 +16,7 @@
 //
 // Provides a single physics API that dispatches to either:
 //   MJB_BACKEND_CPU  -- MuJoCo C (double-precision, CPU thread pool)
-//   MJB_BACKEND_MLX  -- MuJoCo-MLX (float32, Metal GPU via MLX)
+//   MJB_BACKEND_MLX  -- MuJoCo-MLX (float32, GPU GPU via MLX)
 //
 // All state exchange uses float* pointers. The CPU backend converts
 // double <-> float transparently. The MLX backend returns zero-copy
@@ -193,14 +193,14 @@ MJB_API void mjb_model_set_hfield_data(MjbModel* model, int offset,
 
 // Create batched simulation.
 // CPU backend: internally thread-pools over N mjData* instances.
-// MLX backend: uses compiled+vmapped Metal GPU step.
+// MLX backend: uses compiled+vmapped GPU GPU step.
 MJB_API MjbBatchedSim* mjb_batched_create(
     MjbModel* model,
     const MjbBatchedConfig* config);
 
 MJB_API void mjb_batched_free(MjbBatchedSim* sim);
 
-// Returns 1 if the batched sim is actually running Metal GPU kernels,
+// Returns 1 if the batched sim is actually running GPU GPU kernels,
 // 0 if it fell back to CPU thread pool (e.g. nv > 80).
 MJB_API int mjb_batched_is_gpu(const MjbBatchedSim* sim);
 

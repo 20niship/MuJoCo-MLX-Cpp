@@ -1,5 +1,5 @@
 <!-- High-DOF humanoid tree model (~63 hinge joints, nv~69 with freejoint).
-     Approximates the Synth model's DOF count for Metal pipeline stress testing.
+     Approximates the Synth model's DOF count for GPU pipeline stress testing.
      21 bodies, 3 hinge joints per body (x/y/z rotation), similar bone hierarchy. -->
 <mujoco model="high_dof_tree">
   <option gravity="0 0 -9.81" timestep="0.002"/>
