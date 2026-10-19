@@ -36,6 +36,10 @@
 // performance: without compile, each MLX op dispatches a separate GPU kernel.
 // With compile, MLX fuses compatible ops into fewer, larger kernels.
 
+#include <map>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "internal.h"
 #include "mjmlx/mjmlx.h"
 #include <sstream>
@@ -45,7 +49,12 @@
 #include <memory>
 
 // SIMD幅(32)を使い切るため、Bが64で割り切れるときだけ1ワークグループに64環境を載せる(割り切れなければ従来の1)。
-static uint32_t env_threadgroup(int B) { return (B % 64 == 0) ? 64u : 1u; }
+// カーネルごとの最適なスレッドグループ幅(RTX3060実測): 1スレッド=1envの重いカーネルはワープ内分岐/ローカルメモリ競合を避けるため1が速い。環境変数MJMLX_TG_<NAME>で上書き可。
+static uint32_t env_threadgroup(int B, const char* kernel = "", uint32_t def = 64u) {
+    std::string key = std::string("MJMLX_TG_") + kernel;
+    uint32_t tg = getenv(key.c_str()) ? (uint32_t)atoi(getenv(key.c_str())) : def;
+    return (tg > 0 && B % tg == 0) ? tg : 1u;
+}
 #include "compat/mkx_kernels/kinematics.hpp"
 #include "compat/mkx_kernels/euler.hpp"
 #include "compat/mkx_kernels/euler_devmem.hpp"
@@ -239,6 +248,22 @@ static int forward_scratch_per_env(const Model& m) {
 // ── Backend-agnostic host data builders for GLSL (mkx_kernels) collision/solver dispatch ──
 static const int CONTACT_STRIDE = 8;
 static const int MAX_CONTACTS_PER_ENV = 128;
+
+// MJMLX_PROF=1: 各段(kin/forward/collision/solver/cfrc/euler)の直後に評価して区間時間を集計し、50step毎に標準エラーへ出す。
+static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
+    static const bool on = getenv("MJMLX_PROF") != nullptr;
+    if (!on) return;
+    static std::map<std::string, double> acc; static int calls = 0; static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    for (const auto& a : outs) mx::eval({a});
+    auto now = std::chrono::steady_clock::now();
+    acc[name] += std::chrono::duration<double>(now - last).count();
+    last = now;
+    if (std::string(name) == "euler" && ++calls % 50 == 0) {
+        fprintf(stderr, "[prof] per-substep ms:");
+        for (auto& kv : acc) fprintf(stderr, " %s=%.1f", kv.first.c_str(), 1e3 * kv.second / 50);
+        fprintf(stderr, "\n"); acc.clear();
+    }
+}
 static const int MAX_EFC = 256;
 
 static mx::array build_collision_pair_data(const Model& m) {
@@ -292,7 +317,7 @@ static mx::array build_collision_pair_data(const Model& m) {
 // solverカーネルのscratchレイアウト(GLSL版はefc長の配列7本)以上でなければならない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
-    return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3;
+    return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3*nv;
 }
 
 // Build solver pair properties buffer (18 floats per pair)
@@ -773,7 +798,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 1u), 1, 1}
             );
             // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
             MX_MARK_PERSISTENT(kin_raw[0], owner);
@@ -786,6 +811,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             MX_MARK_PERSISTENT(kin_raw[7], owner);
             MX_MARK_PERSISTENT(kin_raw[8], owner);
             auto kin = mx::fast::kernel_outputs(kin_raw);
+            prof_stage("kin", kin);
 
             auto xpos   = mx::reshape(kin[0], {B, nb, 3});
             auto xipos  = mx::reshape(kin[3], {B, nb, 3});
@@ -817,7 +843,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 8u), 1, 1}
                     );
                     // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
                     MX_MARK_PERSISTENT(fwd_raw[0], owner);
@@ -829,6 +855,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     MX_MARK_PERSISTENT(fwd_raw[6], owner);
                     MX_MARK_PERSISTENT(fwd_raw[7], owner);
                     fwd = mx::fast::kernel_outputs(fwd_raw);
+                    prof_stage("forward", fwd);
                 }
 
                 qM_flat = fwd[0];
@@ -854,12 +881,13 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
                              ctx->coll_geom_dataid, ctx->coll_geom_size}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
-                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1}
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 1u), 1, 1}
                         );
                         // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
                         MX_MARK_PERSISTENT(coll_raw[0], owner);
                         MX_MARK_PERSISTENT(coll_raw[1], owner);
                         coll = mx::fast::kernel_outputs(coll_raw);
+                        prof_stage("collision", coll);
                     }
 
                     if (ctx->uses_gpu_solver) {
@@ -885,12 +913,14 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             solver = mx::fast::kernel_outputs(solver_raw);
                         }
                         qfrc_constraint_flat = solver[0];
+                        prof_stage("solver", solver);
                         auto cfrc_raw = (*ctx->cfrc_ext_kernel)(
                             mx::fast::kernel_inputs({coll[0], coll[1], solver[2], ctx->solver_pair_props}),
                             mx::fast::kernel_shapes({{B * nb * 6}}),
-                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "CFRC", 64u), 1, 1});
                         MX_MARK_PERSISTENT(cfrc_raw[0], owner);
                         cfrc_ext_flat = mx::fast::kernel_outputs(cfrc_raw)[0];
+                        prof_stage("cfrc", {cfrc_ext_flat});
                     } else {
                         qfrc_constraint_flat = mx::zeros({B * nv});
                     }
@@ -945,6 +975,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 euler = mx::fast::kernel_outputs(raw);
             }
 
+            prof_stage("euler", euler);
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(kin[0], {B, nb, 3});

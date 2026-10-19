@@ -85,7 +85,9 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "uint ci_off  = bid * NB * 10;\n"
      << "uint cv_off  = bid * NB * 6;\n"
      << "uint qa_off  = bid * NV;\n"
-     << "uint s_off   = bid * SCRATCH_SZ;\n\n";
+     << "uint s_off   = bid * SCRATCH_SZ;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
+     << "#define SCR_IDX(x) (uint(x) * NBATCH + bid)  /* SoA配置: 隣接スレッド(env)が連続アドレスを触りコアレスする */\n\n";
 
   ss << "const int S_CRB = " << off_crb << ";\n"
      << "const int S_CDOF = " << off_cdof << ";\n"
@@ -130,22 +132,22 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
 
   ss << "for (int b = 0; b < NB; b++) {\n"
      << "  float m = body_mass[b];\n"
-     << "  scratch[s_off + S_SUBM + b] = m;\n"
+     << "  scratch[SCR_IDX(S_SUBM + b)] = m;\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    scratch[s_off + S_SUBP + b*3+k] = xipos[xip_off + b*3+k] * m;\n"
+     << "    scratch[SCR_IDX(S_SUBP + b*3+k)] = xipos[xip_off + b*3+k] * m;\n"
      << "}\n";
 
   ss << "for (int b = NB-1; b >= 1; b--) {\n"
      << "  int p = body_par[b];\n"
-     << "  scratch[s_off + S_SUBM + p] += scratch[s_off + S_SUBM + b];\n"
+     << "  scratch[SCR_IDX(S_SUBM + p)] += scratch[SCR_IDX(S_SUBM + b)];\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    scratch[s_off + S_SUBP + p*3+k] += scratch[s_off + S_SUBP + b*3+k];\n"
+     << "    scratch[SCR_IDX(S_SUBP + p*3+k)] += scratch[SCR_IDX(S_SUBP + b*3+k)];\n"
      << "}\n";
 
   ss << "for (int b = 0; b < NB; b++) {\n"
-     << "  float sm = max(scratch[s_off + S_SUBM + b], 1e-8f);\n"
+     << "  float sm = max(scratch[SCR_IDX(S_SUBM + b)], 1e-8f);\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    subtree_com_out[sc_off + b*3+k] = scratch[s_off + S_SUBP + b*3+k] / sm;\n"
+     << "    subtree_com_out[sc_off + b*3+k] = scratch[SCR_IDX(S_SUBP + b*3+k)] / sm;\n"
      << "}\n\n";
 
   ss << "for (int b = 0; b < NB; b++) {\n"
@@ -214,32 +216,32 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "    c6[0]=col[0]; c6[1]=col[1]; c6[2]=col[2];\n"
      << "    c6[3]=col[1]*d[2]-col[2]*d[1]; c6[4]=col[2]*d[0]-col[0]*d[2]; c6[5]=col[0]*d[1]-col[1]*d[0];\n"
      << "  }\n"
-     << "  for (int k=0;k<6;k++) scratch[s_off + S_CDOF + di*6+k] = c6[k];\n"
+     << "  for (int k=0;k<6;k++) scratch[SCR_IDX(S_CDOF + di*6+k)] = c6[k];\n"
      << "}\n\n";
 
   // ═══ Phase B: CRB → mass matrix ═══
   ss << "// Phase B: CRB + mass matrix\n";
 
   ss << "for (int b=0;b<NB;b++) for (int k=0;k<10;k++)\n"
-     << "  scratch[s_off + S_CRB + b*10+k] = cinert_out[ci_off + b*10+k];\n";
+     << "  scratch[SCR_IDX(S_CRB + b*10+k)] = cinert_out[ci_off + b*10+k];\n";
 
-  ss << "for (int k=0;k<10;k++) scratch[s_off + S_CRB + k] = 0.0f;\n";
+  ss << "for (int k=0;k<10;k++) scratch[SCR_IDX(S_CRB + k)] = 0.0f;\n";
 
   ss << "for (int b=NB-1;b>=1;b--) {\n"
      << "  int p = body_par[b];\n"
-     << "  for (int k=0;k<10;k++) scratch[s_off + S_CRB + p*10+k] += scratch[s_off + S_CRB + b*10+k];\n"
+     << "  for (int k=0;k<10;k++) scratch[SCR_IDX(S_CRB + p*10+k)] += scratch[SCR_IDX(S_CRB + b*10+k)];\n"
      << "}\n\n";
 
   ss << "for (int i=0;i<NV*NV;i++) qM_out[qM_off+i] = 0.0f;\n";
 
   ss << "for (int i=0;i<NV;i++) {\n"
      << "  int bi = dof_bodyid[i];\n"
-     << "  float I00=scratch[s_off+S_CRB+bi*10], I11=scratch[s_off+S_CRB+bi*10+1], I22=scratch[s_off+S_CRB+bi*10+2];\n"
-     << "  float I01=scratch[s_off+S_CRB+bi*10+3], I02=scratch[s_off+S_CRB+bi*10+4], I12=scratch[s_off+S_CRB+bi*10+5];\n"
-     << "  float px=scratch[s_off+S_CRB+bi*10+6], py=scratch[s_off+S_CRB+bi*10+7], pz=scratch[s_off+S_CRB+bi*10+8];\n"
-     << "  float mass=scratch[s_off+S_CRB+bi*10+9];\n"
-     << "  float w0=scratch[s_off+S_CDOF+i*6], w1=scratch[s_off+S_CDOF+i*6+1], w2=scratch[s_off+S_CDOF+i*6+2];\n"
-     << "  float l0=scratch[s_off+S_CDOF+i*6+3], l1=scratch[s_off+S_CDOF+i*6+4], l2=scratch[s_off+S_CDOF+i*6+5];\n"
+     << "  float I00=scratch[SCR_IDX(S_CRB+bi*10)], I11=scratch[SCR_IDX(S_CRB+bi*10+1)], I22=scratch[SCR_IDX(S_CRB+bi*10+2)];\n"
+     << "  float I01=scratch[SCR_IDX(S_CRB+bi*10+3)], I02=scratch[SCR_IDX(S_CRB+bi*10+4)], I12=scratch[SCR_IDX(S_CRB+bi*10+5)];\n"
+     << "  float px=scratch[SCR_IDX(S_CRB+bi*10+6)], py=scratch[SCR_IDX(S_CRB+bi*10+7)], pz=scratch[SCR_IDX(S_CRB+bi*10+8)];\n"
+     << "  float mass=scratch[SCR_IDX(S_CRB+bi*10+9)];\n"
+     << "  float w0=scratch[SCR_IDX(S_CDOF+i*6)], w1=scratch[SCR_IDX(S_CDOF+i*6+1)], w2=scratch[SCR_IDX(S_CDOF+i*6+2)];\n"
+     << "  float l0=scratch[SCR_IDX(S_CDOF+i*6+3)], l1=scratch[SCR_IDX(S_CDOF+i*6+4)], l2=scratch[SCR_IDX(S_CDOF+i*6+5)];\n"
      << "  float cc0 = I00*w0+I01*w1+I02*w2 + (py*l2-pz*l1);\n"
      << "  float cc1 = I01*w0+I11*w1+I12*w2 + (pz*l0-px*l2);\n"
      << "  float cc2 = I02*w0+I12*w1+I22*w2 + (px*l1-py*l0);\n"
@@ -251,7 +253,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "    float dot = 0.0f;\n"
      << "    for (int k=0;k<6;k++) {\n"
      << "      float ck = (k==0?cc0:k==1?cc1:k==2?cc2:k==3?cc3:k==4?cc4:cc5);\n"
-     << "      dot += ck * scratch[s_off+S_CDOF+j*6+k];\n"
+     << "      dot += ck * scratch[SCR_IDX(S_CDOF+j*6+k)];\n"
      << "    }\n"
      << "    qM_out[qM_off + i*NV+j] = dot;\n"
      << "    qM_out[qM_off + j*NV+i] = dot;\n"
@@ -264,8 +266,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   // ═══ Phase C: COM velocity ═══
   ss << "// Phase C: COM velocity\n";
 
-  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) { cvel_out[cv_off+b*6+k]=0.0f; scratch[s_off+S_CDOFD+k]=0.0f; }\n"
-     << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++) scratch[s_off+S_CDOFD+di*6+k]=0.0f;\n";
+  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) { cvel_out[cv_off+b*6+k]=0.0f; scratch[SCR_IDX(S_CDOFD+k)]=0.0f; }\n"
+     << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++) scratch[SCR_IDX(S_CDOFD+di*6+k)]=0.0f;\n";
 
   for(int b = 1; b < nb; b++) {
     int pid = body_parentid[static_cast<size_t>(b)];
@@ -276,15 +278,15 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
       ss << "  {\n"
          << "    float ua[3] = float[](cv[0],cv[1],cv[2]);\n"
          << "    float ul[3] = float[](cv[3],cv[4],cv[5]);\n"
-         << "    float va[3],vl[3]; for (int k=0;k<3;k++) { va[k]=scratch[s_off+S_CDOF+" << di << "*6+k]; vl[k]=scratch[s_off+S_CDOF+" << di << "*6+3+k]; }\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+0]=ua[1]*va[2]-ua[2]*va[1];\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+1]=ua[2]*va[0]-ua[0]*va[2];\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+2]=ua[0]*va[1]-ua[1]*va[0];\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+3]=ul[1]*va[2]-ul[2]*va[1]+ua[1]*vl[2]-ua[2]*vl[1];\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+4]=ul[2]*va[0]-ul[0]*va[2]+ua[2]*vl[0]-ua[0]*vl[2];\n"
-         << "    scratch[s_off+S_CDOFD+" << di << "*6+5]=ul[0]*va[1]-ul[1]*va[0]+ua[0]*vl[1]-ua[1]*vl[0];\n"
+         << "    float va[3],vl[3]; for (int k=0;k<3;k++) { va[k]=scratch[SCR_IDX(S_CDOF+" << di << "*6+k)]; vl[k]=scratch[SCR_IDX(S_CDOF+" << di << "*6+3+k)]; }\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+0)]=ua[1]*va[2]-ua[2]*va[1];\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+1)]=ua[2]*va[0]-ua[0]*va[2];\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+2)]=ua[0]*va[1]-ua[1]*va[0];\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+3)]=ul[1]*va[2]-ul[2]*va[1]+ua[1]*vl[2]-ua[2]*vl[1];\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+4)]=ul[2]*va[0]-ul[0]*va[2]+ua[2]*vl[0]-ua[0]*vl[2];\n"
+         << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+5)]=ul[0]*va[1]-ul[1]*va[0]+ua[0]*vl[1]-ua[1]*vl[0];\n"
          << "    float qv = qvel[v_off+" << di << "];\n"
-         << "    for (int k=0;k<6;k++) cv[k] += scratch[s_off+S_CDOF+" << di << "*6+k] * qv;\n"
+         << "    for (int k=0;k<6;k++) cv[k] += scratch[SCR_IDX(S_CDOF+" << di << "*6+k)] * qv;\n"
          << "  }\n";
     }
 
@@ -296,19 +298,19 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   // ═══ Phase D: RNE (Newton-Euler) ═══
   ss << "// Phase D: RNE\n";
 
-  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) scratch[s_off+S_CACC+b*6+k]=0.0f;\n"
-     << "scratch[s_off+S_CACC+3] = " << fmt_float(-gravity[0]) << "f;\n"
-     << "scratch[s_off+S_CACC+4] = " << fmt_float(-gravity[1]) << "f;\n"
-     << "scratch[s_off+S_CACC+5] = " << fmt_float(-gravity[2]) << "f;\n";
+  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) scratch[SCR_IDX(S_CACC+b*6+k)]=0.0f;\n"
+     << "scratch[SCR_IDX(S_CACC+3)] = " << fmt_float(-gravity[0]) << "f;\n"
+     << "scratch[SCR_IDX(S_CACC+4)] = " << fmt_float(-gravity[1]) << "f;\n"
+     << "scratch[SCR_IDX(S_CACC+5)] = " << fmt_float(-gravity[2]) << "f;\n";
 
   for(int b = 1; b < nb; b++) {
     int pid = body_parentid[static_cast<size_t>(b)];
     ss << "{\n"
-       << "  float ac[6]; for (int k=0;k<6;k++) ac[k] = scratch[s_off+S_CACC+" << pid << "*6+k];\n";
+       << "  float ac[6]; for (int k=0;k<6;k++) ac[k] = scratch[SCR_IDX(S_CACC+" << pid << "*6+k)];\n";
     for(int di : body_dofs[static_cast<size_t>(b)]) {
-      ss << "  { float qv=qvel[v_off+" << di << "]; for (int k=0;k<6;k++) ac[k]+=scratch[s_off+S_CDOFD+" << di << "*6+k]*qv; }\n";
+      ss << "  { float qv=qvel[v_off+" << di << "]; for (int k=0;k<6;k++) ac[k]+=scratch[SCR_IDX(S_CDOFD+" << di << "*6+k)]*qv; }\n";
     }
-    ss << "  for (int k=0;k<6;k++) scratch[s_off+S_CACC+" << b << "*6+k]=ac[k];\n"
+    ss << "  for (int k=0;k<6;k++) scratch[SCR_IDX(S_CACC+" << b << "*6+k)]=ac[k];\n"
        << "}\n";
   }
 
@@ -316,8 +318,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  float I00=cinert_out[ci_off+b*10], I11=cinert_out[ci_off+b*10+1], I22=cinert_out[ci_off+b*10+2];\n"
      << "  float I01=cinert_out[ci_off+b*10+3], I02=cinert_out[ci_off+b*10+4], I12=cinert_out[ci_off+b*10+5];\n"
      << "  float px=cinert_out[ci_off+b*10+6], py=cinert_out[ci_off+b*10+7], pz=cinert_out[ci_off+b*10+8], mass=cinert_out[ci_off+b*10+9];\n"
-     << "  float aw0=scratch[s_off+S_CACC+b*6], aw1=scratch[s_off+S_CACC+b*6+1], aw2=scratch[s_off+S_CACC+b*6+2];\n"
-     << "  float al0=scratch[s_off+S_CACC+b*6+3], al1=scratch[s_off+S_CACC+b*6+4], al2=scratch[s_off+S_CACC+b*6+5];\n"
+     << "  float aw0=scratch[SCR_IDX(S_CACC+b*6)], aw1=scratch[SCR_IDX(S_CACC+b*6+1)], aw2=scratch[SCR_IDX(S_CACC+b*6+2)];\n"
+     << "  float al0=scratch[SCR_IDX(S_CACC+b*6+3)], al1=scratch[SCR_IDX(S_CACC+b*6+4)], al2=scratch[SCR_IDX(S_CACC+b*6+5)];\n"
      << "  float Ia0=I00*aw0+I01*aw1+I02*aw2+(py*al2-pz*al1);\n"
      << "  float Ia1=I01*aw0+I11*aw1+I12*aw2+(pz*al0-px*al2);\n"
      << "  float Ia2=I02*aw0+I12*aw1+I22*aw2+(px*al1-py*al0);\n"
@@ -338,23 +340,23 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  float mcf3=vw1*Iv5-vw2*Iv4;\n"
      << "  float mcf4=vw2*Iv3-vw0*Iv5;\n"
      << "  float mcf5=vw0*Iv4-vw1*Iv3;\n"
-     << "  scratch[s_off+S_CFRC+b*6+0]=Ia0+mcf0;\n"
-     << "  scratch[s_off+S_CFRC+b*6+1]=Ia1+mcf1;\n"
-     << "  scratch[s_off+S_CFRC+b*6+2]=Ia2+mcf2;\n"
-     << "  scratch[s_off+S_CFRC+b*6+3]=Ia3+mcf3;\n"
-     << "  scratch[s_off+S_CFRC+b*6+4]=Ia4+mcf4;\n"
-     << "  scratch[s_off+S_CFRC+b*6+5]=Ia5+mcf5;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+0)]=Ia0+mcf0;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+1)]=Ia1+mcf1;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+2)]=Ia2+mcf2;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+3)]=Ia3+mcf3;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+4)]=Ia4+mcf4;\n"
+     << "  scratch[SCR_IDX(S_CFRC+b*6+5)]=Ia5+mcf5;\n"
      << "}\n";
 
   ss << "for (int b=NB-1;b>=1;b--) {\n"
      << "  int p = body_par[b];\n"
-     << "  for (int k=0;k<6;k++) scratch[s_off+S_CFRC+p*6+k] += scratch[s_off+S_CFRC+b*6+k];\n"
+     << "  for (int k=0;k<6;k++) scratch[SCR_IDX(S_CFRC+p*6+k)] += scratch[SCR_IDX(S_CFRC+b*6+k)];\n"
      << "}\n";
 
   ss << "for (int di=0;di<NV;di++) {\n"
      << "  int b=dof_bodyid[di]; float dot=0.0f;\n"
-     << "  for (int k=0;k<6;k++) dot+=scratch[s_off+S_CDOF+di*6+k]*scratch[s_off+S_CFRC+b*6+k];\n"
-     << "  scratch[s_off+S_BIAS+di]=dot;\n"
+     << "  for (int k=0;k<6;k++) dot+=scratch[SCR_IDX(S_CDOF+di*6+k)]*scratch[SCR_IDX(S_CFRC+b*6+k)];\n"
+     << "  scratch[SCR_IDX(S_BIAS+di)]=dot;\n"
      << "}\n\n";
 
   // ═══ Phase E: passive, actuation, qfrc_smooth ═══
@@ -364,7 +366,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  float f = 0.0f;\n"
      << "  if (dof_stiff[di] != 0.0f) f -= dof_stiff[di] * (qpos[q_off+dof_qa[di]] - qpos_spr[dof_qa[di]]);\n"
      << "  if (dof_damp[di] != 0.0f) f -= dof_damp[di] * qvel[v_off+di];\n"
-     << "  scratch[s_off+S_PASS+di] = f;\n"
+     << "  scratch[SCR_IDX(S_PASS+di)] = f;\n"
      << "}\n";
 
   if(nu > 0) {
@@ -400,17 +402,17 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
        << "  float w[6] = float[](o[1]*f[2]-o[2]*f[1], o[2]*f[0]-o[0]*f[2], o[0]*f[1]-o[1]*f[0], f[0], f[1], f[2]);\n";
     for(int a = b; a > 0; a = body_parentid[static_cast<size_t>(a)])
       for(int di : body_dofs[static_cast<size_t>(a)])
-        ss << "  { float dt=0.0f; for (int k=0;k<6;k++) dt += scratch[s_off+S_CDOF+" << di << "*6+k]*w[k]; qfrc_gc[" << di << "] += dt; }\n";
+        ss << "  { float dt=0.0f; for (int k=0;k<6;k++) dt += scratch[SCR_IDX(S_CDOF+" << di << "*6+k)]*w[k]; qfrc_gc[" << di << "] += dt; }\n";
     ss << "}\n";
   }
 
   ss << "for (int di=0;di<NV;di++) {\n"
-     << "  qfrc_smooth_out[qfs_off+di] = scratch[s_off+S_PASS+di] - scratch[s_off+S_BIAS+di] + qfrc_actuator_out[qa_off+di] + qfrc_gc[di];\n"
+     << "  qfrc_smooth_out[qfs_off+di] = scratch[SCR_IDX(S_PASS+di)] - scratch[SCR_IDX(S_BIAS+di)] + qfrc_actuator_out[qa_off+di] + qfrc_gc[di];\n"
      << "}\n";
 
   ss << "uint cd_off = bid * NV * 6;\n"
      << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++)\n"
-     << "  cdof_out[cd_off + di*6+k] = scratch[s_off+S_CDOF+di*6+k];\n";
+     << "  cdof_out[cd_off + di*6+k] = scratch[SCR_IDX(S_CDOF+di*6+k)];\n";
 
   (void)dt;
 

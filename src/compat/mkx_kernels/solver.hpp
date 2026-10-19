@@ -1,6 +1,7 @@
 #pragma once
 // Vendored from 20niship/mlx-cross-platform tests/mujoco/solver.hpp at commit 3202339e12231f3a68f9ee67e0b6085a33c52286.
 
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,10 +24,12 @@ inline std::string solver_fmt_float(float x) {
 } // namespace detail_solver
 
 // ホスト側のscratch確保量(batched.cppのsolver_scratch_per_env)と一致させる責務を持つ、カーネルが1envあたり使うfloat数。
-inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv; }
+inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
   using namespace detail_solver;
+  const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
+  const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-6f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
   const int max_efc              = 256;
   const int contact_stride       = 8;
   const int max_contacts_per_env = 128;
@@ -45,7 +48,7 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float time
   int S_MV            = S_ACTIVE + max_efc;
   int S_JV            = S_MV + nv;
   int S_JACP          = S_JV + max_efc;
-  int S_FLOSS         = S_JACP + nv * 3;
+  int S_FLOSS         = S_JACP + nv * 3 * nv;  // 接触を並列に組むためスレッド(dof)ごとに3*nvを持つ
   int SCRATCH_PER_ENV = S_FLOSS + max_efc;
   if(SCRATCH_PER_ENV != solver_scratch_floats(nv, max_efc)) throw std::logic_error("mjmlx solver: scratchレイアウトとsolver_scratch_floatsが不一致");
 
@@ -69,6 +72,9 @@ shared int tg_nefc;
 shared int tg_ncp;
 shared int tg_crow0[129];  // 接触ciの拘束行は [tg_crow0[ci], tg_crow0[ci+1])
 shared float tg_ba;
+shared float tg_g0;
+shared float tg_rr0;
+shared int tg_done;  // 1ならこのenvは収束したのでNewton反復を打ち切る(ワークグループ内で一様)
 shared float tg_rr;
 shared float tg_pAp;
 )GLSL";
@@ -104,11 +110,13 @@ shared float tg_pAp;
      << "const int NQ = " << nq << ";\n"
      << "const int NLIM = " << nlim << ";\n"
      << "const int NFL = " << nfl << ";\n"
+     << "const bool USE_PYR = " << (use_pyramidal ? "true" : "false") << ";\n"
      << "const int MAX_EFC_N = " << max_efc << ";\n"
      << "const int NSOLVE = " << solver_iters << ";\n"
      << "const int CON_STRIDE = " << contact_stride << ";\n"
      << "const int MAX_CON = " << max_contacts_per_env << ";\n"
      << "const float TIMESTEP = " << solver_fmt_float(timestep) << "f;\n"
+     << "const float GTOL_REL = " << solver_fmt_float(gtol_rel) << "f;\n"
      << "const float MJMINVAL_CV = 1e-12f;\n"
      << "const float MJMINVAL_SV = 1e-14f;\n"
      << "const float MJMINIMP = 0.0001f;\n"
@@ -129,7 +137,7 @@ shared float tg_pAp;
      << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
      << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
      << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n"
-     << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + (i)]\n\n";
+     << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
 
   ss << "uint qp_off = bid * NQ;\n"
      << "uint qm_off = bid * NV * NV;\n"
@@ -148,7 +156,8 @@ shared float tg_pAp;
      << "#define cg_p(i)   H(NV + (i))\n"
      << "#define cg_Ap(i)  H(2*NV + (i))\n";
 
-  ss << "const int CG_ITERS = " << cg_iters << ";\n\n";
+  ss << "const int CG_ITERS = " << cg_iters << ";\n"
+     << "const float CG_TOL = " << solver_fmt_float(cg_tol) << "f;\n\n";
 
   ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
      << "barrier(); memoryBarrierBuffer();\n\n";
@@ -202,8 +211,25 @@ for (int li = 0; li < NLIM; li++) {
 
   ss << R"GLSL(
 int ncp = 0;
-for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
-    tg_crow0[ci] = nefc; ncp = ci + 1;
+{
+    // 各接触が使う拘束行数(ピラミッド錐でcondim>=3なら4行、他は1行、非アクティブは0)を先に数えて行オフセットを決める。
+    int r_run = nefc;
+    for (int ci = 0; ci < ncon && r_run < MAX_EFC_N - 4; ci++) {
+        int ci_o = int(con_off) + ci * CON_STRIDE;
+        int pp_ = int(contact_data_in[ci_o+7]) * 18;
+        bool act_ = contact_data_in[ci_o+6] < pair_props[pp_+3];
+        int cd_ = int(pair_props[pp_+2]);
+        tg_crow0[ci] = r_run; ncp = ci + 1;
+        r_run += act_ ? ((USE_PYR && cd_ >= 3) ? 4 : 1) : 0;
+    }
+    tg_crow0[ncp] = r_run; tg_ncp = ncp; tg_nefc = r_run;
+}
+} // end if (tid == 0)
+barrier(); memoryBarrierBuffer(); memoryBarrierShared();
+// 接触ごとの拘束行を並列(スレッド=接触)に組む。jacp_tmpはスレッド専用領域。
+for (int ci = int(tid); ci < tg_ncp; ci += NV) {
+    int row = tg_crow0[ci];
+    if (tg_crow0[ci+1] == row) continue;
     int ci_off = int(con_off) + ci * CON_STRIDE;
     float c_pos_x = contact_data_in[ci_off+0];
     float c_pos_y = contact_data_in[ci_off+1];
@@ -311,22 +337,22 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
             vec3 tang = (tk==0) ? tt1 : tt2;
             for (int di = 0; di < NV; di++) {
                 float jt = tang.x*jacp_tmp(di*3)+tang.y*jacp_tmp(di*3+1)+tang.z*jacp_tmp(di*3+2);
-                J(nefc,di) = j_normal_arr[di] + mu_k*jt;
+                J(row,di) = j_normal_arr[di] + mu_k*jt;
             }
             float jdot = 0.0f;
-            for (int di = 0; di < NV; di++) jdot += J(nefc,di)*qvel_in[qv_off+di];
-            efc_D(nefc) = D_py;
-            efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
-            nefc++;
+            for (int di = 0; di < NV; di++) jdot += J(row,di)*qvel_in[qv_off+di];
+            efc_D(row) = D_py;
+            efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
+            row++;
             for (int di = 0; di < NV; di++) {
                 float jt = tang.x*jacp_tmp(di*3)+tang.y*jacp_tmp(di*3+1)+tang.z*jacp_tmp(di*3+2);
-                J(nefc,di) = j_normal_arr[di] - mu_k*jt;
+                J(row,di) = j_normal_arr[di] - mu_k*jt;
             }
             jdot = 0.0f;
-            for (int di = 0; di < NV; di++) jdot += J(nefc,di)*qvel_in[qv_off+di];
-            efc_D(nefc) = D_py;
-            efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
-            nefc++;
+            for (int di = 0; di < NV; di++) jdot += J(row,di)*qvel_in[qv_off+di];
+            efc_D(row) = D_py;
+            efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
+            row++;
         }
     } else if (contact_active) {
 )GLSL";
@@ -335,18 +361,15 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
   }
 
   ss << R"GLSL(
-        for (int di = 0; di < NV; di++) J(nefc,di) = j_normal_arr[di];
+        for (int di = 0; di < NV; di++) J(row,di) = j_normal_arr[di];
         float r = max(invw_t*(1.0f-imp_val)/imp_val, MJMINVAL_CV);
-        efc_D(nefc) = 1.0f/r;
+        efc_D(row) = 1.0f/r;
         float jdot = 0.0f;
         for (int di = 0; di < NV; di++) jdot += j_normal_arr[di]*qvel_in[qv_off+di];
-        efc_aref(nefc) = -b_val*jdot - k_val*imp_val*pos;
-        nefc++;
+        efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
+        row++;
     }
 }
-tg_crow0[ncp] = nefc; tg_ncp = ncp;
-tg_nefc = nefc;
-} // end if (tid == 0)
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 int nefc = tg_nefc;
 
@@ -375,17 +398,19 @@ barrier(); memoryBarrierBuffer();
   grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
 barrier(); memoryBarrierBuffer();
 
+if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
+barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int iter = 0; iter < NSOLVE; iter++) {
     search_d(int(tid)) = 0.0f;
     cg_r(int(tid)) = -grad(int(tid));
     cg_p(int(tid)) = -grad(int(tid));
     barrier(); memoryBarrierBuffer();
 
-    if (tid == 0u) { float s = 0.0f; for (int i = 0; i < NV; i++) { float v = cg_r(i); s += v*v; } tg_rr = s; }
+    if (tid == 0u) { float s = 0.0f; for (int i = 0; i < NV; i++) { float v = cg_r(i); s += v*v; } tg_rr = s; tg_rr0 = s; }
     barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 
     for (int cg_it = 0; cg_it < CG_ITERS; cg_it++) {
-        if (tg_rr < 1e-20f) break;
+        if (tg_rr < 1e-20f || tg_rr < CG_TOL * tg_rr0) break;  // 残差2乗が初期値の相対CG_TOL未満なら不正確なNewton方向で十分
 
         float mp = MJMINVAL_SV * cg_p(int(tid));
         for (int j = 0; j < NV; j++) mp += qM_in[qm_off + int(tid)*NV + j] * cg_p(j);
@@ -461,6 +486,8 @@ for (int iter = 0; iter < NSOLVE; iter++) {
             if (tt < bc) { bc=tt; ba_local=a; }
         }
         tg_ba = ba_local;
+        // 1反復のコスト改善が相対1e-6未満(または改善なし)なら収束とみなす。静止付近のenvは1〜2反復で収束し、残りのNSOLVE回を丸ごと省ける。
+        tg_done = (ba_local == 0.0f) ? 1 : 0;
         for (int r2 = 0; r2 < nefc; r2++) Jaref(r2) += ba_local*Jv_arr(r2);
         for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
     }
@@ -474,6 +501,10 @@ for (int iter = 0; iter < NSOLVE; iter++) {
     { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
       grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
     barrier(); memoryBarrierBuffer();
+    // 勾配ノルムが初期値の相対GTOL_REL(2乗比)未満なら収束とみなして打ち切る。静止付近のenvは少ない反復で収束し、残りのNSOLVE回を省ける。
+    if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); if (gn < GTOL_REL*tg_g0) tg_done = 1; }
+    barrier(); memoryBarrierBuffer(); memoryBarrierShared();
+    if (tg_done != 0) break;
 }
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
