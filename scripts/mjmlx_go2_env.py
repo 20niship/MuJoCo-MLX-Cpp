@@ -288,8 +288,13 @@ class MjmlxGo2Env(VecEnv):
             joint_torque = qfrc_actuator[:, 6:18]
             r_torque = W_TORQUE * np.sum(joint_torque**2, axis=1)
         except AttributeError:
+            joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)
             r_torque = np.zeros(self.num_envs, dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
 
+        self.last_reward_terms = {
+            "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
+            "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque,
+        }
         rewards = (
             r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque
         )
@@ -324,7 +329,23 @@ class MjmlxGo2Env(VecEnv):
             obs = obs.copy()
             obs[done_idx] = reset_obs[done_idx]
 
-        extras = {"time_outs": torch.from_numpy(truncated)}
+        # rsl_rl が iteration ごとに平均して tensorboard/標準出力へ書く。報酬は項ごとのstep平均(重み込み)、Metricsは追従誤差など
+        log = {f"Reward/{k}": float(np.mean(v)) for k, v in self.last_reward_terms.items()}
+        log.update({
+            "Metrics/lin_vel_error": float(np.sqrt(lin_err).mean()),
+            "Metrics/ang_vel_error": float(np.sqrt(ang_err).mean()),
+            "Metrics/cmd_speed": float(np.linalg.norm(cmd, axis=1).mean()),
+            "Metrics/base_height": float(qpos[:, 2].mean()),
+            "Metrics/action_abs": float(np.abs(actions.detach().cpu().numpy()).mean()),
+            "Metrics/action_clipped_frac": float((np.abs(actions.detach().cpu().numpy()) > 1.0).mean()),
+            "Metrics/joint_torque_abs": float(np.abs(joint_torque).mean()),
+            "Metrics/foot_contact_frac": float(foot_contact.mean()),
+            "Termination/base_contact": float(base_contact.mean()),
+            "Termination/blew_up": float(blew_up.mean()),
+            "Termination/out_of_terrain": float(out_of_terrain.mean()),
+            "Termination/time_out": float(truncated.mean()),
+        })
+        extras = {"time_outs": torch.from_numpy(truncated), "log": log}
         return (
             self._obs_tensordict(obs),
             torch.from_numpy(rewards),
