@@ -86,6 +86,7 @@ struct RlBatchedSim {
     FloatArray qvel() { int n; auto* p = mjmlx_batched_get_qvel(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray xpos() { int n; auto* p = mjmlx_batched_get_xpos(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray cfrc_ext() { int n; auto* p = mjmlx_batched_get_cfrc_ext(handle, &n); return copy_out(p, n, num_envs); }
+    FloatArray qfrc_actuator() { int n; auto* p = mjmlx_batched_get_qfrc_actuator(handle, &n); return copy_out(p, n, num_envs); }
 };
 
 NB_MODULE(_mjmlx_rl_native, m) {
@@ -111,7 +112,8 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)
         .def("xpos", &RlBatchedSim::xpos)
-        .def("cfrc_ext", &RlBatchedSim::cfrc_ext);
+        .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
+        .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator);
 
     m.def("load_model", [](const std::string& xml_path) -> std::shared_ptr<RlModel> {
         auto model = std::make_shared<RlModel>();
