@@ -66,6 +66,8 @@ float efc_cost(float D, float x, float fl) {
     return (x < 0.0f) ? 0.5f * D * x * x : 0.0f;
 }
 shared int tg_nefc;
+shared int tg_ncp;
+shared int tg_crow0[129];  // 接触ciの拘束行は [tg_crow0[ci], tg_crow0[ci+1])
 shared float tg_ba;
 shared float tg_rr;
 shared float tg_pAp;
@@ -199,7 +201,9 @@ for (int li = 0; li < NLIM; li++) {
   }
 
   ss << R"GLSL(
+int ncp = 0;
 for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
+    tg_crow0[ci] = nefc; ncp = ci + 1;
     int ci_off = int(con_off) + ci * CON_STRIDE;
     float c_pos_x = contact_data_in[ci_off+0];
     float c_pos_y = contact_data_in[ci_off+1];
@@ -340,6 +344,7 @@ for (int ci = 0; ci < ncon && nefc < MAX_EFC_N - 4; ci++) {
         nefc++;
     }
 }
+tg_crow0[ncp] = nefc; tg_ncp = ncp;
 tg_nefc = nefc;
 } // end if (tid == 0)
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
@@ -350,6 +355,7 @@ barrier(); memoryBarrierBuffer();
 
 if (nefc == 0) {
     qfrc_constraint_out[qfc_off + int(tid)] = 0.0f;
+    if (tid == 0u) for (int ci = 0; ci < MAX_CON; ci++) contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = 0.0f;
     return;
 }
 
@@ -472,9 +478,45 @@ for (int iter = 0; iter < NSOLVE; iter++) {
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
   qfrc_constraint_out[qfc_off + int(tid)] = s; }
+barrier(); memoryBarrierBuffer();
+// 接触ごとの法線方向の力(ピラミッド錐は全ファセットの力の和)。cfrc_ext算出用。
+if (tid == 0u) {
+    for (int ci = 0; ci < MAX_CON; ci++) {
+        float fn = 0.0f;
+        if (ci < tg_ncp) for (int r2 = tg_crow0[ci]; r2 < tg_crow0[ci+1]; r2++) fn += efc_force(r2);
+        contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = fn;
+    }
+}
 )GLSL";
 
-  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch"}, ss.str(), header);
+  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
+}
+
+
+// 接触ごとの法線力(solver出力contact_fn)をbodyごとの外力cfrc_ext[B,nb,6]=[torque(3),force(3)]に集約する。接触法線はgeom1->geom2向きなので、body2に+n*Fn、body1に-n*Fnを加える。トルクは0(環境側は力のノルムしか使わない)。
+inline mkx::fast::Kernel<> make_cfrc_ext_kernel(int nb, int contact_stride, int max_contacts_per_env) {
+  std::ostringstream ss;
+  ss << "uint bid = gl_GlobalInvocationID.x;\n"
+     << "const int NB = " << nb << ";\n"
+     << "const int CON_STRIDE = " << contact_stride << ";\n"
+     << "const int MAX_CON = " << max_contacts_per_env << ";\n"
+     << R"GLSL(
+uint out_off = bid * uint(NB) * 6u;
+for (int i = 0; i < NB * 6; i++) cfrc_out[out_off + uint(i)] = 0.0f;
+int ncon = int(contact_count_in[bid]);
+for (int ci = 0; ci < ncon; ci++) {
+    uint ci_off = bid * uint(MAX_CON) * uint(CON_STRIDE) + uint(ci * CON_STRIDE);
+    vec3 n = vec3(contact_data_in[ci_off+3], contact_data_in[ci_off+4], contact_data_in[ci_off+5]);
+    int pp = int(contact_data_in[ci_off+7]) * 18;
+    int b1 = int(pair_props[pp+0]), b2 = int(pair_props[pp+1]);
+    vec3 f = n * contact_fn_in[bid * uint(MAX_CON) + uint(ci)];
+    for (int k = 0; k < 3; k++) {
+        cfrc_out[out_off + uint(b2 * 6 + 3 + k)] += f[k];
+        cfrc_out[out_off + uint(b1 * 6 + 3 + k)] -= f[k];
+    }
+}
+)GLSL";
+  return mkx::fast::compute_kernel("mjmlx_cfrc_ext", {"contact_data_in", "contact_count_in", "contact_fn_in", "pair_props"}, {"cfrc_out"}, ss.str(), "");
 }
 
 } // namespace mjmlx::mkx_kernels

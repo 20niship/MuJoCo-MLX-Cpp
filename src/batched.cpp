@@ -442,6 +442,7 @@ struct BatchedStepContext {
 
     // Solver kernel
     std::optional<KernelFn> solver_kernel;
+    std::optional<KernelFn> cfrc_ext_kernel;
     bool uses_gpu_solver = false;
     mx::array solver_pair_props = mx::zeros({1});
     mx::array solver_body_dof_masks = mx::zeros({1});
@@ -620,8 +621,8 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             mx::eval(ctx->solver_limit_tab, ctx->solver_fric_tab);
         }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
-        // GPU CG solver always needs this cap (100 default is for CPU exact Cholesky)
-        int si = std::min(raw_si, 3);
+        // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
+        int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, 3);
         int cgi = 10;
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
@@ -636,6 +637,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
             m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
+        ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
 
@@ -794,6 +796,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qM_flat = mx::zeros({1});
             mx::array qfrc_smooth_flat = mx::zeros({1});
             mx::array qfrc_constraint_flat = mx::zeros({1});
+            mx::array cfrc_ext_flat = mx::zeros({B * nb * 6});
             mx::array subtree_com_out = mx::zeros({1});
             mx::array cinert_out = mx::zeros({1});
             mx::array cvel_out = mx::zeros({1});
@@ -872,15 +875,22 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                  ctx->solver_body_rootid,
                                  mx::astype(mx::flatten(qpos_batch), mx::float32),
                                  ctx->solver_limit_tab, ctx->solver_fric_tab}),
-                                mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}}),
+                                mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}, {B * MAX_CONTACTS_PER_ENV}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
                             // shapeは毎step固定のため永続化(issue #14)。
                             MX_MARK_PERSISTENT(solver_raw[0], owner);
                             MX_MARK_PERSISTENT(solver_raw[1], owner);
+                            MX_MARK_PERSISTENT(solver_raw[2], owner);
                             solver = mx::fast::kernel_outputs(solver_raw);
                         }
                         qfrc_constraint_flat = solver[0];
+                        auto cfrc_raw = (*ctx->cfrc_ext_kernel)(
+                            mx::fast::kernel_inputs({coll[0], coll[1], solver[2], ctx->solver_pair_props}),
+                            mx::fast::kernel_shapes({{B * nb * 6}}),
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
+                        MX_MARK_PERSISTENT(cfrc_raw[0], owner);
+                        cfrc_ext_flat = mx::fast::kernel_outputs(cfrc_raw)[0];
                     } else {
                         qfrc_constraint_flat = mx::zeros({B * nv});
                     }
@@ -939,7 +949,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
             auto xquat_out = mx::reshape(kin[1], {B, nb, 4});
-            auto cfrc_ext_out = mx::zeros({B, nb, 6});
+            auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out, xquat_out,
                     subtree_com_out, cinert_out, cvel_out,

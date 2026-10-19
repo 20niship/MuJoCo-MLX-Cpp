@@ -22,6 +22,15 @@ vec3 msl_norm(vec3 a) {
     return l > 1e-12 ? a / l : vec3(0.0, 0.0, 1.0);
 }
 
+// 箱ローカル座標の点lcから箱への符号付き距離(外: 正、内: -最小貫入量)。球-箱/カプセル-箱の解析接触で使う。
+float mjmlx_box_sdist(vec3 lc, vec3 bh) {
+    vec3 q = vec3(clamp(lc.x,-bh.x,bh.x), clamp(lc.y,-bh.y,bh.y), clamp(lc.z,-bh.z,bh.z));
+    float dd = msl_len(lc - q);
+    if (dd > 1e-9) return dd;
+    vec3 pen = vec3(bh.x-abs(lc.x), bh.y-abs(lc.y), bh.z-abs(lc.z));
+    return -min(pen.x, min(pen.y, pen.z));
+}
+
 // Generic GJK/EPA support point so plane-X and X-Y contact detection work for any geom-type pair, not just mesh. MuJoCo local-frame convention: sphere size=(radius,_,_), capsule/cylinder size=(radius,halflength,_) axis along local +z, box size=(halfx,halfy,halfz), ellipsoid size=semi-axes.
 vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
                     int mesh_adr, int mesh_nverts, vec3 dir_world) {
@@ -132,6 +141,52 @@ for (int p = 0; p < NUM_PAIRS; p++) {
         int nv1 = (t1 == 7) ? int(mesh_vertnum_buf[mid1]) : 0;
         int nv2 = (t2 == 7) ? int(mesh_vertnum_buf[mid2]) : 0;
 
+        bool sphere_box = ((t1 == 2 || t1 == 3) && t2 == 6) || (t1 == 6 && (t2 == 2 || t2 == 3));
+        if (sphere_box) {
+            // 球/カプセル-箱は解析解で求める。GJK/EPAは貫入数mmの接触で重なり判定を外し法線が不定になり、足先が平坦な箱天面に触れた瞬間に横方向の衝撃を出していた。カプセルは軸線上で箱に最も近い点を球とみなす(接触は1点)。
+            bool sph_first = (t1 != 6);
+            int rt = sph_first ? t1 : t2;
+            vec3 sc = sph_first ? pos1 : pos2;  vec3 rsize = sph_first ? size1 : size2;  float sr = rsize.x;
+            vec3 bc = sph_first ? pos2 : pos1;  vec3 bh = sph_first ? size2 : size1;
+            float BR[9]; for (int k=0;k<9;k++) BR[k] = sph_first ? R2[k] : R1[k];
+            if (rt == 3) {
+                float RR[9]; for (int k=0;k<9;k++) RR[k] = sph_first ? R1[k] : R2[k];
+                vec3 ax = vec3(RR[2], RR[5], RR[8]) * rsize.y;
+                vec3 a0 = sc - ax, a1 = sc + ax;
+                float lo = 0.0, hi = 1.0;
+                for (int it = 0; it < 24; it++) {
+                    float m1 = lo + (hi-lo)/3.0, m2 = hi - (hi-lo)/3.0;
+                    vec3 r1 = mix(a0, a1, m1) - bc, r2 = mix(a0, a1, m2) - bc;
+                    vec3 l1 = vec3(BR[0]*r1.x+BR[3]*r1.y+BR[6]*r1.z, BR[1]*r1.x+BR[4]*r1.y+BR[7]*r1.z, BR[2]*r1.x+BR[5]*r1.y+BR[8]*r1.z);
+                    vec3 l2 = vec3(BR[0]*r2.x+BR[3]*r2.y+BR[6]*r2.z, BR[1]*r2.x+BR[4]*r2.y+BR[7]*r2.z, BR[2]*r2.x+BR[5]*r2.y+BR[8]*r2.z);
+                    if (mjmlx_box_sdist(l1, bh) < mjmlx_box_sdist(l2, bh)) hi = m2; else lo = m1;
+                }
+                sc = mix(a0, a1, 0.5*(lo+hi));
+            }
+            vec3 rel = sc - bc;
+            vec3 lc = vec3(BR[0]*rel.x+BR[3]*rel.y+BR[6]*rel.z, BR[1]*rel.x+BR[4]*rel.y+BR[7]*rel.z, BR[2]*rel.x+BR[5]*rel.y+BR[8]*rel.z);
+            vec3 q = vec3(clamp(lc.x,-bh.x,bh.x), clamp(lc.y,-bh.y,bh.y), clamp(lc.z,-bh.z,bh.z));
+            vec3 dl = lc - q;
+            float dd = msl_len(dl);
+            vec3 nl;  // 箱から球へ向かう単位法線(箱ローカル)
+            float sd;
+            if (dd > 1e-9) { nl = dl / dd; sd = dd - sr; }
+            else {
+                vec3 pen = vec3(bh.x-abs(lc.x), bh.y-abs(lc.y), bh.z-abs(lc.z));
+                if (pen.x <= pen.y && pen.x <= pen.z) { nl = vec3(lc.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0); sd = -pen.x - sr; }
+                else if (pen.y <= pen.z) { nl = vec3(0.0, lc.y >= 0.0 ? 1.0 : -1.0, 0.0); sd = -pen.y - sr; }
+                else { nl = vec3(0.0, 0.0, lc.z >= 0.0 ? 1.0 : -1.0); sd = -pen.z - sr; }
+            }
+            if (sd < pair_margin) {
+                vec3 nw = vec3(BR[0]*nl.x+BR[1]*nl.y+BR[2]*nl.z, BR[3]*nl.x+BR[4]*nl.y+BR[5]*nl.z, BR[6]*nl.x+BR[7]*nl.y+BR[8]*nl.z);
+                vec3 qw = vec3(BR[0]*q.x+BR[1]*q.y+BR[2]*q.z, BR[3]*q.x+BR[4]*q.y+BR[5]*q.z, BR[6]*q.x+BR[7]*q.y+BR[8]*q.z) + bc;
+                vec3 cp = qw + nw * (sd * 0.5);  // 箱側の最近点と球表面点の中点
+                vec3 n12 = sph_first ? -nw : nw;  // 接触法線はgeom1->geom2向き
+                c_pos[0]=cp.x; c_pos[1]=cp.y; c_pos[2]=cp.z;
+                c_norm[0]=n12.x; c_norm[1]=n12.y; c_norm[2]=n12.z;
+                c_dist=sd; has_contact=true;
+            }
+        } else {
         #define SUPPORT1(DIR) mjmlx_support(t1, pos1, R1, size1, adr1, nv1, DIR)
         #define SUPPORT2(DIR) mjmlx_support(t2, pos2, R2, size2, adr2, nv2, DIR)
 
@@ -229,6 +284,7 @@ for (int p = 0; p < NUM_PAIRS; p++) {
         }
         #undef SUPPORT1
         #undef SUPPORT2
+        }
     }
 
     if (has_contact && ncon < MAX_CON) {
