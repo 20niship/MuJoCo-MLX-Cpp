@@ -10,10 +10,10 @@ import torch
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
-from go2_terrain import StairsTerrain
+from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
 
-PHYSICS_DT = 0.02  # go2_mjx.xmlの<option timestep>。IsaacLab/MJX流に物理step=制御stepの50Hzへ
-DECIMATION = 1
+PHYSICS_DT = 0.004  # go2_mjx.xml本来のtimestep。0.02ではPD(kp=50,armature=0.01)が陽的積分で不安定
+DECIMATION = 5  # 5*0.004 = 0.02s -> 50Hz制御
 CONTROL_DT = PHYSICS_DT * DECIMATION
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
@@ -40,7 +40,10 @@ W_FEET_AIR_TIME = 0.01
 FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
 
+# go2_mjx.xmlのiterations=1はCPU(Newton)向け。GPUのソルバは接触が重なると収束が遅く、1〜3回だと一部のenvで速度が発散するため8にする(CPUでも同値を使い挙動を揃える)
+SOLVER_ITERATIONS = 8
 BASE_CONTACT_FORCE_THRESHOLD = 1.0
+SPAWN_FOOTPRINT_RADIUS = 0.5  # 胴体中心から足先までの最大水平距離(関節角ランダム化で脚が開く分を含む)
 PUSH_INTERVAL_STEPS = (int(10.0 / CONTROL_DT), int(15.0 / CONTROL_DT))
 
 
@@ -105,14 +108,15 @@ class MjmlxGo2Env(VecEnv):
         use_gpu: bool = True,
         seed: int | None = None,
         terrain_seed: int | None = None,
+        flat_terrain: bool = False,
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
     ):
         self._native = native_module
-        self.terrain = StairsTerrain(seed=terrain_seed)
+        self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
         build_terrain_model_xml(self.terrain, generated_xml_path)
 
         self._model = native_module.load_model(generated_xml_path)
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=0)
+        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
         self.nq = self._model.nq
         self.nv = self._model.nv
         self.nu = self._model.nu
@@ -183,7 +187,7 @@ class MjmlxGo2Env(VecEnv):
         qvel = qvel.copy()
 
         x, y = self.terrain.sample_spawn_xy(self._rng, n)
-        z = self.terrain.height_at(x) + 0.40  # IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
+        z = self.terrain.max_height_within(x, SPAWN_FOOTPRINT_RADIUS) + 0.40  # 脚が張り出す範囲の最高地形の上に置く。 IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
         yaw = self._rng.uniform(-np.pi, np.pi, size=n)
         qpos[idx, 0] = x
         qpos[idx, 1] = y
@@ -294,7 +298,9 @@ class MjmlxGo2Env(VecEnv):
 
         self._elapsed += 1
         truncated = self._elapsed >= MAX_EPISODE_STEPS
-        terminated = base_contact | blew_up
+        # 通路の外へ出たら地形が無いので落下して学習に使えない: 終了にする
+        out_of_terrain = (np.abs(qpos[:, 1]) > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > self.terrain.total_length)
+        terminated = base_contact | blew_up | out_of_terrain
         dones = truncated | terminated
 
         obs = self._obs(qpos, qvel)
