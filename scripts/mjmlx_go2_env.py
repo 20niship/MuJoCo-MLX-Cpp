@@ -33,7 +33,7 @@ W_TRACK_LIN = 1.5
 W_TRACK_ANG = 0.75
 W_LIN_VEL_Z = -2.0
 W_ANG_VEL_XY = -0.05
-W_TORQUE = -0.0002
+W_TORQUE = -0.00005  # IsaacLabの-0.0002を1/4に。-0.0002だと探索ノイズ下のトルクが追従報酬を上回り探索が損になる
 W_DOF_ACC = -2.5e-7
 W_ACTION_RATE = -0.01
 W_FEET_AIR_TIME = 0.01
@@ -238,7 +238,7 @@ class MjmlxGo2Env(VecEnv):
         return self._obs_tensordict(self._obs(qpos, qvel)), {}
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        action = np.clip(actions.detach().cpu().numpy(), -1.0, 1.0).astype(np.float32)
+        action = actions.detach().cpu().numpy().astype(np.float32)  # IsaacLab同様clipしない(関節目標のみ制御範囲へclip)
         ctrl_target = DEFAULT_JOINT_POS + ACTION_SCALE * action
         ctrl = np.clip(ctrl_target, CTRL_LOW, CTRL_HIGH)
 
@@ -273,6 +273,7 @@ class MjmlxGo2Env(VecEnv):
         r_ang_vel_xy = W_ANG_VEL_XY * np.sum(np.clip(base_ang_vel[:, 0:2], -50.0, 50.0) ** 2, axis=1)
         joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
         r_dof_acc = W_DOF_ACC * np.sum(joint_acc**2, axis=1)
+        action_prev = self._last_action.copy()
         r_action_rate = W_ACTION_RATE * np.sum((action - self._last_action) ** 2, axis=1)
 
         contact_filt = foot_contact | self._last_foot_contact
@@ -336,8 +337,13 @@ class MjmlxGo2Env(VecEnv):
             "Metrics/ang_vel_error": float(np.sqrt(ang_err).mean()),
             "Metrics/cmd_speed": float(np.linalg.norm(cmd, axis=1).mean()),
             "Metrics/base_height": float(qpos[:, 2].mean()),
-            "Metrics/action_abs": float(np.abs(actions.detach().cpu().numpy()).mean()),
-            "Metrics/action_clipped_frac": float((np.abs(actions.detach().cpu().numpy()) > 1.0).mean()),
+            "Metrics/action_abs": float(np.abs(action).mean()),
+            "Metrics/action_rate_abs": float(np.abs(action - action_prev).mean()),
+            "Metrics/ctrl_saturated_frac": float((ctrl_target != ctrl).mean()),
+            "Metrics/joint_vel_abs": float(np.abs(joint_vel).mean()),
+            "Metrics/joint_pos_dev": float(np.abs(qpos[:, 7:19] - DEFAULT_JOINT_POS).mean()),
+            "Metrics/base_tilt": float(np.linalg.norm(_quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))[:, :2], axis=1).mean()),
+            "Metrics/feet_air_time": float(self._feet_air_time.mean()),
             "Metrics/joint_torque_abs": float(np.abs(joint_torque).mean()),
             "Metrics/foot_contact_frac": float(foot_contact.mean()),
             "Termination/base_contact": float(base_contact.mean()),
