@@ -31,11 +31,11 @@ BASE_BODY_IDX = 1
 # reward weights (velocity_env_cfg.RewardsCfg + go2 rough_env_cfg の上書き)
 W_TRACK_LIN = 1.5
 W_TRACK_ANG = 0.75
-W_LIN_VEL_Z = -2.0
-W_ANG_VEL_XY = -0.05
-W_TORQUE = -0.00005  # IsaacLabの-0.0002を1/4に。-0.0002だと探索ノイズ下のトルクが追従報酬を上回り探索が損になる
-W_DOF_ACC = -2.5e-7
-W_ACTION_RATE = -0.01
+W_LIN_VEL_Z = -0.4
+W_ANG_VEL_XY = -0.02
+W_TORQUE = -0.000005  # IsaacLabの-0.0002の1/40。止まっているより歩いて探索する方が得になるよう罰則を弱める
+W_DOF_ACC = -1e-7
+W_ACTION_RATE = -0.003
 W_FEET_AIR_TIME = 0.01
 FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
