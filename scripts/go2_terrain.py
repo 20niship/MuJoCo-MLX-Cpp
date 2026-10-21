@@ -14,11 +14,13 @@ FLAT_MARGIN = 1.5  # 地形の両端に付ける平坦部の奥行き[m]
 class StairsTerrain:
     """階段の box 形状リストと、x座標から段の天面高さを引く関数を持つ。"""
 
-    def __init__(self, seed: int | None = None):
+    def __init__(self, seed: int | None = None, flat: bool = False):
         rng = np.random.default_rng(seed)
 
         depths = rng.uniform(*STEP_DEPTH_RANGE, size=NUM_STEPS_UP)
         heights = np.cumsum(rng.uniform(*STEP_HEIGHT_RANGE, size=NUM_STEPS_UP))
+        if flat:  # 再生/評価用: 段差なしの平地
+            heights = np.zeros(NUM_STEPS_UP)
 
         # edges[i]..edges[i+1] が区間iの境界、tops[i] がその区間の天面高さ(平坦->上り->頂上平坦->下り->平坦)
         edges = [0.0]
@@ -45,6 +47,13 @@ class StairsTerrain:
         x = np.clip(x, 0.0, self.total_length)
         idx = np.clip(np.searchsorted(self.edges, x, side="right") - 1, 0, len(self.tops) - 1)
         return self.tops[idx]
+
+    def max_height_within(self, x: np.ndarray, radius: float) -> np.ndarray:
+        """x±radius に重なる区間の天面高さの最大値。胴体の足元が全て地面より上になる高さの下限に使う。"""
+        lo = np.clip(x - radius, 0.0, self.total_length)[:, None]
+        hi = np.clip(x + radius, 0.0, self.total_length)[:, None]
+        overlap = (self.edges[None, :-1] <= hi) & (self.edges[None, 1:] >= lo)
+        return np.where(overlap, self.tops[None, :], 0.0).max(axis=1)
 
     def sample_spawn_xy(self, rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
         margin = 0.3

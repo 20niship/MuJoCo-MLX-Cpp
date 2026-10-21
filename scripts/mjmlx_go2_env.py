@@ -10,10 +10,10 @@ import torch
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
-from go2_terrain import StairsTerrain
+from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
 
-PHYSICS_DT = 0.02  # go2_mjx.xmlの<option timestep>。IsaacLab/MJX流に物理step=制御stepの50Hzへ
-DECIMATION = 1
+PHYSICS_DT = 0.004  # go2_mjx.xml本来のtimestep。0.02ではPD(kp=50,armature=0.01)が陽的積分で不安定
+DECIMATION = 5  # 5*0.004 = 0.02s -> 50Hz制御
 CONTROL_DT = PHYSICS_DT * DECIMATION
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
@@ -33,14 +33,17 @@ W_TRACK_LIN = 1.5
 W_TRACK_ANG = 0.75
 W_LIN_VEL_Z = -2.0
 W_ANG_VEL_XY = -0.05
-W_TORQUE = -0.0002
+W_TORQUE = -0.00005  # IsaacLabの-0.0002を1/4に。-0.0002だと探索ノイズ下のトルクが追従報酬を上回り探索が損になる
 W_DOF_ACC = -2.5e-7
 W_ACTION_RATE = -0.01
 W_FEET_AIR_TIME = 0.01
 FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
 
+# go2_mjx.xmlのiterations=1はCPU(Newton)向け。GPUのソルバは接触が重なると収束が遅く、1〜3回だと一部のenvで速度が発散するため8にする(CPUでも同値を使い挙動を揃える)
+SOLVER_ITERATIONS = 8
 BASE_CONTACT_FORCE_THRESHOLD = 1.0
+SPAWN_FOOTPRINT_RADIUS = 0.5  # 胴体中心から足先までの最大水平距離(関節角ランダム化で脚が開く分を含む)
 PUSH_INTERVAL_STEPS = (int(10.0 / CONTROL_DT), int(15.0 / CONTROL_DT))
 
 
@@ -105,14 +108,15 @@ class MjmlxGo2Env(VecEnv):
         use_gpu: bool = True,
         seed: int | None = None,
         terrain_seed: int | None = None,
+        flat_terrain: bool = False,
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
     ):
         self._native = native_module
-        self.terrain = StairsTerrain(seed=terrain_seed)
+        self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
         build_terrain_model_xml(self.terrain, generated_xml_path)
 
         self._model = native_module.load_model(generated_xml_path)
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=0)
+        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
         self.nq = self._model.nq
         self.nv = self._model.nv
         self.nu = self._model.nu
@@ -183,7 +187,7 @@ class MjmlxGo2Env(VecEnv):
         qvel = qvel.copy()
 
         x, y = self.terrain.sample_spawn_xy(self._rng, n)
-        z = self.terrain.height_at(x) + 0.40  # IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
+        z = self.terrain.max_height_within(x, SPAWN_FOOTPRINT_RADIUS) + 0.40  # 脚が張り出す範囲の最高地形の上に置く。 IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
         yaw = self._rng.uniform(-np.pi, np.pi, size=n)
         qpos[idx, 0] = x
         qpos[idx, 1] = y
@@ -234,7 +238,7 @@ class MjmlxGo2Env(VecEnv):
         return self._obs_tensordict(self._obs(qpos, qvel)), {}
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        action = np.clip(actions.detach().cpu().numpy(), -1.0, 1.0).astype(np.float32)
+        action = actions.detach().cpu().numpy().astype(np.float32)  # IsaacLab同様clipしない(関節目標のみ制御範囲へclip)
         ctrl_target = DEFAULT_JOINT_POS + ACTION_SCALE * action
         ctrl = np.clip(ctrl_target, CTRL_LOW, CTRL_HIGH)
 
@@ -269,6 +273,7 @@ class MjmlxGo2Env(VecEnv):
         r_ang_vel_xy = W_ANG_VEL_XY * np.sum(np.clip(base_ang_vel[:, 0:2], -50.0, 50.0) ** 2, axis=1)
         joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
         r_dof_acc = W_DOF_ACC * np.sum(joint_acc**2, axis=1)
+        action_prev = self._last_action.copy()
         r_action_rate = W_ACTION_RATE * np.sum((action - self._last_action) ** 2, axis=1)
 
         contact_filt = foot_contact | self._last_foot_contact
@@ -284,8 +289,13 @@ class MjmlxGo2Env(VecEnv):
             joint_torque = qfrc_actuator[:, 6:18]
             r_torque = W_TORQUE * np.sum(joint_torque**2, axis=1)
         except AttributeError:
+            joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)
             r_torque = np.zeros(self.num_envs, dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
 
+        self.last_reward_terms = {
+            "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
+            "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque,
+        }
         rewards = (
             r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque
         )
@@ -294,7 +304,9 @@ class MjmlxGo2Env(VecEnv):
 
         self._elapsed += 1
         truncated = self._elapsed >= MAX_EPISODE_STEPS
-        terminated = base_contact | blew_up
+        # 通路の外へ出たら地形が無いので落下して学習に使えない: 終了にする
+        out_of_terrain = (np.abs(qpos[:, 1]) > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > self.terrain.total_length)
+        terminated = base_contact | blew_up | out_of_terrain
         dones = truncated | terminated
 
         obs = self._obs(qpos, qvel)
@@ -318,7 +330,28 @@ class MjmlxGo2Env(VecEnv):
             obs = obs.copy()
             obs[done_idx] = reset_obs[done_idx]
 
-        extras = {"time_outs": torch.from_numpy(truncated)}
+        # rsl_rl が iteration ごとに平均して tensorboard/標準出力へ書く。報酬は項ごとのstep平均(重み込み)、Metricsは追従誤差など
+        log = {f"Reward/{k}": float(np.mean(v)) for k, v in self.last_reward_terms.items()}
+        log.update({
+            "Metrics/lin_vel_error": float(np.sqrt(lin_err).mean()),
+            "Metrics/ang_vel_error": float(np.sqrt(ang_err).mean()),
+            "Metrics/cmd_speed": float(np.linalg.norm(cmd, axis=1).mean()),
+            "Metrics/base_height": float(qpos[:, 2].mean()),
+            "Metrics/action_abs": float(np.abs(action).mean()),
+            "Metrics/action_rate_abs": float(np.abs(action - action_prev).mean()),
+            "Metrics/ctrl_saturated_frac": float((ctrl_target != ctrl).mean()),
+            "Metrics/joint_vel_abs": float(np.abs(joint_vel).mean()),
+            "Metrics/joint_pos_dev": float(np.abs(qpos[:, 7:19] - DEFAULT_JOINT_POS).mean()),
+            "Metrics/base_tilt": float(np.linalg.norm(_quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))[:, :2], axis=1).mean()),
+            "Metrics/feet_air_time": float(self._feet_air_time.mean()),
+            "Metrics/joint_torque_abs": float(np.abs(joint_torque).mean()),
+            "Metrics/foot_contact_frac": float(foot_contact.mean()),
+            "Termination/base_contact": float(base_contact.mean()),
+            "Termination/blew_up": float(blew_up.mean()),
+            "Termination/out_of_terrain": float(out_of_terrain.mean()),
+            "Termination/time_out": float(truncated.mean()),
+        })
+        extras = {"time_outs": torch.from_numpy(truncated), "log": log}
         return (
             self._obs_tensordict(obs),
             torch.from_numpy(rewards),

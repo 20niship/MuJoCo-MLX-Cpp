@@ -7,42 +7,15 @@ import sys
 from rsl_rl.runners import OnPolicyRunner
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--envs", type=int, default=4096)
-    parser.add_argument("--max-iterations", type=int, default=1500)
-    parser.add_argument("--logdir", type=str, default="runs/go2_stairs")
-    parser.add_argument("--build-dir", type=str, default="build")
-    parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--terrain-seed", type=int, default=0)
-    parser.add_argument("--cmd-vel-min", type=float, default=0.2, help="||cmd_vel||の下限[m/s or rad/s]")
-    parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
-    args = parser.parse_args()
-
-    sys.path.insert(0, args.build_dir)
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import _mjmlx_rl_native as native
-
-    from mjmlx_go2_env import MjmlxGo2Env
-
-    env = MjmlxGo2Env(
-        native,
-        args.envs,
-        cmd_vel_min=args.cmd_vel_min,
-        cmd_vel_max=args.cmd_vel_max,
-        use_gpu=not args.cpu,
-        seed=args.seed,
-        terrain_seed=args.terrain_seed,
-    )
-
+def make_train_cfg(seed: int, max_iterations: int) -> dict:
+    """学習/再生で共有するrsl_rlの設定。"""
     mlp_cfg = dict(hidden_dims=[512, 256, 128], activation="elu", obs_normalization=False)
     train_cfg = {
-        "seed": args.seed,
+        "seed": seed,
         "device": "cpu",
         "num_steps_per_env": 24,
         "init_at_random_ep_len": True,
-        "max_iterations": args.max_iterations,
+        "max_iterations": max_iterations,
         "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
         "clip_actions": None,
         "check_for_nan": True,
@@ -80,6 +53,39 @@ def main() -> None:
         },
         "multi_gpu": None,
     }
+    return train_cfg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--envs", type=int, default=4096)
+    parser.add_argument("--max-iterations", type=int, default=1500)
+    parser.add_argument("--logdir", type=str, default="runs/go2_stairs")
+    parser.add_argument("--build-dir", type=str, default="build")
+    parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--terrain-seed", type=int, default=0)
+    parser.add_argument("--cmd-vel-min", type=float, default=0.2, help="||cmd_vel||の下限[m/s or rad/s]")
+    parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
+    args = parser.parse_args()
+
+    sys.path.insert(0, args.build_dir)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _mjmlx_rl_native as native
+
+    from mjmlx_go2_env import MjmlxGo2Env
+
+    env = MjmlxGo2Env(
+        native,
+        args.envs,
+        cmd_vel_min=args.cmd_vel_min,
+        cmd_vel_max=args.cmd_vel_max,
+        use_gpu=not args.cpu,
+        seed=args.seed,
+        terrain_seed=args.terrain_seed,
+    )
+
+    train_cfg = make_train_cfg(args.seed, args.max_iterations)
 
     runner = OnPolicyRunner(env, train_cfg, log_dir=args.logdir, device=train_cfg["device"])
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=train_cfg["init_at_random_ep_len"])
