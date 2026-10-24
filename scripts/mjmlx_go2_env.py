@@ -111,6 +111,7 @@ class MjmlxGo2Env(VecEnv):
         terrain_seed: int | None = None,
         flat_terrain: bool = False,
         reward_preset: str = "relaxed",
+        device: str = "cpu",
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
     ):
         self._native = native_module
@@ -128,7 +129,7 @@ class MjmlxGo2Env(VecEnv):
         self.num_envs = num_envs
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
-        self.device = "cpu"  # 方策ネットワークはCPU、物理はmjmlx側で別途GPU実行
+        self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
         self.cfg = {
             "task": "go2_stairs_cmd_vel",
             "cmd_vel_min": cmd_vel_min,
@@ -153,7 +154,7 @@ class MjmlxGo2Env(VecEnv):
 
     @property
     def episode_length_buf(self) -> torch.Tensor:
-        return torch.from_numpy(self._elapsed)
+        return torch.from_numpy(self._elapsed).to(self.device)
 
     @episode_length_buf.setter
     def episode_length_buf(self, value: torch.Tensor) -> None:
@@ -228,7 +229,7 @@ class MjmlxGo2Env(VecEnv):
         ).astype(np.float32)
 
     def _obs_tensordict(self, obs: np.ndarray) -> TensorDict:
-        return TensorDict({"policy": torch.from_numpy(obs)}, batch_size=[self.num_envs])
+        return TensorDict({"policy": torch.from_numpy(obs).to(self.device)}, batch_size=[self.num_envs])
 
     def get_observations(self) -> TensorDict:
         qpos, qvel = self._sim.state()
@@ -357,11 +358,11 @@ class MjmlxGo2Env(VecEnv):
             "Termination/out_of_terrain": float(out_of_terrain.mean()),
             "Termination/time_out": float(truncated.mean()),
         })
-        extras = {"time_outs": torch.from_numpy(truncated), "log": log}
+        extras = {"time_outs": torch.from_numpy(truncated).to(self.device), "log": log}
         return (
             self._obs_tensordict(obs),
-            torch.from_numpy(rewards),
-            torch.from_numpy(dones).long(),
+            torch.from_numpy(rewards).to(self.device),
+            torch.from_numpy(dones).long().to(self.device),
             extras,
         )
 

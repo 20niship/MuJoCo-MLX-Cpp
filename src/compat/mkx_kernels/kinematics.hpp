@@ -67,6 +67,7 @@ float[9] mkx_q2mat(vec4 q) {
   src += "uint gxp_off = batch_idx * NG * 3u;\n";
   src += "uint gxm_off = batch_idx * NG * 9u;\n";
 
+  { static const int a8 = getenv("MJMLX_ABL") ? atoi(getenv("MJMLX_ABL")) : 0; src += std::string("const uint NBCHAIN = ") + ((a8 & 8) ? "1u" : "NB") + ";\n"; }
   src += "float bp[" + std::to_string(nbody) + " * 3];\n";
   src += "float bq[" + std::to_string(nbody) + " * 4];\n";
 
@@ -74,7 +75,7 @@ float[9] mkx_q2mat(vec4 q) {
 bp[0]=body_pos[0]; bp[1]=body_pos[1]; bp[2]=body_pos[2];
 bq[0]=body_quat[0]; bq[1]=body_quat[1]; bq[2]=body_quat[2]; bq[3]=body_quat[3];
 
-for (uint b = 1u; b < NB; b++) {
+for (uint b = 1u; b < NBCHAIN; b++) {
     int pid = mkx_I(body_parentid[b]);
     vec3 lp = vec3(body_pos[b*3u], body_pos[b*3u+1u], body_pos[b*3u+2u]);
     vec4 pq = vec4(bq[uint(pid)*4u], bq[uint(pid)*4u+1u], bq[uint(pid)*4u+2u], bq[uint(pid)*4u+3u]);
@@ -141,6 +142,9 @@ for (uint b = 1u; b < NB; b++) {
     bq[b*4u]=quat.x; bq[b*4u+1u]=quat.y; bq[b*4u+2u]=quat.z; bq[b*4u+3u]=quat.w;
 }
 
+)GLSL";
+  static const int abl = getenv("MJMLX_ABL") ? atoi(getenv("MJMLX_ABL")) : 0;
+  if (!(abl & 1)) src += R"GLSL(
 for (uint b = 0u; b < NB; b++) {
     for (uint i = 0u; i < 3u; i++) xpos_out[xp_off+b*3u+i] = bp[b*3u+i];
     for (uint i = 0u; i < 4u; i++) xquat_out[xq_off+b*4u+i] = bq[b*4u+i];
@@ -149,6 +153,8 @@ for (uint b = 0u; b < NB; b++) {
     for (uint i = 0u; i < 9u; i++) xmat_out[xm_off+b*9u+i] = mat[i];
 }
 
+)GLSL";
+  if (!(abl & 2)) src += R"GLSL(
 for (uint b = 0u; b < NB; b++) {
     vec3 ip = vec3(body_ipos[b*3u], body_ipos[b*3u+1u], body_ipos[b*3u+2u]);
     vec4 bqt = vec4(bq[b*4u], bq[b*4u+1u], bq[b*4u+2u], bq[b*4u+3u]);
@@ -160,6 +166,8 @@ for (uint b = 0u; b < NB; b++) {
     for (uint i = 0u; i < 9u; i++) ximat_out[xm_off+b*9u+i] = mat[i];
 }
 
+)GLSL";
+  if (!(abl & 4)) src += R"GLSL(
 for (uint g = 0u; g < NG; g++) {
     int bid = mkx_I(geom_bodyid[g]);
     vec3 gp = vec3(geom_pos[g*3u], geom_pos[g*3u+1u], geom_pos[g*3u+2u]);

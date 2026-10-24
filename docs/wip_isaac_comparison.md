@@ -47,6 +47,28 @@
 - dt/decimationが違う(こちら 0.004×5、Isaac 0.005×4)ので完全に同条件ではない。
 - Isaac Lab公式設定の300 iterationは完走(エピソード長 1000、標準偏差 0.35)。
 
+## 調査ログ(速度, 2026-10-24)
+
+### 実験1: env.stepの時間配分
+- 4096 env、random action。`env.step` 約0.8 s(最小0.52 s)のうち、`sim.step` はGPUへ投げるだけで約7 ms、`sim.state()`(GPU同期) 約770 ms、`cfrc_ext` 約24 ms。python/numpy側(観測・報酬)は約10〜30 msで、全体の数%。
+- 結論: 収集時間はほぼGPU物理。Python側の最適化は効かない。
+
+### 実験2: ステージ内訳(`MJMLX_PROF=1`、build-new、substepあたり)
+- cfrc 7 / collision 23 / euler 6 / forward 44 / kin 40 / solver 92 ms(合計約214 ms)。ただしprofは段ごとに同期するので1段あたり約10 msの同期コストが乗る(通常実行は約105〜156 ms/substep)。
+- kinematicsは `MJMLX_TG_KIN` を 1/4/32 にしても 45/39/70 ms で、スレッド数を増やすと悪化する。
+- kinematicsのアブレーション(`MJMLX_ABL`): 出力ループ3つ(xmat/ximat/geom)を全部消しても 43→20 ms、本体チェーンも消した空に近いカーネルでも約20 ms残る。つまりkin 40 msの約半分は「カーネル1発あたりの固定的なコスト(同期・バッファ確保など)」で、計算そのものではない。段ごとのprofだけでは真の内訳が分からない。
+- `solver_iterations` を 8→1 にしても `env.step` の最小値は 553→528 ms でほぼ変わらない。solverの反復数は支配的ではない。
+
+### 実験3: 他プロセスによるGPU占有(重要)
+- `ollama runner`(別プロセス、pid 51333)がGPUメモリ約10.6 GBとCPU 70%、`ollama serve` がCPU 1000%超を使っている。
+- `env.step` の平均(740〜1080 ms)は最小(520〜550 ms)の約1.5〜2倍にぶれる。これまでの速度比較(41 s/iter など)の一部は、この競合を含んでいる。**クリーンな条件では `env.step` は約520 ms**(24 stepで約12.5 s)で、Isaac Lab(1.9 s)との差は約6.6倍。
+- 残りGPUメモリが約1 GBしか無く、CUDA版torchでのPPO更新(下記)も `OutOfMemoryError` で試せなかった。
+
+### 実験4: PPO更新のGPU化(実装済み、未検証)
+- 実装: `train_go2_ppo.py --device cuda`、envの出力tensorを `.to(device)`。
+- 現行の `.venv` のtorch(2.14.1+cu130)はドライバ565(CUDA 12.7)に対して新しすぎてcudaが使えない。`/home/owner/torch-cu126` に torch 2.8.0+cu126 を入れた(`PYTHONPATH=/home/owner/torch-cu126` で有効。`.venv` は変更していない)。cuda自体は使えることを確認済み。
+- 検証にはGPUメモリの空きが要る(ollama解放待ち)。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
