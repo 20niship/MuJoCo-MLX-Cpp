@@ -64,17 +64,27 @@
 - `env.step` の平均(740〜1080 ms)は最小(520〜550 ms)の約1.5〜2倍にぶれる。これまでの速度比較(41 s/iter など)の一部は、この競合を含んでいる。**クリーンな条件では `env.step` は約520 ms**(24 stepで約12.5 s)で、Isaac Lab(1.9 s)との差は約6.6倍。
 - 残りGPUメモリが約1 GBしか無く、CUDA版torchでのPPO更新(下記)も `OutOfMemoryError` で試せなかった。
 
-### 実験4: PPO更新のGPU化(実装済み、未検証)
+### 実験5: env.stepが「接触あり」で2.5倍遅くなる(重要)
+- GPUが空いた状態(他プロセス無し)で、zero actionの `env.step` を16回連続で測った(ms): `[479, 504, 506, 919, 1350, 1538, 1457, 1280, 1348, ..., 1113, 1218]`。
+- 最初の3 stepは約500 ms(空中〜接地前)、接地して接触が増えると約1100〜1500 msに上がる。前節の「最小値 約520 ms」は接触が少ない状態の値で、学習中の実態は約1.2 s/step。
+- つまり接触あり時の追加コスト約0.7 s/step(約140 ms/substep)がcollision+solverの接触処理。ここが最大のボトルネック。Isaac Labは約80 ms/step。
+
+### 実験6: PPO更新をcuda化(クリーン条件、isaac_flat、4096 env、24 step)
+- iteration時間: CPU PPO 約44 s → **CUDA PPO 約27 s**(約17 s短縮)。PPO更新は約17 s → 0.3 s未満に。
+- 残りの約27 sは物理収集(約1.1 s × 24 step)。Isaac Lab(約2.1 s/iter)との差は約13倍に縮まった(旧: 約19倍)。
+- 以降の学習は `PYTHONPATH=/home/owner/torch-cu126 ... --device cuda` で回す。
+
+### 実験4(参考): PPO更新のGPU化の実装メモ
 - 実装: `train_go2_ppo.py --device cuda`、envの出力tensorを `.to(device)`。
 - 現行の `.venv` のtorch(2.14.1+cu130)はドライバ565(CUDA 12.7)に対して新しすぎてcudaが使えない。`/home/owner/torch-cu126` に torch 2.8.0+cu126 を入れた(`PYTHONPATH=/home/owner/torch-cu126` で有効。`.venv` は変更していない)。cuda自体は使えることを確認済み。
-- 検証にはGPUメモリの空きが要る(ollama解放待ち)。
+- 検証済み(実験6)。ollamaがGPUメモリを開けるまで待つ必要があった。
 
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
 2. **胴体高さ 0.20 m を上げる**: Isaac Labの立位は約0.3 m。関節の `DEFAULT_JOINT_POS`、`ACTION_SCALE`、PD(kp=50, armature=0.01)とIsaacのDCモータ(stiffness 25 / damping 0.5 / effort 23.5)の差を確認する。
-3. **PPO更新をGPUに**: 14 s → 約0.3 sで、iterationが約41 s → 約27 sになる見込み(torchのデバイスをcudaにするだけの可能性)。以前は「不要」との指示。再確認して決める。
-4. **物理の高速化(さらに)**: solverの厳密Cholesky化、kinematics+forward統合、substepを5→4(dt 0.005)。見込みは物理で2〜3倍。10倍には届かない。
+3. ~~PPO更新をGPUに~~: 完了(実験6)。iteration 約44 s → 約27 s。
+4. **物理の高速化(さらに)**: 実験5より、接触あり時のcollision+solver(約140 ms/substep)が本丸。接触数の上限(`MAX_CONTACTS_PER_ENV`)・solverのワークグループ構成・行列構築の見直し。: solverの厳密Cholesky化、kinematics+forward統合、substepを5→4(dt 0.005)。見込みは物理で2〜3倍。10倍には届かない。
 5. 長めの学習(isaac_flat、1500 iteration)で収束するか見る。必要なら `entropy_coef` / `init_std` を調整。
 6. 階段地形への展開は平地で歩けてから。傾き閾値での終了条件の追加も検討(横倒しのまま報酬を稼ぐ局所解を防ぐ)。
 
