@@ -422,6 +422,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
 }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 int nefc = tg_nefc;
+SABL1
 
 qacc(int(tid)) = 0.0f;
 barrier(); memoryBarrierBuffer();
@@ -448,6 +449,7 @@ barrier(); memoryBarrierBuffer();
   grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[uint(int(tid))*NBATCH+bid] - s; }
 barrier(); memoryBarrierBuffer();
 
+SABL2
 if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int iter = 0; iter < NSOLVE; iter++) {
@@ -492,6 +494,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         barrier(); memoryBarrierBuffer();
     }
 
+    SABL3
     { float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[uint(int(tid)*NV + j)*NBATCH+bid]*search_d(j); Mv_arr(int(tid)) = s; }
     barrier(); memoryBarrierBuffer();
 
@@ -541,6 +544,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         for (int r2 = 0; r2 < nefc; r2++) Jaref(r2) += ba_local*Jv_arr(r2);
         for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
     }
+    SABL4
     barrier(); memoryBarrierBuffer(); memoryBarrierShared();
     float ba = tg_ba;
 
@@ -571,6 +575,27 @@ if (tid == 0u) {
 }
 )GLSL";
 
+  {
+    static const int sabl = getenv("MJMLX_SABL") ? atoi(getenv("MJMLX_SABL")) : 0;  // 計測用: 1=拘束構築直後、2=初期勾配直後でqfrc_constraint=0を書いて終了
+    std::string body = ss.str();
+    // 早期returnで依存が切れると前段がコンパイラに消されるので、各点の状態を出力に書いてから終了する。
+    auto rep = [&](const std::string& key, bool on, const std::string& chk) {
+        size_t p = body.find(key);
+        if (p != std::string::npos) body.replace(p, key.size(), on ? "{ float chk_ = " + chk + "; qfrc_constraint_out[qfc_off + int(tid)] = chk_; return; }" : std::string());
+    };
+    const std::string rows = "0.0f; for (int r2 = 0; r2 < nefc; r2++) chk_ += J(r2,int(tid))*(efc_D(r2)+efc_aref(r2)+efc_force(r2))";
+    rep("SABL1", sabl == 1, rows);
+    rep("SABL2", sabl == 2, "grad(int(tid))");
+    rep("SABL3", sabl == 3, "search_d(int(tid))");
+    rep("SABL4", sabl == 4, "tg_ba + search_d(int(tid))");
+    // 共有メモリ版はデータがsharedにあり(barrier()がworkgroupメモリの可視性も保証する)、globalのメモリバリアは不要。memoryBarrierBufferは未完了のglobal load/storeを全部待つので高コスト。
+    static const bool keep_mbb = getenv("MJMLX_KEEP_MBB") != nullptr;
+    if(use_shared && !keep_mbb) {
+      const std::string mbb = "memoryBarrierBuffer();";
+      for(size_t q = body.find(mbb); q != std::string::npos; q = body.find(mbb, q)) body.erase(q, mbb.size());
+    }
+    ss.str(body);
+  }
   return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
 }
 

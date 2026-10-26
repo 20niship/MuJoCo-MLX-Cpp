@@ -108,6 +108,15 @@
 - 結果(4096 env、静かな時): `env.step` 平均 533 → **約330 ms**(最小約245 ms)、約12,300 env-steps/s。接触あり段階の内訳(substep): collision 10 / solver 31 / forward 6 / kin 3 / euler 2。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験11: 現在地と、solverの内訳が測りにくい理由
+- **学習1 iteration(isaac_flat、cuda PPO、4096 env × 24 step): 約6.9 s**(旧: CPU PPO 44 s → cuda PPO 27 s → 今回の物理最適化後 6.9 s)。Isaac Lab 約2.2 s に対して約3.1倍遅い(旧: 約19倍)。
+- `env.step` 内訳(非prof、ゼロaction、4096 env、280 ms): GPU物理(`sim.state()`で同期) 227 ms、`cfrc_ext()` 取得 27 ms、`qfrc_actuator()` 6 ms、Python側 約15 ms。
+- 計測中のGPUは SMクロック 780 MHz(最大2100)・消費電力 約31 W(TDP 170 W)・utilization 15〜100%で、飽和していない(throttle reason=idle)。rootが無いのでクロック固定(`nvidia-smi -lgc`)は不可。
+- solverを段ごとに切り出す計測(`MJMLX_SABL=1..4`): 各点の状態を出力に書いて早期returnする(依存を切るとコンパイラが前段を消してしまうため)。拘束構築まで 11 ms、初期勾配まで 18 ms、CG/直線探索はほぼ0(`MJMLX_CGITERS`を10→1にしても変わらない)、全体 29 ms。反復数(SI 1〜8)・CG反復・`MAX_EFC`(共有メモリ量)を変えてもほぼ変わらない → 反復部分ではなく、固定的な前処理と、Newton反復の更新部分が効いている。
+- 残る想定: `tid==0` が `nefc×NV` の行列ベクトル積などを逐次に回す部分の命令数が、見積もりより大きい。次はこれを全スレッド並列にする。
+- 共有メモリ版はglobalメモリバリア(`memoryBarrierBuffer`)を外した(31→27.5 ms)。`MJMLX_KEEP_MBB=1` で従来動作。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
