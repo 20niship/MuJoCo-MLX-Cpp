@@ -669,7 +669,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl);  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }

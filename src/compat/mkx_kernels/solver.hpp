@@ -194,7 +194,8 @@ shared float tg_pAp;
        << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
        << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n";
   }
-  ss << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
+  if(use_shared) ss << "#define JACP_DECL float jp_l[NV*3];\n#define jacp_tmp(i)  jp_l[(i)]\n\n";  // スレッド専用なのでlocal配列(globalのscratchは散らばって遅い)
+  else ss << "#define JACP_DECL\n#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
 
   ss << "uint qp_off = bid * NQ;\n"
      << "uint qm_off = bid * NV * NV;\n"
@@ -352,6 +353,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     float imp_val = clamp(dmin + imp_y_val * (dmax_v - dmin), dmin, dmax_v);
     if (imp_x_val > 1.0f) imp_val = dmax_v;
 
+    JACP_DECL
     for (int di = 0; di < NV*3; di++) jacp_tmp(di) = 0.0f;
 
     {

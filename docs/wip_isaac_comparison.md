@@ -149,6 +149,12 @@
 - env.stepの内訳(非prof、約132 ms): GPU物理 約113 ms、`cfrc_ext` 取得 約7 ms、`qfrc_actuator` 約2 ms、Python側 約8 ms。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験16: solverの接触ヤコビ作業領域をlocal配列に(solver 12→5.7 ms)
+- 反復数(SI)・limit/frictionloss行・`MAX_EFC`(共有メモリ量)を変えても残る約10 msの固定コストが、接触ごとの `jacp_tmp`(スレッド専用の54 float)をglobalの `solver_scratch` に置いていたことだった(接触スレッドが約300回の散らばったglobal読み書き)。共有メモリ版ではスレッドのlocal配列に変更。
+- 結果(substepあたり、最小値): solver 11.9 → **5.7 ms**。合計 forward 3.5 / cfrc 2.7 / kin 1.8 / solver 5.7 / euler 1.1 / collision 4.9 = 約20 ms。1 step後のCPU/GPU差は不変(関節角 平均5.1e-3 rad)。
+- **学習1 iteration(isaac_flat、cuda PPO、4096 env): 約2.3 s(収集 2.05 s / 更新 0.27 s)**。Isaac Lab 約2.2 s(収集 1.9 s)の約1.07倍。旧: 約44 s(CPU PPO・旧ビルド)。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
