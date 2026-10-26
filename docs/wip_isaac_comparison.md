@@ -87,6 +87,14 @@
 - 結果(接触あり、substepあたり): solver 195 → **49 ms**。`env.step`(4096 env) 平均 1434 → **755 ms**。
 - 検証: `gpu_vs_cpu_humanoid / high_dof`、`model_gpu_vs_cpu_piper / go2_freefall / go2_landing / g1_freefall / g1_landing / h1_freefall` 全通過。
 
+### 実験8: kinematicsの出力をSoA化(kin 34→3.4 ms)
+- `MJMLX_PROF` を「ホスト側のグラフ構築(.build)」と「GPU評価(.eval)」に分離。構築は kin 前で約11〜14 ms/substep、他は1 ms前後。
+- kinematicsのアブレーション(`MJMLX_ABL`)で、チェーン計算は約2.7 ms、**出力書き込み3ループが約30 ms**と判明。1スレッド=1envでAoS(env*S+k)に書くと、ワープ内の各レーンが別キャッシュラインに散らばり、書き込みトランザクションが約290万回になる。
+- 対策: 出力を SoA(成分*B+env)にし、`MJMLX_TG_KIN` の既定を1→64に。隣接envが連続アドレスに書くのでコアレスする。forwardは入力をSoAで読む。vmap経路(GPU forwardを使わない経路)とstate出力、collision入力は転置してAoSに戻す。
+- ポイント: **SoAはTG>=32のときだけ効く**(TG=1だと1ワープ1レーンなのでコアレスしない。SoA化だけ入れるとkinは34→44 msに悪化)。
+- 結果(接触あり、substepあたり): kin.eval 34 → 3.4 ms、`env.step` 平均 755 → 665 ms。
+- 検証: gpu_vs_cpu_humanoid / high_dof、piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

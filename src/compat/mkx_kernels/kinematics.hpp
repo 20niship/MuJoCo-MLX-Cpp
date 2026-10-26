@@ -56,6 +56,7 @@ float[9] mkx_q2mat(vec4 q) {
 
   std::string src;
   src += "uint batch_idx = gl_GlobalInvocationID.x;\n";
+  src += "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n";  // 出力はSoA(成分*B+env): 隣接スレッド(env)が連続アドレスに書きコアレスする\n
   src += "const uint NB = " + std::to_string(nbody) + ";\n";
   src += "const uint NJ = " + std::to_string(njnt) + ";\n";
   src += "const uint NG = " + std::to_string(ngeom) + ";\n";
@@ -95,8 +96,8 @@ for (uint b = 1u; b < NBCHAIN; b++) {
             pos = vec3(qpos[qoff+uint(qa)], qpos[qoff+uint(qa)+1u], qpos[qoff+uint(qa)+2u]);
             quat = vec4(qpos[qoff+uint(qa)+3u], qpos[qoff+uint(qa)+4u], qpos[qoff+uint(qa)+5u], qpos[qoff+uint(qa)+6u]);
             quat = mkx_qnorm(quat);
-            xanchor[xa_off+uint(ji)*3u]=pos.x; xanchor[xa_off+uint(ji)*3u+1u]=pos.y; xanchor[xa_off+uint(ji)*3u+2u]=pos.z;
-            xaxis[xa_off+uint(ji)*3u]=0.0; xaxis[xa_off+uint(ji)*3u+1u]=0.0; xaxis[xa_off+uint(ji)*3u+2u]=1.0;
+            xanchor[uint(uint(ji)*3u)*NBATCH+batch_idx]=pos.x; xanchor[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=pos.y; xanchor[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=pos.z;
+            xaxis[uint(uint(ji)*3u)*NBATCH+batch_idx]=0.0; xaxis[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=0.0; xaxis[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=1.0;
         } else if (jt == 3) {
             // HINGE
             vec3 jp = vec3(jnt_pos[ji*3+0], jnt_pos[ji*3+1], jnt_pos[ji*3+2]);
@@ -109,8 +110,8 @@ for (uint b = 1u; b < NBCHAIN; b++) {
             quat = mkx_qmul(quat, qloc);
             vec3 rjp2 = mkx_qrot(quat, jp);
             pos = anchor - rjp2;
-            xanchor[xa_off+uint(ji)*3u]=anchor.x; xanchor[xa_off+uint(ji)*3u+1u]=anchor.y; xanchor[xa_off+uint(ji)*3u+2u]=anchor.z;
-            xaxis[xa_off+uint(ji)*3u]=ax.x; xaxis[xa_off+uint(ji)*3u+1u]=ax.y; xaxis[xa_off+uint(ji)*3u+2u]=ax.z;
+            xanchor[uint(uint(ji)*3u)*NBATCH+batch_idx]=anchor.x; xanchor[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=anchor.y; xanchor[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=anchor.z;
+            xaxis[uint(uint(ji)*3u)*NBATCH+batch_idx]=ax.x; xaxis[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=ax.y; xaxis[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=ax.z;
         } else if (jt == 1) {
             // BALL
             vec3 jp = vec3(jnt_pos[ji*3+0], jnt_pos[ji*3+1], jnt_pos[ji*3+2]);
@@ -123,8 +124,8 @@ for (uint b = 1u; b < NBCHAIN; b++) {
             quat = mkx_qmul(quat, qloc);
             vec3 rjp2 = mkx_qrot(quat, jp);
             pos = anchor - rjp2;
-            xanchor[xa_off+uint(ji)*3u]=anchor.x; xanchor[xa_off+uint(ji)*3u+1u]=anchor.y; xanchor[xa_off+uint(ji)*3u+2u]=anchor.z;
-            xaxis[xa_off+uint(ji)*3u]=ax.x; xaxis[xa_off+uint(ji)*3u+1u]=ax.y; xaxis[xa_off+uint(ji)*3u+2u]=ax.z;
+            xanchor[uint(uint(ji)*3u)*NBATCH+batch_idx]=anchor.x; xanchor[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=anchor.y; xanchor[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=anchor.z;
+            xaxis[uint(uint(ji)*3u)*NBATCH+batch_idx]=ax.x; xaxis[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=ax.y; xaxis[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=ax.z;
         } else if (jt == 2) {
             // SLIDE
             vec3 jp = vec3(jnt_pos[ji*3+0], jnt_pos[ji*3+1], jnt_pos[ji*3+2]);
@@ -134,8 +135,8 @@ for (uint b = 1u; b < NBCHAIN; b++) {
             vec3 ax = mkx_qrot(quat, ja);
             float dist = qpos[qoff+uint(qa)] - qpos0[qa];
             pos += ax * dist;
-            xanchor[xa_off+uint(ji)*3u]=anchor.x; xanchor[xa_off+uint(ji)*3u+1u]=anchor.y; xanchor[xa_off+uint(ji)*3u+2u]=anchor.z;
-            xaxis[xa_off+uint(ji)*3u]=ax.x; xaxis[xa_off+uint(ji)*3u+1u]=ax.y; xaxis[xa_off+uint(ji)*3u+2u]=ax.z;
+            xanchor[uint(uint(ji)*3u)*NBATCH+batch_idx]=anchor.x; xanchor[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=anchor.y; xanchor[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=anchor.z;
+            xaxis[uint(uint(ji)*3u)*NBATCH+batch_idx]=ax.x; xaxis[uint(uint(ji)*3u+1u)*NBATCH+batch_idx]=ax.y; xaxis[uint(uint(ji)*3u+2u)*NBATCH+batch_idx]=ax.z;
         }
     }
     bp[b*3u]=pos.x; bp[b*3u+1u]=pos.y; bp[b*3u+2u]=pos.z;
@@ -146,11 +147,11 @@ for (uint b = 1u; b < NBCHAIN; b++) {
   static const int abl = getenv("MJMLX_ABL") ? atoi(getenv("MJMLX_ABL")) : 0;
   if (!(abl & 1)) src += R"GLSL(
 for (uint b = 0u; b < NB; b++) {
-    for (uint i = 0u; i < 3u; i++) xpos_out[xp_off+b*3u+i] = bp[b*3u+i];
-    for (uint i = 0u; i < 4u; i++) xquat_out[xq_off+b*4u+i] = bq[b*4u+i];
+    for (uint i = 0u; i < 3u; i++) xpos_out[uint(b*3u+i)*NBATCH+batch_idx] = bp[b*3u+i];
+    for (uint i = 0u; i < 4u; i++) xquat_out[uint(b*4u+i)*NBATCH+batch_idx] = bq[b*4u+i];
     vec4 q = vec4(bq[b*4u], bq[b*4u+1u], bq[b*4u+2u], bq[b*4u+3u]);
     float mat[9] = mkx_q2mat(q);
-    for (uint i = 0u; i < 9u; i++) xmat_out[xm_off+b*9u+i] = mat[i];
+    for (uint i = 0u; i < 9u; i++) xmat_out[uint(b*9u+i)*NBATCH+batch_idx] = mat[i];
 }
 
 )GLSL";
@@ -159,25 +160,26 @@ for (uint b = 0u; b < NB; b++) {
     vec3 ip = vec3(body_ipos[b*3u], body_ipos[b*3u+1u], body_ipos[b*3u+2u]);
     vec4 bqt = vec4(bq[b*4u], bq[b*4u+1u], bq[b*4u+2u], bq[b*4u+3u]);
     vec3 rip = mkx_qrot(bqt, ip);
-    xipos_out[xp_off+b*3u]=bp[b*3u]+rip.x; xipos_out[xp_off+b*3u+1u]=bp[b*3u+1u]+rip.y; xipos_out[xp_off+b*3u+2u]=bp[b*3u+2u]+rip.z;
+    xipos_out[uint(b*3u)*NBATCH+batch_idx]=bp[b*3u]+rip.x; xipos_out[uint(b*3u+1u)*NBATCH+batch_idx]=bp[b*3u+1u]+rip.y; xipos_out[uint(b*3u+2u)*NBATCH+batch_idx]=bp[b*3u+2u]+rip.z;
     vec4 iq = vec4(body_iquat[b*4u], body_iquat[b*4u+1u], body_iquat[b*4u+2u], body_iquat[b*4u+3u]);
     vec4 cq = mkx_qmul(bqt, iq);
     float mat[9] = mkx_q2mat(cq);
-    for (uint i = 0u; i < 9u; i++) ximat_out[xm_off+b*9u+i] = mat[i];
+    for (uint i = 0u; i < 9u; i++) ximat_out[uint(b*9u+i)*NBATCH+batch_idx] = mat[i];
 }
 
 )GLSL";
+  if (abl & 16) src += "xpos_out[batch_idx] = bp[3u*(NB-1u)] + bq[4u*(NB-1u)] + bp[5] + bq[7];\n";  // 計測用: チェーンを生かす
   if (!(abl & 4)) src += R"GLSL(
 for (uint g = 0u; g < NG; g++) {
     int bid = mkx_I(geom_bodyid[g]);
     vec3 gp = vec3(geom_pos[g*3u], geom_pos[g*3u+1u], geom_pos[g*3u+2u]);
     vec4 bqt = vec4(bq[uint(bid)*4u], bq[uint(bid)*4u+1u], bq[uint(bid)*4u+2u], bq[uint(bid)*4u+3u]);
     vec3 rgp = mkx_qrot(bqt, gp);
-    geom_xpos_out[gxp_off+g*3u]=bp[uint(bid)*3u]+rgp.x; geom_xpos_out[gxp_off+g*3u+1u]=bp[uint(bid)*3u+1u]+rgp.y; geom_xpos_out[gxp_off+g*3u+2u]=bp[uint(bid)*3u+2u]+rgp.z;
+    geom_xpos_out[uint(g*3u)*NBATCH+batch_idx]=bp[uint(bid)*3u]+rgp.x; geom_xpos_out[uint(g*3u+1u)*NBATCH+batch_idx]=bp[uint(bid)*3u+1u]+rgp.y; geom_xpos_out[uint(g*3u+2u)*NBATCH+batch_idx]=bp[uint(bid)*3u+2u]+rgp.z;
     vec4 gq = vec4(geom_quat[g*4u], geom_quat[g*4u+1u], geom_quat[g*4u+2u], geom_quat[g*4u+3u]);
     vec4 cq = mkx_qmul(bqt, gq);
     float mat[9] = mkx_q2mat(cq);
-    for (uint i = 0u; i < 9u; i++) geom_xmat_out[gxm_off+g*9u+i] = mat[i];
+    for (uint i = 0u; i < 9u; i++) geom_xmat_out[uint(g*9u+i)*NBATCH+batch_idx] = mat[i];
 }
 )GLSL";
 

@@ -254,9 +254,11 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
     static const bool on = getenv("MJMLX_PROF") != nullptr;
     if (!on) return;
     static std::map<std::string, double> acc; static int calls = 0; static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    auto t_enter = std::chrono::steady_clock::now();
     for (const auto& a : outs) mx::eval({a});
     auto now = std::chrono::steady_clock::now();
-    acc[name] += std::chrono::duration<double>(now - last).count();
+    acc[std::string(name) + ".build"] += std::chrono::duration<double>(t_enter - last).count();  // 前段のeval後からこの段のeval開始まで(ホスト側のグラフ構築)
+    acc[std::string(name) + ".eval"] += std::chrono::duration<double>(now - t_enter).count();
     last = now;
     if (std::string(name) == "euler" && ++calls % 50 == 0) {
         fprintf(stderr, "[prof] per-substep ms:");
@@ -798,7 +800,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 1u), 1, 1}
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 64u), 1, 1}
             );
             // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
             MX_MARK_PERSISTENT(kin_raw[0], owner);
@@ -813,11 +815,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto kin = mx::fast::kernel_outputs(kin_raw);
             prof_stage("kin", kin);
 
-            auto xpos   = mx::reshape(kin[0], {B, nb, 3});
-            auto xipos  = mx::reshape(kin[3], {B, nb, 3});
-            auto ximat  = mx::reshape(kin[4], {B, nb, 3, 3});
-            auto xanchor = (nj > 0) ? mx::reshape(kin[5], {B, nj, 3}) : mx::zeros({B, 1});
-            auto xaxis   = (nj > 0) ? mx::reshape(kin[6], {B, nj, 3}) : mx::zeros({B, 1});
+            // kinematicsの出力はSoA(成分*B+env)。GPU forward/collisionはSoAのまま読む。vmap経路とstate出力はAoS({B,...})が要るので転置する。
+            auto kin_view = [&](int idx, int per, mx::Shape shp, bool soa) {
+                return soa ? mx::reshape(kin[idx], shp) : mx::reshape(mx::transpose(mx::reshape(kin[idx], {per, B})), shp);
+            };
+            auto xpos   = kin_view(0, nb * 3, {B, nb, 3}, use_gpu_fwd);
+            auto xipos  = kin_view(3, nb * 3, {B, nb, 3}, use_gpu_fwd);
+            auto ximat  = kin_view(4, nb * 9, {B, nb, 3, 3}, use_gpu_fwd);
+            auto xanchor = (nj > 0) ? kin_view(5, nj * 3, {B, nj, 3}, use_gpu_fwd) : mx::zeros({B, 1});
+            auto xaxis   = (nj > 0) ? kin_view(6, nj * 3, {B, nj, 3}, use_gpu_fwd) : mx::zeros({B, 1});
 
             mx::array qM_flat = mx::zeros({1});
             mx::array qfrc_smooth_flat = mx::zeros({1});
@@ -869,8 +875,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 // ── Collision + Solver ──
                 if (ctx->uses_gpu_collision) {
                     // Collision kernel: detect contacts from geom transforms
-                    auto geom_xpos_flat = mx::flatten(mx::reshape(kin[7], {B, ng, 3}));
-                    auto geom_xmat_flat = mx::flatten(mx::reshape(kin[8], {B, ng, 3, 3}));
+                    // collisionは1スレッド=1envで自分のgeomを順に読むためAoS({B,ng,..})に転置して渡す(SoAのまま読むと成分ごとに別キャッシュラインになり遅い)。
+                    auto geom_xpos_flat = mx::flatten(kin_view(7, ng * 3, {B, ng, 3}, false));
+                    auto geom_xmat_flat = mx::flatten(kin_view(8, ng * 9, {B, ng, 3, 3}, false));
 
                     int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
                     std::vector<mx::array> coll;
@@ -929,10 +936,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 }
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
-                auto xquat = mx::reshape(kin[1], {B, nb, 4});
-                auto xmat  = mx::reshape(kin[2], {B, nb, 3, 3});
-                auto gxpos = (ng > 0) ? mx::reshape(kin[7], {B, ng, 3}) : mx::zeros({B, 1});
-                auto gxmat = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
+                auto xquat = kin_view(1, nb * 4, {B, nb, 4}, false);
+                auto xmat  = kin_view(2, nb * 9, {B, nb, 3, 3}, false);
+                auto gxpos = (ng > 0) ? kin_view(7, ng * 3, {B, ng, 3}, false) : mx::zeros({B, 1});
+                auto gxmat = (ng > 0) ? kin_view(8, ng * 9, {B, ng, 3, 3}, false) : mx::zeros({B, 1});
 
                 auto mid = vmapped_fwd({
                     qpos_batch, qvel_batch, ctrl_batch,
@@ -978,8 +985,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             prof_stage("euler", euler);
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
-            auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
-            auto xquat_out = mx::reshape(kin[1], {B, nb, 4});
+            auto xpos_out = kin_view(0, nb * 3, {B, nb, 3}, false);
+            auto xquat_out = kin_view(1, nb * 4, {B, nb, 4}, false);
             auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out, xquat_out,
