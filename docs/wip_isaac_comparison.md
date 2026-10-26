@@ -133,6 +133,14 @@
 - 残る差: 接触ありで平均5e-3 rad、最大9e-2 rad。接触まわり(foot の condim=6 のねじり/転がり摩擦行をGPUが持たない、接触面のsolimp/solrefの混合など)の可能性。
 - 検証: humanoid / high_dof / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験14: solverの反復内のglobal読み出しを共有メモリへ(solver 45→12 ms)
+- 反復あたり約5 ms(SI=1,2,4,8 で 11/15.6/27/45 ms)かかっていたが、CG・直線探索・Newton打ち切りを変えてもほぼ効かなかった。反復内で毎回、質量行列 `qM_in`(SoA配置で成分ごとに別キャッシュライン)をglobalメモリから読んでいたのが原因。
+- 対策: 共有メモリ版は `qM` と `qfrc_smooth` を最初に共有メモリへ1回だけ読み込む(`QMV` / `QFS` マクロ)。さらに直線探索(Jv・合計・二分法・候補コスト)を全スレッドで並列化(結果はほぼ変わらず、効いたのは上記のqM)。
+- 結果(接触あり、4096 env、substepあたり): solver 45 → **12 ms**(SI=8)。1 step後のCPU/GPU差は変わらず(関節角 平均5.1e-3 rad)。
+- **学習1 iteration(isaac_flat、cuda PPO): 約2.9 s**(Isaac Lab 約2.2 s の1.3倍。収集 2.6 s / 更新 0.27 s)。
+- Newton反復数: SI=4にしても1 stepのCPU差はほぼ同じ(5.6e-3 rad)で速くなる(旧solver時 45→27 ms)ので、速度が必要なら下げられる。現在はSI=8のまま。
+- 検証: humanoid / high_dof / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

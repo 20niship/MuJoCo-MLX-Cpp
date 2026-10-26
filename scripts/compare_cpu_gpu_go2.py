@@ -19,6 +19,7 @@ def main() -> None:
     ap.add_argument("--warm", type=int, default=60, help="状態を集めるためにGPU envを走らせるstep数")
     ap.add_argument("--samples", type=int, default=5, help="比較する状態の数(warmの後、10stepごと)")
     ap.add_argument("--preset", default="isaac_flat")
+    ap.add_argument("--solver-iters", type=int, default=None)
     ap.add_argument("--lift", type=float, default=0.0, help="胴体を持ち上げて接触を無くした状態で比べる(物理のうち接触以外の差を見る)[m]")
     args = ap.parse_args()
 
@@ -28,6 +29,8 @@ def main() -> None:
     import _mjmlx_rl_native as native
     import mjmlx_go2_env as e
 
+    if args.solver_iters is not None:
+        e.SOLVER_ITERATIONS = args.solver_iters
     kw = dict(cmd_vel_min=0.2, cmd_vel_max=1.0, seed=0, terrain_seed=0, flat_terrain=True, reward_preset=args.preset)
     gpu = e.MjmlxGo2Env(native, args.envs, use_gpu=True, generated_xml_path="/tmp/go2_cmp_gpu.xml", **kw)
     cpu = e.MjmlxGo2Env(native, args.envs, use_gpu=False, generated_xml_path="/tmp/go2_cmp_cpu.xml", **kw)
