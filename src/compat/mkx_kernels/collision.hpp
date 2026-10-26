@@ -83,7 +83,7 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
      << "uint gx_off = bid * NG * 3;\n"
      << "uint gm_off = bid * NG * 9;\n"
      << "uint con_off = bid * MAX_CON * STRIDE;\n\n"
-     << "for (int i = 0; i < MAX_CON * STRIDE; i++) contact_data[con_off + i] = 0.0f;\n"
+     // contact_dataの全消去はしない(1env 1024float × スレッド単位の散らばった書き込みが支配的だった)。solver/cfrcは contact_count 個しか読まない。
      << "int ncon = 0;\n\n"
      << "const int PAIR_STRIDE = 6;\n\n";
 

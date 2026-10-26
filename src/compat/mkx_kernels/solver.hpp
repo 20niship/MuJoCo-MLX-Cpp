@@ -562,7 +562,8 @@ for (int iter = 0; iter < NSOLVE; iter++) {
 barrier(); memoryBarrierBuffer();
 // 接触ごとの法線方向の力(ピラミッド錐は全ファセットの力の和)。cfrc_ext算出用。
 if (tid == 0u) {
-    for (int ci = 0; ci < MAX_CON; ci++) {
+    int nc_out = int(contact_count_in[bid]);
+    for (int ci = 0; ci < nc_out && ci < MAX_CON; ci++) {  // cfrcはcontact_count個しか読まないので128個全部は書かない
         float fn = 0.0f;
         if (ci < tg_ncp) for (int r2 = tg_crow0[ci]; r2 < tg_crow0[ci+1]; r2++) fn += efc_force(r2);
         contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = fn;

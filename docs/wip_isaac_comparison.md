@@ -101,6 +101,13 @@
 - 結果(接触あり、substepあたり): forward.eval 37 → **6 ms**。`env.step`(4096 env) 平均 665 → **533 ms**。
 - 検証: gpu_vs_cpu_humanoid / high_dof、piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験10: 不要なglobal書き込みの削除(collision 20→10 ms、solver 49→31 ms)
+- collisionは毎回 `contact_data` の全域(1env 128接触×8 = 1024 float)を1スレッドでゼロ埋めしていた。solverとcfrcは `contact_count` 個しか読まないので削除(散らばった書き込み約420万回/substep)。
+- solverは終わりに `contact_fn_out` を128個全部、thread 0が逐次に書いていた。`contact_count` 個だけに変更。
+- 注意: 計測中にollama(別プロセス)がCPU/GPUを使うと `env.step` が2〜3倍にぶれる。比較は最小値(min)か、静かな時の複数回で見る。
+- 結果(4096 env、静かな時): `env.step` 平均 533 → **約330 ms**(最小約245 ms)、約12,300 env-steps/s。接触あり段階の内訳(substep): collision 10 / solver 31 / forward 6 / kin 3 / euler 2。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
