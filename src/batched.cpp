@@ -1244,7 +1244,7 @@ MJMLX_API void mjmlx_batched_get_state(
     if (!sim) return;
     auto& s = sim->sim;
     // cfrc_ext(接触力)も同じevalで一緒に評価する(別evalにするとsubmit+同期がもう1回要る)。envは毎stepで両方読む。
-    if (s.cfrc_ext.size() > 0) mx::eval({s.qpos, s.qvel, s.cfrc_ext});
+    if (s.cfrc_ext.size() > 0) mx::eval(s.qpos, s.qvel, s.cfrc_ext);
     else mx::eval(s.qpos, s.qvel);
 
     if (nq_out) *nq_out = s.model->nq;

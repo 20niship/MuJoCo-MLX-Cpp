@@ -155,6 +155,15 @@
 - **学習1 iteration(isaac_flat、cuda PPO、4096 env): 約2.3 s(収集 2.05 s / 更新 0.27 s)**。Isaac Lab 約2.2 s(収集 1.9 s)の約1.07倍。旧: 約44 s(CPU PPO・旧ビルド)。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験17: 計算バッファをVRAM(デバイスローカル)に置く(最大の効果、Isaac Labを上回る)
+- 原因: `extern/mlx_vulkan` のバッファ確保は `HOST_VISIBLE|HOST_COHERENT` だけを要求していた。dGPU(RTX 3060、ReBAR無し: BAR1は256 MiB)ではこれがシステムメモリになり、**全カーネルのload/storeがPCIe越し**だった。これまでの「globalメモリの散らばったアクセスが極端に遅い」は、この上に乗った現象。
+- 対策(サブモジュール `20niship/mlx_vulkan` の `perf/device-local-buffers` ブランチ、5e658dd): デバイスローカルかつホスト不可視のメモリ型があればそれを使い、CPUとのupload/downloadはステージングバッファ+`vkCmdCopyBuffer`経由に。型が無い/確保失敗ならホストメモリにフォールバック(統合GPU・lavapipeは従来通り)。`MKX_DEVICE_LOCAL=0` で従来動作。
+- 結果(substepあたり、最小値): forward 3.5→1.0 / cfrc 2.8→0.3 / kin 1.8→0.6 / euler 1.1→0.5 / collision 4.8→1.6 / solver 5.8→5.6 ms。`env.step`(4096 env) 平均 92 → **52 ms**(最小 32 ms)、約79,000 env-steps/s(Isaac Lab 約45,000)。
+- **学習1 iteration(isaac_flat、cuda PPO、4096 env、24 step): 約1.3 s(収集 1.0 s / 更新 0.27 s)**。Isaac Lab 約2.2 s(収集 1.9 s)の約1.7倍速い。旧: 約44 s。
+- 1 step後のCPU/GPU差は不変(関節角 平均5.1e-3 rad)。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+- 注意: 親リポジトリのサブモジュールポインタを `5e658dd` に更新。CIは `perf/device-local-buffers` のコミットをfetchできる必要がある。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
