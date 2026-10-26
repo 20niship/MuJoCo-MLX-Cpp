@@ -76,6 +76,7 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
 
   std::ostringstream ss;
   ss << "uint bid = gl_GlobalInvocationID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
      << "const int NG = " << ng << ";\n"
      << "const int NUM_PAIRS = " << npairs << ";\n"
      << "const int MAX_CON = " << max_contacts_per_env << ";\n"
@@ -96,8 +97,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
     float rbound_sum = pair_data[pd+5];
 
     if (t1 != 0 && t2 != 0) {
-        vec3 c1 = vec3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
-        vec3 c2 = vec3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
+        vec3 c1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
+        vec3 c2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
         if (msl_len(c1 - c2) >= rbound_sum) continue;
     }
 
@@ -108,11 +109,11 @@ for (int p = 0; p < NUM_PAIRS; p++) {
         int plane_g = (t1 == 0) ? g1 : g2;
         int xg = (t1 == 0) ? g2 : g1;
         int xt = (t1 == 0) ? t2 : t1;
-        vec3 ppos = vec3(geom_xpos[gx_off+plane_g*3], geom_xpos[gx_off+plane_g*3+1], geom_xpos[gx_off+plane_g*3+2]);
-        float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[gm_off+plane_g*9+k];
+        vec3 ppos = vec3(geom_xpos[uint(plane_g*3)*NBATCH+bid], geom_xpos[uint(plane_g*3+1)*NBATCH+bid], geom_xpos[uint(plane_g*3+2)*NBATCH+bid]);
+        float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[uint(plane_g*9+k)*NBATCH+bid];
         vec3 normal = vec3(pR[2], pR[5], pR[8]);
-        vec3 xpos_ = vec3(geom_xpos[gx_off+xg*3], geom_xpos[gx_off+xg*3+1], geom_xpos[gx_off+xg*3+2]);
-        float xR[9]; for (int k=0;k<9;k++) xR[k] = geom_xmat[gm_off+xg*9+k];
+        vec3 xpos_ = vec3(geom_xpos[uint(xg*3)*NBATCH+bid], geom_xpos[uint(xg*3+1)*NBATCH+bid], geom_xpos[uint(xg*3+2)*NBATCH+bid]);
+        float xR[9]; for (int k=0;k<9;k++) xR[k] = geom_xmat[uint(xg*9+k)*NBATCH+bid];
         vec3 xsize = vec3(geom_size_buf[xg*3], geom_size_buf[xg*3+1], geom_size_buf[xg*3+2]);
         int mesh_id = (xt == 7) ? int(geom_dataid_buf[xg]) : 0;
         int adr = (xt == 7) ? int(mesh_vertadr_buf[mesh_id]) : 0;
@@ -128,10 +129,10 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             has_contact = true;
         }
     } else {
-        vec3 pos1 = vec3(geom_xpos[gx_off+g1*3], geom_xpos[gx_off+g1*3+1], geom_xpos[gx_off+g1*3+2]);
-        vec3 pos2 = vec3(geom_xpos[gx_off+g2*3], geom_xpos[gx_off+g2*3+1], geom_xpos[gx_off+g2*3+2]);
-        float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[gm_off+g1*9+k];
-        float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[gm_off+g2*9+k];
+        vec3 pos1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
+        vec3 pos2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
+        float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[uint(g1*9+k)*NBATCH+bid];
+        float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[uint(g2*9+k)*NBATCH+bid];
         vec3 size1 = vec3(geom_size_buf[g1*3], geom_size_buf[g1*3+1], geom_size_buf[g1*3+2]);
         vec3 size2 = vec3(geom_size_buf[g2*3], geom_size_buf[g2*3+1], geom_size_buf[g2*3+2]);
         int mid1 = (t1 == 7) ? int(geom_dataid_buf[g1]) : 0;

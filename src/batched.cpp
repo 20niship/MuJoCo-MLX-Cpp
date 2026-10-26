@@ -636,6 +636,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
                  ctx->coll_mesh_vertnum, ctx->coll_geom_dataid, ctx->coll_geom_size);
 
+        if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
             m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_collision = true;
@@ -883,8 +884,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 if (ctx->uses_gpu_collision) {
                     // Collision kernel: detect contacts from geom transforms
                     // collisionは1スレッド=1envで自分のgeomを順に読むためAoS({B,ng,..})に転置して渡す(SoAのまま読むと成分ごとに別キャッシュラインになり遅い)。
-                    auto geom_xpos_flat = mx::flatten(kin_view(7, ng * 3, {B, ng, 3}, false));
-                    auto geom_xmat_flat = mx::flatten(kin_view(8, ng * 9, {B, ng, 3, 3}, false));
+                    auto geom_xpos_flat = mx::flatten(kin_view(7, ng * 3, {B, ng, 3}, true));
+                    auto geom_xmat_flat = mx::flatten(kin_view(8, ng * 9, {B, ng, 3, 3}, true));
 
                     int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
                     std::vector<mx::array> coll;
@@ -895,7 +896,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
                              ctx->coll_geom_dataid, ctx->coll_geom_size}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
-                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 1u), 1, 1}
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 32u), 1, 1}
                         );
                         // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
                         MX_MARK_PERSISTENT(coll_raw[0], owner);
@@ -1242,7 +1243,9 @@ MJMLX_API void mjmlx_batched_get_state(
 {
     if (!sim) return;
     auto& s = sim->sim;
-    mx::eval(s.qpos, s.qvel);
+    // cfrc_ext(接触力)も同じevalで一緒に評価する(別evalにするとsubmit+同期がもう1回要る)。envは毎stepで両方読む。
+    if (s.cfrc_ext.size() > 0) mx::eval({s.qpos, s.qvel, s.cfrc_ext});
+    else mx::eval(s.qpos, s.qvel);
 
     if (nq_out) *nq_out = s.model->nq;
     if (nv_out) *nv_out = s.model->nv;

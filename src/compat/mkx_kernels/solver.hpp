@@ -105,7 +105,9 @@ shared float tg_pAp;
        << "shared float sh_Mv[" << nv << "];\n"
        << "shared float sh_red[" << 12 * nv << "];\n"
        << "shared float sh_qM[" << nv * nv << "];\n"
-       << "shared float sh_qfs[" << nv << "];\n";
+       << "shared float sh_qfs[" << nv << "];\n"
+       << "shared float sh_cdof[" << nv * 6 << "];\n"
+       << "shared float sh_scom[" << nb * 3 << "];\n";
     header += sh.str();
   }
   {
@@ -156,6 +158,8 @@ shared float tg_pAp;
   if(use_shared) {
     ss << "#define QMV(i)       sh_qM[(i)]\n";
     ss << "#define QFS(i)       sh_qfs[(i)]\n";
+    ss << "#define CDOF(i)      sh_cdof[(i)]\n";
+    ss << "#define SCOM(i)      sh_scom[(i)]\n";
     ss << "#define H(i)         sh_H[(i)]\n"
        << "#define J(r,c)       sh_J[(r)*NV+(c)]\n"
        << "#define efc_D(i)     sh_D[(i)]\n"
@@ -173,6 +177,8 @@ shared float tg_pAp;
   } else {
     ss << "#define QMV(i)       qM_in[uint(i)*NBATCH+bid]\n";
     ss << "#define QFS(i)       qfrc_smooth_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define CDOF(i)      cdof_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define SCOM(i)      subtree_com_in[uint(i)*NBATCH+bid]\n";
     ss << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
        << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
        << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
@@ -217,6 +223,8 @@ shared float tg_pAp;
     // 共有メモリ版は全域のゼロ埋めをしない: 拘束行(J/D/aref/floss)は作る時に全要素を書き、qacc等は読む前に必ず書く。
     ss << "for (int ii = int(tid); ii < NV*NV; ii += NV) sh_qM[ii] = qM_in[uint(ii)*NBATCH+bid];\n"
        << "sh_qfs[tid] = qfrc_smooth_in[uint(int(tid))*NBATCH+bid];\n"
+       << "for (int ii = int(tid); ii < NV*6; ii += NV) sh_cdof[ii] = cdof_in[uint(ii)*NBATCH+bid];\n"
+       << "for (int ii = int(tid); ii < NB*3; ii += NV) sh_scom[ii] = subtree_com_in[uint(ii)*NBATCH+bid];\n"
        << "sh_qacc[tid] = 0.0f;\nbarrier();\n\n";
   }
 
@@ -348,13 +356,13 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
 
     {
         int rid = int(body_rootid_buf[body2]);
-        float ox = c_pos_x - subtree_com_in[uint(rid*3)*NBATCH+bid];
-        float oy = c_pos_y - subtree_com_in[uint(rid*3+1)*NBATCH+bid];
-        float oz = c_pos_z - subtree_com_in[uint(rid*3+2)*NBATCH+bid];
+        float ox = c_pos_x - SCOM(rid*3);
+        float oy = c_pos_y - SCOM(rid*3+1);
+        float oz = c_pos_z - SCOM(rid*3+2);
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body2*NV+di] < 0.5f) continue;
-            float ax=cdof_in[uint(di*6)*NBATCH+bid],ay=cdof_in[uint(di*6+1)*NBATCH+bid],az=cdof_in[uint(di*6+2)*NBATCH+bid];
-            float lx=cdof_in[uint(di*6+3)*NBATCH+bid],ly=cdof_in[uint(di*6+4)*NBATCH+bid],lz=cdof_in[uint(di*6+5)*NBATCH+bid];
+            float ax=CDOF(di*6),ay=CDOF(di*6+1),az=CDOF(di*6+2);
+            float lx=CDOF(di*6+3),ly=CDOF(di*6+4),lz=CDOF(di*6+5);
             jacp_tmp(di*3+0) += lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) += ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) += lz + (ax*oy - ay*ox);
@@ -362,13 +370,13 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     }
     {
         int rid = int(body_rootid_buf[body1]);
-        float ox = c_pos_x - subtree_com_in[uint(rid*3)*NBATCH+bid];
-        float oy = c_pos_y - subtree_com_in[uint(rid*3+1)*NBATCH+bid];
-        float oz = c_pos_z - subtree_com_in[uint(rid*3+2)*NBATCH+bid];
+        float ox = c_pos_x - SCOM(rid*3);
+        float oy = c_pos_y - SCOM(rid*3+1);
+        float oz = c_pos_z - SCOM(rid*3+2);
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body1*NV+di] < 0.5f) continue;
-            float ax=cdof_in[uint(di*6)*NBATCH+bid],ay=cdof_in[uint(di*6+1)*NBATCH+bid],az=cdof_in[uint(di*6+2)*NBATCH+bid];
-            float lx=cdof_in[uint(di*6+3)*NBATCH+bid],ly=cdof_in[uint(di*6+4)*NBATCH+bid],lz=cdof_in[uint(di*6+5)*NBATCH+bid];
+            float ax=CDOF(di*6),ay=CDOF(di*6+1),az=CDOF(di*6+2);
+            float lx=CDOF(di*6+3),ly=CDOF(di*6+4),lz=CDOF(di*6+5);
             jacp_tmp(di*3+0) -= lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) -= ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) -= lz + (ax*oy - ay*ox);

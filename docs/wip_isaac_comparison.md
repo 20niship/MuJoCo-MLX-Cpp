@@ -141,6 +141,14 @@
 - Newton反復数: SI=4にしても1 stepのCPU差はほぼ同じ(5.6e-3 rad)で速くなる(旧solver時 45→27 ms)ので、速度が必要なら下げられる。現在はSI=8のまま。
 - 検証: humanoid / high_dof / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験15: collisionのSoA読み出し+TG=32、cdof/subtree_comの共有メモリ化
+- collisionが読むgeomの位置・姿勢をkinematicsのSoA出力のまま読み(転置をやめる)、`MJMLX_TG_COLL` の既定を1→32に。実験10で `contact_data` の全消去を無くしたので、TG>1でもコアレスの利点が出るようになった(TG=8/16/32/64 で 13.1/6.9/4.7/5.7 ms、TG=1 は7.3 ms)。
+- solverは `cdof` / `subtree_com` も共有メモリに読み込む(効果は小さい)。
+- 結果(substepあたり、最小値): collision 8.4 → 4.7 ms。合計 forward 3.3 / cfrc 2.5 / kin 1.8 / solver 11.9 / euler 1.2 / collision 4.7 = 約25 ms。
+- 学習1 iteration は約2.9〜3.0 s(クロックのぶれ込みで実測は2.86〜3.05 s)。Isaac Lab 約2.2 s の約1.3倍。
+- env.stepの内訳(非prof、約132 ms): GPU物理 約113 ms、`cfrc_ext` 取得 約7 ms、`qfrc_actuator` 約2 ms、Python側 約8 ms。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
