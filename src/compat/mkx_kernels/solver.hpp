@@ -212,29 +212,31 @@ shared float tg_pAp;
   }
 
   ss << "SABL0\n";
-  ss << "if (tid == 0u) {\n"
-     << "int ncon = int(contact_count_in[bid]);\n"
-     << "int nefc = 0;\n\n";
-
-  if(nfl > 0) {
+  const int nfl_eff = std::min(nfl, max_efc - 4);
+  if(nfl_eff > 0) {
+    // frictionloss行は常に先頭に並び、行ごとに独立なので全スレッドで並列に作る。
+    ss << "const int NFL_EFF = " << nfl_eff << ";\n";
     ss << R"GLSL(
-for (int fi = 0; fi < NFL; fi++) {
-    if (nefc >= MAX_EFC_N - 4) break;
+for (int fi = int(tid); fi < NFL_EFF; fi += NV) {
     int fp = fi * 10;
     int dof = int(fric_tab[fp+0]);
     float fl = fric_tab[fp+1];
     float k_f, b_f, imp_f;
     efc_kbi(fric_tab[fp+2], fric_tab[fp+3], fric_tab[fp+4], fric_tab[fp+5], fric_tab[fp+6], fric_tab[fp+7], fric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
     float r_f = max(fric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
-    for (int di = 0; di < NV; di++) J(nefc, di) = 0.0f;
-    J(nefc, dof) = 1.0f;
-    efc_D(nefc) = 1.0f / r_f;
-    efc_aref(nefc) = -b_f * qvel_in[qv_off + dof];
-    efc_floss(nefc) = fl;
-    nefc++;
+    for (int di = 0; di < NV; di++) J(fi, di) = 0.0f;
+    J(fi, dof) = 1.0f;
+    efc_D(fi) = 1.0f / r_f;
+    efc_aref(fi) = -b_f * qvel_in[qv_off + dof];
+    efc_floss(fi) = fl;
 }
+barrier();
 )GLSL";
   }
+  ss << "if (tid == 0u) {\n"
+     << "int ncon = int(contact_count_in[bid]);\n"
+     << "int nefc = " << nfl_eff << ";\n\n";
+
   if(nlim > 0) {
     ss << R"GLSL(
 for (int li = 0; li < NLIM; li++) {

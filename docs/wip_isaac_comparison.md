@@ -124,6 +124,15 @@
 - 静かな時の最小値(substepあたり、接触あり): solver 18.4 / collision 4.7 / forward 3.2 / cfrc 2.5 / kin 1.3 / euler 1.0 ms(合計 約31 ms)。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験13: CPUとGPUの差(1 step比較)とeulerdampの修正
+- `scripts/compare_cpu_gpu_go2.py`: GPU envで集めた接触を含む多様な状態を、CPU(MuJoCo C)とGPUに同じに設定し、同じactionで1制御step進めて関節角・胴体速度の差を測る(`--lift` で接触なしの状態)。長い軌道の比較はカオス的に増幅されるので1 stepで見る。
+- 解像度の確認: Newton打ち切り(`MJMLX_GTOL`)・CG反復を変えても1 stepの差はほぼ変わらない(平均 約1.4e-2 rad) → 原因はソルバの精度ではない。
+- **接触なし**(胴体を1 m持ち上げ)でも差が大きい(関節角 平均 2.0e-2 rad)ので、接触以外の物理の差と判明。原因: GPUのEulerカーネルが常に関節dampingを陰的に扱い、さらにactuatorの速度項(biasprm の kd)も陰的に畳み込んでいた。Go2のXMLは `eulerdamp="disable"` なのでCPUは全て陽的。
+- 修正: 積分器がEulerで `eulerdamp` が無効のときは陰的dampingを入れない。actuatorの速度項の陰的処理は implicit/implicitfast のときだけ行う。
+- 結果(1 step、関節角): 接触なし 平均2.0e-2 → 5.7e-4 rad(p95 3e-2 → 3e-6)、接触あり 平均1.4e-2 → 5.3e-3 rad(p95 2.3e-2 → 9.5e-3)。
+- 残る差: 接触ありで平均5e-3 rad、最大9e-2 rad。接触まわり(foot の condim=6 のねじり/転がり摩擦行をGPUが持たない、接触面のsolimp/solrefの混合など)の可能性。
+- 検証: humanoid / high_dof / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

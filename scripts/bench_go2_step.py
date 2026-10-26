@@ -19,6 +19,7 @@ def main() -> None:
     ap.add_argument("--envs", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--dt", type=float, default=None, help="物理dtの上書き(decimationは制御周期0.02sになるよう自動)")
     ap.add_argument("--solver-iters", type=int, default=None, help="Newton反復数の上書き(既定はenvの値)")
     args = ap.parse_args()
 
@@ -28,6 +29,10 @@ def main() -> None:
     import _mjmlx_rl_native as native
     from mjmlx_go2_env import MjmlxGo2Env
 
+    if args.dt is not None:
+        import mjmlx_go2_env
+        mjmlx_go2_env.PHYSICS_DT = args.dt
+        mjmlx_go2_env.DECIMATION = round(0.02 / args.dt)
     if args.solver_iters is not None:
         import mjmlx_go2_env
         mjmlx_go2_env.SOLVER_ITERATIONS = args.solver_iters

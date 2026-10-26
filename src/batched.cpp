@@ -552,9 +552,14 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 
     auto damp_ptr = m.dof_damping.data<float>();
     std::vector<float> damp_vals(damp_ptr, damp_ptr + m.nv);
+    // MuJoCoのEulerは関節dampingだけを陰的に扱い、`eulerdamp`を無効にした模型(Go2など)ではそれも陽的になる。CPUと挙動を合わせるため、
+    // Eulerかつeulerdamp無効のときは陰的dampingを入れない。implicit/implicitfastはactuatorの速度項も含めて陰的に扱う(下のブロック)。
+    const bool integ_implicit = (m.opt.integrator == IntegratorType::IMPLICIT || m.opt.integrator == IntegratorType::IMPLICITFAST);
+    const bool euler_damp_off = (m.opt.integrator == IntegratorType::EULER) && (m.opt.disableflags & DisableBit::EULERDAMP);
+    if (euler_damp_off) std::fill(damp_vals.begin(), damp_vals.end(), 0.0f);
 
     // mujoco本家のimplicit/implicitfast(mj_implicitSkip https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_forward.c#L1799 がactuatorVelDeriv https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_derivative.c#L2503 でd(qfrc_actuator)/d(qvel)を陰的に畳み込む)相当をdof_dampingと同じ機構に便乗させて再現(本カーネルはintegrator設定無視でexplicitのままだったためUR5eのimplicitfast前提PDゲインが発散していた)。
-    if (m.nu > 0 && m.actuator_biastype.size() > 0) {
+    if (integ_implicit && m.nu > 0 && m.actuator_biastype.size() > 0) {
         mx::eval(m.actuator_biastype, m.actuator_biasprm, m.actuator_gaintype, m.actuator_gainprm,
                  m.actuator_trntype, m.actuator_trnid, m.actuator_gear);
         auto biastype_ptr = m.actuator_biastype.data<int32_t>();
