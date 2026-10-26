@@ -264,7 +264,6 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
         fprintf(stderr, "\n"); acc.clear();
     }
 }
-static const int MAX_EFC = 256;
 
 static mx::array build_collision_pair_data(const Model& m) {
     m.init_cache();
@@ -317,6 +316,7 @@ static mx::array build_collision_pair_data(const Model& m) {
 // solverカーネルのscratchレイアウト(GLSL版はefc長の配列7本)以上でなければならない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
+    const int MAX_EFC = mkx_kernels::solver_max_efc_for(nv);
     return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3*nv;
 }
 
@@ -652,7 +652,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
-        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
+        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, mkx_kernels::solver_max_efc_for(m.nv))) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);

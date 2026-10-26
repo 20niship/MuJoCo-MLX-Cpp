@@ -19,6 +19,7 @@ def main() -> None:
     ap.add_argument("--envs", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--solver-iters", type=int, default=None, help="Newton反復数の上書き(既定はenvの値)")
     args = ap.parse_args()
 
     sys.path.insert(0, args.build_dir)
@@ -27,6 +28,9 @@ def main() -> None:
     import _mjmlx_rl_native as native
     from mjmlx_go2_env import MjmlxGo2Env
 
+    if args.solver_iters is not None:
+        import mjmlx_go2_env
+        mjmlx_go2_env.SOLVER_ITERATIONS = args.solver_iters
     env = MjmlxGo2Env(native, args.envs, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
     env.reset()
     rng = np.random.default_rng(0)

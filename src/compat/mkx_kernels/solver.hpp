@@ -24,13 +24,21 @@ inline std::string solver_fmt_float(float x) {
 } // namespace detail_solver
 
 // ホスト側のscratch確保量(batched.cppのsolver_scratch_per_env)と一致させる責務を持つ、カーネルが1envあたり使うfloat数。
+// 1envあたりの拘束行数の上限。小さいほどscratchが小さくキャッシュに載りやすい(超過分の接触は落ちる)。MJMLX_MAX_EFCで上書き。
+inline int solver_max_efc() { static const int v = getenv("MJMLX_MAX_EFC") ? atoi(getenv("MJMLX_MAX_EFC")) : 256; return v; }
+// 小さいモデル(nv<=32)は拘束行列などをworkgroup共有メモリに置く。globalメモリのレイテンシ(数百cycle)が直列部分を支配するため。
+// 共有メモリに載せるため拘束行数の上限を下げる(超過分の接触は落ちる)。MJMLX_SOLVER_SHARED=0で無効。
+inline bool solver_use_shared(int nv) { static const bool on = !getenv("MJMLX_SOLVER_SHARED") || atoi(getenv("MJMLX_SOLVER_SHARED")) != 0; return on && nv <= 32; }
+inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(solver_max_efc(), 96) : solver_max_efc(); }
+
 inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-6f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
-  const int max_efc              = 256;
+  const int max_efc              = solver_max_efc_for(nv);
+  const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
   const int max_contacts_per_env = 128;
 
@@ -79,6 +87,24 @@ shared float tg_rr;
 shared float tg_pAp;
 )GLSL";
 
+  if(use_shared) {
+    std::ostringstream sh;
+    sh << "shared float sh_H[" << nv * nv << "];\n"
+       << "shared float sh_J[" << max_efc * nv << "];\n"
+       << "shared float sh_D[" << max_efc << "];\n"
+       << "shared float sh_aref[" << max_efc << "];\n"
+       << "shared float sh_force[" << max_efc << "];\n"
+       << "shared float sh_Jaref[" << max_efc << "];\n"
+       << "shared float sh_act[" << max_efc << "];\n"
+       << "shared float sh_floss[" << max_efc << "];\n"
+       << "shared float sh_Jv[" << max_efc << "];\n"
+       << "shared float sh_grad[" << nv << "];\n"
+       << "shared float sh_search[" << nv << "];\n"
+       << "shared float sh_qacc[" << nv << "];\n"
+       << "shared float sh_Ma[" << nv << "];\n"
+       << "shared float sh_Mv[" << nv << "];\n";
+    header += sh.str();
+  }
   {
     std::ostringstream hk;
     hk << "void efc_kbi(float solref0, float solref1, float si0, float si1, float si2, float si3, float si4, float pos, out float k_val, out float b_val, out float imp_val) {\n"
@@ -122,22 +148,39 @@ shared float tg_pAp;
      << "const float MJMINIMP = 0.0001f;\n"
      << "const float MJMAXIMP = 0.9999f;\n\n";
 
-  ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n"
-     << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
-     << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
-     << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
-     << "#define efc_aref(i)  solver_scratch[s_off + " << S_AREF << " + (i)]\n"
-     << "#define efc_force(i) solver_scratch[s_off + " << S_FORCE << " + (i)]\n"
-     << "#define grad(i)      solver_scratch[s_off + " << S_GRAD << " + (i)]\n"
-     << "#define search_d(i)  solver_scratch[s_off + " << S_SEARCH << " + (i)]\n"
-     << "#define qacc(i)      solver_scratch[s_off + " << S_QACC << " + (i)]\n"
-     << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
-     << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
-     << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
-     << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
-     << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
-     << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n"
-     << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
+  ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n";
+  if(use_shared) {
+    ss << "#define H(i)         sh_H[(i)]\n"
+       << "#define J(r,c)       sh_J[(r)*NV+(c)]\n"
+       << "#define efc_D(i)     sh_D[(i)]\n"
+       << "#define efc_aref(i)  sh_aref[(i)]\n"
+       << "#define efc_force(i) sh_force[(i)]\n"
+       << "#define grad(i)      sh_grad[(i)]\n"
+       << "#define search_d(i)  sh_search[(i)]\n"
+       << "#define qacc(i)      sh_qacc[(i)]\n"
+       << "#define Ma(i)        sh_Ma[(i)]\n"
+       << "#define Jaref(i)     sh_Jaref[(i)]\n"
+       << "#define act(i)       sh_act[(i)]\n"
+       << "#define efc_floss(i) sh_floss[(i)]\n"
+       << "#define Mv_arr(i)    sh_Mv[(i)]\n"
+       << "#define Jv_arr(i)    sh_Jv[(i)]\n";
+  } else {
+    ss << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
+       << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
+       << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
+       << "#define efc_aref(i)  solver_scratch[s_off + " << S_AREF << " + (i)]\n"
+       << "#define efc_force(i) solver_scratch[s_off + " << S_FORCE << " + (i)]\n"
+       << "#define grad(i)      solver_scratch[s_off + " << S_GRAD << " + (i)]\n"
+       << "#define search_d(i)  solver_scratch[s_off + " << S_SEARCH << " + (i)]\n"
+       << "#define qacc(i)      solver_scratch[s_off + " << S_QACC << " + (i)]\n"
+       << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
+       << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
+       << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
+       << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
+       << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
+       << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n";
+  }
+  ss << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
 
   ss << "uint qp_off = bid * NQ;\n"
      << "uint qm_off = bid * NV * NV;\n"
@@ -159,6 +202,12 @@ shared float tg_pAp;
   ss << "const int CG_ITERS = " << cg_iters << ";\n"
      << "const float CG_TOL = " << solver_fmt_float(cg_tol) << "f;\n\n";
 
+  if(use_shared) {
+    ss << "for (int ii = int(tid); ii < " << nv * nv << "; ii += NV) sh_H[ii] = 0.0f;\n"
+       << "for (int ii = int(tid); ii < " << max_efc * nv << "; ii += NV) sh_J[ii] = 0.0f;\n"
+       << "for (int ii = int(tid); ii < " << max_efc << "; ii += NV) { sh_D[ii] = 0.0f; sh_aref[ii] = 0.0f; sh_force[ii] = 0.0f; sh_Jaref[ii] = 0.0f; sh_act[ii] = 0.0f; sh_floss[ii] = 0.0f; sh_Jv[ii] = 0.0f; }\n"
+       << "sh_grad[tid] = 0.0f; sh_search[tid] = 0.0f; sh_qacc[tid] = 0.0f; sh_Ma[tid] = 0.0f; sh_Mv[tid] = 0.0f;\n";
+  }
   ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
      << "barrier(); memoryBarrierBuffer();\n\n";
 

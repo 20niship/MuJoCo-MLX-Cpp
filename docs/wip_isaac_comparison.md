@@ -79,6 +79,14 @@
 - 現行の `.venv` のtorch(2.14.1+cu130)はドライバ565(CUDA 12.7)に対して新しすぎてcudaが使えない。`/home/owner/torch-cu126` に torch 2.8.0+cu126 を入れた(`PYTHONPATH=/home/owner/torch-cu126` で有効。`.venv` は変更していない)。cuda自体は使えることを確認済み。
 - 検証済み(実験6)。ollamaがGPUメモリを開けるまで待つ必要があった。
 
+### 実験7: solverの拘束行列などを共有メモリへ(効果大)
+- 接触あり状態(4096 env、`MJMLX_PROF=1`、substepあたり)のsolverは約195 ms。Newton反復数を変えると `solver ≒ 70 ms(固定) + 19 ms × 反復数`(`MJMLX_GTOL=0`、SI=1/2/4/8 で 91/123/147/211 ms)。
+- `MAX_EFC` を 256→48 に下げても変わらない(メモリ量・ゼロ埋めは原因ではない)。
+- 原因の見立て: `tid==0` の1スレッドが `nefc×NV` の行列ベクトル積や10回の二分法をglobalメモリ(`solver_scratch`)上で逐次に回す。ループ長が動的で展開されず、1回ごとにglobalメモリのレイテンシ(数百cycle)を待つ。
+- 対策: nv<=32のモデルは J/D/aref/force/Jaref/act/floss/Jv/grad/search/qacc/Ma/Mv/H を `shared` に置く(`solver_use_shared`)。共有メモリに載せるため拘束行数上限を96に下げる(超過分の接触は落ちる)。`MJMLX_SOLVER_SHARED=0` で従来動作。
+- 結果(接触あり、substepあたり): solver 195 → **49 ms**。`env.step`(4096 env) 平均 1434 → **755 ms**。
+- 検証: `gpu_vs_cpu_humanoid / high_dof`、`model_gpu_vs_cpu_piper / go2_freefall / go2_landing / g1_freefall / g1_landing / h1_freefall` 全通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
