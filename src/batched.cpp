@@ -849,7 +849,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 8u), 1, 1}
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 64u), 1, 1}
                     );
                     // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
                     MX_MARK_PERSISTENT(fwd_raw[0], owner);
@@ -866,10 +866,12 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
                 qM_flat = fwd[0];
                 qfrc_smooth_flat = fwd[1];
-                subtree_com_out = mx::reshape(fwd[2], {B, nb, 3});
-                cinert_out = mx::reshape(fwd[3], {B, nb, 10});
-                cvel_out = mx::reshape(fwd[4], {B, nb, 6});
-                qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
+                // forwardの出力はSoA(成分*B+env)。solver/eulerはSoAのまま読み、state出力は転置してAoSに戻す。
+                auto fwd_aos = [&](int idx, int per, mx::Shape shp) { return mx::reshape(mx::transpose(mx::reshape(fwd[idx], {per, B})), shp); };
+                subtree_com_out = fwd_aos(2, nb * 3, {B, nb, 3});
+                cinert_out = fwd_aos(3, nb * 10, {B, nb, 10});
+                cvel_out = fwd_aos(4, nb * 6, {B, nb, 6});
+                qfrc_actuator_out = fwd_aos(5, nv, {B, nv});
                 auto cdof_flat = fwd[7]; // (B * nv * 6)
 
                 // ── Collision + Solver ──
@@ -903,7 +905,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         {
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
-                                 mx::flatten(subtree_com_out),
+                                 mx::flatten(fwd[2]),
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
@@ -946,8 +948,9 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     xpos, xquat, xmat, xipos, ximat,
                     xanchor, xaxis, gxpos, gxmat
                 });
-                qM_flat = mx::flatten(mid[0]);
-                qfrc_smooth_flat = mx::flatten(mid[1]);
+                // eulerはSoA(成分*B+env)で読むので、vmap経路のAoS出力を転置する
+                qM_flat = mx::flatten(mx::transpose(mx::reshape(mid[0], {B, nv * nv})));
+                qfrc_smooth_flat = mx::flatten(mx::transpose(mx::reshape(mid[1], {B, nv})));
                 qfrc_constraint_flat = mx::flatten(mid[2]);
                 subtree_com_out = mx::reshape(mid[4], {B, nb, 3});
                 cinert_out = mx::reshape(mid[5], {B, nb, 10});

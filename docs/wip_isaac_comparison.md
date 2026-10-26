@@ -95,6 +95,12 @@
 - 結果(接触あり、substepあたり): kin.eval 34 → 3.4 ms、`env.step` 平均 755 → 665 ms。
 - 検証: gpu_vs_cpu_humanoid / high_dof、piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験9: forwardの出力(作業領域)もSoA化(forward 37→6 ms)
+- forwardカーネルは出力バッファ(qM/cinert/cvel/subtree_com/qfrc/cdof)を**作業メモリとして読み書き**しており、AoSのためスレッドごとに散らばった大量のglobalアクセスが発生していた。
+- 対策: これらの出力を全部SoAにし(`X_out[off+e]` → `X_out[e*B+env]` を機械的に置換)、forward TGの既定を8→64に。solver/eulerもSoAで読む(solverはworkgroup=1env なので `NBATCH=gl_NumWorkGroups.x`)。state出力(subtree_com/cinert/cvel/qfrc_actuator)とvmap経路は転置でAoSに戻す。
+- 結果(接触あり、substepあたり): forward.eval 37 → **6 ms**。`env.step`(4096 env) 平均 665 → **533 ms**。
+- 検証: gpu_vs_cpu_humanoid / high_dof、piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

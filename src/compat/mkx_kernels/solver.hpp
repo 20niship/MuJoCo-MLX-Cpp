@@ -130,6 +130,7 @@ shared float tg_pAp;
   std::ostringstream ss;
 
   ss << "uint bid = gl_WorkGroupID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x;\n"
      << "uint tid = gl_LocalInvocationID.x;\n"
      << "const int NV = " << nv << ";\n"
      << "const int NB = " << nb << ";\n"
@@ -332,13 +333,13 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
 
     {
         int rid = int(body_rootid_buf[body2]);
-        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
-        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
-        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        float ox = c_pos_x - subtree_com_in[uint(rid*3)*NBATCH+bid];
+        float oy = c_pos_y - subtree_com_in[uint(rid*3+1)*NBATCH+bid];
+        float oz = c_pos_z - subtree_com_in[uint(rid*3+2)*NBATCH+bid];
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body2*NV+di] < 0.5f) continue;
-            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
-            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            float ax=cdof_in[uint(di*6)*NBATCH+bid],ay=cdof_in[uint(di*6+1)*NBATCH+bid],az=cdof_in[uint(di*6+2)*NBATCH+bid];
+            float lx=cdof_in[uint(di*6+3)*NBATCH+bid],ly=cdof_in[uint(di*6+4)*NBATCH+bid],lz=cdof_in[uint(di*6+5)*NBATCH+bid];
             jacp_tmp(di*3+0) += lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) += ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) += lz + (ax*oy - ay*ox);
@@ -346,13 +347,13 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     }
     {
         int rid = int(body_rootid_buf[body1]);
-        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
-        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
-        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        float ox = c_pos_x - subtree_com_in[uint(rid*3)*NBATCH+bid];
+        float oy = c_pos_y - subtree_com_in[uint(rid*3+1)*NBATCH+bid];
+        float oz = c_pos_z - subtree_com_in[uint(rid*3+2)*NBATCH+bid];
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body1*NV+di] < 0.5f) continue;
-            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
-            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            float ax=cdof_in[uint(di*6)*NBATCH+bid],ay=cdof_in[uint(di*6+1)*NBATCH+bid],az=cdof_in[uint(di*6+2)*NBATCH+bid];
+            float lx=cdof_in[uint(di*6+3)*NBATCH+bid],ly=cdof_in[uint(di*6+4)*NBATCH+bid],lz=cdof_in[uint(di*6+5)*NBATCH+bid];
             jacp_tmp(di*3+0) -= lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) -= ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) -= lz + (ax*oy - ay*ox);
@@ -431,7 +432,7 @@ if (nefc == 0) {
     return;
 }
 
-{ float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[qm_off + int(tid)*NV + j]*qacc(j); Ma(int(tid)) = s; }
+{ float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[uint(int(tid)*NV + j)*NBATCH+bid]*qacc(j); Ma(int(tid)) = s; }
 barrier(); memoryBarrierBuffer();
 
 if (tid == 0u) {
@@ -444,7 +445,7 @@ if (tid == 0u) {
 barrier(); memoryBarrierBuffer();
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
-  grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
+  grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[uint(int(tid))*NBATCH+bid] - s; }
 barrier(); memoryBarrierBuffer();
 
 if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
@@ -462,7 +463,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         if (tg_rr < 1e-20f || tg_rr < CG_TOL * tg_rr0) break;  // 残差2乗が初期値の相対CG_TOL未満なら不正確なNewton方向で十分
 
         float mp = MJMINVAL_SV * cg_p(int(tid));
-        for (int j = 0; j < NV; j++) mp += qM_in[qm_off + int(tid)*NV + j] * cg_p(j);
+        for (int j = 0; j < NV; j++) mp += qM_in[uint(int(tid)*NV + j)*NBATCH+bid] * cg_p(j);
 
         for (int r2 = int(tid); r2 < nefc; r2 += NV) {
             float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*cg_p(j);
@@ -491,7 +492,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         barrier(); memoryBarrierBuffer();
     }
 
-    { float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[qm_off + int(tid)*NV + j]*search_d(j); Mv_arr(int(tid)) = s; }
+    { float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[uint(int(tid)*NV + j)*NBATCH+bid]*search_d(j); Mv_arr(int(tid)) = s; }
     barrier(); memoryBarrierBuffer();
 
     if (tid == 0u) {
@@ -500,7 +501,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
             Jv_arr(r2) = s;
         }
         float qg=0.0f,lg=0.0f,qc=0.0f,lc=0.0f;
-        for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]); }
+        for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-qfrc_smooth_in[uint(i)*NBATCH+bid]); }
         for (int r2 = 0; r2 < nefc; r2++) { qc += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc += -efc_force(r2)*Jv_arr(r2); }
         float dnom = 2.0f*(qg+qc);
         float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
@@ -526,7 +527,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         float als[5] = float[](abis, an, 0.5f*an, 0.1f*an, 0.01f);
         float bc = 1e30f, ba_local = 0.0f;
         float cc2=0.0f; for (int r2 = 0; r2 < nefc; r2++) cc2 += efc_cost(efc_D(r2), Jaref(r2), efc_floss(r2));
-        float cg=0.0f; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*qacc(i);
+        float cg=0.0f; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[uint(i)*NBATCH+bid])*qacc(i);
         bc = cc2+cg;
         for (int ai = 0; ai < 5; ai++) {
             float a = als[ai]; float tc2=0.0f;
@@ -548,7 +549,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
     barrier(); memoryBarrierBuffer();
 
     { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
-      grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
+      grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[uint(int(tid))*NBATCH+bid] - s; }
     barrier(); memoryBarrierBuffer();
     // 勾配ノルムが初期値の相対GTOL_REL(2乗比)未満なら収束とみなして打ち切る。静止付近のenvは少ない反復で収束し、残りのNSOLVE回を省ける。
     if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); if (gn < GTOL_REL*tg_g0) tg_done = 1; }
