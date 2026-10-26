@@ -117,6 +117,13 @@
 - 共有メモリ版はglobalメモリバリア(`memoryBarrierBuffer`)を外した(31→27.5 ms)。`MJMLX_KEEP_MBB=1` で従来動作。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験12: solverの前処理(ゼロ埋め・初期勾配)を削る
+- `MJMLX_SABL=5`(ゼロ埋め直後)で測ると、solverの前処理のゼロ埋めだけで約6 ms/substep。共有メモリ版はJ/D/aref/floss等を行を作る時に全要素書くようにし、global scratchと共有メモリの一括ゼロ埋めを廃止(→0.8 ms)。
+- 初期勾配は `qacc=0` なので `Ma=0`、`Jaref=-aref`。1スレッドで回していた行列ベクトル積を省き、行ごとの更新を全スレッドで並列化。
+- **計測のぶれ対策**: 別プロセスのollamaが動くと各段が2〜3倍にぶれる。`scripts/prof_min.sh [build-dir] [回数]` で複数回回して段ごとの最小値を取る。
+- 静かな時の最小値(substepあたり、接触あり): solver 18.4 / collision 4.7 / forward 3.2 / cfrc 2.5 / kin 1.3 / euler 1.0 ms(合計 約31 ms)。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

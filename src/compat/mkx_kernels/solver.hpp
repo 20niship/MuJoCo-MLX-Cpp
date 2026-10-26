@@ -203,15 +203,15 @@ shared float tg_pAp;
   ss << "const int CG_ITERS = " << cg_iters << ";\n"
      << "const float CG_TOL = " << solver_fmt_float(cg_tol) << "f;\n\n";
 
-  if(use_shared) {
-    ss << "for (int ii = int(tid); ii < " << nv * nv << "; ii += NV) sh_H[ii] = 0.0f;\n"
-       << "for (int ii = int(tid); ii < " << max_efc * nv << "; ii += NV) sh_J[ii] = 0.0f;\n"
-       << "for (int ii = int(tid); ii < " << max_efc << "; ii += NV) { sh_D[ii] = 0.0f; sh_aref[ii] = 0.0f; sh_force[ii] = 0.0f; sh_Jaref[ii] = 0.0f; sh_act[ii] = 0.0f; sh_floss[ii] = 0.0f; sh_Jv[ii] = 0.0f; }\n"
-       << "sh_grad[tid] = 0.0f; sh_search[tid] = 0.0f; sh_qacc[tid] = 0.0f; sh_Ma[tid] = 0.0f; sh_Mv[tid] = 0.0f;\n";
+  if(!use_shared) {
+    ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
+       << "barrier(); memoryBarrierBuffer();\n\n";
+  } else {
+    // 共有メモリ版は全域のゼロ埋めをしない: 拘束行(J/D/aref/floss)は作る時に全要素を書き、qacc等は読む前に必ず書く。
+    ss << "sh_qacc[tid] = 0.0f;\nbarrier();\n\n";
   }
-  ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
-     << "barrier(); memoryBarrierBuffer();\n\n";
 
+  ss << "SABL0\n";
   ss << "if (tid == 0u) {\n"
      << "int ncon = int(contact_count_in[bid]);\n"
      << "int nefc = 0;\n\n";
@@ -226,6 +226,7 @@ for (int fi = 0; fi < NFL; fi++) {
     float k_f, b_f, imp_f;
     efc_kbi(fric_tab[fp+2], fric_tab[fp+3], fric_tab[fp+4], fric_tab[fp+5], fric_tab[fp+6], fric_tab[fp+7], fric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
     float r_f = max(fric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
+    for (int di = 0; di < NV; di++) J(nefc, di) = 0.0f;
     J(nefc, dof) = 1.0f;
     efc_D(nefc) = 1.0f / r_f;
     efc_aref(nefc) = -b_f * qvel_in[qv_off + dof];
@@ -250,6 +251,8 @@ for (int li = 0; li < NLIM; li++) {
         float k_l, b_l, imp_l;
         efc_kbi(lim_tab[lp+5], lim_tab[lp+6], lim_tab[lp+7], lim_tab[lp+8], lim_tab[lp+9], lim_tab[lp+10], lim_tab[lp+11], pos, k_l, b_l, imp_l);
         float r_l = max(lim_tab[lp+12] * (1.0f - imp_l) / imp_l, MJMINVAL_CV);
+        for (int di = 0; di < NV; di++) J(nefc, di) = 0.0f;
+        efc_floss(nefc) = 0.0f;
         J(nefc, dof) = sgn;
         efc_D(nefc) = 1.0f / r_l;
         efc_aref(nefc) = -b_l * (sgn * qvel_in[qv_off + dof]) - k_l * imp_l * pos;
@@ -280,6 +283,7 @@ barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     int row = tg_crow0[ci];
     if (tg_crow0[ci+1] == row) continue;
+    for (int rr = row; rr < tg_crow0[ci+1]; rr++) efc_floss(rr) = 0.0f;
     int ci_off = int(con_off) + ci * CON_STRIDE;
     float c_pos_x = contact_data_in[ci_off+0];
     float c_pos_y = contact_data_in[ci_off+1];
@@ -433,16 +437,9 @@ if (nefc == 0) {
     return;
 }
 
-{ float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[uint(int(tid)*NV + j)*NBATCH+bid]*qacc(j); Ma(int(tid)) = s; }
-barrier(); memoryBarrierBuffer();
-
-if (tid == 0u) {
-    for (int r2 = 0; r2 < nefc; r2++) {
-        float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*qacc(j);
-        Jaref(r2) = s - efc_aref(r2);
-    }
-    for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
-}
+// qacc=0から始めるので M*qacc=0、J*qacc=0(Jaref=-aref)。行ごとに独立なので全スレッドで並列に更新する。
+Ma(int(tid)) = 0.0f;
+for (int r2 = int(tid); r2 < nefc; r2 += NV) { Jaref(r2) = -efc_aref(r2); EFC_REFRESH(r2); }
 barrier(); memoryBarrierBuffer();
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
@@ -584,6 +581,7 @@ if (tid == 0u) {
         if (p != std::string::npos) body.replace(p, key.size(), on ? "{ float chk_ = " + chk + "; qfrc_constraint_out[qfc_off + int(tid)] = chk_; return; }" : std::string());
     };
     const std::string rows = "0.0f; for (int r2 = 0; r2 < nefc; r2++) chk_ += J(r2,int(tid))*(efc_D(r2)+efc_aref(r2)+efc_force(r2))";
+    rep("SABL0", sabl == 5, "sh_H[0] + sh_J[int(tid)] + solver_scratch[s_off + int(tid)]");
     rep("SABL1", sabl == 1, rows);
     rep("SABL2", sabl == 2, "grad(int(tid))");
     rep("SABL3", sabl == 3, "search_d(int(tid))");
