@@ -12,8 +12,8 @@ from tensordict import TensorDict
 
 from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
 
-PHYSICS_DT = 0.004  # go2_mjx.xml本来のtimestep。0.02ではPD(kp=50,armature=0.01)が陽的積分で不安定
-DECIMATION = 5  # 5*0.004 = 0.02s -> 50Hz制御
+PHYSICS_DT = 0.005  # Isaac LabのGo2と同じdt(0.005s x decimation 4)。0.01以上ではPD(kp=50,armature=0.01)が陽的積分で不安定
+DECIMATION = 4  # 4*0.005 = 0.02s -> 50Hz制御
 CONTROL_DT = PHYSICS_DT * DECIMATION
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
