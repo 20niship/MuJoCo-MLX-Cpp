@@ -348,9 +348,9 @@ static void validate_model(const mjModel* m) {
 
     // Integrator types: Euler, RK4, Implicit, ImplicitFast all supported
 
-    // Check for sensors (not supported)
+    // sensorはbatched経路(mjmlx_batched_get_sensordata)のみ対応。単体経路では計算しない。
     if (m->nsensor > 0)
-        fprintf(stderr, "[mjmlx WARNING] Model has %lld sensors -- not supported, ignored.\n", (long long)m->nsensor);
+        fprintf(stderr, "[mjmlx WARNING] Model has %lld sensors -- computed only by the batched sim (mjmlx_batched_get_sensordata).\n", (long long)m->nsensor);
 }
 
 // Load a MuJoCo C model and convert to internal Model.

@@ -1197,6 +1197,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
                 model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
+            handle->sim.sensor = mjmlx::make_sensor_ctx(model->mj_model, B);
         }
 
         return handle;
@@ -1225,6 +1226,7 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
         ? mx::reshape(mx::array(ctrl_flat, {B * nu}, mx::float32), {B, nu})
         : mx::zeros({B, ctrl_dim});
 
+    if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
     auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
     s.qpos = results[0];
     s.qvel = results[1];
@@ -1322,6 +1324,31 @@ MJMLX_API const float* mjmlx_batched_get_cinert(const MjmlxBatchedSim* sim, int*
     return (sim->sim.cinert.size() > 0) ? sim->sim.cinert.data<float>() : nullptr;
 }
 
+MJMLX_API int mjmlx_batched_nsensordata(const MjmlxBatchedSim* sim) {
+    if (!sim) return 0;
+    if (sim->cpu_mode) return sim->cpu_model->nsensordata;
+    return sim->sim.sensor ? mjmlx::sensor_nsensordata(*sim->sim.sensor) : 0;
+}
+
+MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, int* n_out) {
+    if (n_out) *n_out = 0;
+    if (!sim) return nullptr;
+    int nsd = mjmlx_batched_nsensordata(sim);
+    if (nsd == 0) return nullptr;
+    int B = sim->sim.num_envs;
+    if (n_out) *n_out = B * nsd;
+
+    if (sim->cpu_mode) {
+        sim->sensordata_buf.resize((size_t)B * nsd);
+        for (int i = 0; i < B; i++)
+            for (int j = 0; j < nsd; j++) sim->sensordata_buf[(size_t)i * nsd + j] = (float)sim->cpu_datas[i]->sensordata[j];
+        return sim->sensordata_buf.data();
+    }
+
+    mjmlx::sensor_compute(*sim->sim.sensor, sim->sim, sim->sensordata_buf);
+    return sim->sensordata_buf.data();
+}
+
 MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n_out) {
     if (!sim) return nullptr;
     mx::eval(sim->sim.cvel);
@@ -1364,6 +1391,7 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
     auto& s = sim->sim;
     int B = s.num_envs;
     int nq = s.model->nq, nv = s.model->nv;
+    if (s.sensor) mjmlx::sensor_mark_reset(*s.sensor, reset_mask, B);
 
     mx::eval(s.qpos, s.qvel);
     std::vector<float> qp(s.qpos.data<float>(), s.qpos.data<float>() + B * nq);
