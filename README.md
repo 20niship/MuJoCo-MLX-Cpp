@@ -126,7 +126,7 @@ uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir bui
 - **地形カリキュラム**: 実装対象外(固定難度の階段地形のみ)
 - **heading_command方式のcmd_vel生成**: `||cmd_vel|| ∈ [--cmd-vel-min, --cmd-vel-max]`の直接サンプリングに簡略化
 
-## Performance measurement(学習速度・CPU/GPU差・他ツールとの比較)
+## Performance measurement(学習速度・CPU/GPU差・Isaac Labとの比較)
 
 事前に別プロセス(ollama等)がGPU/CPUを使っていないか確認する(各段の時間が2〜3倍ぶれる)。以降のスクリプトは `--build-dir`(既定 `build`)でPython拡張のビルド先を指す。
 
@@ -158,22 +158,6 @@ uv run python scripts/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # �
 just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
 ```
 長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
-
-### 4. 経路探索(vamp)との比較の測り方
-本リポジトリには経路探索(motion planning)の実装は無い。比較対象のベースラインとして [vamp](https://github.com/KavrakiLab/vamp)(CPU SIMDのRRT-Connect等)の計画時間は次で測れる:
-```bash
-uv venv --python 3.12 .venv-vamp && uv pip install --python .venv-vamp/bin/python vamp-planner numpy
-```
-```python
-import time, numpy as np, vamp
-a = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]); b = np.array([2.35, 1.0, 0.0, -0.8, 0.0, 2.5, 0.785])
-env = vamp.Environment(); env.add_sphere(vamp.Sphere([0.55, 0.0, 0.25], 0.2))   # 障害物を足して難しくする
-rng = vamp.panda.xorshift(); ts = []
-for _ in range(20):
-    t = time.perf_counter(); r = vamp.panda.rrtc(a, b, env, vamp.RRTCSettings(), rng); ts.append((time.perf_counter() - t) * 1e3)
-print(f"solved={r.solved} median={np.median(ts):.3f} ms")   # 球1個の単純な場面で約0.03 ms(AVX2のCPU)
-```
-難しい問題セットはvampが配布するMotionBenchMaker(bookshelf / cage / table など)を使う。
 
 ## Architecture
 
