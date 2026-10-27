@@ -81,10 +81,11 @@ const char* kVert = R"(
 #version 450
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_nrm;
+layout(location = 2) in vec2 in_uv;
 layout(std430, binding = 0) readonly buffer GX { float geom_xpos[]; };
 layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };
 layout(std430, binding = 2) readonly buffer CP { vec4 cam[]; };
-struct G { vec4 rgba; vec4 ms; uvec4 ids; };
+struct G { vec4 rgba; vec4 ms; uvec4 ids; vec4 tx; };
 layout(std430, binding = 3) readonly buffer GT { G gt[]; };
 )" "$COMMON" R"(
 layout(location = 0) out vec3 v_world;
@@ -92,6 +93,7 @@ layout(location = 1) out vec3 v_nrm;
 layout(location = 2) out float v_depth;
 layout(location = 3) flat out uint v_vis;
 layout(location = 4) flat out uint v_cam;
+layout(location = 5) out vec2 v_uv;
 out float gl_ClipDistance[4];
 void main() {
   uint idx = uint(gl_InstanceIndex);
@@ -102,7 +104,7 @@ void main() {
   mat3 R;
   for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = geom_xmat[(g * 9u + 3u * i + j) * pc.B + e];
   vec3 world = gp + R * in_pos;
-  v_world = world; v_nrm = R * in_nrm; v_vis = vis; v_cam = ec;
+  v_world = world; v_nrm = R * in_nrm; v_vis = vis; v_cam = ec; v_uv = in_uv;
 
   vec4 c0 = cam[ec * 4u];
   vec3 d = world - c0.xyz;
@@ -132,19 +134,28 @@ layout(location = 1) in vec3 v_nrm;
 layout(location = 2) in float v_depth;
 layout(location = 3) flat in uint v_vis;
 layout(location = 4) flat in uint v_cam;
+layout(location = 5) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 layout(location = 1) out float o_depth;
 layout(std430, binding = 2) readonly buffer CP { vec4 cam[]; };
-struct G { vec4 rgba; vec4 ms; uvec4 ids; };
+struct G { vec4 rgba; vec4 ms; uvec4 ids; vec4 tx; };
 layout(std430, binding = 3) readonly buffer GT { G gt[]; };
 struct L { vec4 pos; vec4 dir; vec4 diffuse; vec4 ambient; vec4 specular; };
 layout(std430, binding = 4) readonly buffer LT { L lights[]; };
+layout(std430, binding = 8) readonly buffer TX { uint texels[]; };
 )" "$COMMON" R"(
 void main() {
   G g = gt[v_vis];
   vec3 V = normalize(cam[v_cam * 4u].xyz - v_world);
   vec3 N = normalize(v_nrm);
   if (dot(N, V) < 0.0) N = -N;
+  vec3 base = g.rgba.xyz;
+  if (g.ids.y != 0u) {
+    uint w = g.ids.w >> 16, h = g.ids.w & 0xffffu;
+    vec2 f = fract(v_uv);
+    uint px = texels[g.ids.z + min(uint(f.y * float(h)), h - 1u) * w + min(uint(f.x * float(w)), w - 1u)];
+    base *= vec3(float(px & 255u), float((px >> 8) & 255u), float((px >> 16) & 255u)) / 255.0;
+  }
   float shin = max(g.ms.y * 128.0, 1.0);
   vec3 col = vec3(0.0);
   for (uint i = 0u; i < pc.nlights; i++) {
@@ -153,7 +164,7 @@ void main() {
     vec3 Ld = type == 2 ? cam[v_cam * 4u + 3u].xyz : (type == 1 ? -normalize(l.dir.xyz) : normalize(l.pos.xyz - v_world));
     float nd = max(dot(N, Ld), 0.0);
     float sp = nd > 0.0 ? pow(max(dot(N, normalize(Ld + V)), 0.0), shin) : 0.0;
-    col += l.ambient.xyz * g.rgba.xyz + l.diffuse.xyz * nd * g.rgba.xyz + l.specular.xyz * sp * g.ms.x;
+    col += l.ambient.xyz * base + l.diffuse.xyz * nd * base + l.specular.xyz * sp * g.ms.x;
   }
   o_color = vec4(clamp(col, 0.0, 1.0), 1.0);
   o_depth = v_depth;
@@ -194,7 +205,7 @@ std::vector<uint32_t> compile_glsl(const std::string& source, const char* stage)
 
 // ── ジオメトリ(geomローカル座標)────────────────────────────────────────────────
 
-struct Vtx { float p[3]; float n[3]; };
+struct Vtx { float p[3]; float n[3]; float uv[2]; };
 struct Mesh { std::vector<Vtx> v; std::vector<uint32_t> i; };
 
 struct ProfilePt { float r, z, nr, nz; };
@@ -288,6 +299,51 @@ Mesh make_primitive(int type, const float* s) {
     return {};
 }
 
+// 平面状のUV(MuJoCoのplane/box/hfieldの2Dテクスチャ写像: 中心がu=0.5, vは+y側が小さい)。
+void apply_planar_uv(Mesh& m, float hx, float hy, const float* rep, bool uniform) {
+    for (auto& v : m.v) {
+        v.uv[0] = (uniform ? v.p[0] * rep[0] / 2 : rep[0] * v.p[0] / (2 * hx)) + 0.5f;
+        v.uv[1] = 0.5f - (uniform ? v.p[1] * rep[1] / 2 : rep[1] * v.p[1] / (2 * hy));
+    }
+}
+
+void smooth_normals(Mesh& m) {
+    std::vector<float> acc(m.v.size() * 3, 0.0f);
+    for (size_t t = 0; t + 2 < m.i.size(); t += 3) {
+        const float *a = m.v[m.i[t]].p, *b = m.v[m.i[t + 1]].p, *c = m.v[m.i[t + 2]].p;
+        float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        for (int k = 0; k < 3; k++) for (int j = 0; j < 3; j++) acc[m.i[t + k] * 3 + j] += n[j];
+    }
+    for (size_t v = 0; v < m.v.size(); v++) {
+        float* n = &acc[v * 3];
+        float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l < 1e-20f) { n[0] = 0; n[1] = 0; n[2] = 1; l = 1; }
+        for (int j = 0; j < 3; j++) m.v[v].n[j] = n[j] / l;
+    }
+}
+
+// 高さ格子: x=(2c/(ncol-1)-1)*size0, y=(2r/(nrow-1)-1)*size1, z=data*size2。側面のskirtは作らない。
+Mesh make_hfield(const mjModel* m, int id) {
+    Mesh out;
+    int nr = m->hfield_nrow[id], nc = m->hfield_ncol[id];
+    const float* data = m->hfield_data + m->hfield_adr[id];
+    float sx = (float)m->hfield_size[4 * id], sy = (float)m->hfield_size[4 * id + 1], sz = (float)m->hfield_size[4 * id + 2];
+    for (int r = 0; r < nr; r++)
+        for (int c = 0; c < nc; c++) {
+            Vtx v{};
+            v.p[0] = (2.0f * c / (nc - 1) - 1) * sx; v.p[1] = (2.0f * r / (nr - 1) - 1) * sy; v.p[2] = data[r * nc + c] * sz;
+            out.v.push_back(v);
+        }
+    for (int r = 0; r + 1 < nr; r++)
+        for (int c = 0; c + 1 < nc; c++) {
+            uint32_t a = r * nc + c, b = a + 1, d = a + nc, e = d + 1;
+            out.i.insert(out.i.end(), {a, b, e, a, e, d});
+        }
+    smooth_normals(out);
+    return out;
+}
+
 Mesh make_mesh(const mjModel* m, int id) {
     Mesh out;
     int va = m->mesh_vertadr[id], vn = m->mesh_vertnum[id], fa = m->mesh_faceadr[id], fn = m->mesh_facenum[id];
@@ -321,7 +377,7 @@ void vk_check(VkResult r, const char* what) {
 struct GpuBuf { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; size_t size = 0; };
 
 // std430のvec4/uvec4配列と合わせるための構造体(CPU側)。
-struct GeomRec { float rgba[4]; float ms[4]; uint32_t ids[4]; };
+struct GeomRec { float rgba[4]; float ms[4]; uint32_t ids[4]; float tx[4]; };
 struct LightRec { float pos[4], dir[4], diffuse[4], ambient[4], specular[4]; };
 struct CamConst { float a[4], b[4], rl[3][4], rw[3][4]; int32_t ids[4]; };
 struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, pad0; float aspect, znear, zfar, pad1; };
@@ -339,7 +395,7 @@ struct MjmlxCameraRenderer {
     uint32_t draw_count = 0;
     std::vector<float> clear_rgb = {0.2f, 0.3f, 0.4f};
 
-    GpuBuf vbo, ibo, indirect, gtab, lights, camc, campose;
+    GpuBuf vbo, ibo, indirect, gtab, lights, camc, campose, texbuf;
     VkImage img_color = VK_NULL_HANDLE, img_depth = VK_NULL_HANDLE, img_zbuf = VK_NULL_HANDLE;
     VkDeviceMemory mem_color = VK_NULL_HANDLE, mem_depth = VK_NULL_HANDLE, mem_zbuf = VK_NULL_HANDLE;
     VkImageView view_color = VK_NULL_HANDLE, view_depth = VK_NULL_HANDLE, view_zbuf = VK_NULL_HANDLE;
@@ -447,7 +503,7 @@ struct MjmlxCameraRenderer {
     ~MjmlxCameraRenderer() {
         if (!h.device) return;
         vkDeviceWaitIdle(h.device);
-        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &rb_color, &rb_depth}) destroy(*b);
+        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &rb_color, &rb_depth}) destroy(*b);
         if (dpool) vkDestroyDescriptorPool(h.device, dpool, nullptr);
         if (gfx) vkDestroyPipeline(h.device, gfx, nullptr);
         if (comp) vkDestroyPipeline(h.device, comp, nullptr);
@@ -481,16 +537,26 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     std::vector<Range> ranges;
     std::vector<GeomRec> grecs;
     std::map<int, Range> mesh_cache;
+    std::map<int, uint32_t> tex_off;
+    std::vector<uint32_t> texels;
     for (int g = 0; g < m->ngeom; g++) {
-        if (m->geom_group[g] > 2 || m->geom_type[g] == mjGEOM_HFIELD) continue;
+        if (m->geom_group[g] > 2) continue;
         Range r;
         bool is_mesh = m->geom_type[g] == mjGEOM_MESH;
+        int mid = m->geom_matid[g];
+        int tid = (mid >= 0 && (m->geom_type[g] == mjGEOM_PLANE || m->geom_type[g] == mjGEOM_BOX || m->geom_type[g] == mjGEOM_HFIELD)) ? m->mat_texid[mid * mjNTEXROLE + mjTEXROLE_RGB] : -1;
+        if (tid >= 0 && m->tex_type[tid] != mjTEXTURE_2D) tid = -1;
         auto cached = is_mesh ? mesh_cache.find(m->geom_dataid[g]) : mesh_cache.end();
         if (cached != mesh_cache.end()) r = cached->second;
         else {
             float s[3] = {(float)m->geom_size[3 * g], (float)m->geom_size[3 * g + 1], (float)m->geom_size[3 * g + 2]};
-            Mesh me = is_mesh ? make_mesh(m, m->geom_dataid[g]) : make_primitive(m->geom_type[g], s);
+            Mesh me = is_mesh ? make_mesh(m, m->geom_dataid[g]) : m->geom_type[g] == mjGEOM_HFIELD ? make_hfield(m, m->geom_dataid[g]) : make_primitive(m->geom_type[g], s);
             if (me.i.empty()) continue;
+            if (tid >= 0) {
+                bool hf = m->geom_type[g] == mjGEOM_HFIELD;
+                float hx = hf ? (float)m->hfield_size[4 * m->geom_dataid[g]] : (s[0] > 0 ? s[0] : 100.0f), hy = hf ? (float)m->hfield_size[4 * m->geom_dataid[g] + 1] : (s[1] > 0 ? s[1] : 100.0f);
+                apply_planar_uv(me, hx, hy, &m->mat_texrepeat[2 * mid], m->mat_texuniform[mid] != 0);
+            }
             if (!is_mesh) orient_outward(me);
             r = {(uint32_t)idx.size(), (uint32_t)me.i.size(), (int32_t)vtx.size()};
             vtx.insert(vtx.end(), me.v.begin(), me.v.end());
@@ -499,7 +565,6 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         }
         ranges.push_back(r);
         GeomRec gr{};
-        int mid = m->geom_matid[g];
         const float* rgba = &m->geom_rgba[4 * g];
         bool def = rgba[0] == 0.5f && rgba[1] == 0.5f && rgba[2] == 0.5f && rgba[3] == 1.0f;
         const float* use = (mid >= 0 && def) ? &m->mat_rgba[4 * mid] : rgba;
@@ -507,6 +572,18 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         gr.ms[0] = mid >= 0 ? m->mat_specular[mid] : 0.5f;
         gr.ms[1] = mid >= 0 ? m->mat_shininess[mid] : 0.5f;
         gr.ids[0] = (uint32_t)g;
+        if (tid >= 0) {
+            if (!tex_off.count(tid)) {
+                int tw = m->tex_width[tid], th = m->tex_height[tid], nch = m->tex_nchannel[tid];
+                tex_off[tid] = (uint32_t)texels.size();
+                const unsigned char* src = m->tex_data + m->tex_adr[tid];
+                for (int k = 0; k < tw * th; k++) {
+                    const unsigned char* q = src + k * nch;
+                    texels.push_back(q[0] | (uint32_t)q[nch > 1 ? 1 : 0] << 8 | (uint32_t)q[nch > 2 ? 2 : 0] << 16 | 0xff000000u);
+                }
+            }
+            gr.ids[1] = 1; gr.ids[2] = tex_off[tid]; gr.ids[3] = ((uint32_t)m->tex_width[tid] << 16) | (uint32_t)m->tex_height[tid];
+        }
         grecs.push_back(gr);
     }
     nvis = (uint32_t)ranges.size();
@@ -588,6 +665,8 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vbo = make_device_buf(vtx.data(), vtx.size() * sizeof(Vtx), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     ibo = make_device_buf(idx.data(), idx.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     indirect = make_device_buf(cmds.data(), cmds.size() * sizeof(VkDrawIndexedIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    if (texels.empty()) texels.push_back(0);
+    texbuf = make_device_buf(texels.data(), texels.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     gtab = make_device_buf(grecs.data(), grecs.size() * sizeof(GeomRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     lights = make_device_buf(lrecs.data(), lrecs.size() * sizeof(LightRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     camc = make_device_buf(ccs.data(), ccs.size() * sizeof(CamConst), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -633,16 +712,16 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vk_check(vkCreateFramebuffer(h.device, &fbi, nullptr, &fb), "vkCreateFramebuffer");
 
     // ディスクリプタ: 0 geom_xpos, 1 geom_xmat, 2 campose, 3 geom表, 4 光源, 5 body_xpos, 6 body_xmat, 7 カメラ定数。
-    VkDescriptorSetLayoutBinding lb[8];
-    for (uint32_t i = 0; i < 8; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutBinding lb[9];
+    for (uint32_t i = 0; i < 9; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 8; sli.pBindings = lb;
+    sli.bindingCount = 9; sli.pBindings = lb;
     vk_check(vkCreateDescriptorSetLayout(h.device, &sli, nullptr, &set_layout), "vkCreateDescriptorSetLayout");
     VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushC)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &set_layout; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
     vk_check(vkCreatePipelineLayout(h.device, &pli, nullptr, &pipe_layout), "vkCreatePipelineLayout");
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
     vk_check(vkCreateDescriptorPool(h.device, &dpi, nullptr, &dpool), "vkCreateDescriptorPool");
@@ -651,14 +730,15 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vk_check(vkAllocateDescriptorSets(h.device, &dai, &dset), "vkAllocateDescriptorSets");
     VkDescriptorBufferInfo bi[3] = {{campose.buf, 0, VK_WHOLE_SIZE}, {gtab.buf, 0, VK_WHOLE_SIZE}, {lights.buf, 0, VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo bc{camc.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[4]{};
-    uint32_t bind[4] = {2, 3, 4, 7};
-    const VkDescriptorBufferInfo* infos[4] = {&bi[0], &bi[1], &bi[2], &bc};
-    for (int i = 0; i < 4; i++) {
+    VkDescriptorBufferInfo bt{texbuf.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[5]{};
+    uint32_t bind[5] = {2, 3, 4, 7, 8};
+    const VkDescriptorBufferInfo* infos[5] = {&bi[0], &bi[1], &bi[2], &bc, &bt};
+    for (int i = 0; i < 5; i++) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = dset; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = infos[i];
     }
-    vkUpdateDescriptorSets(h.device, 4, w, 0, nullptr);
+    vkUpdateDescriptorSets(h.device, 5, w, 0, nullptr);
 
     // パイプライン。
     m_comp = make_module(compile_glsl(with_common(kCamComp), "comp"));
@@ -673,9 +753,9 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, m_vert, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m_frag, "main", nullptr}};
     VkVertexInputBindingDescription vb{0, sizeof(Vtx), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}};
+    VkVertexInputAttributeDescription va[3] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}, {2, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb; vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = va;
+    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb; vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = va;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, (float)img_w, (float)img_h, 0, 1};

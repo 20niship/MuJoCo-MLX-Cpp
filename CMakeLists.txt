@@ -387,6 +387,11 @@ if(MJMLX_BUILD_PYTHON)
     target_include_directories(_mjmlx_rl_native PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    # MuJoCo Renderer(GL要)とのhfield/texture比較。GL環境が無いCIでは回さないのでcorrectnessには含めない。
+    if(MJMLX_BUILD_TESTS)
+        add_test(NAME camera_vs_mujoco COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_mujoco.py ${CMAKE_BINARY_DIR})
+        set_tests_properties(camera_vs_mujoco PROPERTIES LABELS "mujoco_render")
+    endif()
     set_target_properties(_mjmlx_rl_native PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
