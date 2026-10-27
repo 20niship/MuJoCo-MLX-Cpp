@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/cmake_install.cmake",
-		"/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/extern/mlx_vulkan/cmake_install.cmake",
-		"/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/_deps/doctest-build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

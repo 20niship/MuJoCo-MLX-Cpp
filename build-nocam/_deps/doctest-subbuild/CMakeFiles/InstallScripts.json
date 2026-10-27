@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/_deps/doctest-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
