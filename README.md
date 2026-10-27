@@ -157,6 +157,14 @@ uv run python scripts/compare_cpu_gpu_go2.py --build-dir build              # �
 uv run python scripts/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
 just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
 ```
+
+#### CPU(MuJoCo C)とGPU(MKX/Vulkan)の比較動画
+
+`just check-video-export` が生成する、piper / openarm / go2 / g1 の4ロボットを左CPU・右GPUで並べたタイル動画(3秒)。
+
+(動画リンクは準備中)
+
+動画はリポジトリには含めない(サイズが大きいため)。上のコマンドで `runs/video/compare.mp4` に生成される。arm2種はCPUとGPUが一致し、go2/g1は着地後に接触解の差で軌道が分かれる。
 長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
 
 ## Architecture
