@@ -56,6 +56,61 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
     return mx::array(buf.data(), {n}, mx::int32);
 }
 
+// SDF geomのプラグイン距離関数をgeomローカルの一様格子にベイクする(GPUカーネルから直接プラグインを呼べないため)。
+// 格子はaabbを10%広げた範囲。範囲外はカーネル側でクランプ点までの距離を足して外挿する。
+static constexpr int SDF_GRID_RES = 96;
+static constexpr float SDF_GRID_PAD = 1.1f;
+
+static void bake_sdf_geoms(const mjModel* m, Model& model) {
+    std::vector<int> sdf_geoms;
+    for (int g = 0; g < m->ngeom; g++)
+        if (m->geom_type[g] == mjGEOM_SDF) sdf_geoms.push_back(g);
+    if (sdf_geoms.empty()) return;
+
+    const int N = SDF_GRID_RES;
+    const size_t cells = (size_t)N * N * N;
+    std::vector<float> info((size_t)m->ngeom * Model::SDF_INFO_STRIDE, 0.0f);
+    for (int g = 0; g < m->ngeom; g++) info[(size_t)g * Model::SDF_INFO_STRIDE] = -1.0f;
+    std::vector<float> grid(sdf_geoms.size() * cells);
+
+    mjData* d = mj_makeData(m);
+    for (size_t k = 0; k < sdf_geoms.size(); k++) {
+        int g = sdf_geoms[k];
+        if (m->geom_plugin[g] < 0)
+            throw std::runtime_error("SDF geom without plugin is not supported (geom " + std::to_string(g) + ")");
+        const mjpPlugin* plugin = mjp_getPluginAtSlot(m->plugin[m->geom_plugin[g]]);
+        if (!plugin || !plugin->sdf_distance)
+            throw std::runtime_error("SDF plugin of geom " + std::to_string(g) + " has no sdf_distance");
+
+        float* inf = &info[(size_t)g * Model::SDF_INFO_STRIDE];
+        inf[0] = (float)(k * cells);
+        const double* ab = m->geom_aabb + 6 * g;
+        for (int a = 0; a < 3; a++) {
+            inf[1 + a] = (float)ab[a];
+            inf[4 + a] = (float)ab[3 + a];
+            inf[7 + a] = (float)ab[3 + a] * SDF_GRID_PAD;
+        }
+        inf[10] = (float)m->geom_rbound[g];
+
+        float* out = &grid[k * cells];
+        for (int iz = 0; iz < N; iz++)
+            for (int iy = 0; iy < N; iy++)
+                for (int ix = 0; ix < N; ix++) {
+                    const int idx[3] = {ix, iy, iz};
+                    double x[3];
+                    for (int a = 0; a < 3; a++)
+                        x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (N - 1) - 1.0);
+                    out[((size_t)iz * N + iy) * N + ix] =
+                        (float)plugin->sdf_distance(x, d, m->geom_plugin[g]);
+                }
+    }
+    mj_deleteData(d);
+
+    model.sdf_res = N;
+    model.geom_sdf_info = mx::array(info.data(), {(int)info.size()}, mx::float32);
+    model.sdf_grid = mx::array(grid.data(), {(int)grid.size()}, mx::float32);
+}
+
 // Convert an mjModel* to our internal Model struct.
 // The mjModel* is NOT freed here -- caller manages its lifetime.
 static Model convert_model(mjModel* m) {
@@ -90,6 +145,8 @@ static Model convert_model(mjModel* m) {
     model.opt.wind = to_mx_f(m->opt.wind, 3);
     model.opt.viscosity = static_cast<float>(m->opt.viscosity);
     model.opt.density = static_cast<float>(m->opt.density);
+    model.opt.sdf_initpoints = m->opt.sdf_initpoints;
+    model.opt.sdf_iterations = m->opt.sdf_iterations;
 
     // Statistics
     model.stat.meaninertia = static_cast<float>(m->stat.meaninertia);
@@ -292,6 +349,8 @@ static Model convert_model(mjModel* m) {
 
     // Exclude body pairs
     model.nexclude = m->nexclude;
+    bake_sdf_geoms(m, model);
+
     if (m->nexclude > 0) {
         model.exclude_signature = to_mx_i(m->exclude_signature, (int)m->nexclude);
     }
@@ -315,6 +374,12 @@ static void validate_model(const mjModel* m) {
             default: break;
         }
     }
+    // SDF geomはSDF同士の衝突のみGPUカーネルで対応(相手がSDF以外の組は接触しない)
+    for (int i = 0; i < m->ngeom; i++)
+        if (m->geom_type[i] == mjGEOM_SDF) {
+            fprintf(stderr, "[mjmlx WARNING] Model has SDF geoms -- only SDF-SDF collision is supported (batched GPU path).\n");
+            break;
+        }
     // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
     // BOX geom collision is now supported (Phase 3.1)
     // HFIELD geom collision is now supported (Phase 3.4)
@@ -1200,6 +1265,8 @@ void Model::init_cache() const {
                 max_contacts = 8; // conservative fallback
             }
         }
+        else if (cp.type1 == (int)GeomType::SDF && cp.type2 == (int)GeomType::SDF)
+            max_contacts = std::min(opt.sdf_initpoints, 50); // 初期点ごとに最大1接触(mjMAXCONPAIR)
         else if (cp.type2 == (int)GeomType::MESH || cp.type1 == (int)GeomType::MESH)
             max_contacts = 1; // GJK/EPA returns 1 contact
         else if (cp.type1 == (int)GeomType::HFIELD || cp.type2 == (int)GeomType::HFIELD)

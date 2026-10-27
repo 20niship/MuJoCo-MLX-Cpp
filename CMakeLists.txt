@@ -239,6 +239,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_sdf_gear tests/test_sdf_gear.cpp)
+    target_link_libraries(test_sdf_gear PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_sdf_gear PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     add_executable(test_gpu_accuracy tests/test_gpu_accuracy.cpp)
     target_link_libraries(test_gpu_accuracy PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_gpu_accuracy PRIVATE
@@ -321,6 +328,7 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME gpu_vs_cpu_high_dof COMMAND test_gpu_vs_cpu ${_M}/high_dof_tree.xml 0.5 0.5 3.0)
     add_test(NAME gpu_vs_cpu_contact_stress COMMAND test_gpu_vs_cpu ${_M}/contact_stress.xml 1e-2 5e-2 0.5)
     set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
+
 
     # MJCF <sensor>のGPU値 vs MuJoCo C(同一状態でmj_forward)。accelerometerは1step差分なので空中のp95のみ緩い閾値で比較する。
     add_test(NAME sensors_air COMMAND test_sensors ${_M}/sensors.xml 60 1e-4 2.0)

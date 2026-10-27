@@ -280,7 +280,7 @@ MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
     int npairs = (int)c.collision_pairs.size();
 
     mx::eval(m.geom_type, m.geom_size, m.geom_dataid,
-             m.mesh_vertadr, m.mesh_vertnum, m.mesh_vert);
+             m.mesh_vertadr, m.mesh_vertnum, m.mesh_vert, m.geom_sdf_info);
     auto gt = m.geom_type.data<int>();
     auto gs = m.geom_size.data<float>();
     auto gdi = m.geom_dataid.data<int>();
@@ -293,6 +293,10 @@ MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
         if (t == 2) { geom_rb[g] = gs[g*3]; continue; }
         if (t == 3) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1]); continue; }
         if (t == 6) { geom_rb[g] = std::sqrt(gs[g*3]*gs[g*3] + gs[g*3+1]*gs[g*3+1] + gs[g*3+2]*gs[g*3+2]); continue; }
+        if (t == 8) { // SDF: bakeしたinfoのrbound(info[10])
+            geom_rb[g] = m.geom_sdf_info.data<float>()[g * Model::SDF_INFO_STRIDE + 10];
+            continue;
+        }
         if (t == 7 && gdi[g] >= 0) {
             auto mva = m.mesh_vertadr.data<int>();
             auto mvn = m.mesh_vertnum.data<int>();
@@ -468,6 +472,8 @@ struct BatchedStepContext {
     bool uses_gpu_collision = false;
     mx::array coll_pair_data = mx::zeros({1});
     mx::array coll_mesh_verts = mx::zeros({1});
+    mx::array coll_sdf_info = mx::zeros({1});
+    mx::array coll_sdf_grid = mx::zeros({1});
     mx::array coll_mesh_vertadr = mx::zeros({1});
     mx::array coll_mesh_vertnum = mx::zeros({1});
     mx::array coll_geom_dataid = mx::zeros({1});
@@ -640,12 +646,18 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         ctx->coll_mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
         ctx->coll_geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
         ctx->coll_geom_size = mx::astype(mx::flatten(m.geom_size), mx::float32);
+        if (m.sdf_res > 0) {
+            ctx->coll_sdf_info = m.geom_sdf_info;
+            ctx->coll_sdf_grid = m.sdf_grid;
+        }
+        mx::eval(ctx->coll_sdf_info, ctx->coll_sdf_grid);
         mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
                  ctx->coll_mesh_vertnum, ctx->coll_geom_dataid, ctx->coll_geom_size);
 
         if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
-            m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV);
+            m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV,
+            std::max(m.sdf_res, 2), m.sdf_res > 0 ? m.opt.sdf_initpoints : 0, m.opt.sdf_iterations);
         ctx->uses_gpu_collision = true;
     }
 
@@ -919,7 +931,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             mx::fast::kernel_inputs({geom_xpos_flat, geom_xmat_flat,
                              ctx->coll_mesh_verts, ctx->coll_pair_data,
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
-                             ctx->coll_geom_dataid, ctx->coll_geom_size}),
+                             ctx->coll_geom_dataid, ctx->coll_geom_size,
+                             ctx->coll_sdf_info, ctx->coll_sdf_grid}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
                             std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 32u), 1, 1}
                         );
