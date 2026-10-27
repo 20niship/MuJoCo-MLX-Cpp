@@ -769,12 +769,12 @@ void Model::init_cache() const {
                 cp.g1 = g1_; cp.g2 = g2_;
                 cp.type1 = t1_; cp.type2 = t2_;
                 cp.body1 = b1; cp.body2 = b2;
-                cp.margin = gmargin_ptr[g1_] + gmargin_ptr[g2_];
+                cp.margin = std::max(gmargin_ptr[g1_], gmargin_ptr[g2_]);  // MuJoCo C mj_collideGeomPair: margin/gapは2geomの最大値(和ではない)
                 float gap = 0.0f;
                 if (geom_gap.size() > 0) {
                     mx::eval(geom_gap);
                     auto gp = geom_gap.data<float>();
-                    gap = gp[g1_] + gp[g2_];
+                    gap = std::max(gp[g1_], gp[g2_]);
                 }
                 cp.gap = gap;
                 for (int k = 0; k < 3; k++) {

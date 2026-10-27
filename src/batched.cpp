@@ -267,7 +267,14 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
     }
 }
 
-static mx::array build_collision_pair_data(const Model& m) {
+// GCC 12(CIのDockerイメージ)は、build_contextにインライン展開されたペアデータ作成ループのベクトル化でinternal compiler errorを出すため、この2関数ではベクトル化しない。
+#if defined(__GNUC__) && !defined(__clang__)
+#define MJMLX_NO_VECTORIZE __attribute__((optimize("no-tree-vectorize"), noinline))
+#else
+#define MJMLX_NO_VECTORIZE
+#endif
+
+MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
@@ -301,7 +308,7 @@ static mx::array build_collision_pair_data(const Model& m) {
         }
     }
 
-    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
+    // Build pair data: g1, g2, type1, type2, margin(検出しきい値), rbound_sum
     std::vector<float> data(npairs * 6);
     for (int p = 0; p < npairs; p++) {
         const auto& cp = c.collision_pairs[p];
@@ -309,8 +316,8 @@ static mx::array build_collision_pair_data(const Model& m) {
         data[p*6+1] = (float)cp.g2;
         data[p*6+2] = (float)cp.type1;
         data[p*6+3] = (float)cp.type2;
-        data[p*6+4] = cp.margin + cp.gap;
-        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
+        data[p*6+4] = cp.margin;
+        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin;
     }
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
@@ -380,7 +387,7 @@ static std::vector<float> build_solver_friction_table(const Model& m, int& n_out
     return tab;
 }
 
-static mx::array build_solver_pair_props(const Model& m) {
+MJMLX_NO_VECTORIZE static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
@@ -390,7 +397,7 @@ static mx::array build_solver_pair_props(const Model& m) {
         data[p*18+0] = (float)cp.body1;
         data[p*18+1] = (float)cp.body2;
         data[p*18+2] = (float)cp.condim;
-        data[p*18+3] = cp.margin + cp.gap;
+        data[p*18+3] = cp.margin - cp.gap;  // includemargin: dist < includemarginで拘束行を作り、拘束のposは dist - includemargin
         for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
         data[p*18+9] = cp.solref[0];
         data[p*18+10] = cp.solref[1];
@@ -656,7 +663,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
         int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, 3);
-        int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 10;
+        int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 30;  // CPUとの差を小さくするため十分に回す(CG_TOLで早期終了する)
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);

@@ -36,7 +36,7 @@ inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
-  const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-6f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
+  const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
   const int max_efc              = solver_max_efc_for(nv);
   const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
@@ -331,7 +331,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     float invw_t = pair_props[pp+16];
 
     bool contact_active = (c_dist < pair_margin_v);
-    float pos = c_dist;
+    float pos = c_dist - pair_margin_v;  // pair_props[3]=includemargin(margin-gap)
 
     float tc = solref0;
 )GLSL";
