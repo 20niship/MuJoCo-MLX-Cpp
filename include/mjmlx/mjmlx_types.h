@@ -34,6 +34,7 @@ extern "C" {
 typedef struct MjmlxModel MjmlxModel;
 typedef struct MjmlxData MjmlxData;
 typedef struct MjmlxBatchedSim MjmlxBatchedSim;
+typedef struct MjmlxCameraRenderer MjmlxCameraRenderer;
 
 // Integrator types (matches MuJoCo mjtIntegrator)
 typedef enum {

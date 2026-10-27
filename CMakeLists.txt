@@ -127,6 +127,7 @@ set(MJMLX_SOURCES
     src/solver_vmap.cpp
     src/forward_vmap.cpp
     src/batched.cpp
+    src/camera.cpp
 )
 
 add_library(mjmlx SHARED ${MJMLX_SOURCES})
@@ -260,6 +261,12 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_camera tests/test_camera.cpp)
+    target_link_libraries(test_camera PRIVATE mjmlx ${CMAKE_DL_LIBS})
+    set_target_properties(test_camera PROPERTIES ENABLE_EXPORTS ON)
+    target_include_directories(test_camera PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_camera PRIVATE Vulkan::Vulkan)
+
     add_executable(diag_go2_compare tests/diag_go2_compare.cpp)
     target_link_libraries(diag_go2_compare PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(diag_go2_compare PRIVATE
@@ -285,7 +292,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME math_full COMMAND test_math_full)
     add_test(NAME linalg_full COMMAND test_linalg_full)
     add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
-    set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
+    add_test(NAME camera COMMAND test_camera)
+    set_tests_properties(math_full linalg_full batched_collision_primitives camera PROPERTIES LABELS "correctness")
 
     # GPU(MKX) vs CPU(MuJoCo C)のバッチ比較(旧test_metal_synthの代替)。引数は[tol_1step tol_10step tol_100step](qvelは10倍)。
     # humanoidは厳密に一致する。high_dof_tree/contact_stressはGPU-CPU間に既知の乖離があり、現状値を少し超える閾値でのリグレッション検知用(乖離を直したら締める)。

@@ -215,6 +215,25 @@ MJMLX_API void mjmlx_batched_grad_step(
     MjmlxBatchedSim* sim,
     float* grad_out);
 
+// ============================================================
+// Camera sensor (Vulkan, GPU batched sim only)
+// ============================================================
+
+// Creates a renderer for all <camera>s of the model, for every env. Pipelines are built here only; returns NULL on failure (no camera, no GPU, ...).
+MJMLX_API MjmlxCameraRenderer* mjmlx_camera_create(MjmlxBatchedSim* sim, int width, int height);
+MJMLX_API void mjmlx_camera_free(MjmlxCameraRenderer* r);
+MJMLX_API int mjmlx_camera_count(const MjmlxCameraRenderer* r);
+
+// Renders the current state of all envs x cameras with a single vkCmdDrawIndexedIndirect. Returns 0 on success.
+MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r);
+
+// Number of draw calls issued by the last render (always 1).
+MJMLX_API int mjmlx_camera_draw_call_count(const MjmlxCameraRenderer* r);
+
+// Read back the last render. rgb: uint8[num_envs * ncam * H * W * 3], depth: float[num_envs * ncam * H * W] (metres along the optical axis; background = zfar).
+MJMLX_API int mjmlx_camera_get_rgb(MjmlxCameraRenderer* r, uint8_t* out);
+MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer* r, float* out);
+
 #ifdef __cplusplus
 }
 #endif
