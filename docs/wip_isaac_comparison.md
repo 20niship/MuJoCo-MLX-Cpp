@@ -177,6 +177,13 @@
 - 結果(1制御step後、接触あり): 関節角 平均 3.0e-3 → **3.8e-4 rad**(p95 4.7e-3 → 4.7e-4)、胴体速度 平均 3.1e-2 → 1.25e-2(p95 5.3e-2 → 1.6e-2)。実験13(eulerdamp)と実験18(condim 6)と合わせ、着手時の平均 1.4e-2 rad から約1/37。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall / batched_collision_primitives 通過。
 
+### 実験20: GPUのRNEで free/ball 関節の cdof_dot をMuJoCoと同じ速度でまとめて計算(ジャイロ項が約3倍ずれていた)
+- 切り分け: 空中(`--lift 1.0`)でも基部の**角速度だけ**がCPUとずれる(並進速度・関節角は一致)。慣性が非等方な自由剛体1個(`diaginertia="0.1 0.2 0.25"`、重力0)に角速度(2,1,0.5)を与えて1 step進めると、解析解(オイラーの運動方程式)の Δω_x=-0.005 に対し、CPUは-0.00497で一致、GPUは-0.0146(約3倍)。
+- 原因: GPU forwardのPhase C(`cdof_dot = crossMotion(cvel, cdof)`)が全dofを逐次の速度で計算していた。MuJoCo(`mj_comVel`)は hinge/slide は1自由度ずつ逐次だが、free は並進3dof(`cdof_dot=0`)を速度に加算した後、回転3dofを**同じcvel**でまとめて計算してから加算し、ball は回転3dofを同じcvelでまとめて計算する。逐次にすると余分な `Σ_{i<j} ω_i ω_j (a_i×a_j)` が入る。
+- 修正: free/ball をまとめて計算する形に生成コードを変更(`forward.hpp`)。自由剛体は解析解・CPUと完全に一致。
+- 結果(Go2、1制御step後): 接触あり 関節角 平均 3.8e-4 → **1.35e-4 rad**(p95 4.7e-4 → 4.4e-4、最大 1.1e-1 → 6.1e-3)、基部角速度 平均 1.25e-2 → **1.4e-3 rad/s**。接触なし 角速度 平均 6.7e-3 → 2.6e-4。着手時(関節角 平均 1.4e-2 rad)から約1/100。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall / batched_collision_primitives 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
