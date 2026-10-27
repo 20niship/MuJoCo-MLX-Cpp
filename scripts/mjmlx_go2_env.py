@@ -143,6 +143,13 @@ class MjmlxGo2Env(VecEnv):
         self._imu = Imu(self._hub) if use_sensors else None
         self._feet_contact_sensor = ContactSensor(self._sim, num_envs, FOOT_BODY_IDX, BASE_CONTACT_FORCE_THRESHOLD) if use_sensors else None
         self._base_contact_sensor = ContactSensor(self._sim, num_envs, [BASE_BODY_IDX], BASE_CONTACT_FORCE_THRESHOLD) if use_sensors else None
+        # 毎step読む値(qpos/qvel/足と胴体の接触力ノルム/関節トルク)をGPUで1つに詰めて1回で転送する。個別に読み戻すと配列ごとに遅い。センサ経路やCPU実行では使わない
+        self._pack = None
+        if self._hub is None:
+            try:
+                self._pack = self._sim.set_pack_spec(np.array([BASE_BODY_IDX, *FOOT_BODY_IDX], dtype=np.int32), 6, 12)
+            except RuntimeError:
+                pass
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
         self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
@@ -166,7 +173,10 @@ class MjmlxGo2Env(VecEnv):
         self._next_push_step = self._rng.integers(*PUSH_INTERVAL_STEPS, size=num_envs)
 
         all_mask = np.ones(num_envs, dtype=np.int32)
-        self._reset_envs(all_mask)
+        qpos, qvel = self._sim.state()
+        qpos, qvel = qpos.copy(), qvel.copy()
+        self._reset_envs(all_mask, qpos, qvel)
+        self._sim.set_state(qpos, qvel)
 
     @property
     def episode_length_buf(self) -> torch.Tensor:
@@ -196,15 +206,14 @@ class MjmlxGo2Env(VecEnv):
             cmd[zero] = cand / n2 * target
         return cmd
 
-    def _reset_envs(self, mask: np.ndarray) -> None:
+    def _reset_envs(self, mask: np.ndarray, qpos: np.ndarray, qvel: np.ndarray) -> None:
+        """maskのenvの状態をqpos/qvel(host配列、書き換える)に初期化する。simへの反映は呼び出し側がset_stateでまとめて行う(読み戻し・書き込みを減らすため)。"""
         idx = np.nonzero(mask)[0]
         n = len(idx)
         if n == 0:
             return
-        self._sim.reset(mask)
-        qpos, qvel = self._sim.state()
-        qpos = qpos.copy()
-        qvel = qvel.copy()
+        if self._hub is not None:
+            self._sim.reset(mask)  # センサ側の「リセット直後」フラグを立てる
 
         x, y = self.terrain.sample_spawn_xy(self._rng, n)
         z = self.terrain.max_height_within(x, SPAWN_FOOTPRINT_RADIUS) + 0.40  # 脚が張り出す範囲の最高地形の上に置く。 IsaacLabのUNITREE_GO2_CFG.init_state.pos[2]
@@ -222,7 +231,6 @@ class MjmlxGo2Env(VecEnv):
         qvel[idx, 3:6] = self._rng.uniform(-rv, rv, size=(n, 3))
         qvel[idx, 6:18] = 0.0
 
-        self._sim.set_state(qpos, qvel)
         self._elapsed[idx] = 0
         self._commands[idx] = self._sample_commands(n)
         self._last_action[idx] = 0.0
@@ -231,7 +239,10 @@ class MjmlxGo2Env(VecEnv):
         self._last_foot_contact[idx] = False
         self._next_push_step[idx] = self._elapsed[idx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=n)
 
-    def _obs(self, qpos: np.ndarray, qvel: np.ndarray, from_sensors: bool = False) -> np.ndarray:
+    def _obs(self, qpos: np.ndarray, qvel: np.ndarray, from_sensors: bool = False, rows: np.ndarray | None = None) -> np.ndarray:
+        """rowsを渡すとそのenvだけの観測(qpos/qvelもその行分を渡す)。"""
+        cmd = self._commands if rows is None else self._commands[rows]
+        last_action = self._last_action if rows is None else self._last_action[rows]
         if from_sensors:
             base_lin_vel = self._imu.lin_vel_b.cpu().numpy()
             base_ang_vel = self._imu.ang_vel_b.cpu().numpy()
@@ -245,7 +256,7 @@ class MjmlxGo2Env(VecEnv):
         joint_pos_rel = qpos[:, 7:19] - DEFAULT_JOINT_POS
         joint_vel = qvel[:, 6:18]
         return np.concatenate(
-            [base_lin_vel, base_ang_vel, projected_gravity, self._commands, joint_pos_rel, joint_vel, self._last_action],
+            [base_lin_vel, base_ang_vel, projected_gravity, cmd, joint_pos_rel, joint_vel, last_action],
             axis=1,
         ).astype(np.float32)
 
@@ -258,8 +269,10 @@ class MjmlxGo2Env(VecEnv):
 
     def reset(self) -> tuple[TensorDict, dict]:
         mask = np.ones(self.num_envs, dtype=np.int32)
-        self._reset_envs(mask)
         qpos, qvel = self._sim.state()
+        qpos, qvel = qpos.copy(), qvel.copy()
+        self._reset_envs(mask, qpos, qvel)
+        self._sim.set_state(qpos, qvel)
         return self._obs_tensordict(self._obs(qpos, qvel)), {}
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
@@ -269,8 +282,15 @@ class MjmlxGo2Env(VecEnv):
 
         for _ in range(DECIMATION):
             self._sim.step(ctrl)
-        qpos, qvel = self._sim.state()
-        cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
+        if self._pack is not None:
+            pk = self._sim.read_pack()
+            nq, nv = self.nq, self.nv
+            qpos, qvel = pk[:, :nq], pk[:, nq:nq + nv]
+            contact_force = pk[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
+            joint_torque = pk[:, nq + nv + 5:]
+        else:
+            qpos, qvel = self._sim.state()
+            cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
         if self._hub is not None:
             self._hub.read()
             self._feet_contact_sensor.update(CONTROL_DT)
@@ -289,6 +309,9 @@ class MjmlxGo2Env(VecEnv):
         if self._hub is not None:
             base_contact = self._base_contact_sensor.is_contact[:, 0].cpu().numpy()
             foot_contact = self._feet_contact_sensor.is_contact.cpu().numpy()
+        elif self._pack is not None:
+            base_contact = contact_force[:, 0] > BASE_CONTACT_FORCE_THRESHOLD
+            foot_contact = contact_force[:, 1:] > BASE_CONTACT_FORCE_THRESHOLD
         else:
             cfrc = cfrc_ext.reshape(self.num_envs, -1, 6)
             base_force_norm = np.linalg.norm(cfrc[:, BASE_BODY_IDX, 3:6], axis=1)
@@ -320,13 +343,12 @@ class MjmlxGo2Env(VecEnv):
         projected_gravity = _quat_rotate_inverse(quat, np.tile(np.array([0.0, 0.0, -1.0], np.float32), (self.num_envs, 1)))
         r_flat_orient = self._w["flat_orientation"] * np.sum(projected_gravity[:, 0:2] ** 2, axis=1)
 
-        try:
-            qfrc_actuator = self._sim.qfrc_actuator()
-            joint_torque = qfrc_actuator[:, 6:18]
-            r_torque = self._w["torque"] * np.sum(joint_torque**2, axis=1)
-        except AttributeError:
-            joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)
-            r_torque = np.zeros(self.num_envs, dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
+        if self._pack is None:
+            try:
+                joint_torque = self._sim.qfrc_actuator()[:, 6:18]
+            except AttributeError:
+                joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
+        r_torque = self._w["torque"] * np.sum(joint_torque**2, axis=1)
 
         self.last_reward_terms = {
             "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
@@ -350,24 +372,21 @@ class MjmlxGo2Env(VecEnv):
         self._prev_joint_vel = joint_vel.copy()
 
         push_due = self._elapsed >= self._next_push_step
-        if push_due.any():
-            qpos2, qvel2 = qpos.copy(), qvel.copy()
-            pidx = np.nonzero(push_due)[0]
-            qvel2[pidx, 0:2] += self._rng.uniform(-0.5, 0.5, size=(len(pidx), 2))
-            self._sim.set_state(qpos2, qvel2)
-            self._next_push_step[pidx] = self._elapsed[pidx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=len(pidx))
-
         done_idx = np.nonzero(dones)[0]
-        if len(done_idx) > 0:
-            mask = dones.astype(np.int32)
-            self._reset_envs(mask)
-            if self._hub is not None:
-                self._feet_contact_sensor.reset(torch.from_numpy(dones))
-                self._base_contact_sensor.reset(torch.from_numpy(dones))
-            reset_qpos, reset_qvel = self._sim.state()
-            reset_obs = self._obs(reset_qpos, reset_qvel)
-            obs = obs.copy()
-            obs[done_idx] = reset_obs[done_idx]
+        if push_due.any() or len(done_idx) > 0:
+            qpos2, qvel2 = qpos.copy(), qvel.copy()  # 以降のログ/指標は押す前・リセット前のqpos/qvelを使うので別配列に書く
+            if push_due.any():
+                pidx = np.nonzero(push_due)[0]
+                qvel2[pidx, 0:2] += self._rng.uniform(-0.5, 0.5, size=(len(pidx), 2))
+                self._next_push_step[pidx] = self._elapsed[pidx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=len(pidx))
+            if len(done_idx) > 0:
+                self._reset_envs(dones.astype(np.int32), qpos2, qvel2)
+                if self._hub is not None:
+                    self._feet_contact_sensor.reset(torch.from_numpy(dones))
+                    self._base_contact_sensor.reset(torch.from_numpy(dones))
+                obs = obs.copy()
+                obs[done_idx] = self._obs(qpos2[done_idx], qvel2[done_idx], rows=done_idx)
+            self._sim.set_state(qpos2, qvel2)
 
         # rsl_rl が iteration ごとに平均して tensorboard/標準出力へ書く。報酬は項ごとのstep平均(重み込み)、Metricsは追従誤差など
         log = {f"Reward/{k}": float(np.mean(v)) for k, v in self.last_reward_terms.items()}

@@ -104,6 +104,7 @@ shared float tg_pAp;
        << "shared float sh_Ma[" << nv << "];\n"
        << "shared float sh_Mv[" << nv << "];\n"
        << "shared float sh_red[" << 12 * nv << "];\n"
+       << "shared float sh_ld[" << nv << "];\n"
        << "shared float sh_qM[" << nv * nv << "];\n"
        << "shared float sh_qfs[" << nv << "];\n"
        << "shared float sh_cdof[" << nv * 6 << "];\n"
@@ -501,6 +502,7 @@ SABL2
 if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int iter = 0; iter < NSOLVE; iter++) {
+CG_BEGIN
     search_d(int(tid)) = 0.0f;
     cg_r(int(tid)) = -grad(int(tid));
     cg_p(int(tid)) = -grad(int(tid));
@@ -541,7 +543,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         cg_p(int(tid)) = cg_r(int(tid)) + beta_cg * cg_p(int(tid));
         barrier(); memoryBarrierBuffer();
     }
-
+CG_END
     SABL3
     { float s = 0.0f; for (int j = 0; j < NV; j++) s += QMV(int(tid)*NV + j)*search_d(j); Mv_arr(int(tid)) = s; }
     barrier(); memoryBarrierBuffer();
@@ -623,6 +625,51 @@ if (tid == 0u) {
         contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = fn;
     }
 }
+)GLSL";
+
+  // Newton方向 (M + J^T diag(D*act) J) s = -grad を共有メモリ上のコレスキーで直接解く。CG(最大30反復x約7回のbarrier)より命令数が数分の1で、方向も厳密になる。
+  // 1スレッド=1行(dof)。Hの行を作って(非アクティブ行は飛ばす)、列ごとに1回のbarrierで分解し、前進/後退代入も列方向に並列化する。
+  const std::string kDirectSolve = R"GLSL(
+    {
+        float ar[NV];
+        for (int j = 0; j < NV; j++) ar[j] = QMV(int(tid)*NV + j) + ((j == int(tid)) ? MJMINVAL_SV : 0.0f);
+        for (int r2 = 0; r2 < nefc; r2++) {
+            float w = efc_D(r2) * act(r2);
+            if (w == 0.0f) continue;
+            float jt = J(r2, int(tid)) * w;
+            for (int j = 0; j < NV; j++) ar[j] += jt * J(r2, j);
+        }
+        for (int j = 0; j < NV; j++) H(int(tid)*NV + j) = ar[j];
+    }
+    barrier();
+    for (int j = 0; j < NV; j++) {
+        float dj = H(j*NV + j);
+        for (int k = 0; k < j; k++) { float l = H(j*NV + k); dj -= l*l; }
+        dj = sqrt(max(dj, 1e-6f));
+        if (int(tid) > j) {
+            float sj = H(int(tid)*NV + j);
+            for (int k = 0; k < j; k++) sj -= H(int(tid)*NV + k) * H(j*NV + k);
+            H(int(tid)*NV + j) = sj / dj;
+        }
+        if (int(tid) == j) sh_ld[j] = dj;
+        barrier();
+    }
+    {
+        float bt = -grad(int(tid));
+        for (int i = 0; i < NV; i++) {
+            if (int(tid) == i) sh_red[i] = bt / sh_ld[i];
+            barrier();
+            if (int(tid) > i) bt -= H(int(tid)*NV + i) * sh_red[i];
+        }
+        float yt = sh_red[int(tid)];
+        for (int i = NV - 1; i >= 0; i--) {
+            if (int(tid) == i) sh_red[NV + i] = yt / sh_ld[i];
+            barrier();
+            if (int(tid) < i) yt -= H(i*NV + int(tid)) * sh_red[NV + i];
+        }
+        search_d(int(tid)) = sh_red[NV + int(tid)];
+    }
+    barrier();
 )GLSL";
 
   const std::string kLineSearchParallel = R"GLSL(
@@ -710,6 +757,14 @@ if (tid == 0u) {
       size_t b0 = body.find("LS_BEGIN\n"), e0 = body.find("LS_END\n");
       if(b0 != std::string::npos && e0 != std::string::npos) {
         if(use_shared) body.replace(b0, e0 + 7 - b0, kLineSearchParallel);
+        else { body.erase(e0, 7); body.erase(b0, 9); }
+      }
+    }
+    {
+      static const bool use_cg = getenv("MJMLX_SOLVER_CG") != nullptr;  // 従来のCG法に戻す(比較用)
+      size_t b0 = body.find("CG_BEGIN\n"), e0 = body.find("CG_END\n");
+      if(b0 != std::string::npos && e0 != std::string::npos) {
+        if(use_shared && !use_cg) body.replace(b0, e0 + 7 - b0, kDirectSolve);
         else { body.erase(e0, 7); body.erase(b0, 9); }
       }
     }

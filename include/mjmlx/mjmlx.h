@@ -206,6 +206,10 @@ MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, 
 MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx, const float* qpos, int nq);
 MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx, const float* qvel, int nv);
 
+// ホスト読み戻しは配列ごとに遅い(ステージングが非キャッシュ)ので、[qpos, qvel, 指定bodyの接触力ノルム, qfrc_actuator一部]を1転送にまとめる。set_pack_specはstrideを返す(失敗-1)。
+MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof);
+MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out);
+
 // Evaluate qpos + qvel in a single GPU fence. Call before get_qpos/get_qvel to
 // avoid two sequential GPU syncs.
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim);
