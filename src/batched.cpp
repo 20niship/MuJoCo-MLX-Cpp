@@ -254,9 +254,11 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
     static const bool on = getenv("MJMLX_PROF") != nullptr;
     if (!on) return;
     static std::map<std::string, double> acc; static int calls = 0; static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    auto t_enter = std::chrono::steady_clock::now();
     for (const auto& a : outs) mx::eval({a});
     auto now = std::chrono::steady_clock::now();
-    acc[name] += std::chrono::duration<double>(now - last).count();
+    acc[std::string(name) + ".build"] += std::chrono::duration<double>(t_enter - last).count();  // 前段のeval後からこの段のeval開始まで(ホスト側のグラフ構築)
+    acc[std::string(name) + ".eval"] += std::chrono::duration<double>(now - t_enter).count();
     last = now;
     if (std::string(name) == "euler" && ++calls % 50 == 0) {
         fprintf(stderr, "[prof] per-substep ms:");
@@ -264,7 +266,6 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
         fprintf(stderr, "\n"); acc.clear();
     }
 }
-static const int MAX_EFC = 256;
 
 static mx::array build_collision_pair_data(const Model& m) {
     m.init_cache();
@@ -317,6 +318,7 @@ static mx::array build_collision_pair_data(const Model& m) {
 // solverカーネルのscratchレイアウト(GLSL版はefc長の配列7本)以上でなければならない。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。不足すると末尾のenvがバッファ外を読み書きしゼロ/不定値/GPUリカバリを起こす。
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
+    const int MAX_EFC = mkx_kernels::solver_max_efc_for(nv);
     return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3*nv;
 }
 
@@ -550,9 +552,14 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 
     auto damp_ptr = m.dof_damping.data<float>();
     std::vector<float> damp_vals(damp_ptr, damp_ptr + m.nv);
+    // MuJoCoのEulerは関節dampingだけを陰的に扱い、`eulerdamp`を無効にした模型(Go2など)ではそれも陽的になる。CPUと挙動を合わせるため、
+    // Eulerかつeulerdamp無効のときは陰的dampingを入れない。implicit/implicitfastはactuatorの速度項も含めて陰的に扱う(下のブロック)。
+    const bool integ_implicit = (m.opt.integrator == IntegratorType::IMPLICIT || m.opt.integrator == IntegratorType::IMPLICITFAST);
+    const bool euler_damp_off = (m.opt.integrator == IntegratorType::EULER) && (m.opt.disableflags & DisableBit::EULERDAMP);
+    if (euler_damp_off) std::fill(damp_vals.begin(), damp_vals.end(), 0.0f);
 
     // mujoco本家のimplicit/implicitfast(mj_implicitSkip https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_forward.c#L1799 がactuatorVelDeriv https://github.com/google-deepmind/mujoco/blob/71d430c71f8593a977136485e81314ec19a66e7e/src/engine/engine_derivative.c#L2503 でd(qfrc_actuator)/d(qvel)を陰的に畳み込む)相当をdof_dampingと同じ機構に便乗させて再現(本カーネルはintegrator設定無視でexplicitのままだったためUR5eのimplicitfast前提PDゲインが発散していた)。
-    if (m.nu > 0 && m.actuator_biastype.size() > 0) {
+    if (integ_implicit && m.nu > 0 && m.actuator_biastype.size() > 0) {
         mx::eval(m.actuator_biastype, m.actuator_biasprm, m.actuator_gaintype, m.actuator_gainprm,
                  m.actuator_trntype, m.actuator_trnid, m.actuator_gear);
         auto biastype_ptr = m.actuator_biastype.data<int32_t>();
@@ -629,6 +636,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         mx::eval(ctx->coll_mesh_verts, ctx->coll_mesh_vertadr,
                  ctx->coll_mesh_vertnum, ctx->coll_geom_dataid, ctx->coll_geom_size);
 
+        if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
             m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_collision = true;
@@ -648,11 +656,11 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
         int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, 3);
-        int cgi = 10;
+        int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 10;
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
-        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, MAX_EFC)) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
+        if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, mkx_kernels::solver_max_efc_for(m.nv))) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
         ctx->solver_pair_props = build_solver_pair_props(m);
         ctx->solver_body_dof_masks = build_body_dof_masks(m);
         ctx->solver_body_rootid = build_body_rootid(m);
@@ -661,7 +669,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, ctx->solver_nlim, ctx->solver_nfl);
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl);  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
@@ -798,7 +806,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                  ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr,
                  qpos_flat}),
                 mx::fast::kernel_shapes(kin_shapes),
-                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 1u), 1, 1}
+                std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 64u), 1, 1}
             );
             // loc_idは__LINE__由来なので1出力1行で明示(同一行だと全出力が同じキーに衝突する)。shapeは毎step固定のため全出力永続化(issue #14)。
             MX_MARK_PERSISTENT(kin_raw[0], owner);
@@ -813,11 +821,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto kin = mx::fast::kernel_outputs(kin_raw);
             prof_stage("kin", kin);
 
-            auto xpos   = mx::reshape(kin[0], {B, nb, 3});
-            auto xipos  = mx::reshape(kin[3], {B, nb, 3});
-            auto ximat  = mx::reshape(kin[4], {B, nb, 3, 3});
-            auto xanchor = (nj > 0) ? mx::reshape(kin[5], {B, nj, 3}) : mx::zeros({B, 1});
-            auto xaxis   = (nj > 0) ? mx::reshape(kin[6], {B, nj, 3}) : mx::zeros({B, 1});
+            // kinematicsの出力はSoA(成分*B+env)。GPU forward/collisionはSoAのまま読む。vmap経路とstate出力はAoS({B,...})が要るので転置する。
+            auto kin_view = [&](int idx, int per, mx::Shape shp, bool soa) {
+                return soa ? mx::reshape(kin[idx], shp) : mx::reshape(mx::transpose(mx::reshape(kin[idx], {per, B})), shp);
+            };
+            auto xpos   = kin_view(0, nb * 3, {B, nb, 3}, use_gpu_fwd);
+            auto xipos  = kin_view(3, nb * 3, {B, nb, 3}, use_gpu_fwd);
+            auto ximat  = kin_view(4, nb * 9, {B, nb, 3, 3}, use_gpu_fwd);
+            auto xanchor = (nj > 0) ? kin_view(5, nj * 3, {B, nj, 3}, use_gpu_fwd) : mx::zeros({B, 1});
+            auto xaxis   = (nj > 0) ? kin_view(6, nj * 3, {B, nj, 3}, use_gpu_fwd) : mx::zeros({B, 1});
 
             mx::array qM_flat = mx::zeros({1});
             mx::array qfrc_smooth_flat = mx::zeros({1});
@@ -843,7 +855,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
                          {B * scratchSz}, {B * nv * 6}}),
-                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 8u), 1, 1}
+                        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 64u), 1, 1}
                     );
                     // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
                     MX_MARK_PERSISTENT(fwd_raw[0], owner);
@@ -860,17 +872,20 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
 
                 qM_flat = fwd[0];
                 qfrc_smooth_flat = fwd[1];
-                subtree_com_out = mx::reshape(fwd[2], {B, nb, 3});
-                cinert_out = mx::reshape(fwd[3], {B, nb, 10});
-                cvel_out = mx::reshape(fwd[4], {B, nb, 6});
-                qfrc_actuator_out = mx::reshape(fwd[5], {B, nv});
+                // forwardの出力はSoA(成分*B+env)。solver/eulerはSoAのまま読み、state出力は転置してAoSに戻す。
+                auto fwd_aos = [&](int idx, int per, mx::Shape shp) { return mx::reshape(mx::transpose(mx::reshape(fwd[idx], {per, B})), shp); };
+                subtree_com_out = fwd_aos(2, nb * 3, {B, nb, 3});
+                cinert_out = fwd_aos(3, nb * 10, {B, nb, 10});
+                cvel_out = fwd_aos(4, nb * 6, {B, nb, 6});
+                qfrc_actuator_out = fwd_aos(5, nv, {B, nv});
                 auto cdof_flat = fwd[7]; // (B * nv * 6)
 
                 // ── Collision + Solver ──
                 if (ctx->uses_gpu_collision) {
                     // Collision kernel: detect contacts from geom transforms
-                    auto geom_xpos_flat = mx::flatten(mx::reshape(kin[7], {B, ng, 3}));
-                    auto geom_xmat_flat = mx::flatten(mx::reshape(kin[8], {B, ng, 3, 3}));
+                    // collisionは1スレッド=1envで自分のgeomを順に読むためAoS({B,ng,..})に転置して渡す(SoAのまま読むと成分ごとに別キャッシュラインになり遅い)。
+                    auto geom_xpos_flat = mx::flatten(kin_view(7, ng * 3, {B, ng, 3}, true));
+                    auto geom_xmat_flat = mx::flatten(kin_view(8, ng * 9, {B, ng, 3, 3}, true));
 
                     int con_buf_sz = B * MAX_CONTACTS_PER_ENV * CONTACT_STRIDE;
                     std::vector<mx::array> coll;
@@ -881,7 +896,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                              ctx->coll_mesh_vertadr, ctx->coll_mesh_vertnum,
                              ctx->coll_geom_dataid, ctx->coll_geom_size}),
                             mx::fast::kernel_shapes({{con_buf_sz}, {B}}),
-                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 1u), 1, 1}
+                            std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "COLL", 32u), 1, 1}
                         );
                         // shapeはcon_buf_sz(=B*MAX_CONTACTS_PER_ENV*CONTACT_STRIDE)固定のため永続化(issue #14)。
                         MX_MARK_PERSISTENT(coll_raw[0], owner);
@@ -896,7 +911,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         {
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
-                                 mx::flatten(subtree_com_out),
+                                 mx::flatten(fwd[2]),
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
@@ -929,18 +944,19 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 }
             } else {
                 // ── Phase 2b: vmap(forward) (hybrid path for nv ≤ 80) ──
-                auto xquat = mx::reshape(kin[1], {B, nb, 4});
-                auto xmat  = mx::reshape(kin[2], {B, nb, 3, 3});
-                auto gxpos = (ng > 0) ? mx::reshape(kin[7], {B, ng, 3}) : mx::zeros({B, 1});
-                auto gxmat = (ng > 0) ? mx::reshape(kin[8], {B, ng, 3, 3}) : mx::zeros({B, 1});
+                auto xquat = kin_view(1, nb * 4, {B, nb, 4}, false);
+                auto xmat  = kin_view(2, nb * 9, {B, nb, 3, 3}, false);
+                auto gxpos = (ng > 0) ? kin_view(7, ng * 3, {B, ng, 3}, false) : mx::zeros({B, 1});
+                auto gxmat = (ng > 0) ? kin_view(8, ng * 9, {B, ng, 3, 3}, false) : mx::zeros({B, 1});
 
                 auto mid = vmapped_fwd({
                     qpos_batch, qvel_batch, ctrl_batch,
                     xpos, xquat, xmat, xipos, ximat,
                     xanchor, xaxis, gxpos, gxmat
                 });
-                qM_flat = mx::flatten(mid[0]);
-                qfrc_smooth_flat = mx::flatten(mid[1]);
+                // eulerはSoA(成分*B+env)で読むので、vmap経路のAoS出力を転置する
+                qM_flat = mx::flatten(mx::transpose(mx::reshape(mid[0], {B, nv * nv})));
+                qfrc_smooth_flat = mx::flatten(mx::transpose(mx::reshape(mid[1], {B, nv})));
                 qfrc_constraint_flat = mx::flatten(mid[2]);
                 subtree_com_out = mx::reshape(mid[4], {B, nb, 3});
                 cinert_out = mx::reshape(mid[5], {B, nb, 10});
@@ -978,8 +994,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             prof_stage("euler", euler);
             auto new_qpos = mx::reshape(euler[0], {B, nq});
             auto new_qvel = mx::reshape(euler[1], {B, nv});
-            auto xpos_out = mx::reshape(kin[0], {B, nb, 3});
-            auto xquat_out = mx::reshape(kin[1], {B, nb, 4});
+            auto xpos_out = kin_view(0, nb * 3, {B, nb, 3}, false);
+            auto xquat_out = kin_view(1, nb * 4, {B, nb, 4}, false);
             auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out, xquat_out,
@@ -1227,7 +1243,9 @@ MJMLX_API void mjmlx_batched_get_state(
 {
     if (!sim) return;
     auto& s = sim->sim;
-    mx::eval(s.qpos, s.qvel);
+    // cfrc_ext(接触力)も同じevalで一緒に評価する(別evalにするとsubmit+同期がもう1回要る)。envは毎stepで両方読む。
+    if (s.cfrc_ext.size() > 0) mx::eval(s.qpos, s.qvel, s.cfrc_ext);
+    else mx::eval(s.qpos, s.qvel);
 
     if (nq_out) *nq_out = s.model->nq;
     if (nv_out) *nv_out = s.model->nv;

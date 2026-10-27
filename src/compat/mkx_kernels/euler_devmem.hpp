@@ -28,12 +28,13 @@ inline mkx::fast::Kernel<> make_euler_devmem_kernel(int nv, int nq, float dt, co
   std::ostringstream ss;
 
   ss << "uint batch_idx = gl_GlobalInvocationID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
      << "const uint n = " << n << "u;\n"
      << "uint moff = batch_idx * n * n;\n"
      << "uint voff = batch_idx * n;\n"
      << "uint qoff = batch_idx * " << nq << "u;\n"
 
-     << "for (uint i = 0u; i < n * n; i++) L_scratch[moff + i] = qM[moff + i];\n";
+     << "for (uint i = 0u; i < n * n; i++) L_scratch[moff + i] = qM[uint(i)*NBATCH+batch_idx];\n";
 
   for(int i = 0; i < nv; i++) {
     if(dof_damping_vals[static_cast<size_t>(i)] != 0.0f) {
@@ -43,7 +44,7 @@ inline mkx::fast::Kernel<> make_euler_devmem_kernel(int nv, int nq, float dt, co
   for(int i = 0; i < n; i++) ss << "L_scratch[moff + " << i * n + i << "] += 1e-6f;\n";
 
   ss << "float rhs[" << n << "];\n"
-     << "for (uint i = 0u; i < n; i++) rhs[i] = qfrc_smooth[voff+i] + qfrc_constraint[voff+i];\n"
+     << "for (uint i = 0u; i < n; i++) rhs[i] = qfrc_smooth[uint(i)*NBATCH+batch_idx] + qfrc_constraint[voff+i];\n"
 
      << "for (uint j = 0u; j < n; j++) {\n"
      << "  float s = 0.0f;\n"

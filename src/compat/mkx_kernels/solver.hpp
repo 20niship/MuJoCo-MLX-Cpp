@@ -24,13 +24,21 @@ inline std::string solver_fmt_float(float x) {
 } // namespace detail_solver
 
 // ホスト側のscratch確保量(batched.cppのsolver_scratch_per_env)と一致させる責務を持つ、カーネルが1envあたり使うfloat数。
+// 1envあたりの拘束行数の上限。小さいほどscratchが小さくキャッシュに載りやすい(超過分の接触は落ちる)。MJMLX_MAX_EFCで上書き。
+inline int solver_max_efc() { static const int v = getenv("MJMLX_MAX_EFC") ? atoi(getenv("MJMLX_MAX_EFC")) : 256; return v; }
+// 小さいモデル(nv<=32)は拘束行列などをworkgroup共有メモリに置く。globalメモリのレイテンシ(数百cycle)が直列部分を支配するため。
+// 共有メモリに載せるため拘束行数の上限を下げる(超過分の接触は落ちる)。MJMLX_SOLVER_SHARED=0で無効。
+inline bool solver_use_shared(int nv) { static const bool on = !getenv("MJMLX_SOLVER_SHARED") || atoi(getenv("MJMLX_SOLVER_SHARED")) != 0; return on && nv <= 32; }
+inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(solver_max_efc(), 96) : solver_max_efc(); }
+
 inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-6f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
-  const int max_efc              = 256;
+  const int max_efc              = solver_max_efc_for(nv);
+  const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
   const int max_contacts_per_env = 128;
 
@@ -79,6 +87,29 @@ shared float tg_rr;
 shared float tg_pAp;
 )GLSL";
 
+  if(use_shared) {
+    std::ostringstream sh;
+    sh << "shared float sh_H[" << nv * nv << "];\n"
+       << "shared float sh_J[" << max_efc * nv << "];\n"
+       << "shared float sh_D[" << max_efc << "];\n"
+       << "shared float sh_aref[" << max_efc << "];\n"
+       << "shared float sh_force[" << max_efc << "];\n"
+       << "shared float sh_Jaref[" << max_efc << "];\n"
+       << "shared float sh_act[" << max_efc << "];\n"
+       << "shared float sh_floss[" << max_efc << "];\n"
+       << "shared float sh_Jv[" << max_efc << "];\n"
+       << "shared float sh_grad[" << nv << "];\n"
+       << "shared float sh_search[" << nv << "];\n"
+       << "shared float sh_qacc[" << nv << "];\n"
+       << "shared float sh_Ma[" << nv << "];\n"
+       << "shared float sh_Mv[" << nv << "];\n"
+       << "shared float sh_red[" << 12 * nv << "];\n"
+       << "shared float sh_qM[" << nv * nv << "];\n"
+       << "shared float sh_qfs[" << nv << "];\n"
+       << "shared float sh_cdof[" << nv * 6 << "];\n"
+       << "shared float sh_scom[" << nb * 3 << "];\n";
+    header += sh.str();
+  }
   {
     std::ostringstream hk;
     hk << "void efc_kbi(float solref0, float solref1, float si0, float si1, float si2, float si3, float si4, float pos, out float k_val, out float b_val, out float imp_val) {\n"
@@ -104,6 +135,7 @@ shared float tg_pAp;
   std::ostringstream ss;
 
   ss << "uint bid = gl_WorkGroupID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x;\n"
      << "uint tid = gl_LocalInvocationID.x;\n"
      << "const int NV = " << nv << ";\n"
      << "const int NB = " << nb << ";\n"
@@ -111,6 +143,7 @@ shared float tg_pAp;
      << "const int NLIM = " << nlim << ";\n"
      << "const int NFL = " << nfl << ";\n"
      << "const bool USE_PYR = " << (use_pyramidal ? "true" : "false") << ";\n"
+     << "const bool PYR_FULL = " << (use_shared && use_pyramidal ? "true" : "false") << ";  // 共有メモリ版はcondim 4/6(ねじり・転がり摩擦)も 2*(condim-1) 本の摩擦行として扱う(CPUのスカラー実装と同じ)\n"
      << "const int MAX_EFC_N = " << max_efc << ";\n"
      << "const int NSOLVE = " << solver_iters << ";\n"
      << "const int CON_STRIDE = " << contact_stride << ";\n"
@@ -122,22 +155,50 @@ shared float tg_pAp;
      << "const float MJMINIMP = 0.0001f;\n"
      << "const float MJMAXIMP = 0.9999f;\n\n";
 
-  ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n"
-     << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
-     << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
-     << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
-     << "#define efc_aref(i)  solver_scratch[s_off + " << S_AREF << " + (i)]\n"
-     << "#define efc_force(i) solver_scratch[s_off + " << S_FORCE << " + (i)]\n"
-     << "#define grad(i)      solver_scratch[s_off + " << S_GRAD << " + (i)]\n"
-     << "#define search_d(i)  solver_scratch[s_off + " << S_SEARCH << " + (i)]\n"
-     << "#define qacc(i)      solver_scratch[s_off + " << S_QACC << " + (i)]\n"
-     << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
-     << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
-     << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
-     << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
-     << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
-     << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n"
-     << "#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
+  ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n";
+  if(use_shared) {
+    ss << "#define QMV(i)       sh_qM[(i)]\n";
+    ss << "#define QFS(i)       sh_qfs[(i)]\n";
+    ss << "#define CDOF(i)      sh_cdof[(i)]\n";
+    ss << "#define SCOM(i)      sh_scom[(i)]\n";
+    ss << "#define H(i)         sh_H[(i)]\n"
+       << "#define J(r,c)       sh_J[(r)*NV+(c)]\n"
+       << "#define efc_D(i)     sh_D[(i)]\n"
+       << "#define efc_aref(i)  sh_aref[(i)]\n"
+       << "#define efc_force(i) sh_force[(i)]\n"
+       << "#define grad(i)      sh_grad[(i)]\n"
+       << "#define search_d(i)  sh_search[(i)]\n"
+       << "#define qacc(i)      sh_qacc[(i)]\n"
+       << "#define Ma(i)        sh_Ma[(i)]\n"
+       << "#define Jaref(i)     sh_Jaref[(i)]\n"
+       << "#define act(i)       sh_act[(i)]\n"
+       << "#define efc_floss(i) sh_floss[(i)]\n"
+       << "#define Mv_arr(i)    sh_Mv[(i)]\n"
+       << "#define Jv_arr(i)    sh_Jv[(i)]\n";
+  } else {
+    ss << "#define QMV(i)       qM_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define QFS(i)       qfrc_smooth_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define CDOF(i)      cdof_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define SCOM(i)      subtree_com_in[uint(i)*NBATCH+bid]\n";
+    ss << "#define H(i)         solver_scratch[s_off + " << S_H << " + (i)]\n"
+       << "#define J(r,c)       solver_scratch[s_off + " << S_J << " + (r)*NV+(c)]\n"
+       << "#define efc_D(i)     solver_scratch[s_off + " << S_D << " + (i)]\n"
+       << "#define efc_aref(i)  solver_scratch[s_off + " << S_AREF << " + (i)]\n"
+       << "#define efc_force(i) solver_scratch[s_off + " << S_FORCE << " + (i)]\n"
+       << "#define grad(i)      solver_scratch[s_off + " << S_GRAD << " + (i)]\n"
+       << "#define search_d(i)  solver_scratch[s_off + " << S_SEARCH << " + (i)]\n"
+       << "#define qacc(i)      solver_scratch[s_off + " << S_QACC << " + (i)]\n"
+       << "#define Ma(i)        solver_scratch[s_off + " << S_MA << " + (i)]\n"
+       << "#define Jaref(i)     solver_scratch[s_off + " << S_JAREF << " + (i)]\n"
+       << "#define act(i)       solver_scratch[s_off + " << S_ACTIVE << " + (i)]\n"
+       << "#define efc_floss(i) solver_scratch[s_off + " << S_FLOSS << " + (i)]\n"
+       << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
+       << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n";
+  }
+  if(use_shared) ss << "#define JACR_DECL float jr_l[NV*3];\n#define JACR_ADD(di,x,y,z) { jr_l[(di)*3] += (x); jr_l[(di)*3+1] += (y); jr_l[(di)*3+2] += (z); }\n#define JACR_SUB(di,x,y,z) { jr_l[(di)*3] -= (x); jr_l[(di)*3+1] -= (y); jr_l[(di)*3+2] -= (z); }\n#define JACR_ZERO for (int di_ = 0; di_ < NV*3; di_++) jr_l[di_] = 0.0f;\n#define JACR(i) jr_l[(i)]\n";
+  else ss << "#define JACR_DECL\n#define JACR_ADD(di,x,y,z)\n#define JACR_SUB(di,x,y,z)\n#define JACR_ZERO\n#define JACR(i) 0.0f\n";
+  if(use_shared) ss << "#define JACP_DECL float jp_l[NV*3];\n#define jacp_tmp(i)  jp_l[(i)]\n\n";  // スレッド専用なのでlocal配列(globalのscratchは散らばって遅い)
+  else ss << "#define JACP_DECL\n#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
 
   ss << "uint qp_off = bid * NQ;\n"
      << "uint qm_off = bid * NV * NV;\n"
@@ -159,31 +220,44 @@ shared float tg_pAp;
   ss << "const int CG_ITERS = " << cg_iters << ";\n"
      << "const float CG_TOL = " << solver_fmt_float(cg_tol) << "f;\n\n";
 
-  ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
-     << "barrier(); memoryBarrierBuffer();\n\n";
+  if(!use_shared) {
+    ss << "for (int ii = int(tid); ii < " << SCRATCH_PER_ENV << "; ii += NV) solver_scratch[s_off + ii] = 0.0f;\n"
+       << "barrier(); memoryBarrierBuffer();\n\n";
+  } else {
+    // 共有メモリ版は全域のゼロ埋めをしない: 拘束行(J/D/aref/floss)は作る時に全要素を書き、qacc等は読む前に必ず書く。
+    ss << "for (int ii = int(tid); ii < NV*NV; ii += NV) sh_qM[ii] = qM_in[uint(ii)*NBATCH+bid];\n"
+       << "sh_qfs[tid] = qfrc_smooth_in[uint(int(tid))*NBATCH+bid];\n"
+       << "for (int ii = int(tid); ii < NV*6; ii += NV) sh_cdof[ii] = cdof_in[uint(ii)*NBATCH+bid];\n"
+       << "for (int ii = int(tid); ii < NB*3; ii += NV) sh_scom[ii] = subtree_com_in[uint(ii)*NBATCH+bid];\n"
+       << "sh_qacc[tid] = 0.0f;\nbarrier();\n\n";
+  }
 
-  ss << "if (tid == 0u) {\n"
-     << "int ncon = int(contact_count_in[bid]);\n"
-     << "int nefc = 0;\n\n";
-
-  if(nfl > 0) {
+  ss << "SABL0\n";
+  const int nfl_eff = std::min(nfl, max_efc - 4);
+  if(nfl_eff > 0) {
+    // frictionloss行は常に先頭に並び、行ごとに独立なので全スレッドで並列に作る。
+    ss << "const int NFL_EFF = " << nfl_eff << ";\n";
     ss << R"GLSL(
-for (int fi = 0; fi < NFL; fi++) {
-    if (nefc >= MAX_EFC_N - 4) break;
+for (int fi = int(tid); fi < NFL_EFF; fi += NV) {
     int fp = fi * 10;
     int dof = int(fric_tab[fp+0]);
     float fl = fric_tab[fp+1];
     float k_f, b_f, imp_f;
     efc_kbi(fric_tab[fp+2], fric_tab[fp+3], fric_tab[fp+4], fric_tab[fp+5], fric_tab[fp+6], fric_tab[fp+7], fric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
     float r_f = max(fric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
-    J(nefc, dof) = 1.0f;
-    efc_D(nefc) = 1.0f / r_f;
-    efc_aref(nefc) = -b_f * qvel_in[qv_off + dof];
-    efc_floss(nefc) = fl;
-    nefc++;
+    for (int di = 0; di < NV; di++) J(fi, di) = 0.0f;
+    J(fi, dof) = 1.0f;
+    efc_D(fi) = 1.0f / r_f;
+    efc_aref(fi) = -b_f * qvel_in[qv_off + dof];
+    efc_floss(fi) = fl;
 }
+barrier();
 )GLSL";
   }
+  ss << "if (tid == 0u) {\n"
+     << "int ncon = int(contact_count_in[bid]);\n"
+     << "int nefc = " << nfl_eff << ";\n\n";
+
   if(nlim > 0) {
     ss << R"GLSL(
 for (int li = 0; li < NLIM; li++) {
@@ -200,6 +274,8 @@ for (int li = 0; li < NLIM; li++) {
         float k_l, b_l, imp_l;
         efc_kbi(lim_tab[lp+5], lim_tab[lp+6], lim_tab[lp+7], lim_tab[lp+8], lim_tab[lp+9], lim_tab[lp+10], lim_tab[lp+11], pos, k_l, b_l, imp_l);
         float r_l = max(lim_tab[lp+12] * (1.0f - imp_l) / imp_l, MJMINVAL_CV);
+        for (int di = 0; di < NV; di++) J(nefc, di) = 0.0f;
+        efc_floss(nefc) = 0.0f;
         J(nefc, dof) = sgn;
         efc_D(nefc) = 1.0f / r_l;
         efc_aref(nefc) = -b_l * (sgn * qvel_in[qv_off + dof]) - k_l * imp_l * pos;
@@ -214,13 +290,13 @@ int ncp = 0;
 {
     // 各接触が使う拘束行数(ピラミッド錐でcondim>=3なら4行、他は1行、非アクティブは0)を先に数えて行オフセットを決める。
     int r_run = nefc;
-    for (int ci = 0; ci < ncon && r_run < MAX_EFC_N - 4; ci++) {
+    for (int ci = 0; ci < ncon && r_run < MAX_EFC_N - 10; ci++) {
         int ci_o = int(con_off) + ci * CON_STRIDE;
         int pp_ = int(contact_data_in[ci_o+7]) * 18;
         bool act_ = contact_data_in[ci_o+6] < pair_props[pp_+3];
         int cd_ = int(pair_props[pp_+2]);
         tg_crow0[ci] = r_run; ncp = ci + 1;
-        r_run += act_ ? ((USE_PYR && cd_ >= 3) ? 4 : 1) : 0;
+        r_run += act_ ? (PYR_FULL ? (cd_ >= 2 ? 2*(cd_-1) : 1) : ((USE_PYR && cd_ >= 3) ? 4 : 1)) : 0;
     }
     tg_crow0[ncp] = r_run; tg_ncp = ncp; tg_nefc = r_run;
 }
@@ -230,6 +306,7 @@ barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     int row = tg_crow0[ci];
     if (tg_crow0[ci+1] == row) continue;
+    for (int rr = row; rr < tg_crow0[ci+1]; rr++) efc_floss(rr) = 0.0f;
     int ci_off = int(con_off) + ci * CON_STRIDE;
     float c_pos_x = contact_data_in[ci_off+0];
     float c_pos_y = contact_data_in[ci_off+1];
@@ -279,34 +356,39 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     float imp_val = clamp(dmin + imp_y_val * (dmax_v - dmin), dmin, dmax_v);
     if (imp_x_val > 1.0f) imp_val = dmax_v;
 
+    JACP_DECL
+    JACR_DECL
     for (int di = 0; di < NV*3; di++) jacp_tmp(di) = 0.0f;
+    JACR_ZERO
 
     {
         int rid = int(body_rootid_buf[body2]);
-        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
-        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
-        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        float ox = c_pos_x - SCOM(rid*3);
+        float oy = c_pos_y - SCOM(rid*3+1);
+        float oz = c_pos_z - SCOM(rid*3+2);
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body2*NV+di] < 0.5f) continue;
-            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
-            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            float ax=CDOF(di*6),ay=CDOF(di*6+1),az=CDOF(di*6+2);
+            float lx=CDOF(di*6+3),ly=CDOF(di*6+4),lz=CDOF(di*6+5);
             jacp_tmp(di*3+0) += lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) += ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) += lz + (ax*oy - ay*ox);
+            JACR_ADD(di, ax, ay, az)
         }
     }
     {
         int rid = int(body_rootid_buf[body1]);
-        float ox = c_pos_x - subtree_com_in[sc_off + rid*3];
-        float oy = c_pos_y - subtree_com_in[sc_off + rid*3+1];
-        float oz = c_pos_z - subtree_com_in[sc_off + rid*3+2];
+        float ox = c_pos_x - SCOM(rid*3);
+        float oy = c_pos_y - SCOM(rid*3+1);
+        float oz = c_pos_z - SCOM(rid*3+2);
         for (int di = 0; di < NV; di++) {
             if (body_dof_masks_buf[body1*NV+di] < 0.5f) continue;
-            float ax=cdof_in[cd_off+di*6],ay=cdof_in[cd_off+di*6+1],az=cdof_in[cd_off+di*6+2];
-            float lx=cdof_in[cd_off+di*6+3],ly=cdof_in[cd_off+di*6+4],lz=cdof_in[cd_off+di*6+5];
+            float ax=CDOF(di*6),ay=CDOF(di*6+1),az=CDOF(di*6+2);
+            float lx=CDOF(di*6+3),ly=CDOF(di*6+4),lz=CDOF(di*6+5);
             jacp_tmp(di*3+0) -= lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) -= ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) -= lz + (ax*oy - ay*ox);
+            JACR_SUB(di, ax, ay, az)
         }
     }
 )GLSL";
@@ -323,7 +405,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     else tt1 = msl_cross(nn, vec3(0,1,0));
     tt1 = msl_norm(tt1); tt2 = msl_cross(nn, tt1);
 
-    if (condim >= 3 && contact_active) {
+    if (PYR_FULL ? (condim >= 2 && contact_active) : (condim >= 3 && contact_active)) {
         float mu0 = fri0, mu0_sq = mu0*mu0;
         float invw_py = invw_t + mu0_sq*invw_t;
         float r_first = max(invw_py*(1.0f-imp_val)/imp_val, MJMINVAL_CV);
@@ -331,6 +413,28 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     ss << "        float r_py = max(2.0f*mu0_sq/" << solver_fmt_float(impratio) << "f*r_first, MJMINVAL_CV);\n";
     ss << R"GLSL(
         float D_py = 1.0f/r_py;
+        if (PYR_FULL) {
+            // 全方向: 0,1=接線(並進)、2=ねじり(法線まわり)、3,4=転がり(接線1,2まわり)。各方向でJ_normal ± mu_k*J_k の2行。
+            int ndir = condim - 1;
+            for (int tk = 0; tk < ndir; tk++) {
+                float mu_k = pair_props[pp+4+tk];
+                vec3 dir = (tk == 0 || tk == 3) ? tt1 : ((tk == 1 || tk == 4) ? tt2 : nn);
+                for (int sg_i = 0; sg_i < 2; sg_i++) {
+                    float sg = (sg_i == 0) ? 1.0f : -1.0f;
+                    float jdot = 0.0f;
+                    for (int di = 0; di < NV; di++) {
+                        float jt = (tk < 2) ? dir.x*jacp_tmp(di*3)+dir.y*jacp_tmp(di*3+1)+dir.z*jacp_tmp(di*3+2)
+                                            : dir.x*JACR(di*3)+dir.y*JACR(di*3+1)+dir.z*JACR(di*3+2);
+                        float jv = j_normal_arr[di] + sg*mu_k*jt;
+                        J(row,di) = jv;
+                        jdot += jv*qvel_in[qv_off+di];
+                    }
+                    efc_D(row) = D_py;
+                    efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
+                    row++;
+                }
+            }
+        } else {
         float mu_vals[2] = float[](fri0, fri1);
         for (int tk = 0; tk < 2; tk++) {
             float mu_k = mu_vals[tk];
@@ -354,6 +458,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
             efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
             row++;
         }
+        }
     } else if (contact_active) {
 )GLSL";
   } else {
@@ -372,6 +477,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
 }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 int nefc = tg_nefc;
+SABL1
 
 qacc(int(tid)) = 0.0f;
 barrier(); memoryBarrierBuffer();
@@ -382,22 +488,16 @@ if (nefc == 0) {
     return;
 }
 
-{ float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[qm_off + int(tid)*NV + j]*qacc(j); Ma(int(tid)) = s; }
-barrier(); memoryBarrierBuffer();
-
-if (tid == 0u) {
-    for (int r2 = 0; r2 < nefc; r2++) {
-        float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*qacc(j);
-        Jaref(r2) = s - efc_aref(r2);
-    }
-    for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
-}
+// qacc=0から始めるので M*qacc=0、J*qacc=0(Jaref=-aref)。行ごとに独立なので全スレッドで並列に更新する。
+Ma(int(tid)) = 0.0f;
+for (int r2 = int(tid); r2 < nefc; r2 += NV) { Jaref(r2) = -efc_aref(r2); EFC_REFRESH(r2); }
 barrier(); memoryBarrierBuffer();
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
-  grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
+  grad(int(tid)) = Ma(int(tid)) - QFS(int(tid)) - s; }
 barrier(); memoryBarrierBuffer();
 
+SABL2
 if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int iter = 0; iter < NSOLVE; iter++) {
@@ -413,7 +513,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         if (tg_rr < 1e-20f || tg_rr < CG_TOL * tg_rr0) break;  // 残差2乗が初期値の相対CG_TOL未満なら不正確なNewton方向で十分
 
         float mp = MJMINVAL_SV * cg_p(int(tid));
-        for (int j = 0; j < NV; j++) mp += qM_in[qm_off + int(tid)*NV + j] * cg_p(j);
+        for (int j = 0; j < NV; j++) mp += QMV(int(tid)*NV + j) * cg_p(j);
 
         for (int r2 = int(tid); r2 < nefc; r2 += NV) {
             float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*cg_p(j);
@@ -442,16 +542,18 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         barrier(); memoryBarrierBuffer();
     }
 
-    { float s = 0.0f; for (int j = 0; j < NV; j++) s += qM_in[qm_off + int(tid)*NV + j]*search_d(j); Mv_arr(int(tid)) = s; }
+    SABL3
+    { float s = 0.0f; for (int j = 0; j < NV; j++) s += QMV(int(tid)*NV + j)*search_d(j); Mv_arr(int(tid)) = s; }
     barrier(); memoryBarrierBuffer();
 
+LS_BEGIN
     if (tid == 0u) {
         for (int r2 = 0; r2 < nefc; r2++) {
             float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*search_d(j);
             Jv_arr(r2) = s;
         }
         float qg=0.0f,lg=0.0f,qc=0.0f,lc=0.0f;
-        for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-qfrc_smooth_in[qfs_off+i]); }
+        for (int i = 0; i < NV; i++) { qg += 0.5f*search_d(i)*Mv_arr(i); lg += search_d(i)*(Ma(i)-QFS(i)); }
         for (int r2 = 0; r2 < nefc; r2++) { qc += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc += -efc_force(r2)*Jv_arr(r2); }
         float dnom = 2.0f*(qg+qc);
         float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
@@ -477,7 +579,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         float als[5] = float[](abis, an, 0.5f*an, 0.1f*an, 0.01f);
         float bc = 1e30f, ba_local = 0.0f;
         float cc2=0.0f; for (int r2 = 0; r2 < nefc; r2++) cc2 += efc_cost(efc_D(r2), Jaref(r2), efc_floss(r2));
-        float cg=0.0f; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-qfrc_smooth_in[qfs_off+i])*qacc(i);
+        float cg=0.0f; for (int i = 0; i < NV; i++) cg += 0.5f*(Ma(i)-QFS(i))*qacc(i);
         bc = cc2+cg;
         for (int ai = 0; ai < 5; ai++) {
             float a = als[ai]; float tc2=0.0f;
@@ -491,6 +593,8 @@ for (int iter = 0; iter < NSOLVE; iter++) {
         for (int r2 = 0; r2 < nefc; r2++) Jaref(r2) += ba_local*Jv_arr(r2);
         for (int r2 = 0; r2 < nefc; r2++) EFC_REFRESH(r2);
     }
+LS_END
+    SABL4
     barrier(); memoryBarrierBuffer(); memoryBarrierShared();
     float ba = tg_ba;
 
@@ -499,7 +603,7 @@ for (int iter = 0; iter < NSOLVE; iter++) {
     barrier(); memoryBarrierBuffer();
 
     { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
-      grad(int(tid)) = Ma(int(tid)) - qfrc_smooth_in[qfs_off+int(tid)] - s; }
+      grad(int(tid)) = Ma(int(tid)) - QFS(int(tid)) - s; }
     barrier(); memoryBarrierBuffer();
     // 勾配ノルムが初期値の相対GTOL_REL(2乗比)未満なら収束とみなして打ち切る。静止付近のenvは少ない反復で収束し、残りのNSOLVE回を省ける。
     if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); if (gn < GTOL_REL*tg_g0) tg_done = 1; }
@@ -512,7 +616,8 @@ for (int iter = 0; iter < NSOLVE; iter++) {
 barrier(); memoryBarrierBuffer();
 // 接触ごとの法線方向の力(ピラミッド錐は全ファセットの力の和)。cfrc_ext算出用。
 if (tid == 0u) {
-    for (int ci = 0; ci < MAX_CON; ci++) {
+    int nc_out = int(contact_count_in[bid]);
+    for (int ci = 0; ci < nc_out && ci < MAX_CON; ci++) {  // cfrcはcontact_count個しか読まないので128個全部は書かない
         float fn = 0.0f;
         if (ci < tg_ncp) for (int r2 = tg_crow0[ci]; r2 < tg_crow0[ci+1]; r2++) fn += efc_force(r2);
         contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = fn;
@@ -520,6 +625,102 @@ if (tid == 0u) {
 }
 )GLSL";
 
+  const std::string kLineSearchParallel = R"GLSL(
+    // 直線探索を全スレッドで並列に行う(共有メモリ版)。行(拘束)はスレッドに割り当て、合計は共有配列に書いてbarrier後に全スレッドが同じ順で足すので結果は全スレッドで一致する。
+    for (int r2 = int(tid); r2 < nefc; r2 += NV) { float s = 0.0f; for (int j = 0; j < NV; j++) s += J(r2,j)*search_d(j); Jv_arr(r2) = s; }
+    {
+        float sd_ = search_d(int(tid));
+        sh_red[int(tid)] = sd_*(Ma(int(tid)) - QFS(int(tid)));
+        sh_red[NV+int(tid)] = 0.5f*sd_*Mv_arr(int(tid));
+        sh_red[2*NV+int(tid)] = 0.5f*(Ma(int(tid)) - QFS(int(tid)))*qacc(int(tid));
+        float qc_p = 0.0f, lc_p = 0.0f;
+        for (int r2 = int(tid); r2 < nefc; r2 += NV) { qc_p += 0.5f*efc_D(r2)*Jv_arr(r2)*Jv_arr(r2)*act(r2); lc_p += -efc_force(r2)*Jv_arr(r2); }
+        sh_red[3*NV+int(tid)] = qc_p; sh_red[4*NV+int(tid)] = lc_p;
+    }
+    barrier();
+    float lg = 0.0f, qg = 0.0f, cg = 0.0f, qc = 0.0f, lc = 0.0f;
+    for (int i = 0; i < NV; i++) { lg += sh_red[i]; qg += sh_red[NV+i]; cg += sh_red[2*NV+i]; qc += sh_red[3*NV+i]; lc += sh_red[4*NV+i]; }
+    barrier();
+    float dnom = 2.0f*(qg+qc);
+    float an = clamp(-(lg+lc)/max(dnom, MJMINVAL_SV), -2.0f, 2.0f);
+    // コストの導関数に対する二分法で厳密な1次元最小化を行う。
+    float lo_a = 0.0f, hi_a = 2.0f;
+    for (int bi = 0; bi < 10; bi++) {
+        float mid = 0.5f*(lo_a+hi_a);
+        float dd_p = 0.0f;
+        for (int r2 = int(tid); r2 < nefc; r2 += NV) {
+            float x = Jaref(r2) + mid*Jv_arr(r2);
+            float fl = efc_floss(r2); float Dd = efc_D(r2);
+            float dc = 0.0f;
+            if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
+            else if (x < 0.0f) { dc = Dd*x; }
+            dd_p += dc*Jv_arr(r2);
+        }
+        sh_red[int(tid)] = dd_p;
+        barrier();
+        float dd = lg + mid*2.0f*qg;
+        for (int i = 0; i < NV; i++) dd += sh_red[i];
+        barrier();
+        if (dd > 0.0f) hi_a = mid; else lo_a = mid;
+    }
+    float abis = 0.5f*(lo_a+hi_a);
+    float als[5] = float[](abis, an, 0.5f*an, 0.1f*an, 0.01f);
+    {
+        float cc_p = 0.0f; float tc_p0 = 0.0f, tc_p1 = 0.0f, tc_p2 = 0.0f, tc_p3 = 0.0f, tc_p4 = 0.0f;
+        for (int r2 = int(tid); r2 < nefc; r2 += NV) {
+            float Dd = efc_D(r2), fl = efc_floss(r2), jr = Jaref(r2), jv = Jv_arr(r2);
+            cc_p += efc_cost(Dd, jr, fl);
+            tc_p0 += efc_cost(Dd, jr + als[0]*jv, fl); tc_p1 += efc_cost(Dd, jr + als[1]*jv, fl); tc_p2 += efc_cost(Dd, jr + als[2]*jv, fl);
+            tc_p3 += efc_cost(Dd, jr + als[3]*jv, fl); tc_p4 += efc_cost(Dd, jr + als[4]*jv, fl);
+        }
+        sh_red[int(tid)] = cc_p; sh_red[NV+int(tid)] = tc_p0; sh_red[2*NV+int(tid)] = tc_p1; sh_red[3*NV+int(tid)] = tc_p2; sh_red[4*NV+int(tid)] = tc_p3; sh_red[5*NV+int(tid)] = tc_p4;
+    }
+    barrier();
+    float cc2 = 0.0f; float tcs[5] = float[](0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < NV; i++) { cc2 += sh_red[i]; for (int ai = 0; ai < 5; ai++) tcs[ai] += sh_red[(1+ai)*NV+i]; }
+    float bc = cc2 + cg, ba_local = 0.0f;
+    for (int ai = 0; ai < 5; ai++) {
+        float a = als[ai];
+        float tt = tcs[ai] + cg + a*lg + 0.5f*a*a*(2.0f*qg);
+        if (tt < bc) { bc = tt; ba_local = a; }
+    }
+    for (int r2 = int(tid); r2 < nefc; r2 += NV) { Jaref(r2) += ba_local*Jv_arr(r2); EFC_REFRESH(r2); }
+    if (tid == 0u) {
+        tg_ba = ba_local;
+        // 1反復のコスト改善が無ければ収束とみなす。
+        tg_done = (ba_local == 0.0f) ? 1 : 0;
+    }
+    barrier();
+)GLSL";
+  {
+    static const int sabl = getenv("MJMLX_SABL") ? atoi(getenv("MJMLX_SABL")) : 0;  // 計測用: 1=拘束構築直後、2=初期勾配直後でqfrc_constraint=0を書いて終了
+    std::string body = ss.str();
+    // 早期returnで依存が切れると前段がコンパイラに消されるので、各点の状態を出力に書いてから終了する。
+    auto rep = [&](const std::string& key, bool on, const std::string& chk) {
+        size_t p = body.find(key);
+        if (p != std::string::npos) body.replace(p, key.size(), on ? "{ float chk_ = " + chk + "; qfrc_constraint_out[qfc_off + int(tid)] = chk_; return; }" : std::string());
+    };
+    const std::string rows = "0.0f; for (int r2 = 0; r2 < nefc; r2++) chk_ += J(r2,int(tid))*(efc_D(r2)+efc_aref(r2)+efc_force(r2))";
+    rep("SABL0", sabl == 5, "sh_H[0] + sh_J[int(tid)] + solver_scratch[s_off + int(tid)]");
+    rep("SABL1", sabl == 1, rows);
+    rep("SABL2", sabl == 2, "grad(int(tid))");
+    rep("SABL3", sabl == 3, "search_d(int(tid))");
+    rep("SABL4", sabl == 4, "tg_ba + search_d(int(tid))");
+    {
+      size_t b0 = body.find("LS_BEGIN\n"), e0 = body.find("LS_END\n");
+      if(b0 != std::string::npos && e0 != std::string::npos) {
+        if(use_shared) body.replace(b0, e0 + 7 - b0, kLineSearchParallel);
+        else { body.erase(e0, 7); body.erase(b0, 9); }
+      }
+    }
+    // 共有メモリ版はデータがsharedにあり(barrier()がworkgroupメモリの可視性も保証する)、globalのメモリバリアは不要。memoryBarrierBufferは未完了のglobal load/storeを全部待つので高コスト。
+    static const bool keep_mbb = getenv("MJMLX_KEEP_MBB") != nullptr;
+    if(use_shared && !keep_mbb) {
+      const std::string mbb = "memoryBarrierBuffer();";
+      for(size_t q = body.find(mbb); q != std::string::npos; q = body.find(mbb, q)) body.erase(q, mbb.size());
+    }
+    ss.str(body);
+  }
   return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
 }
 

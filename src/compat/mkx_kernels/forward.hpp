@@ -134,7 +134,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  float m = body_mass[b];\n"
      << "  scratch[SCR_IDX(S_SUBM + b)] = m;\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    scratch[SCR_IDX(S_SUBP + b*3+k)] = xipos[xip_off + b*3+k] * m;\n"
+     << "    scratch[SCR_IDX(S_SUBP + b*3+k)] = xipos[uint(b*3+k)*NBATCH+bid] * m;\n"
      << "}\n";
 
   ss << "for (int b = NB-1; b >= 1; b--) {\n"
@@ -147,7 +147,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   ss << "for (int b = 0; b < NB; b++) {\n"
      << "  float sm = max(scratch[SCR_IDX(S_SUBM + b)], 1e-8f);\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    subtree_com_out[sc_off + b*3+k] = scratch[SCR_IDX(S_SUBP + b*3+k)] / sm;\n"
+     << "    subtree_com_out[uint(b*3+k)*NBATCH+bid] = scratch[SCR_IDX(S_SUBP + b*3+k)] / sm;\n"
      << "}\n\n";
 
   ss << "for (int b = 0; b < NB; b++) {\n"
@@ -155,8 +155,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  int rid = body_root[b];\n"
      << "  float off[3];\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    off[k] = xipos[xip_off + b*3+k] - subtree_com_out[sc_off + rid*3+k];\n"
-     << "  float R[9]; for (int k=0;k<9;k++) R[k] = ximat[xim_off + b*9+k];\n"
+     << "    off[k] = xipos[uint(b*3+k)*NBATCH+bid] - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
+     << "  float R[9]; for (int k=0;k<9;k++) R[k] = ximat[uint(b*9+k)*NBATCH+bid];\n"
      << "  float Ix = body_inert[b*3], Iy = body_inert[b*3+1], Iz = body_inert[b*3+2];\n"
      << "  float RI[9] = float[](R[0]*Ix,R[1]*Iy,R[2]*Iz, R[3]*Ix,R[4]*Iy,R[5]*Iz, R[6]*Ix,R[7]*Iy,R[8]*Iz);\n"
      << "  float Ig[9];\n"
@@ -169,16 +169,16 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  Ig[1] -= m*off[0]*off[1]; Ig[3] -= m*off[1]*off[0];\n"
      << "  Ig[2] -= m*off[0]*off[2]; Ig[6] -= m*off[2]*off[0];\n"
      << "  Ig[5] -= m*off[1]*off[2]; Ig[7] -= m*off[2]*off[1];\n"
-     << "  cinert_out[ci_off + b*10+0] = Ig[0];\n"
-     << "  cinert_out[ci_off + b*10+1] = Ig[4];\n"
-     << "  cinert_out[ci_off + b*10+2] = Ig[8];\n"
-     << "  cinert_out[ci_off + b*10+3] = Ig[1];\n"
-     << "  cinert_out[ci_off + b*10+4] = Ig[2];\n"
-     << "  cinert_out[ci_off + b*10+5] = Ig[5];\n"
-     << "  cinert_out[ci_off + b*10+6] = off[0]*m;\n"
-     << "  cinert_out[ci_off + b*10+7] = off[1]*m;\n"
-     << "  cinert_out[ci_off + b*10+8] = off[2]*m;\n"
-     << "  cinert_out[ci_off + b*10+9] = m;\n"
+     << "  cinert_out[uint(b*10+0)*NBATCH+bid] = Ig[0];\n"
+     << "  cinert_out[uint(b*10+1)*NBATCH+bid] = Ig[4];\n"
+     << "  cinert_out[uint(b*10+2)*NBATCH+bid] = Ig[8];\n"
+     << "  cinert_out[uint(b*10+3)*NBATCH+bid] = Ig[1];\n"
+     << "  cinert_out[uint(b*10+4)*NBATCH+bid] = Ig[2];\n"
+     << "  cinert_out[uint(b*10+5)*NBATCH+bid] = Ig[5];\n"
+     << "  cinert_out[uint(b*10+6)*NBATCH+bid] = off[0]*m;\n"
+     << "  cinert_out[uint(b*10+7)*NBATCH+bid] = off[1]*m;\n"
+     << "  cinert_out[uint(b*10+8)*NBATCH+bid] = off[2]*m;\n"
+     << "  cinert_out[uint(b*10+9)*NBATCH+bid] = m;\n"
      << "}\n\n";
 
   ss << "for (int di = 0; di < NV; di++) {\n"
@@ -187,11 +187,11 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  int ji = dof_jid[di];\n"
      << "  int ra = dof_rotaxis[di];\n"
      << "  int rid = body_root[bdi];\n"
-     << "  float rc[3]; for (int k=0;k<3;k++) rc[k] = subtree_com_out[sc_off + rid*3+k];\n"
+     << "  float rc[3]; for (int k=0;k<3;k++) rc[k] = subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
      << "  float c6[6] = float[](0.0f,0.0f,0.0f,0.0f,0.0f,0.0f);\n"
      << "  if (jt == 3) {\n"
-     << "    float ax[3] = float[](xaxis[xax_off+ji*3], xaxis[xax_off+ji*3+1], xaxis[xax_off+ji*3+2]);\n"
-     << "    float anc[3] = float[](xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]);\n"
+     << "    float ax[3] = float[](xaxis[uint(ji*3)*NBATCH+bid], xaxis[uint(ji*3+1)*NBATCH+bid], xaxis[uint(ji*3+2)*NBATCH+bid]);\n"
+     << "    float anc[3] = float[](xanchor[uint(ji*3)*NBATCH+bid], xanchor[uint(ji*3+1)*NBATCH+bid], xanchor[uint(ji*3+2)*NBATCH+bid]);\n"
      << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
      << "    c6[0]=ax[0]; c6[1]=ax[1]; c6[2]=ax[2];\n"
      << "    c6[3]=ax[1]*d[2]-ax[2]*d[1]; c6[4]=ax[2]*d[0]-ax[0]*d[2]; c6[5]=ax[0]*d[1]-ax[1]*d[0];\n"
@@ -199,19 +199,19 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "    int sub = di - " << (njnt > 0 ? jnt_dofadr0 : 0) << ";\n"
      << "    c6[3+sub] = 1.0f;\n"
      << "  } else if (jt == 0 && ra >= 0) {\n"
-     << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[xm_off + bdi*9+k];\n"
+     << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[uint(bdi*9+k)*NBATCH+bid];\n"
      << "    float col[3] = float[](rm[ra], rm[3+ra], rm[6+ra]);\n"
-     << "    float anc[3] = float[](xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]);\n"
+     << "    float anc[3] = float[](xanchor[uint(ji*3)*NBATCH+bid], xanchor[uint(ji*3+1)*NBATCH+bid], xanchor[uint(ji*3+2)*NBATCH+bid]);\n"
      << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
      << "    c6[0]=col[0]; c6[1]=col[1]; c6[2]=col[2];\n"
      << "    c6[3]=col[1]*d[2]-col[2]*d[1]; c6[4]=col[2]*d[0]-col[0]*d[2]; c6[5]=col[0]*d[1]-col[1]*d[0];\n"
      << "  } else if (jt == 2) {\n"
-     << "    float ax[3] = float[](xaxis[xax_off+ji*3], xaxis[xax_off+ji*3+1], xaxis[xax_off+ji*3+2]);\n"
+     << "    float ax[3] = float[](xaxis[uint(ji*3)*NBATCH+bid], xaxis[uint(ji*3+1)*NBATCH+bid], xaxis[uint(ji*3+2)*NBATCH+bid]);\n"
      << "    c6[3]=ax[0]; c6[4]=ax[1]; c6[5]=ax[2];\n"
      << "  } else if (jt == 1) {\n"
-     << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[xm_off + bdi*9+k];\n"
+     << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[uint(bdi*9+k)*NBATCH+bid];\n"
      << "    float col[3] = float[](rm[ra], rm[3+ra], rm[6+ra]);\n"
-     << "    float anc[3] = float[](xanchor[xa_off+ji*3], xanchor[xa_off+ji*3+1], xanchor[xa_off+ji*3+2]);\n"
+     << "    float anc[3] = float[](xanchor[uint(ji*3)*NBATCH+bid], xanchor[uint(ji*3+1)*NBATCH+bid], xanchor[uint(ji*3+2)*NBATCH+bid]);\n"
      << "    float d[3]; for (int k=0;k<3;k++) d[k] = rc[k] - anc[k];\n"
      << "    c6[0]=col[0]; c6[1]=col[1]; c6[2]=col[2];\n"
      << "    c6[3]=col[1]*d[2]-col[2]*d[1]; c6[4]=col[2]*d[0]-col[0]*d[2]; c6[5]=col[0]*d[1]-col[1]*d[0];\n"
@@ -223,7 +223,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   ss << "// Phase B: CRB + mass matrix\n";
 
   ss << "for (int b=0;b<NB;b++) for (int k=0;k<10;k++)\n"
-     << "  scratch[SCR_IDX(S_CRB + b*10+k)] = cinert_out[ci_off + b*10+k];\n";
+     << "  scratch[SCR_IDX(S_CRB + b*10+k)] = cinert_out[uint(b*10+k)*NBATCH+bid];\n";
 
   ss << "for (int k=0;k<10;k++) scratch[SCR_IDX(S_CRB + k)] = 0.0f;\n";
 
@@ -232,7 +232,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  for (int k=0;k<10;k++) scratch[SCR_IDX(S_CRB + p*10+k)] += scratch[SCR_IDX(S_CRB + b*10+k)];\n"
      << "}\n\n";
 
-  ss << "for (int i=0;i<NV*NV;i++) qM_out[qM_off+i] = 0.0f;\n";
+  ss << "for (int i=0;i<NV*NV;i++) qM_out[uint(i)*NBATCH+bid] = 0.0f;\n";
 
   ss << "for (int i=0;i<NV;i++) {\n"
      << "  int bi = dof_bodyid[i];\n"
@@ -255,24 +255,24 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "      float ck = (k==0?cc0:k==1?cc1:k==2?cc2:k==3?cc3:k==4?cc4:cc5);\n"
      << "      dot += ck * scratch[SCR_IDX(S_CDOF+j*6+k)];\n"
      << "    }\n"
-     << "    qM_out[qM_off + i*NV+j] = dot;\n"
-     << "    qM_out[qM_off + j*NV+i] = dot;\n"
+     << "    qM_out[uint(i*NV+j)*NBATCH+bid] = dot;\n"
+     << "    qM_out[uint(j*NV+i)*NBATCH+bid] = dot;\n"
      << "    j = dof_par[j];\n"
      << "  }\n"
      << "}\n";
 
-  ss << "for (int i=0;i<NV;i++) qM_out[qM_off + i*NV+i] += dof_arm[i];\n\n";
+  ss << "for (int i=0;i<NV;i++) qM_out[uint(i*NV+i)*NBATCH+bid] += dof_arm[i];\n\n";
 
   // ═══ Phase C: COM velocity ═══
   ss << "// Phase C: COM velocity\n";
 
-  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) { cvel_out[cv_off+b*6+k]=0.0f; scratch[SCR_IDX(S_CDOFD+k)]=0.0f; }\n"
+  ss << "for (int b=0;b<NB;b++) for (int k=0;k<6;k++) { cvel_out[uint(b*6+k)*NBATCH+bid]=0.0f; scratch[SCR_IDX(S_CDOFD+k)]=0.0f; }\n"
      << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++) scratch[SCR_IDX(S_CDOFD+di*6+k)]=0.0f;\n";
 
   for(int b = 1; b < nb; b++) {
     int pid = body_parentid[static_cast<size_t>(b)];
     ss << "{\n"
-       << "  float cv[6]; for (int k=0;k<6;k++) cv[k] = cvel_out[cv_off+" << pid << "*6+k];\n";
+       << "  float cv[6]; for (int k=0;k<6;k++) cv[k] = cvel_out[uint(" << pid << "*6+k)*NBATCH+bid];\n";
 
     for(int di : body_dofs[static_cast<size_t>(b)]) {
       ss << "  {\n"
@@ -290,7 +290,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
          << "  }\n";
     }
 
-    ss << "  for (int k=0;k<6;k++) cvel_out[cv_off+" << b << "*6+k] = cv[k];\n"
+    ss << "  for (int k=0;k<6;k++) cvel_out[uint(" << b << "*6+k)*NBATCH+bid] = cv[k];\n"
        << "}\n";
   }
   ss << "\n";
@@ -315,9 +315,9 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   }
 
   ss << "for (int b=0;b<NB;b++) {\n"
-     << "  float I00=cinert_out[ci_off+b*10], I11=cinert_out[ci_off+b*10+1], I22=cinert_out[ci_off+b*10+2];\n"
-     << "  float I01=cinert_out[ci_off+b*10+3], I02=cinert_out[ci_off+b*10+4], I12=cinert_out[ci_off+b*10+5];\n"
-     << "  float px=cinert_out[ci_off+b*10+6], py=cinert_out[ci_off+b*10+7], pz=cinert_out[ci_off+b*10+8], mass=cinert_out[ci_off+b*10+9];\n"
+     << "  float I00=cinert_out[uint(b*10)*NBATCH+bid], I11=cinert_out[uint(b*10+1)*NBATCH+bid], I22=cinert_out[uint(b*10+2)*NBATCH+bid];\n"
+     << "  float I01=cinert_out[uint(b*10+3)*NBATCH+bid], I02=cinert_out[uint(b*10+4)*NBATCH+bid], I12=cinert_out[uint(b*10+5)*NBATCH+bid];\n"
+     << "  float px=cinert_out[uint(b*10+6)*NBATCH+bid], py=cinert_out[uint(b*10+7)*NBATCH+bid], pz=cinert_out[uint(b*10+8)*NBATCH+bid], mass=cinert_out[uint(b*10+9)*NBATCH+bid];\n"
      << "  float aw0=scratch[SCR_IDX(S_CACC+b*6)], aw1=scratch[SCR_IDX(S_CACC+b*6+1)], aw2=scratch[SCR_IDX(S_CACC+b*6+2)];\n"
      << "  float al0=scratch[SCR_IDX(S_CACC+b*6+3)], al1=scratch[SCR_IDX(S_CACC+b*6+4)], al2=scratch[SCR_IDX(S_CACC+b*6+5)];\n"
      << "  float Ia0=I00*aw0+I01*aw1+I02*aw2+(py*al2-pz*al1);\n"
@@ -326,8 +326,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  float Ia3=mass*al0-(py*aw2-pz*aw1);\n"
      << "  float Ia4=mass*al1-(pz*aw0-px*aw2);\n"
      << "  float Ia5=mass*al2-(px*aw1-py*aw0);\n"
-     << "  float vw0=cvel_out[cv_off+b*6], vw1=cvel_out[cv_off+b*6+1], vw2=cvel_out[cv_off+b*6+2];\n"
-     << "  float vl0=cvel_out[cv_off+b*6+3], vl1=cvel_out[cv_off+b*6+4], vl2=cvel_out[cv_off+b*6+5];\n"
+     << "  float vw0=cvel_out[uint(b*6)*NBATCH+bid], vw1=cvel_out[uint(b*6+1)*NBATCH+bid], vw2=cvel_out[uint(b*6+2)*NBATCH+bid];\n"
+     << "  float vl0=cvel_out[uint(b*6+3)*NBATCH+bid], vl1=cvel_out[uint(b*6+4)*NBATCH+bid], vl2=cvel_out[uint(b*6+5)*NBATCH+bid];\n"
      << "  float Iv0=I00*vw0+I01*vw1+I02*vw2+(py*vl2-pz*vl1);\n"
      << "  float Iv1=I01*vw0+I11*vw1+I12*vw2+(pz*vl0-px*vl2);\n"
      << "  float Iv2=I02*vw0+I12*vw1+I22*vw2+(px*vl1-py*vl0);\n"
@@ -383,10 +383,10 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
        << "      fa += mom * force;\n"
        << "    }\n"
        << "  }\n"
-       << "  qfrc_actuator_out[qa_off+di] = fa;\n"
+       << "  qfrc_actuator_out[uint(di)*NBATCH+bid] = fa;\n"
        << "}\n";
   } else {
-    ss << "for (int di=0;di<NV;di++) qfrc_actuator_out[qa_off+di] = 0.0f;\n";
+    ss << "for (int di=0;di<NV;di++) qfrc_actuator_out[uint(di)*NBATCH+bid] = 0.0f;\n";
   }
 
   // 重力補償(MuJoCo mj_gravcomp相当): gravcomp!=0のbodyのCOMに力 -m*gravcomp*gravity を掛け、そのbodyの祖先(自身含む)のdofへcdofで射影してqfrc_smoothへ足す。
@@ -398,7 +398,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss << "{\n"
        << "  float f[3] = float[](" << fmt_float(-m * gravity[0]) << "f," << fmt_float(-m * gravity[1]) << "f," << fmt_float(-m * gravity[2]) << "f);\n"
        << "  int rid = body_root[" << b << "];\n"
-       << "  float o[3]; for (int k=0;k<3;k++) o[k] = xipos[xip_off+" << b << "*3+k] - subtree_com_out[sc_off+rid*3+k];\n"
+       << "  float o[3]; for (int k=0;k<3;k++) o[k] = xipos[uint(" << b << "*3+k)*NBATCH+bid] - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
        << "  float w[6] = float[](o[1]*f[2]-o[2]*f[1], o[2]*f[0]-o[0]*f[2], o[0]*f[1]-o[1]*f[0], f[0], f[1], f[2]);\n";
     for(int a = b; a > 0; a = body_parentid[static_cast<size_t>(a)])
       for(int di : body_dofs[static_cast<size_t>(a)])
@@ -407,12 +407,12 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   }
 
   ss << "for (int di=0;di<NV;di++) {\n"
-     << "  qfrc_smooth_out[qfs_off+di] = scratch[SCR_IDX(S_PASS+di)] - scratch[SCR_IDX(S_BIAS+di)] + qfrc_actuator_out[qa_off+di] + qfrc_gc[di];\n"
+     << "  qfrc_smooth_out[uint(di)*NBATCH+bid] = scratch[SCR_IDX(S_PASS+di)] - scratch[SCR_IDX(S_BIAS+di)] + qfrc_actuator_out[uint(di)*NBATCH+bid] + qfrc_gc[di];\n"
      << "}\n";
 
   ss << "uint cd_off = bid * NV * 6;\n"
      << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++)\n"
-     << "  cdof_out[cd_off + di*6+k] = scratch[SCR_IDX(S_CDOF+di*6+k)];\n";
+     << "  cdof_out[uint(di*6+k)*NBATCH+bid] = scratch[SCR_IDX(S_CDOF+di*6+k)];\n";
 
   (void)dt;
 

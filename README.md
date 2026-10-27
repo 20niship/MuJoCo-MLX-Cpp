@@ -105,11 +105,59 @@ uv run python scripts/train_go2_ppo.py --build-dir build-mkx --envs 2048 --max-i
 tensorboard --logdir runs/go2_stairs --host 0.0.0.0 --port 6006
 ```
 
+#### 平地での学習・推論・Isaac Lab準拠の報酬(Linux / MKX Vulkan)
+
+```bash
+# 階段なしの平地 + Isaac Lab(UnitreeGo2FlatEnvCfg)準拠の報酬、PPO更新もGPU(CUDA)で回す
+PYTHONPATH=<cu126等のtorch> uv run python scripts/train_go2_ppo.py --build-dir build --flat \
+  --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
+
+# 学習済みモデルで前後左右のcmd_velを与え、2x2タイル動画(runs/video/*.mp4)と追従誤差を出す
+uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
+```
+
+- `--reward-preset`: `relaxed`(罰則を弱めた従来設定)/ `isaac_flat`(Isaac Lab準拠: `flat_orientation_l2`・`feet_air_time`など)
+- `--device cuda`: ドライバに合うCUDA版torchが要る(例: ドライバ12.7なら `torch+cu126`)。CPUのままでも動くがPPO更新が約17秒/iter遅い
+- `MJMLX_GO2_INTEGRATOR=implicitfast`: PDアクチュエータを陰的に扱う(既定はXMLのまま=陽的)
+
 エンジンの制約により、IsaacLab版から以下を省略・簡略化している:
 - **height_scanner観測**: 本エンジンにレイキャストAPIが無いため、盲目(proprioception only)方策になる
 - **per-envの物理DR(質量/摩擦/COM)**: batched simが全envで単一モデルを共有するため、env別に質量・摩擦を変えるAPIが無い
 - **地形カリキュラム**: 実装対象外(固定難度の階段地形のみ)
 - **heading_command方式のcmd_vel生成**: `||cmd_vel|| ∈ [--cmd-vel-min, --cmd-vel-max]`の直接サンプリングに簡略化
+
+## Performance measurement(学習速度・CPU/GPU差・Isaac Labとの比較)
+
+事前に別プロセス(ollama等)がGPU/CPUを使っていないか確認する(各段の時間が2〜3倍ぶれる)。以降のスクリプトは `--build-dir`(既定 `build`)でPython拡張のビルド先を指す。
+
+### 1. Go2のenv.step速度(4096 env)
+```bash
+uv run python scripts/bench_go2_step.py --build-dir build --envs 4096     # 平均/最小[ms]とenv-steps/s
+MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build --steps 40   # 段(kin/forward/collision/solver/cfrc/euler)ごとの.build/.eval[ms/substep]
+scripts/prof_min.sh build 5                                              # 上を複数回回し、段ごとの最小値を出す(ぶれ対策)
+```
+`--build-dir` を別コミットのビルドにすれば前後比較できる。`MJMLX_TG_<KERNEL>`(KIN/FWD/COLL)でスレッド数、`MJMLX_SOLVER_SHARED=0`・`MKX_DEVICE_LOCAL=0`で最適化を無効にして効果を切り分けられる。
+
+### 2. 学習1 iterationの時間(Isaac Labと比較)
+`train_go2_ppo.py` のログの `Iteration time` / `Collection time` が1 iteration(4096 env × 24 step)の時間。Isaac Labは別環境(Python 3.11)に入れて同じ条件で測る:
+```bash
+uv venv --python 3.11 ~/isaac/.venv && source ~/isaac/.venv/bin/activate   # python は別名の場合があるので .venv/bin/python を直接使う
+uv pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
+git clone --depth 1 --branch v2.3.2 https://github.com/isaac-sim/IsaacLab.git ~/isaac/IsaacLab && cd ~/isaac/IsaacLab
+uv pip install "setuptools<81" wheel && uv pip install --no-build-isolation flatdict==4.0.1   # isaaclab.sh --install がflatdictのビルドで失敗するため先に入れる
+./isaaclab.sh --install rsl_rl
+OMNI_KIT_ACCEPT_EULA=YES ~/isaac/.venv/bin/python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless --max_iterations 20   # ログの Computation / collection / learning を見る
+```
+RTX 3060(12 GB)での実測は `docs/wip_isaac_comparison.md`(本リポジトリ約1.3 s/iter、Isaac Lab約2.2 s/iter)。
+
+### 3. CPU(MuJoCo C)とGPUの物理の差
+```bash
+uv run python scripts/compare_cpu_gpu_go2.py --build-dir build              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
+uv run python scripts/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
+just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
+```
+長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
 
 ## Architecture
 

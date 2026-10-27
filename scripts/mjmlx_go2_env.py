@@ -12,9 +12,10 @@ from tensordict import TensorDict
 
 from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
 
-PHYSICS_DT = 0.004  # go2_mjx.xml本来のtimestep。0.02ではPD(kp=50,armature=0.01)が陽的積分で不安定
-DECIMATION = 5  # 5*0.004 = 0.02s -> 50Hz制御
+PHYSICS_DT = 0.005  # Isaac LabのGo2と同じdt(0.005s x decimation 4)。0.01以上ではPD(kp=50,armature=0.01)が陽的積分で不安定
+DECIMATION = 4  # 4*0.005 = 0.02s -> 50Hz制御
 CONTROL_DT = PHYSICS_DT * DECIMATION
+INTEGRATOR = os.environ.get("MJMLX_GO2_INTEGRATOR", "")  # 空ならXMLのまま(euler、eulerdamp無効=PDは陽的)。"implicitfast"でPDを陰的に扱う(Isaac LabのPDアクチュエータ相当、CPU/GPU差は同程度)
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
 
@@ -31,12 +32,13 @@ BASE_BODY_IDX = 1
 # reward weights (velocity_env_cfg.RewardsCfg + go2 rough_env_cfg の上書き)
 W_TRACK_LIN = 1.5
 W_TRACK_ANG = 0.75
-W_LIN_VEL_Z = -2.0
-W_ANG_VEL_XY = -0.05
-W_TORQUE = -0.00005  # IsaacLabの-0.0002を1/4に。-0.0002だと探索ノイズ下のトルクが追従報酬を上回り探索が損になる
-W_DOF_ACC = -2.5e-7
-W_ACTION_RATE = -0.01
-W_FEET_AIR_TIME = 0.01
+# 報酬重みとreset乱数のプリセット。relaxed=罰則を弱めた従来設定、isaac_flat=IsaacLabのUnitreeGo2FlatEnvCfg準拠
+PRESETS = {
+    "relaxed": dict(lin_vel_z=-0.4, ang_vel_xy=-0.02, torque=-5e-6, dof_acc=-1e-7, action_rate=-0.003, feet_air_time=0.01,
+                    flat_orientation=0.0, joint_reset_scale=(0.5, 1.5), reset_vel=0.5),
+    "isaac_flat": dict(lin_vel_z=-2.0, ang_vel_xy=-0.05, torque=-2e-4, dof_acc=-2.5e-7, action_rate=-0.01, feet_air_time=0.25,
+                       flat_orientation=-2.5, joint_reset_scale=(1.0, 1.0), reset_vel=0.0),
+}
 FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
 
@@ -92,6 +94,14 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
+    for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
+        old, new = kv.split("->", 1)
+        xml = xml.replace(old, new)
+    if INTEGRATOR:
+        if 'integrator="' in xml:
+            xml = re.sub(r'integrator="[^"]*"', f'integrator="{INTEGRATOR}"', xml, count=1)
+        else:
+            xml = xml.replace('<option ', f'<option integrator="{INTEGRATOR}" ', 1)
     terrain_geoms = f"<body name=\"terrain\">\n    {terrain.to_mjcf_bodies()}\n  </body>\n</worldbody>"
     xml = xml.replace("</worldbody>", terrain_geoms)
     with open(out_path, "w") as f:
@@ -109,9 +119,12 @@ class MjmlxGo2Env(VecEnv):
         seed: int | None = None,
         terrain_seed: int | None = None,
         flat_terrain: bool = False,
+        reward_preset: str = "relaxed",
+        device: str = "cpu",
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
     ):
         self._native = native_module
+        self._w = PRESETS[reward_preset]
         self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
         build_terrain_model_xml(self.terrain, generated_xml_path)
 
@@ -125,7 +138,7 @@ class MjmlxGo2Env(VecEnv):
         self.num_envs = num_envs
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
-        self.device = "cpu"  # 方策ネットワークはCPU、物理はmjmlx側で別途GPU実行
+        self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
         self.cfg = {
             "task": "go2_stairs_cmd_vel",
             "cmd_vel_min": cmd_vel_min,
@@ -150,7 +163,7 @@ class MjmlxGo2Env(VecEnv):
 
     @property
     def episode_length_buf(self) -> torch.Tensor:
-        return torch.from_numpy(self._elapsed)
+        return torch.from_numpy(self._elapsed).to(self.device)
 
     @episode_length_buf.setter
     def episode_length_buf(self, value: torch.Tensor) -> None:
@@ -194,12 +207,12 @@ class MjmlxGo2Env(VecEnv):
         qpos[idx, 2] = z
         qpos[idx, 3:7] = _yaw_to_quat(yaw)
 
-        joint_scale = self._rng.uniform(0.5, 1.5, size=(n, 12)).astype(np.float32)
+        joint_scale = self._rng.uniform(*self._w["joint_reset_scale"], size=(n, 12)).astype(np.float32)
         qpos[idx, 7:19] = DEFAULT_JOINT_POS * joint_scale
 
-        qvel[idx, 0:2] = self._rng.uniform(-0.5, 0.5, size=(n, 2))
-        qvel[idx, 2] = self._rng.uniform(-0.5, 0.5, size=n)
-        qvel[idx, 3:6] = self._rng.uniform(-0.5, 0.5, size=(n, 3))
+        rv = self._w["reset_vel"]
+        qvel[idx, 0:3] = self._rng.uniform(-rv, rv, size=(n, 3))
+        qvel[idx, 3:6] = self._rng.uniform(-rv, rv, size=(n, 3))
         qvel[idx, 6:18] = 0.0
 
         self._sim.set_state(qpos, qvel)
@@ -225,7 +238,7 @@ class MjmlxGo2Env(VecEnv):
         ).astype(np.float32)
 
     def _obs_tensordict(self, obs: np.ndarray) -> TensorDict:
-        return TensorDict({"policy": torch.from_numpy(obs)}, batch_size=[self.num_envs])
+        return TensorDict({"policy": torch.from_numpy(obs).to(self.device)}, batch_size=[self.num_envs])
 
     def get_observations(self) -> TensorDict:
         qpos, qvel = self._sim.state()
@@ -269,35 +282,38 @@ class MjmlxGo2Env(VecEnv):
         r_track_lin = W_TRACK_LIN * np.exp(-lin_err / TRACK_STD_SQ)
         r_track_ang = W_TRACK_ANG * np.exp(-ang_err / TRACK_STD_SQ)
         # 接触衝撃の瞬間は速度が物理的に大きく跳ねうるので、二乗前にクリップしてreward発散を防ぐ
-        r_lin_vel_z = W_LIN_VEL_Z * np.clip(base_lin_vel[:, 2], -20.0, 20.0) ** 2
-        r_ang_vel_xy = W_ANG_VEL_XY * np.sum(np.clip(base_ang_vel[:, 0:2], -50.0, 50.0) ** 2, axis=1)
+        r_lin_vel_z = self._w["lin_vel_z"] * np.clip(base_lin_vel[:, 2], -20.0, 20.0) ** 2
+        r_ang_vel_xy = self._w["ang_vel_xy"] * np.sum(np.clip(base_ang_vel[:, 0:2], -50.0, 50.0) ** 2, axis=1)
         joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
-        r_dof_acc = W_DOF_ACC * np.sum(joint_acc**2, axis=1)
+        r_dof_acc = self._w["dof_acc"] * np.sum(joint_acc**2, axis=1)
         action_prev = self._last_action.copy()
-        r_action_rate = W_ACTION_RATE * np.sum((action - self._last_action) ** 2, axis=1)
+        r_action_rate = self._w["action_rate"] * np.sum((action - self._last_action) ** 2, axis=1)
 
         contact_filt = foot_contact | self._last_foot_contact
         first_contact = (self._feet_air_time > 0.0) & contact_filt
         self._feet_air_time += CONTROL_DT
-        r_air_time = W_FEET_AIR_TIME * np.sum((self._feet_air_time - FEET_AIR_TIME_TARGET) * first_contact, axis=1)
+        r_air_time = self._w["feet_air_time"] * np.sum((self._feet_air_time - FEET_AIR_TIME_TARGET) * first_contact, axis=1)
         r_air_time *= np.linalg.norm(cmd[:, 0:2], axis=1) > 0.1
         self._feet_air_time *= ~contact_filt
         self._last_foot_contact = foot_contact
 
+        projected_gravity = _quat_rotate_inverse(quat, np.tile(np.array([0.0, 0.0, -1.0], np.float32), (self.num_envs, 1)))
+        r_flat_orient = self._w["flat_orientation"] * np.sum(projected_gravity[:, 0:2] ** 2, axis=1)
+
         try:
             qfrc_actuator = self._sim.qfrc_actuator()
             joint_torque = qfrc_actuator[:, 6:18]
-            r_torque = W_TORQUE * np.sum(joint_torque**2, axis=1)
+            r_torque = self._w["torque"] * np.sum(joint_torque**2, axis=1)
         except AttributeError:
             joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)
             r_torque = np.zeros(self.num_envs, dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
 
         self.last_reward_terms = {
             "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
-            "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque,
+            "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque, "flat_orientation": r_flat_orient,
         }
         rewards = (
-            r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque
+            r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque + r_flat_orient
         )
         # 未知の接触イベント等でどれかの項が想定外に暴れてもvalue関数の発散を防ぐ最終防衛ライン
         rewards = np.where(blew_up, 0.0, np.clip(rewards, -50.0, 50.0)).astype(np.float32)
@@ -351,11 +367,11 @@ class MjmlxGo2Env(VecEnv):
             "Termination/out_of_terrain": float(out_of_terrain.mean()),
             "Termination/time_out": float(truncated.mean()),
         })
-        extras = {"time_outs": torch.from_numpy(truncated), "log": log}
+        extras = {"time_outs": torch.from_numpy(truncated).to(self.device), "log": log}
         return (
             self._obs_tensordict(obs),
-            torch.from_numpy(rewards),
-            torch.from_numpy(dones).long(),
+            torch.from_numpy(rewards).to(self.device),
+            torch.from_numpy(dones).long().to(self.device),
             extras,
         )
 

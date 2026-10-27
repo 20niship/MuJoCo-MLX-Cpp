@@ -64,6 +64,9 @@ def main() -> None:
     parser.add_argument("--build-dir", type=str, default="build")
     parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cpu", help="PPO更新のデバイス(cuda可)")
+    parser.add_argument("--flat", action="store_true", help="階段なしの平地で学習する")
+    parser.add_argument("--reward-preset", default="relaxed", choices=["relaxed", "isaac_flat"])
     parser.add_argument("--terrain-seed", type=int, default=0)
     parser.add_argument("--cmd-vel-min", type=float, default=0.2, help="||cmd_vel||の下限[m/s or rad/s]")
     parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
@@ -83,9 +86,13 @@ def main() -> None:
         use_gpu=not args.cpu,
         seed=args.seed,
         terrain_seed=args.terrain_seed,
+        flat_terrain=args.flat,
+        reward_preset=args.reward_preset,
+        device=args.device,
     )
 
     train_cfg = make_train_cfg(args.seed, args.max_iterations)
+    train_cfg["device"] = args.device
 
     runner = OnPolicyRunner(env, train_cfg, log_dir=args.logdir, device=train_cfg["device"])
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=train_cfg["init_at_random_ep_len"])

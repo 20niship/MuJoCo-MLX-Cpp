@@ -45,6 +45,7 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--out", default="runs/video/cmd_vel.mp4")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--reward-preset", default="relaxed")
     args = ap.parse_args()
 
     sys.path.insert(0, args.build_dir)
@@ -57,7 +58,7 @@ def main() -> None:
     ckpt = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path(args.logdir))
     xml_path = "/tmp/go2_play_generated.xml"
     env = e.MjmlxGo2Env(native, len(CASES), cmd_vel_min=0.0, cmd_vel_max=1.0, use_gpu=not args.cpu, seed=0, terrain_seed=0,
-                        flat_terrain=True, generated_xml_path=xml_path)
+                        flat_terrain=True, reward_preset=args.reward_preset, generated_xml_path=xml_path)
     runner = OnPolicyRunner(env, make_train_cfg(0, 1), log_dir=None, device="cpu")
     runner.load(str(ckpt))
     policy = runner.get_inference_policy(device="cpu")
