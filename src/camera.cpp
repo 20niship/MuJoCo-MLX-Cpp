@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,103 @@
 #include "mjmlx/mjmlx.h"
 
 using VB = mx::Backend;
+
+namespace {
+
+// ── Vulkanデバイス(mkxへ注入する)──────────────────────────────────────────────
+
+struct CamDevice {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t queue_family = 0;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    bool multi_draw_indirect = true, shader_clip_distance = true;
+    bool valid = false;
+    std::string reason = "camera device not prepared (mjmlx_load_model was not called before any Vulkan use)";
+};
+CamDevice g_dev;
+
+// graphics+computeのqueue familyと、indirect描画に要るfeatureを持つデバイスだけをmkxに注入する。満たさなければ何もせず従来のmkx既定になる(カメラだけが使えない)。
+void prepare_device() {
+    if (const char* e = std::getenv("MJMLX_CAMERA_DEVICE")) { if (std::atoi(e) == 0) { g_dev.reason = "disabled by MJMLX_CAMERA_DEVICE=0"; return; } }
+    VkInstance inst = VK_NULL_HANDLE;
+    try {
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "mjmlx"; app.apiVersion = VK_API_VERSION_1_3;
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> exts(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, exts.data());
+        std::vector<const char*> ie;
+        bool portability = false;
+        for (auto& e : exts) if (std::string(e.extensionName) == "VK_KHR_portability_enumeration") { ie.push_back("VK_KHR_portability_enumeration"); portability = true; }
+        VkInstanceCreateInfo ii{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ii.pApplicationInfo = &app; ii.enabledExtensionCount = (uint32_t)ie.size(); ii.ppEnabledExtensionNames = ie.data();
+        if (portability) ii.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        if (vkCreateInstance(&ii, nullptr, &inst) != VK_SUCCESS) { g_dev.reason = "vkCreateInstance failed"; return; }
+        uint32_t nd = 0;
+        vkEnumeratePhysicalDevices(inst, &nd, nullptr);
+        if (nd == 0) { g_dev.reason = "no Vulkan device"; vkDestroyInstance(inst, nullptr); return; }
+        std::vector<VkPhysicalDevice> devs(nd);
+        vkEnumeratePhysicalDevices(inst, &nd, devs.data());
+        int idx = 0;
+        if (const char* e = std::getenv("MKX_VULKAN_DEVICE_INDEX")) idx = std::atoi(e);
+        if (idx < 0 || idx >= (int)nd) idx = 0;
+        VkPhysicalDevice phys = devs[idx];
+        uint32_t nf = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> fam(nf);
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &nf, fam.data());
+        int qf = -1;
+        for (uint32_t i = 0; i < nf; i++)
+            if ((fam[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { qf = (int)i; break; }
+        VkPhysicalDeviceFeatures sup{};
+        vkGetPhysicalDeviceFeatures(phys, &sup);
+        if (qf < 0) { g_dev.reason = "no graphics+compute queue family"; vkDestroyInstance(inst, nullptr); return; }
+        if (!sup.multiDrawIndirect || !sup.drawIndirectFirstInstance) { g_dev.reason = "device lacks multiDrawIndirect/drawIndirectFirstInstance"; vkDestroyInstance(inst, nullptr); return; }
+        if (!sup.shaderClipDistance) { g_dev.reason = "device lacks shaderClipDistance"; vkDestroyInstance(inst, nullptr); return; }
+        VkPhysicalDeviceFeatures en{};
+        en.multiDrawIndirect = en.drawIndirectFirstInstance = en.shaderClipDistance = VK_TRUE;
+        uint32_t nde = 0;
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, nullptr);
+        std::vector<VkExtensionProperties> dex(nde);
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, dex.data());
+        std::vector<const char*> de;
+        for (auto& e : dex) if (std::string(e.extensionName) == "VK_KHR_portability_subset") de.push_back("VK_KHR_portability_subset");
+        float prio = 1.0f;
+        VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        qi.queueFamilyIndex = (uint32_t)qf; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+        VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi; di.pEnabledFeatures = &en;
+        di.enabledExtensionCount = (uint32_t)de.size(); di.ppEnabledExtensionNames = de.data();
+        VkDevice dev = VK_NULL_HANDLE;
+        if (vkCreateDevice(phys, &di, nullptr, &dev) != VK_SUCCESS) { g_dev.reason = "vkCreateDevice failed"; vkDestroyInstance(inst, nullptr); return; }
+        VkQueue q;
+        vkGetDeviceQueue(dev, (uint32_t)qf, 0, &q);
+        mkx::VulkanBackend::ExternalDevice ext{inst, phys, dev, q, (uint32_t)qf};
+        if (!mkx::VulkanBackend::use_external_device(ext)) {
+            g_dev.reason = "mkx was already initialised before mjmlx_load_model";
+            vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
+            return;
+        }
+        g_dev.instance = inst; g_dev.physical = phys; g_dev.device = dev; g_dev.queue = q; g_dev.queue_family = (uint32_t)qf;
+        g_dev.valid = true; g_dev.reason.clear();
+    } catch (const std::exception& e) {
+        g_dev.reason = e.what();
+        if (inst && !g_dev.valid) vkDestroyInstance(inst, nullptr);
+    }
+}
+
+} // namespace
+
+namespace mjmlx {
+void camera_prepare_device() {
+    static std::once_flag f;
+    std::call_once(f, prepare_device);
+}
+} // namespace mjmlx
 
 namespace {
 
@@ -330,7 +428,7 @@ struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, pad0; f
 
 struct MjmlxCameraRenderer {
     mjmlx::BatchedSim* sim = nullptr;
-    mkx::VulkanBackend::DeviceHandles h;
+    CamDevice h;
     int B = 0, ncam = 0, W = 0, H = 0, nbody = 0, ngeom = 0;
     uint32_t nvis = 0, nlights = 0, tiles_x = 0, tiles_y = 0, ntiles = 0;
     uint32_t img_w = 0, img_h = 0;
@@ -447,6 +545,7 @@ struct MjmlxCameraRenderer {
     ~MjmlxCameraRenderer() {
         if (!h.device) return;
         vkDeviceWaitIdle(h.device);
+        if (h.command_pool) vkDestroyCommandPool(h.device, h.command_pool, nullptr);
         for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &rb_color, &rb_depth}) destroy(*b);
         if (dpool) vkDestroyDescriptorPool(h.device, dpool, nullptr);
         if (gfx) vkDestroyPipeline(h.device, gfx, nullptr);
@@ -712,7 +811,12 @@ MJMLX_API MjmlxCameraRenderer* mjmlx_camera_create(MjmlxBatchedSim* sim, int wid
     try {
         r->sim = &sim->sim;
         r->B = sim->sim.num_envs; r->W = width; r->H = height;
-        r->h = mkx::VulkanBackend::device_handles();
+        mjmlx::camera_prepare_device();
+        if (!g_dev.valid) throw std::runtime_error("camera unsupported on this Vulkan setup: " + g_dev.reason);
+        r->h = g_dev;
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = g_dev.queue_family;
+        vk_check(vkCreateCommandPool(g_dev.device, &pi, nullptr, &r->h.command_pool), "vkCreateCommandPool");
         r->build(sim->mj_model);
         return r.release();
     } catch (const std::exception& e) {

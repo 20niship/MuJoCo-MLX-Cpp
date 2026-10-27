@@ -356,6 +356,7 @@ static void validate_model(const mjModel* m) {
 // Load a MuJoCo C model and convert to internal Model.
 // Returns {Model, mjModel*} pair -- caller owns the mjModel*.
 std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
+    camera_prepare_device(); // mkxが最初にVulkanを使う前(配列確保前)に呼ぶ必要がある
     char error[1000] = "";
     mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
     if (!m) {

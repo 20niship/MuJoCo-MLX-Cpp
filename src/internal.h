@@ -594,6 +594,9 @@ int sensor_nsensordata(const SensorCtx& ctx);
 
 // ── Module functions (internal C++ API) ──────────────────────
 
+// camera.cpp / camera_stub.cpp: mkxの初期化前にgraphics+compute queueとindirect描画featureを持つデバイスを注入する(不可なら何もしない)
+void camera_prepare_device();
+
 // io.cpp
 Model load_model(const char* xml_path);
 Model load_model_from_string(const char* xml_string);

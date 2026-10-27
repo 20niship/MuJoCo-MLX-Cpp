@@ -127,9 +127,16 @@ set(MJMLX_SOURCES
     src/solver_vmap.cpp
     src/forward_vmap.cpp
     src/batched.cpp
-    src/camera.cpp
     src/sensor.cpp
 )
+
+# カメラ(Vulkan graphics + multi-draw indirect)は任意機能。OFFだとmjmlx_camera_*はスタブになり、カメラ無しの学習・ビルドには影響しない。
+option(MJMLX_BUILD_CAMERA "Build the Vulkan camera sensor (needs graphics queue + multiDrawIndirect at runtime)" ON)
+if(MJMLX_BUILD_CAMERA)
+    list(APPEND MJMLX_SOURCES src/camera.cpp)
+else()
+    list(APPEND MJMLX_SOURCES src/camera_stub.cpp)
+endif()
 
 add_library(mjmlx SHARED ${MJMLX_SOURCES})
 target_include_directories(mjmlx
@@ -262,11 +269,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    if(MJMLX_BUILD_CAMERA)
     add_executable(test_camera tests/test_camera.cpp)
     target_link_libraries(test_camera PRIVATE mjmlx ${CMAKE_DL_LIBS})
     set_target_properties(test_camera PROPERTIES ENABLE_EXPORTS ON)
     target_include_directories(test_camera PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(test_camera PRIVATE Vulkan::Vulkan)
+    endif()
     add_executable(test_sensors tests/test_sensors.cpp)
     target_link_libraries(test_sensors PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_sensors PRIVATE
@@ -299,8 +308,11 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME math_full COMMAND test_math_full)
     add_test(NAME linalg_full COMMAND test_linalg_full)
     add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
-    add_test(NAME camera COMMAND test_camera)
-    set_tests_properties(math_full linalg_full batched_collision_primitives camera PROPERTIES LABELS "correctness")
+    if(MJMLX_BUILD_CAMERA)
+        add_test(NAME camera COMMAND test_camera)
+        set_tests_properties(camera PROPERTIES SKIP_RETURN_CODE 77 LABELS "correctness")
+    endif()
+    set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
 
     # GPU(MKX) vs CPU(MuJoCo C)のバッチ比較(旧test_metal_synthの代替)。引数は[tol_1step tol_10step tol_100step](qvelは10倍)。
     # humanoidは厳密に一致する。high_dof_tree/contact_stressはGPU-CPU間に既知の乖離があり、現状値を少し超える閾値でのリグレッション検知用(乖離を直したら締める)。
