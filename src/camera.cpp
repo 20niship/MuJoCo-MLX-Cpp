@@ -373,7 +373,9 @@ struct MjmlxCameraRenderer {
         VkMemoryRequirements rq;
         vkGetBufferMemoryRequirements(h.device, b.buf, &rq);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = rq.size; ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props);
+        ai.allocationSize = rq.size;
+        // 読み出し用のホスト可視メモリはuncachedだと遅い(CPU読みが桁違いに遅くなる)ためcachedを優先する。
+        try { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props | VK_MEMORY_PROPERTY_HOST_CACHED_BIT); } catch (...) { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props); }
         vk_check(vkAllocateMemory(h.device, &ai, nullptr, &b.mem), "vkAllocateMemory(buffer)");
         vkBindBufferMemory(h.device, b.buf, b.mem, 0);
         return b;
@@ -508,6 +510,11 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         grecs.push_back(gr);
     }
     nvis = (uint32_t)ranges.size();
+    if (std::getenv("MJMLX_CAM_PROF")) {
+        uint64_t tri = 0;
+        for (auto& rg : ranges) tri += rg.count / 3;
+        fprintf(stderr, "[cam] visible geoms=%u triangles/env=%llu vertices(shared)=%zu\n", nvis, (unsigned long long)tri, vtx.size());
+    }
     if (nvis == 0) throw std::runtime_error("mjmlx_camera: no visible geoms (group 0-2)");
 
     // 全(env,cam)x可視geomのindirectコマンド。instance indexで(env,cam,geom)を引く。
@@ -724,11 +731,13 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
     if (!r) return -1;
     try {
         auto& s = *r->sim;
+        auto t_a = std::chrono::steady_clock::now();
         auto kin = s.kinematics(s.qpos);
         std::vector<mkx::NodePtr<VB>> roots;
         for (auto& k : kin) roots.push_back(k.node());
         mkx::eval_nodes<VB>(roots);
         mkx::VulkanBackend::wait_idle();
+        auto t_b = std::chrono::steady_clock::now();
         auto buf = [&](int i) { return mkx::buffer_for<VB>(kin[i].node())->buffer; };
 
         VkDescriptorBufferInfo bi[4] = {{buf(7), 0, VK_WHOLE_SIZE}, {buf(8), 0, VK_WHOLE_SIZE}, {buf(0), 0, VK_WHOLE_SIZE}, {buf(2), 0, VK_WHOLE_SIZE}};
@@ -769,6 +778,10 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             r->draw_calls++;
             vkCmdEndRenderPass(c);
         });
+        if (std::getenv("MJMLX_CAM_PROF")) {
+            auto t_c = std::chrono::steady_clock::now();
+            fprintf(stderr, "[cam] kin=%.2fms gpu(compute+draw)=%.2fms\n", std::chrono::duration<double, std::milli>(t_b - t_a).count(), std::chrono::duration<double, std::milli>(t_c - t_b).count());
+        }
         r->rendered = true; r->read_back = false;
         return 0;
     } catch (const std::exception& e) {

@@ -232,6 +232,18 @@ cmake -B build -DMJMLX_BUILD_PYTHON=ON
 cmake --build build -j$(sysctl -n hw.logicalcpu)
 ```
 
+### カメラセンサ(Vulkan, GPUバッチsim専用)
+
+MJCFの`<camera>`/`<light>`/geomのrgbaを使い、全env x 全カメラを`vkCmdDrawIndexedIndirect` 1回でレンダリングする(Phong、RGB+depth)。物理stepとは別パスで、`create_camera`した時のみパイプラインを構築する。
+
+```python
+cam = native.create_camera(sim, 128, 128)  # sim: create_batched(use_gpu=True)の戻り値
+cam.render()
+rgb, depth = cam.rgb(), cam.depth()        # (num_envs, ncam, H, W, 3) uint8 / (num_envs, ncam, H, W) float32(m)
+```
+
+例: `scripts/example_go2_camera.py`、MuJoCo比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera.py`。未対応: 影・テクスチャ・hfield・半透明・可動bodyに付いたlight・trackcom(body原点で近似)。
+
 ### Running tests
 
 ```bash
