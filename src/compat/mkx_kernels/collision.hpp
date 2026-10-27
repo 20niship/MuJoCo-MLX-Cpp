@@ -11,7 +11,7 @@
 namespace mjmlx::mkx_kernels {
 
 inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128,
-                                                int sdf_res = 2, int sdf_initpoints = 0, int sdf_iterations = 0) {
+                                                int sdf_initpoints = 0, int sdf_iterations = 0) {
   const int contact_stride = 8;
 
   std::string header = R"GLSL(
@@ -75,29 +75,92 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
 }
 )GLSL" + std::string(R"GLSL(
 // ── SDF-SDF (MuJoCo mjc_SDF 移植) ──
-// sdf_info(geomごと11float)=[格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound]。格子はgeomローカルの一様ボクセルで、格子外はクランプ点までの距離を足して外挿する。
-float mjmlx_sdf_cell(int base, ivec3 i) {
-    return sdf_grid[base + (i.z * SDF_RES + i.y) * SDF_RES + i.x];
+// sdf_info(geomごと20float)=[格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound, 軸ごとのセル数(3), 種別, gear属性(5)]。格子はgeomローカルの一様ボクセルで、格子外はクランプ点までの距離を足して外挿する。
+float mjmlx_sdf_cell(int base, ivec3 n, ivec3 i) {
+    return sdf_grid[base + (i.z * n.y + i.y) * n.x + i.x];
+}
+float mjmlx_sdf_dist_grid(int g, vec3 x);
+
+// MuJoCo gearプラグイン(plugin/sdf/gear.cc)のdistance()の移植。属性=[alpha, diameter, teeth, thickness, innerdiameter]
+float mjmlx_gear_mod(float x, float y) { return x - y * floor(x / y); }
+float mjmlx_gear_smooth_union(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return b * (1.0 - h) + a * h - k * h * (1.0 - h);
+}
+float mjmlx_gear_dist(int o, vec3 p) {
+    float alpha = sdf_info[o+15], D = sdf_info[o+16], N = sdf_info[o+17], thick = sdf_info[o+18], inner = sdf_info[o+19];
+    const float PI = 3.14159265358979;
+    float psi = 3.096e-5 * N * N - 6.557e-3 * N + 0.551;
+    float R = D / 2.0;
+    float rho = length(p.xy);
+    float Pd = N / D;
+    float P = PI / Pd;
+    float a = 1.0 / Pd;
+    float Ro = (D + 2.0 * a) / 2.0;
+    float h = 2.2 / Pd;
+    float innerR = Ro - h - 0.14 * D;
+    if (inner >= 0.0) innerR = inner / 2.0;
+    float d2;
+    if (innerR - rho > 0.0) d2 = innerR - rho;
+    else if (Ro - rho < -0.2) d2 = rho - Ro;
+    else {
+        float Rb = D * cos(psi) / 2.0;
+        float fi = atan(p.y, p.x) + alpha;
+        float alphaStride = P / R;
+        float invAlpha = acos(Rb / R);
+        float invPhi = tan(invAlpha) - invAlpha;
+        float shift = alphaStride / 2.0 - 2.0 * invPhi;
+        float fia = mjmlx_gear_mod(fi + shift / 2.0, alphaStride) - shift / 2.0;
+        float fib = mjmlx_gear_mod(-fi - shift + shift / 2.0, alphaStride) - shift / 2.0;
+        float dista = -1.0e6, distb = -1.0e6;
+        if (Rb < rho) {
+            float acr = acos(Rb / rho);
+            float ta = sqrt(rho * rho - Rb * Rb);
+            dista = ta - Rb * (fia + acr);
+            distb = ta - Rb * (fib + acr);
+        }
+        float gearOuter = rho - Ro;
+        float gearLowBase = rho - (Ro - h);
+        float crownBase = rho - innerR;
+        float cogs = max(dista, distb);
+        float baseWalls = max(fia - (alphaStride - shift), fib - (alphaStride - shift));
+        cogs = max(baseWalls, cogs);
+        // smoothIntersection(gearOuter, cogs, k) = max(max(a,b), -smoothUnion(max(a,-b), max(b,-a), k))
+        float k = 0.0035 * D;
+        cogs = max(max(gearOuter, cogs), -mjmlx_gear_smooth_union(max(gearOuter, -cogs), max(cogs, -gearOuter), k));
+        cogs = mjmlx_gear_smooth_union(gearLowBase, cogs, Rb - Ro + h);
+        d2 = max(cogs, -crownBase);
+    }
+    vec2 w = vec2(d2, abs(p.z) - thick / 2.0);
+    return min(max(w.x, w.y), 0.0) + length(max(w, vec2(0.0)));
 }
 float mjmlx_sdf_dist(int g, vec3 x) {
-    int o = g * 11;
+    int o = g * 20;
+    if (sdf_info[o+14] > 0.5) return mjmlx_gear_dist(o, x);
+    return mjmlx_sdf_dist_grid(g, x);
+}
+float mjmlx_sdf_dist_grid(int g, vec3 x) {
+    int o = g * 20;
     int base = int(sdf_info[o]);
+    ivec3 n = ivec3(sdf_info[o+11], sdf_info[o+12], sdf_info[o+13]);
     vec3 ctr = vec3(sdf_info[o+1], sdf_info[o+2], sdf_info[o+3]);
     vec3 gh = vec3(sdf_info[o+7], sdf_info[o+8], sdf_info[o+9]);
     vec3 xc = clamp(x, ctr - gh, ctr + gh);
-    vec3 u = (xc - (ctr - gh)) / (2.0 * gh) * float(SDF_RES - 1);
-    ivec3 i0 = min(ivec3(floor(u)), ivec3(SDF_RES - 2));
+    vec3 u = (xc - (ctr - gh)) / (2.0 * gh) * vec3(n - 1);
+    ivec3 i0 = min(ivec3(floor(u)), (n - 2));
     vec3 f = u - vec3(i0);
-    float c00 = mix(mjmlx_sdf_cell(base, i0), mjmlx_sdf_cell(base, i0 + ivec3(1,0,0)), f.x);
-    float c10 = mix(mjmlx_sdf_cell(base, i0 + ivec3(0,1,0)), mjmlx_sdf_cell(base, i0 + ivec3(1,1,0)), f.x);
-    float c01 = mix(mjmlx_sdf_cell(base, i0 + ivec3(0,0,1)), mjmlx_sdf_cell(base, i0 + ivec3(1,0,1)), f.x);
-    float c11 = mix(mjmlx_sdf_cell(base, i0 + ivec3(0,1,1)), mjmlx_sdf_cell(base, i0 + ivec3(1,1,1)), f.x);
+    float c00 = mix(mjmlx_sdf_cell(base, n, i0), mjmlx_sdf_cell(base, n, i0 + ivec3(1,0,0)), f.x);
+    float c10 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,1,0)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,1,0)), f.x);
+    float c01 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,0,1)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,0,1)), f.x);
+    float c11 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,1,1)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,1,1)), f.x);
     return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z) + length(x - xc);
 }
 // 中心差分の勾配(刻みは1セル)
 vec3 mjmlx_sdf_grad(int g, vec3 x) {
-    int o = g * 11;
-    vec3 h = vec3(sdf_info[o+7], sdf_info[o+8], sdf_info[o+9]) * (2.0 / float(SDF_RES - 1));
+    int o = g * 20;
+    bool exact = sdf_info[o+14] > 0.5;
+    vec3 h = vec3(sdf_info[o+7], sdf_info[o+8], sdf_info[o+9]) * 2.0 / (vec3(ivec3(sdf_info[o+11], sdf_info[o+12], sdf_info[o+13])) - 1.0);
+    if (exact) h = vec3(2e-4);
     return vec3(mjmlx_sdf_dist(g, x + vec3(h.x,0,0)) - mjmlx_sdf_dist(g, x - vec3(h.x,0,0)),
                 mjmlx_sdf_dist(g, x + vec3(0,h.y,0)) - mjmlx_sdf_dist(g, x - vec3(0,h.y,0)),
                 mjmlx_sdf_dist(g, x + vec3(0,0,h.z)) - mjmlx_sdf_dist(g, x - vec3(0,0,h.z))) / (2.0 * h);
@@ -148,8 +211,6 @@ float mjmlx_sdf_descend(int ga, int gb, mat3 R21, vec3 p21, inout vec3 x, int ty
 }
 )GLSL");
 
-  header = "const int SDF_RES = " + std::to_string(sdf_res) + ";\n" + header;
-
   std::ostringstream ss;
   ss << "uint bid = gl_GlobalInvocationID.x;\n"
      << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
@@ -195,10 +256,10 @@ for (int p = 0; p < NUM_PAIRS; p++) {
 
             // g1フレームでのAABB交差
             vec3 lo1 = vec3(1e10), hi1 = vec3(-1e10), lo2 = vec3(1e10), hi2 = vec3(-1e10);
-            vec3 c1 = vec3(sdf_info[g1*11+1], sdf_info[g1*11+2], sdf_info[g1*11+3]);
-            vec3 h1 = vec3(sdf_info[g1*11+4], sdf_info[g1*11+5], sdf_info[g1*11+6]);
-            vec3 c2 = vec3(sdf_info[g2*11+1], sdf_info[g2*11+2], sdf_info[g2*11+3]);
-            vec3 h2 = vec3(sdf_info[g2*11+4], sdf_info[g2*11+5], sdf_info[g2*11+6]);
+            vec3 c1 = vec3(sdf_info[g1*20+1], sdf_info[g1*20+2], sdf_info[g1*20+3]);
+            vec3 h1 = vec3(sdf_info[g1*20+4], sdf_info[g1*20+5], sdf_info[g1*20+6]);
+            vec3 c2 = vec3(sdf_info[g2*20+1], sdf_info[g2*20+2], sdf_info[g2*20+3]);
+            vec3 h2 = vec3(sdf_info[g2*20+4], sdf_info[g2*20+5], sdf_info[g2*20+6]);
             for (int k = 0; k < 8; k++) {
                 vec3 v1 = c1 + h1 * vec3((k&1) != 0 ? 1.0 : -1.0, (k&2) != 0 ? 1.0 : -1.0, (k&4) != 0 ? 1.0 : -1.0);
                 vec3 v2 = R21 * (c2 + h2 * vec3((k&1) != 0 ? 1.0 : -1.0, (k&2) != 0 ? 1.0 : -1.0, (k&4) != 0 ? 1.0 : -1.0)) + p21;

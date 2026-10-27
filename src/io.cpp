@@ -58,7 +58,7 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
 
 // SDF geomのプラグイン距離関数をgeomローカルの一様格子にベイクする(GPUカーネルから直接プラグインを呼べないため)。
 // 格子はaabbを10%広げた範囲。範囲外はカーネル側でクランプ点までの距離を足して外挿する。
-static constexpr int SDF_GRID_RES = 96;
+static constexpr double SDF_GRID_CELLS = 2.0e6;  // geomあたりのセル数。軸ごとの分割数はセルがほぼ立方体になるよう配分する
 static constexpr float SDF_GRID_PAD = 1.1f;
 
 static void bake_sdf_geoms(const mjModel* m, Model& model) {
@@ -67,15 +67,12 @@ static void bake_sdf_geoms(const mjModel* m, Model& model) {
         if (m->geom_type[g] == mjGEOM_SDF) sdf_geoms.push_back(g);
     if (sdf_geoms.empty()) return;
 
-    const int N = SDF_GRID_RES;
-    const size_t cells = (size_t)N * N * N;
     std::vector<float> info((size_t)m->ngeom * Model::SDF_INFO_STRIDE, 0.0f);
     for (int g = 0; g < m->ngeom; g++) info[(size_t)g * Model::SDF_INFO_STRIDE] = -1.0f;
-    std::vector<float> grid(sdf_geoms.size() * cells);
+    std::vector<float> grid;
 
     mjData* d = mj_makeData(m);
-    for (size_t k = 0; k < sdf_geoms.size(); k++) {
-        int g = sdf_geoms[k];
+    for (int g : sdf_geoms) {
         if (m->geom_plugin[g] < 0)
             throw std::runtime_error("SDF geom without plugin is not supported (geom " + std::to_string(g) + ")");
         const mjpPlugin* plugin = mjp_getPluginAtSlot(m->plugin[m->geom_plugin[g]]);
@@ -83,30 +80,52 @@ static void bake_sdf_geoms(const mjModel* m, Model& model) {
             throw std::runtime_error("SDF plugin of geom " + std::to_string(g) + " has no sdf_distance");
 
         float* inf = &info[(size_t)g * Model::SDF_INFO_STRIDE];
-        inf[0] = (float)(k * cells);
+        inf[0] = (float)grid.size();
+        // 格子は歯面の曲率に対し粗く(補間誤差~0.5mm)偽接触が出るため、gearはGPU側で解析式を直接評価する(属性のみ渡す)
+        const bool is_gear = plugin->name && !strcmp(plugin->name, "mujoco.sdf.gear");
+        if (is_gear) {
+            static const char* names[5] = {"alpha", "diameter", "teeth", "thickness", "innerdiameter"};
+            static const float defs[5] = {0, 2.8f, 25, .2f, -1};
+            inf[14] = 1.0f;
+            for (int a = 0; a < 5; a++) {
+                const char* v = mj_getPluginConfig(m, m->geom_plugin[g], names[a]);
+                inf[15 + a] = (v && *v) ? (float)atof(v) : defs[a];
+            }
+        }
         const double* ab = m->geom_aabb + 6 * g;
+        double vol = 1.0;
         for (int a = 0; a < 3; a++) {
             inf[1 + a] = (float)ab[a];
             inf[4 + a] = (float)ab[3 + a];
             inf[7 + a] = (float)ab[3 + a] * SDF_GRID_PAD;
+            vol *= 2.0 * inf[7 + a];
         }
         inf[10] = (float)m->geom_rbound[g];
+        const double h = std::cbrt(vol / SDF_GRID_CELLS);
+        int n[3];
+        for (int a = 0; a < 3; a++) {
+            n[a] = std::max(2, (int)std::ceil(2.0 * inf[7 + a] / h) + 1);
+            inf[11 + a] = (float)n[a];
+        }
 
-        float* out = &grid[k * cells];
-        for (int iz = 0; iz < N; iz++)
-            for (int iy = 0; iy < N; iy++)
-                for (int ix = 0; ix < N; ix++) {
+        const size_t base = grid.size();
+        if (is_gear) for (int a = 0; a < 3; a++) { n[a] = 2; inf[11 + a] = 2.0f; }
+        grid.resize(base + (size_t)n[0] * n[1] * n[2]);
+        if (is_gear) { std::fill(grid.begin() + base, grid.end(), 0.0f); continue; }
+        for (int iz = 0; iz < n[2]; iz++)
+            for (int iy = 0; iy < n[1]; iy++)
+                for (int ix = 0; ix < n[0]; ix++) {
                     const int idx[3] = {ix, iy, iz};
                     double x[3];
                     for (int a = 0; a < 3; a++)
-                        x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (N - 1) - 1.0);
-                    out[((size_t)iz * N + iy) * N + ix] =
+                        x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (n[a] - 1) - 1.0);
+                    grid[base + ((size_t)iz * n[1] + iy) * n[0] + ix] =
                         (float)plugin->sdf_distance(x, d, m->geom_plugin[g]);
                 }
     }
     mj_deleteData(d);
 
-    model.sdf_res = N;
+    model.has_sdf = true;
     model.geom_sdf_info = mx::array(info.data(), {(int)info.size()}, mx::float32);
     model.sdf_grid = mx::array(grid.data(), {(int)grid.size()}, mx::float32);
 }

@@ -330,7 +330,7 @@ MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
 static int solver_scratch_per_env(const Model& m) {
     int nv = m.nv;
     const int MAX_EFC = mkx_kernels::solver_max_efc_for(nv);
-    return nv*nv + MAX_EFC*nv + 7*MAX_EFC + 5*nv + nv*3*nv;
+    return mkx_kernels::solver_scratch_floats(nv, MAX_EFC);
 }
 
 // Build solver pair properties buffer (18 floats per pair)
@@ -646,7 +646,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         ctx->coll_mesh_vertnum = mx::astype(mx::flatten(m.mesh_vertnum), mx::float32);
         ctx->coll_geom_dataid = mx::astype(mx::flatten(m.geom_dataid), mx::float32);
         ctx->coll_geom_size = mx::astype(mx::flatten(m.geom_size), mx::float32);
-        if (m.sdf_res > 0) {
+        if (m.has_sdf) {
             ctx->coll_sdf_info = m.geom_sdf_info;
             ctx->coll_sdf_grid = m.sdf_grid;
         }
@@ -657,7 +657,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
             m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV,
-            std::max(m.sdf_res, 2), m.sdf_res > 0 ? m.opt.sdf_initpoints : 0, m.opt.sdf_iterations);
+            m.has_sdf ? m.opt.sdf_initpoints : 0, m.opt.sdf_iterations);
         ctx->uses_gpu_collision = true;
     }
 
@@ -674,7 +674,8 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
-        int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, 3);
+        // SDF接触は1ペアで多数点(sdf_initpoints)になり剛性も高いため、3回ではNewtonが収束せず発散/脱落する(SDFギアは5回以上で一致)。
+        int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, m.has_sdf ? 10 : 3);
         int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 30;  // CPUとの差を小さくするため十分に回す(CG_TOLで早期終了する)
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));

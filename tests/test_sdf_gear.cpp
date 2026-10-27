@@ -1,12 +1,12 @@
 // SDF-SDF衝突のGPU(MKX) vs MuJoCo Cの比較。MuJoCo公式のSDFギア模型(2枚のギア、従動側に一定トルク)を1000step回し、
-// 歯が噛み合って回る向きと角度が一致することを見る。SDFの距離関数はプラグイン(libsdf_plugin)が必要。
+// 歯が噛み合って回る向きと角度が一致することを見る(SDF_TRACE=1で50stepごとの経過を表示)。SDFの距離関数はプラグイン(libsdf_plugin)が必要。
 // Usage: test_sdf_gear <libsdf_plugin.so> <sdf_gear.xml> [tol_rad]
 #include "test_utils.h"
 #include <vector>
 
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <libsdf_plugin.so> <sdf_gear.xml> [tol_rad]\n", argv[0]); return 1; }
-    double tol = argc > 3 ? atof(argv[3]) : 0.3;
+    double tol = argc > 3 ? atof(argv[3]) : 0.05;
     mj_loadPluginLibrary(argv[1]);
     auto* model = mjmlx_load_model(argv[2]);
     if (!model) { fprintf(stderr, "FAIL: load\n"); return 1; }

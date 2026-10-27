@@ -233,11 +233,11 @@ struct Model {
     mx::array mesh_vert = mx::array({});       // (total_verts, 3) float: all mesh vertices
 
     // SDF geom: プラグインSDFをgeomローカルのボクセル格子にベイクしたもの(GPU衝突カーネルがtrilinearでサンプルする)
-    // geom_sdf_info: (ngeom, SDF_INFO_STRIDE) = [格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound]。SDFでないgeomは先頭が-1
-    static constexpr int SDF_INFO_STRIDE = 11;
-    int sdf_res = 0;                            // 格子の1辺のセル数
+    // geom_sdf_info: (ngeom, SDF_INFO_STRIDE) = [格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound, 軸ごとのセル数(3), 種別(0=格子,1=gearを解析評価), gear属性(5)]。SDFでないgeomは先頭が-1
+    static constexpr int SDF_INFO_STRIDE = 20;
+    bool has_sdf = false;
     mx::array geom_sdf_info = mx::array({});
-    mx::array sdf_grid = mx::array({});         // (nsdf * sdf_res^3,) float: 符号付き距離
+    mx::array sdf_grid = mx::array({});         // (全SDFのセル数合計,) float: 符号付き距離
 
     // Hfield data (for height field collision)
     int nhfield = 0;
