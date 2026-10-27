@@ -654,7 +654,7 @@ Remaining gaps: **RK4/ImplicitFast** in batched (needs GPU kernel rewrite or den
 
 6. **MUSCLE actuators**: MUSCLE gain/bias/dynamics **deferred** (Phase 6.3). Biomechanical models only.
 
-7. **Sensors**: Not implemented (Phase 8). ~50 sensor types; RL training reads joint/body state directly. **DEFERRED.**
+7. **Sensors**: Batched GPU path only (`src/sensor.cpp`, issue #37). Computed on demand from the step outputs (xpos/xquat/cvel/subtree_com/qpos/qvel), outside `compiled_step`, so models without `<sensor>` pay nothing. Values correspond to the state at the start of the last step (same as `d->sensordata` after `mj_step`). Supported: gyro/accelerometer/velocimeter/magnetometer, frame*, joint*/ball*, actuatorpos/vel, subtreecom. Not yet: force/torque/touch, rangefinder, camera. Python wrappers in `scripts/mjmlx_sensors.py` follow the Isaac Lab Imu/ContactSensor layout.
 
 8. **Differentiable physics**: `grad(step)` via `mx::grad` (Phase 9). Requires full pipeline to be autodiff-compatible. Separate project-scale effort. **DEFERRED.**
 

@@ -5,11 +5,14 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 
 #include "mjmlx/mjmlx.h"
 #include "mjmlx/mjmlx_types.h"
 
 #include <memory>
+#include <tuple>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -86,6 +89,19 @@ struct RlBatchedSim {
     FloatArray qvel() { int n; auto* p = mjmlx_batched_get_qvel(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray xpos() { int n; auto* p = mjmlx_batched_get_xpos(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray cfrc_ext() { int n; auto* p = mjmlx_batched_get_cfrc_ext(handle, &n); return copy_out(p, n, num_envs); }
+    // (num_envs, nsensordata)。MJCFの<sensor>をMuJoCoのsensor_adr順に並べたもの。sensorが無ければ(num_envs, 0)。
+    FloatArray sensordata() {
+        int n = 0;
+        const float* p = mjmlx_batched_get_sensordata(handle, &n);
+        int nsd = mjmlx_batched_nsensordata(handle);
+        if (!p || nsd == 0) {
+            float* buf = new float[1];
+            nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            size_t shape[2] = {static_cast<size_t>(num_envs), 0};
+            return FloatArray(buf, 2, shape, owner);
+        }
+        return copy_out(p, n, num_envs);
+    }
     FloatArray qfrc_actuator() { int n; auto* p = mjmlx_batched_get_qfrc_actuator(handle, &n); return copy_out(p, n, num_envs); }
 };
 
@@ -96,7 +112,19 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def_prop_ro("nq", [](const RlModel& m) { return mjmlx_model_info(m.handle).nq; })
         .def_prop_ro("nv", [](const RlModel& m) { return mjmlx_model_info(m.handle).nv; })
         .def_prop_ro("nu", [](const RlModel& m) { return mjmlx_model_info(m.handle).nu; })
-        .def_prop_ro("nbody", [](const RlModel& m) { return mjmlx_model_info(m.handle).nbody; });
+        .def_prop_ro("nbody", [](const RlModel& m) { return mjmlx_model_info(m.handle).nbody; })
+        .def_prop_ro("nsensordata", [](const RlModel& m) { return mjmlx_model_nsensordata(m.handle); })
+        // [(name, mjtSensor type, adr, dim), ...]
+        .def("sensors", [](const RlModel& m) {
+            std::vector<std::tuple<std::string, int, int, int>> out;
+            for (int i = 0; i < mjmlx_model_nsensor(m.handle); i++) {
+                const char* nm = mjmlx_model_sensor_name(m.handle, i);
+                out.emplace_back(nm ? nm : "", mjmlx_model_sensor_type(m.handle, i), mjmlx_model_sensor_adr(m.handle, i), mjmlx_model_sensor_dim(m.handle, i));
+            }
+            return out;
+        })
+        // mjtObj(body=1, joint=3, geom=5, site=6 ...)の名前からid。無ければ-1
+        .def("name2id", [](const RlModel& m, int obj_type, const std::string& name) { return mjmlx_name2id(m.handle, obj_type, name.c_str()); });
 
     nb::class_<RlBatchedSim>(m, "BatchedSim")
         .def_prop_ro("num_envs", [](const RlBatchedSim& s) { return s.num_envs; })
@@ -113,6 +141,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("qvel", &RlBatchedSim::qvel)
         .def("xpos", &RlBatchedSim::xpos)
         .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
+        .def("sensordata", &RlBatchedSim::sensordata)
         .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator);
 
     m.def("load_model", [](const std::string& xml_path) -> std::shared_ptr<RlModel> {

@@ -68,6 +68,7 @@ def main() -> None:
     parser.add_argument("--flat", action="store_true", help="階段なしの平地で学習する")
     parser.add_argument("--reward-preset", default="relaxed", choices=["relaxed", "isaac_flat"])
     parser.add_argument("--terrain-seed", type=int, default=0)
+    parser.add_argument("--use-sensors", action="store_true", help="観測のbase速度・重力と接触判定をMJCFの<sensor>/ContactSensor(Isaac Lab形式)から取る")
     parser.add_argument("--cmd-vel-min", type=float, default=0.2, help="||cmd_vel||の下限[m/s or rad/s]")
     parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
     args = parser.parse_args()
@@ -89,6 +90,7 @@ def main() -> None:
         flat_terrain=args.flat,
         reward_preset=args.reward_preset,
         device=args.device,
+        use_sensors=args.use_sensors,
     )
 
     train_cfg = make_train_cfg(args.seed, args.max_iterations)

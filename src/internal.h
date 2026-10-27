@@ -8,6 +8,7 @@
 
 #include <mujoco/mujoco.h>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -554,6 +555,8 @@ struct Data {
 
 // ── BatchedSim ───────────────────────────────────────────────
 
+struct SensorCtx;  // sensor.cpp。モデルにsensorがあるときだけ確保する
+
 struct BatchedSim {
     const Model* model;
     int num_envs;
@@ -574,7 +577,17 @@ struct BatchedSim {
 
     // Compiled+vmapped step function
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step;
+
+    // sensor (MJCF <sensor>)。nsensor==0なら空で、stepに追加コストはない
+    std::shared_ptr<SensorCtx> sensor;
 };
+
+// sensor.cpp
+std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs);
+void sensor_before_step(SensorCtx& ctx, const BatchedSim& sim);  // step前の出力(xpos/cvel等)を保存(accelerometerの差分用)
+void sensor_mark_reset(SensorCtx& ctx, const int* reset_mask, int num_envs);
+void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& out);  // (B, nsensordata)をhostで計算
+int sensor_nsensordata(const SensorCtx& ctx);
 
 // ── Module functions (internal C++ API) ──────────────────────
 
@@ -675,6 +688,7 @@ struct MjmlxBatchedSim {
     bool cpu_mode = false;
     mjModel* cpu_model = nullptr;           // borrowed from MjmlxModel, not owned
     std::vector<mjData*> cpu_datas;
+    mutable std::vector<float> sensordata_buf;  // get_sensordataの返却用
 
     ~MjmlxBatchedSim() {
         for (auto* d : cpu_datas) if (d) mj_deleteData(d);
