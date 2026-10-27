@@ -187,6 +187,38 @@ Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセ�
 
 注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定16、0でLOD無効)で変えられる。
 
+### 5. Genesisとの比較(カメラ無しの物理step / カメラあり)
+```bash
+uv venv --python 3.12 ~/genesis/.venv && uv pip install --python ~/genesis/.venv/bin/python torch --index-url https://download.pytorch.org/whl/cu126 && uv pip install --python ~/genesis/.venv/bin/python genesis-world pillow   # genesis-world 1.4.5, gs-madrona 0.0.10
+uv run python scripts/bench_physics_vs_others.py --envs 256 1024 4096          # カメラ無し: mjmlx / Isaac Lab(--no_camera) / Genesis
+uv run python scripts/bench_camera_vs_isaac.py --only genesis --envs 64 256 1024 4096 --sizes 64 128   # カメラあり: Genesis列(JSONはmjmlx/isaacと同形式)
+```
+**カメラ無し Go2(平地、制御1step=dt 0.005 x decimation 4、ランダムaction)、env-steps/s**(RTX 3060。`scripts/genesis_bench.py` / `isaac_camera_bench.py --no_camera`):
+
+| envs | mjmlx | Isaac Lab | Genesis |
+|---|---|---|---|
+| 256 | 27,024 | 16,768 | 61,072 |
+| 1024 | 64,635 | 57,882 | 153,979 |
+| 4096 | 93,608 | 114,013 | 260,728 |
+
+**カメラあり(Go2、1カメラ/env、RGB+depth、64px/128px)**。mjmlxは高速化後(描画のみ=GPU上まで)、IsaacはTiledCamera、GenesisはBatchRenderer(Madronaのbatch rasterizer):
+
+| envs | px | mjmlx 描画のみ | Isaac 描画のみ | Genesis 描画のみ | mjmlx 物理+描画 | Isaac 物理+描画 | Genesis 物理+描画 |
+|---|---|---|---|---|---|---|---|
+| 64 | 64 | 40,630 | 3,298 | 27,380 | 4,180 | 2,238 | 10,446 |
+| 64 | 128 | 17,206 | 1,557 | 25,559 | 3,563 | 1,179 | 10,266 |
+| 256 | 64 | 50,956 | 5,490 | 69,090 | 10,972 | 4,133 | 32,073 |
+| 256 | 128 | 18,567 | 2,427 | 55,899 | 6,196 | 2,240 | 29,098 |
+| 1024 | 64 | 53,466 | 7,924 | 112,056 | 17,604 | 7,278 | 64,373 |
+| 1024 | 128 | 18,832 | skip | 80,380 | 7,363 | skip | 52,395 |
+| 4096 | 64 | 55,908 | skip | 124,204 | 19,608 | skip | 82,918 |
+| 4096 | 128 | 22,578 | skip | 90,048 | 7,423 | skip | 66,068 |
+
+条件差の注記:
+- 物理: Genesisはgenesis-world 1.4.5(quadrants)、`SimOptions(dt=0.005)`のscene.step()を4回、substeps既定、self-collision無効、Genesis同梱のgo2.urdf(位置制御kp=20,kd=0.5、ランダムaction=基準姿勢+0.5*N(0,1))、平面。観測・報酬の計算は含まない(物理step+action適用のみ)。mjmlxは`MjmlxGo2Env.step`(報酬・観測を含む、go2_mjx.xml、Newton solver 8反復)、Isaacは`ManagerBasedRLEnv.step`(観測・報酬・イベント込み、Isaac Lab標準のGo2平地設定、PhysX)。ソルバ・接触モデル・Go2モデル(質量/関節設定)が3者で異なるため、物理速度は厳密な同条件比較ではない。
+- 描画: Genesisの出力はGPUのtorchテンソル(CPU読出なし)、IsaacもGPUテンソル、mjmlxの「描画のみ」もGPU上まで(CPU読出込みは別列)。Genesis(Madrona)とmjmlxはラスタライザ、IsaacはRTX(最小設定)。GenesisのGo2 visualメッシュ(合計約39.9万三角形/env、各リンクの重複を含む)はmjmlxのものと同規模で、前方カメラ(ベース搭載)。照明・シェーディング・近遠面は3者で異なる。mjmlxはLOD(既定ON)で近似、他は不明(Isaac/Madronaはフル精度のはず)。
+- 計測のばらつきが大きい(GPUクロック変動。bench_go2_step.pyの4096env値(約53k)とbench_physics_vs_others.pyのmjmlx値(約94k)が異なる実行がある)。
+
 ## Architecture
 
 ```

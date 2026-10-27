@@ -77,6 +77,19 @@ def bench_isaac(args, n, size):
     return {"skip": (err[-1][:200] if err else f"no result (exit={p.returncode})")}
 
 
+def bench_genesis(args, n, size):
+    cmd = [args.genesis_python, "-u", os.path.join(HERE, "genesis_bench.py"), "--mode", "camera", "--num_envs", str(n), "--size", str(size), "--iters", str(args.iters)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.isaac_timeout)
+    except subprocess.TimeoutExpired:
+        return {"skip": f"timeout {args.isaac_timeout}s"}
+    for line in p.stdout.splitlines():
+        if line.startswith("GENESIS_RESULT "):
+            return json.loads(line[len("GENESIS_RESULT "):])
+    err = [l for l in (p.stdout + p.stderr).splitlines() if "rror" in l or "out of memory" in l.lower()]
+    return {"skip": (err[-1][:200] if err else f"no result (exit={p.returncode})")}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-dir", default="build")
@@ -85,9 +98,10 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--out", default="runs/camera_vs_isaac.json")
     ap.add_argument("--camera", choices=["front", "orbit"], default="front")
-    ap.add_argument("--only", choices=["mjmlx", "isaac"], default=None)
+    ap.add_argument("--only", choices=["mjmlx", "isaac", "genesis"], default=None)
     ap.add_argument("--isaac-python", default=os.path.expanduser("~/isaac/.venv/bin/python"))
     ap.add_argument("--isaac-lab-dir", default=os.path.expanduser("~/isaac/IsaacLab"))
+    ap.add_argument("--genesis-python", default=os.path.expanduser("~/genesis/.venv/bin/python"))
     ap.add_argument("--isaac-timeout", type=int, default=1800)
     args = ap.parse_args()
     sys.path.insert(0, args.build_dir)
@@ -97,22 +111,29 @@ def main():
         for size in args.sizes:
             key = f"{n}x{size}"
             r = results.setdefault(key, {"num_envs": n, "size": size})
-            if args.only != "isaac":
+            if args.only in (None, "mjmlx"):
                 r["mjmlx"] = bench_mjmlx(args, n, size)
-            if args.only != "mjmlx":
+            if args.only in (None, "isaac"):
                 r["isaac"] = bench_isaac(args, n, size)
+            if args.only in (None, "genesis"):
+                r["genesis"] = bench_genesis(args, n, size)
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
             json.dump(results, open(args.out, "w"), indent=1)
             print(key, json.dumps(r), flush=True)
 
-    print("\n| envs | px | mjmlx 描画のみ GPU (env-frames/s) | mjmlx 描画+読出 (env-frames/s) | Isaac 描画のみ (env-frames/s) | mjmlx 物理+描画 (env-steps/s) | Isaac 物理+描画 (env-steps/s) |")
-    print("|---|---|---|---|---|---|---|")
+    print("\n| envs | px | mjmlx 描画のみ | Isaac 描画のみ | Genesis 描画のみ | mjmlx 物理+描画 | Isaac 物理+描画 | Genesis 物理+描画 |")
+    print("|---|---|---|---|---|---|---|---|")
     f = lambda n, s: "-" if not s else f"{n / s:,.0f}"
+
+    def cell(r, who, key):
+        d = r.get(who)
+        if not d:
+            return "-"
+        return "skip" if "skip" in d else f(r["num_envs"], d.get(key))
+
     for r in results.values():
-        m, i = r.get("mjmlx", {}), r.get("isaac", {})
-        iv = (lambda k: f(r["num_envs"], i.get(k))) if "skip" not in i else (lambda k: "skip: " + i["skip"][:40])
-        print(f"| {r['num_envs']} | {r['size']} | {f(r['num_envs'], m.get('render_gpu_s'))} | {f(r['num_envs'], m.get('render_readback_s'))} | "
-              f"{iv('render_only_s') if i else '-'} | {f(r['num_envs'], m.get('step_plus_render_s'))} | {iv('step_plus_render_s') if i else '-'} |")
+        print(f"| {r['num_envs']} | {r['size']} | {cell(r, 'mjmlx', 'render_gpu_s')} | {cell(r, 'isaac', 'render_only_s')} | {cell(r, 'genesis', 'render_only_s')} | "
+              f"{cell(r, 'mjmlx', 'step_plus_render_s')} | {cell(r, 'isaac', 'step_plus_render_s')} | {cell(r, 'genesis', 'step_plus_render_s')} |")
 
 
 if __name__ == "__main__":
