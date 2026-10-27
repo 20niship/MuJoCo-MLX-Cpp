@@ -43,7 +43,7 @@ FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
 
 # go2_mjx.xmlのiterations=1はCPU(Newton)向け。GPUのソルバは接触が重なると収束が遅く、1〜3回だと一部のenvで速度が発散するため8にする(CPUでも同値を使い挙動を揃える)
-SOLVER_ITERATIONS = 8
+SOLVER_ITERATIONS = 16  # CPU(MuJoCo C)との差を小さくするため十分に反復する(収束した環は早期終了)
 BASE_CONTACT_FORCE_THRESHOLD = 1.0
 SPAWN_FOOTPRINT_RADIUS = 0.5  # 胴体中心から足先までの最大水平距離(関節角ランダム化で脚が開く分を含む)
 PUSH_INTERVAL_STEPS = (int(10.0 / CONTROL_DT), int(15.0 / CONTROL_DT))

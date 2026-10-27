@@ -184,6 +184,20 @@
 - 結果(Go2、1制御step後): 接触あり 関節角 平均 3.8e-4 → **1.35e-4 rad**(p95 4.7e-4 → 4.4e-4、最大 1.1e-1 → 6.1e-3)、基部角速度 平均 1.25e-2 → **1.4e-3 rad/s**。接触なし 角速度 平均 6.7e-3 → 2.6e-4。着手時(関節角 平均 1.4e-2 rad)から約1/100。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall / batched_collision_primitives 通過。
 
+### 実験21: solverの収束を厳しくして残りの差を下限まで縮める(速度の余裕を差の縮小に回す)
+- 実験19・20のあと、解を厳しく解くほど差が減ることが分かった(以前は反復数を変えても効かなかったが、物理の食い違いが直ったので残りはソルバの収束)。
+  | solver設定 | 関節角差 平均 / p95 | env.step |
+  |---|---|---|
+  | SI=8, GTOL=1e-6, CG=10 | 1.35e-4 / 4.4e-4 rad | 67 ms |
+  | SI=12, GTOL=1e-8, CG=20 | 4.5e-5 / 2.7e-5 | 69 ms |
+  | SI=16, GTOL=1e-10, CG=30 | 3.8e-5 / 4.1e-6 | 75 ms |
+  | SI=30, GTOL=1e-12, CG=40 | 3.7e-5 / 3.2e-6 | 83 ms |
+  接触なし(空中)の下限は 平均 4.0e-5 / p95 2.5e-6 で、SI=16 の接触ありのp95(4.1e-6)はこれと同水準。つまり接触ありでも空中の誤差(float32と非線形ソルバの残差)まで縮んだ。
+- 既定を SI=16(env)、`MJMLX_GTOL=1e-10`、`MJMLX_CGITERS=30` に変更。収束した環は早期終了するので速度への影響は約12%。
+- 結果: 接触あり 関節角 平均 3.8e-5 rad(p95 4e-6、最大 2.4e-2)、基部角速度 平均 3.7e-4 rad/s。最大値(2e-2)は空中でも同じ値で、速く振り回される少数の状態の増幅(float32)。着手時(平均 1.4e-2 rad)から約1/370。
+- **学習1 iteration(isaac_flat、cuda PPO): 約1.42 s**(収集 1.15 s)。Isaac Lab 約2.2 s の約1.55倍速い。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall / batched_collision_primitives 通過。1秒のランディング軌道の関節角差は 0.18 rad(接触でカオス的に増幅される軌道比較なので1 step後の差で評価)。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。
