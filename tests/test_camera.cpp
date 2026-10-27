@@ -14,6 +14,7 @@
 
 // 描画系コマンドを数えるインターポーザ(libvulkanの同名シンボルより先に解決される)。
 static std::atomic<int> g_draws{0};
+#ifdef __linux__ // シンボルインターポーズはLinuxのみ(macでは内部カウンタだけを見る)
 extern "C" {
 VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
     static auto f = reinterpret_cast<PFN_vkCmdDrawIndexedIndirect>(dlsym(RTLD_NEXT, "vkCmdDrawIndexedIndirect"));
@@ -35,12 +36,14 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer c, VkBuffer b, VkDe
     g_draws++;
     f(c, b, o, n, s);
 }
+#endif
 }
 
 namespace {
 
 int g_fail = 0;
 const char* g_dump = nullptr;
+bool g_skip = false;
 #define CHECK(cond, ...)                                  \
     do {                                                  \
         if (!(cond)) {                                    \
@@ -136,15 +139,20 @@ void run(int B) {
     mjmlx_batched_set_state(sim, qpos.data(), qvel.data());
 
     MjmlxCameraRenderer* cam = mjmlx_camera_create(sim, W, H);
-    CHECK(cam != nullptr, "camera create");
-    if (!cam) return;
+    if (!cam) { // GPU/driverがindirect描画に未対応の環境ではスキップ(ctestのSKIP_RETURN_CODE=77)
+        printf("SKIP: camera unsupported on this device\n");
+        g_skip = true;
+        return;
+    }
     CHECK(mjmlx_camera_count(cam) == 2, "ncam=%d", mjmlx_camera_count(cam));
 
     g_draws = 0;
     CHECK(mjmlx_camera_render(cam) == 0, "render");
     int draws = g_draws.load();
     printf("B=%d: vkCmdDraw*呼び出し回数(インターポーザ実測)=%d, レンダラ内部カウンタ=%d\n", B, draws, mjmlx_camera_draw_call_count(cam));
+#ifdef __linux__
     CHECK(draws == 1, "draw calls=%d (expected 1)", draws);
+#endif
     CHECK(mjmlx_camera_draw_call_count(cam) == 1, "internal draw count");
 
     size_t n = (size_t)B * 2 * H * W;
@@ -192,7 +200,8 @@ void run(int B) {
 int main(int argc, char** argv) {
     if (argc > 1) g_dump = argv[1];
     run(4);
-    run(64);
+    if (!g_skip) run(64);
+    if (g_skip) return 77;
     if (g_fail) { printf("test_camera: %d FAIL\n", g_fail); return 1; }
     printf("test_camera: PASS\n");
     return 0;

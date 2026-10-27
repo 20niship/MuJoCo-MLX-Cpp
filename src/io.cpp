@@ -348,14 +348,15 @@ static void validate_model(const mjModel* m) {
 
     // Integrator types: Euler, RK4, Implicit, ImplicitFast all supported
 
-    // Check for sensors (not supported)
+    // sensorはbatched経路(mjmlx_batched_get_sensordata)のみ対応。単体経路では計算しない。
     if (m->nsensor > 0)
-        fprintf(stderr, "[mjmlx WARNING] Model has %lld sensors -- not supported, ignored.\n", (long long)m->nsensor);
+        fprintf(stderr, "[mjmlx WARNING] Model has %lld sensors -- computed only by the batched sim (mjmlx_batched_get_sensordata).\n", (long long)m->nsensor);
 }
 
 // Load a MuJoCo C model and convert to internal Model.
 // Returns {Model, mjModel*} pair -- caller owns the mjModel*.
 std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
+    camera_prepare_device(); // mkxが最初にVulkanを使う前(配列確保前)に呼ぶ必要がある
     char error[1000] = "";
     mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
     if (!m) {
@@ -769,12 +770,12 @@ void Model::init_cache() const {
                 cp.g1 = g1_; cp.g2 = g2_;
                 cp.type1 = t1_; cp.type2 = t2_;
                 cp.body1 = b1; cp.body2 = b2;
-                cp.margin = gmargin_ptr[g1_] + gmargin_ptr[g2_];
+                cp.margin = std::max(gmargin_ptr[g1_], gmargin_ptr[g2_]);  // MuJoCo C mj_collideGeomPair: margin/gapは2geomの最大値(和ではない)
                 float gap = 0.0f;
                 if (geom_gap.size() > 0) {
                     mx::eval(geom_gap);
                     auto gp = geom_gap.data<float>();
-                    gap = gp[g1_] + gp[g2_];
+                    gap = std::max(gp[g1_], gp[g2_]);
                 }
                 cp.gap = gap;
                 for (int k = 0; k < 3; k++) {

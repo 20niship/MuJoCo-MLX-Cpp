@@ -70,6 +70,14 @@ MJMLX_API float mjmlx_model_body_mass(const MjmlxModel* model, int body_id);
 // Returns -1 if not found.
 MJMLX_API int mjmlx_name2id(const MjmlxModel* model, int obj_type, const char* name);
 
+// MJCF <sensor>のメタ情報(MuJoCoのsensor_type/sensor_adr/sensor_dim/名前)。
+MJMLX_API int mjmlx_model_nsensor(const MjmlxModel* model);
+MJMLX_API int mjmlx_model_nsensordata(const MjmlxModel* model);
+MJMLX_API const char* mjmlx_model_sensor_name(const MjmlxModel* model, int sensor_id);  // 無名ならNULL
+MJMLX_API int mjmlx_model_sensor_type(const MjmlxModel* model, int sensor_id);  // mjtSensor
+MJMLX_API int mjmlx_model_sensor_adr(const MjmlxModel* model, int sensor_id);
+MJMLX_API int mjmlx_model_sensor_dim(const MjmlxModel* model, int sensor_id);
+
 // Access the underlying MuJoCo C mjModel pointer (for model field accessors).
 // Returns a const mjModel* cast to void*. Valid for the lifetime of the MjmlxModel.
 MJMLX_API const void* mjmlx_get_mj_model(const MjmlxModel* model);
@@ -188,6 +196,11 @@ MJMLX_API const float* mjmlx_batched_get_cinert(const MjmlxBatchedSim* sim, int*
 MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_qfrc_actuator(const MjmlxBatchedSim* sim, int* n_out);
 MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, int* n_out);
+
+// MJCF <sensor>の値。float[num_envs * nsensordata]、各envの並びはMuJoCoのd->sensordata(sensor_adr)と同一。
+// batchedの出力はstep開始時点の状態なので、mj_step後のsensordataと対応する。sensorが無いモデルではnsensordata=0・NULLを返す。
+MJMLX_API int mjmlx_batched_nsensordata(const MjmlxBatchedSim* sim);
+MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, int* n_out);
 
 // Per-env state setters (for custom RSI resets with noise).
 MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx, const float* qpos, int nq);

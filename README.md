@@ -242,7 +242,9 @@ cam.render()
 rgb, depth = cam.rgb(), cam.depth()        # (num_envs, ncam, H, W, 3) uint8 / (num_envs, ncam, H, W) float32(m)
 ```
 
-例: `scripts/example_go2_camera.py`、MuJoCo比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera.py`。未対応: 影・テクスチャ・hfield・半透明・可動bodyに付いたlight・trackcom(body原点で近似)。
+例: `scripts/example_go2_camera.py`、MuJoCo比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera.py`。カメラはCMakeオプション `MJMLX_BUILD_CAMERA`(既定ON)で分離されている。OFFにすると `mjmlx_camera_*` はスタブ(`create_camera` が明確なエラー)になり、カメラ無しの学習・ビルドには影響しない。ONでも、graphics+compute queue family・multiDrawIndirect・drawIndirectFirstInstance・shaderClipDistanceのいずれかを持たない/mkxが先に初期化された場合は `create_camera` だけが失敗する(理由をstderrに出す)。MoltenVK(mac)でのこれらのfeatureの有無は未検証(実機が無い)。カメラ用デバイスは `mjmlx_load_model` 時にmkxへ注入される(`VulkanBackend::use_external_device`)。環境変数 `MJMLX_CAMERA_DEVICE=0` で注入を無効化できる。
+
+未対応: 影・テクスチャ・hfield・半透明・可動bodyに付いたlight・trackcom(body原点で近似)。
 
 ### Running tests
 

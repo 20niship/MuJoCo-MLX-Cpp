@@ -11,6 +11,7 @@ from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
 from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
+from mjmlx_sensors import ContactSensor, Imu, SensorHub
 
 PHYSICS_DT = 0.005  # Isaac LabのGo2と同じdt(0.005s x decimation 4)。0.01以上ではPD(kp=50,armature=0.01)が陽的積分で不安定
 DECIMATION = 4  # 4*0.005 = 0.02s -> 50Hz制御
@@ -43,7 +44,7 @@ FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
 
 # go2_mjx.xmlのiterations=1はCPU(Newton)向け。GPUのソルバは接触が重なると収束が遅く、1〜3回だと一部のenvで速度が発散するため8にする(CPUでも同値を使い挙動を揃える)
-SOLVER_ITERATIONS = 8
+SOLVER_ITERATIONS = 16  # CPU(MuJoCo C)との差を小さくするため十分に反復する(収束した環は早期終了)
 BASE_CONTACT_FORCE_THRESHOLD = 1.0
 SPAWN_FOOTPRINT_RADIUS = 0.5  # 胴体中心から足先までの最大水平距離(関節角ランダム化で脚が開く分を含む)
 PUSH_INTERVAL_STEPS = (int(10.0 / CONTROL_DT), int(15.0 / CONTROL_DT))
@@ -122,6 +123,7 @@ class MjmlxGo2Env(VecEnv):
         reward_preset: str = "relaxed",
         device: str = "cpu",
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
+        use_sensors: bool = False,
     ):
         self._native = native_module
         self._w = PRESETS[reward_preset]
@@ -136,6 +138,11 @@ class MjmlxGo2Env(VecEnv):
         assert self.nu == 12
 
         self.num_envs = num_envs
+        # use_sensors: 観測のbase速度・重力をMJCFの<sensor>(gyro/orientation/velocimeter相当)、足/胴体の接触をContactSensorから取る(Isaac Lab形式)。センサ値は1物理step遅れ
+        self._hub = SensorHub(self._sim, self._model) if use_sensors else None
+        self._imu = Imu(self._hub) if use_sensors else None
+        self._feet_contact_sensor = ContactSensor(self._sim, num_envs, FOOT_BODY_IDX, BASE_CONTACT_FORCE_THRESHOLD) if use_sensors else None
+        self._base_contact_sensor = ContactSensor(self._sim, num_envs, [BASE_BODY_IDX], BASE_CONTACT_FORCE_THRESHOLD) if use_sensors else None
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
         self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
@@ -224,12 +231,17 @@ class MjmlxGo2Env(VecEnv):
         self._last_foot_contact[idx] = False
         self._next_push_step[idx] = self._elapsed[idx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=n)
 
-    def _obs(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
-        quat = qpos[:, 3:7]
-        base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
-        base_ang_vel = qvel[:, 3:6]
-        gravity = np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (qpos.shape[0], 1))
-        projected_gravity = _quat_rotate_inverse(quat, gravity)
+    def _obs(self, qpos: np.ndarray, qvel: np.ndarray, from_sensors: bool = False) -> np.ndarray:
+        if from_sensors:
+            base_lin_vel = self._imu.lin_vel_b.cpu().numpy()
+            base_ang_vel = self._imu.ang_vel_b.cpu().numpy()
+            projected_gravity = self._imu.projected_gravity_b.cpu().numpy()
+        else:
+            quat = qpos[:, 3:7]
+            base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
+            base_ang_vel = qvel[:, 3:6]
+            gravity = np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (qpos.shape[0], 1))
+            projected_gravity = _quat_rotate_inverse(quat, gravity)
         joint_pos_rel = qpos[:, 7:19] - DEFAULT_JOINT_POS
         joint_vel = qvel[:, 6:18]
         return np.concatenate(
@@ -259,6 +271,10 @@ class MjmlxGo2Env(VecEnv):
             self._sim.step(ctrl)
         qpos, qvel = self._sim.state()
         cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
+        if self._hub is not None:
+            self._hub.read()
+            self._feet_contact_sensor.update(CONTROL_DT)
+            self._base_contact_sensor.update(CONTROL_DT)
 
         not_finite = ~np.isfinite(qpos).all(axis=1) | ~np.isfinite(qvel).all(axis=1)
         finite_qpos = np.where(np.isfinite(qpos), qpos, 0.0)
@@ -270,11 +286,15 @@ class MjmlxGo2Env(VecEnv):
         base_ang_vel = qvel[:, 3:6]
         joint_vel = qvel[:, 6:18]
 
-        cfrc = cfrc_ext.reshape(self.num_envs, -1, 6)
-        base_force_norm = np.linalg.norm(cfrc[:, BASE_BODY_IDX, 3:6], axis=1)
-        base_contact = base_force_norm > BASE_CONTACT_FORCE_THRESHOLD
-        foot_force_norm = np.linalg.norm(cfrc[:, FOOT_BODY_IDX, 3:6], axis=2)
-        foot_contact = foot_force_norm > BASE_CONTACT_FORCE_THRESHOLD
+        if self._hub is not None:
+            base_contact = self._base_contact_sensor.is_contact[:, 0].cpu().numpy()
+            foot_contact = self._feet_contact_sensor.is_contact.cpu().numpy()
+        else:
+            cfrc = cfrc_ext.reshape(self.num_envs, -1, 6)
+            base_force_norm = np.linalg.norm(cfrc[:, BASE_BODY_IDX, 3:6], axis=1)
+            base_contact = base_force_norm > BASE_CONTACT_FORCE_THRESHOLD
+            foot_force_norm = np.linalg.norm(cfrc[:, FOOT_BODY_IDX, 3:6], axis=2)
+            foot_contact = foot_force_norm > BASE_CONTACT_FORCE_THRESHOLD
 
         cmd = self._commands
         lin_err = np.sum((cmd[:, 0:2] - base_lin_vel[:, 0:2]) ** 2, axis=1)
@@ -325,7 +345,7 @@ class MjmlxGo2Env(VecEnv):
         terminated = base_contact | blew_up | out_of_terrain
         dones = truncated | terminated
 
-        obs = self._obs(qpos, qvel)
+        obs = self._obs(qpos, qvel, from_sensors=self._hub is not None)
         self._last_action = action.copy()
         self._prev_joint_vel = joint_vel.copy()
 
@@ -341,6 +361,9 @@ class MjmlxGo2Env(VecEnv):
         if len(done_idx) > 0:
             mask = dones.astype(np.int32)
             self._reset_envs(mask)
+            if self._hub is not None:
+                self._feet_contact_sensor.reset(torch.from_numpy(dones))
+                self._base_contact_sensor.reset(torch.from_numpy(dones))
             reset_qpos, reset_qvel = self._sim.state()
             reset_obs = self._obs(reset_qpos, reset_qvel)
             obs = obs.copy()

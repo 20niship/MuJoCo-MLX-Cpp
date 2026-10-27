@@ -8,6 +8,7 @@
 
 #include <mujoco/mujoco.h>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -554,6 +555,8 @@ struct Data {
 
 // ── BatchedSim ───────────────────────────────────────────────
 
+struct SensorCtx;  // sensor.cpp。モデルにsensorがあるときだけ確保する
+
 struct BatchedSim {
     const Model* model;
     int num_envs;
@@ -577,9 +580,22 @@ struct BatchedSim {
 
     // カメラ描画用: qpos(B*nq)からGPU運動学カーネルだけを再実行する(stepには含めない)。出力はkernelの9出力(SoA: 要素(成分,env)は成分*B+env)。
     std::function<std::vector<mx::array>(const mx::array&)> kinematics;
+
+    // sensor (MJCF <sensor>)。nsensor==0なら空で、stepに追加コストはない
+    std::shared_ptr<SensorCtx> sensor;
 };
 
+// sensor.cpp
+std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs);
+void sensor_before_step(SensorCtx& ctx, const BatchedSim& sim);  // step前の出力(xpos/cvel等)を保存(accelerometerの差分用)
+void sensor_mark_reset(SensorCtx& ctx, const int* reset_mask, int num_envs);
+void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& out);  // (B, nsensordata)をhostで計算
+int sensor_nsensordata(const SensorCtx& ctx);
+
 // ── Module functions (internal C++ API) ──────────────────────
+
+// camera.cpp / camera_stub.cpp: mkxの初期化前にgraphics+compute queueとindirect描画featureを持つデバイスを注入する(不可なら何もしない)
+void camera_prepare_device();
 
 // io.cpp
 Model load_model(const char* xml_path);
@@ -680,6 +696,7 @@ struct MjmlxBatchedSim {
     mjModel* mj_model = nullptr;            // GPUパスでカメラ描画が参照する(borrowed, レンダラ作成時にコピーするので作成後は不要)
     mjModel* cpu_model = nullptr;           // borrowed from MjmlxModel, not owned
     std::vector<mjData*> cpu_datas;
+    mutable std::vector<float> sensordata_buf;  // get_sensordataの返却用
 
     ~MjmlxBatchedSim() {
         for (auto* d : cpu_datas) if (d) mj_deleteData(d);
