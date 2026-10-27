@@ -40,6 +40,17 @@ struct CamDevice {
 };
 CamDevice g_dev;
 
+// mkxへ注入したinstance/deviceの所有者。mkxのContext(関数内static、注入後の初回使用で生成)より先に構築されるので、終了時はmkxの解放が済んでから破棄される。
+struct CamDeviceOwner {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    ~CamDeviceOwner() {
+        if (device) vkDestroyDevice(device, nullptr);
+        if (instance) vkDestroyInstance(instance, nullptr);
+    }
+};
+CamDeviceOwner g_dev_owner;
+
 // graphics+computeのqueue familyと、indirect描画に要るfeatureを持つデバイスだけをmkxに注入する。満たさなければ何もせず従来のmkx既定になる(カメラだけが使えない)。
 void prepare_device() {
     if (const char* e = std::getenv("MJMLX_CAMERA_DEVICE")) { if (std::atoi(e) == 0) { g_dev.reason = "disabled by MJMLX_CAMERA_DEVICE=0"; return; } }
@@ -104,6 +115,7 @@ void prepare_device() {
             return;
         }
         g_dev.instance = inst; g_dev.physical = phys; g_dev.device = dev; g_dev.queue = q; g_dev.queue_family = (uint32_t)qf;
+        g_dev_owner.instance = inst; g_dev_owner.device = dev;
         g_dev.valid = true; g_dev.reason.clear();
     } catch (const std::exception& e) {
         g_dev.reason = e.what();
