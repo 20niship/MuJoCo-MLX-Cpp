@@ -18,9 +18,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 # Isaacの水平画角 2*atan(20.955/(2*24)) = 47.5度に合わせた前方カメラ1台(baseの+x方向)。
+# --camera orbit: ロボット全体が写る三人称カメラ(mjmlxのみ。frontはIsaacと同じ前方視点でロボット自身はほぼ写らない)
+_orbit = "--camera" in sys.argv and sys.argv[sys.argv.index("--camera") + 1] == "orbit"
+_cam = ('<camera name="front" mode="targetbody" target="base" pos="-1.4 -1.4 0.7" fovy="45"/>' if _orbit else '<camera name="front" pos="0.4 0 0.15" xyaxes="0 -1 0 0 0 1" fovy="47.5"/>')
 os.environ["MJMLX_GO2_XML_SUBST"] = (
-    '<camera name="track"->'
-    '<camera name="front" pos="0.4 0 0.15" xyaxes="0 -1 0 0 0 1" fovy="47.5"/><camera name="track";'
+    '<camera name="track"->' + _cam + '<camera name="track";'
     "<worldbody>-><worldbody>"
     '<light pos="0 0 4" dir="0.3 0.2 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>'
 )
@@ -82,6 +84,7 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128])
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--out", default="runs/camera_vs_isaac.json")
+    ap.add_argument("--camera", choices=["front", "orbit"], default="front")
     ap.add_argument("--only", choices=["mjmlx", "isaac"], default=None)
     ap.add_argument("--isaac-python", default=os.path.expanduser("~/isaac/.venv/bin/python"))
     ap.add_argument("--isaac-lab-dir", default=os.path.expanduser("~/isaac/IsaacLab"))

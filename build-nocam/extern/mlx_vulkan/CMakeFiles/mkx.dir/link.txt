@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmkx.a CMakeFiles/mkx.dir/src/mkx/vulkan/vulkan_backend.cpp.o
+/usr/bin/ranlib libmkx.a

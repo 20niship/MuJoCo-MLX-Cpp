@@ -1,0 +1,5 @@
+if(EXISTS "/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/extern/mlx_vulkan/mkx_tests_tests-b858cb2.cmake")
+  include("/home/owner/Desktop/programs/MuJoCo-MLX-Cpp/.claude/worktrees/camera/build-nocam/extern/mlx_vulkan/mkx_tests_tests-b858cb2.cmake")
+else()
+  add_test(mkx_tests_NOT_BUILT-b858cb2 mkx_tests_NOT_BUILT-b858cb2)
+endif()
