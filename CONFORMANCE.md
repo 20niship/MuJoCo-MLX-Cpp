@@ -357,7 +357,7 @@ MuJoCo-MLX-Cpp's solver supports:
 
 | Subsystem | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |-----------|----------|-----|----------------|
-| **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 21 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37) |
+| **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 19 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37) |
 | **Fixed tendons** (length, velocity, J, passive) | Full | Yes | Yes (Phase 5.1) |
 | **Spatial tendons** (wrapping geometry) | Full | Yes | **No** (DEFERRED) |
 | **Tendon limits + friction** | Full | Yes | Yes (Phase 5.4-5.5) |
@@ -609,7 +609,7 @@ remaining conformance gap:
 | Transmission types | 6 | 4 | 3 (JOINT, TENDON, SITE) |
 | Gain types | 4 | 3 | 2 (FIXED, AFFINE) |
 | Dynamics types | 6 | 5 | 4 (NONE, INTEGRATOR, FILTER, FILTEREXACT) |
-| Sensor types | 49 | ~30 | 21 (batched GPU) |
+| Sensor types | 49 | ~30 | 19 (batched GPU) |
 | Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
 | Batched GPU sim | No | Yes (CUDA/TPU) | Yes (GPU, 73K SPS training) |
