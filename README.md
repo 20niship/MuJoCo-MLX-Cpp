@@ -167,6 +167,26 @@ https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
 動画はリポジトリには含めない(サイズが大きいため)。上のコマンドで `runs/video/compare.mp4` に生成される。arm2種はCPUとGPUが一致し、go2/g1は着地後に接触解の差で軌道が分かれる。
 長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
 
+### 4. カメラ描画速度(Isaac Lab TiledCameraと比較)
+```bash
+uv run python scripts/bench_camera_vs_isaac.py --build-dir build            # 両方測ってJSON(runs/camera_vs_isaac.json)と表を出す
+uv run python scripts/bench_camera_vs_isaac.py --only mjmlx --envs 256 --sizes 64   # こちらだけ
+```
+Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセス、RTX機能を全て切り、Go2平地env、TiledCamera 1台/env、rgb+distance_to_camera)を子プロセスで呼ぶ。RTX 3060 12GB、Go2、1カメラ/env、env-frames/s(描画のみ)と env-steps/s(物理4substep+描画1回):
+
+| envs | px | mjmlx 描画のみ(GPU) | mjmlx 描画+CPU読出 | Isaac 描画のみ | mjmlx 物理+描画 | Isaac 物理+描画 |
+|---|---|---|---|---|---|---|
+| 64 | 64 | 1,718 | 1,531 | 3,298 | 1,161 | 2,238 |
+| 64 | 128 | 1,708 | 1,190 | 1,557 | 960 | 1,179 |
+| 256 | 64 | 1,960 | 1,762 | 5,490 | 1,390 | 4,133 |
+| 256 | 128 | 1,898 | 1,090 | 2,427 | 1,010 | 2,240 |
+| 1024 | 64 | 2,763 | 1,737 | 7,924 | 1,499 | 7,278 |
+| 1024 | 128 | 2,794 | 1,214 | skip(Isaacが1800sで未完) | 1,138 | skip |
+| 4096 | 64 | 3,882 | 1,949 | skip(同上) | 1,797 | skip |
+| 4096 | 128 | 3,867 | 1,397 | skip(同上) | 1,319 | skip |
+
+注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。こちらはGo2のvisual meshが約40万三角形/envありジオメトリ律速。測定できた範囲では、64pxでIsaacの0.35〜0.52倍(1024envで0.35倍)、128px・64envではIsaacと同等(1.1倍)、128px・256envで0.78倍。
+
 ## Architecture
 
 ```
