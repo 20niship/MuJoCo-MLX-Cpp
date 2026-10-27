@@ -48,14 +48,14 @@ struct RlBatchedSim {
     int nq = 0, nv = 0, nu = 0;
     ~RlBatchedSim() { if (handle) mjmlx_batched_free(handle); }
 
-    void step(FloatArray ctrl) {
+    void step(FloatArray ctrl, int n) {
         if (nu > 0) {
             if (ctrl.ndim() != 2 || static_cast<int>(ctrl.shape(0)) != num_envs || static_cast<int>(ctrl.shape(1)) != nu) {
                 throw std::runtime_error("mjmlx_rl: ctrl must have shape (num_envs, nu)");
             }
-            mjmlx_batched_step(handle, ctrl.data());
+            mjmlx_batched_step_n(handle, ctrl.data(), n);
         } else {
-            mjmlx_batched_step(handle, nullptr);
+            mjmlx_batched_step_n(handle, nullptr, n);
         }
     }
 
@@ -176,7 +176,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def_prop_ro("nq", [](const RlBatchedSim& s) { return s.nq; })
         .def_prop_ro("nv", [](const RlBatchedSim& s) { return s.nv; })
         .def_prop_ro("nu", [](const RlBatchedSim& s) { return s.nu; })
-        .def("step", &RlBatchedSim::step, nb::arg("ctrl"))
+        .def("step", &RlBatchedSim::step, nb::arg("ctrl"), nb::arg("n") = 1)
         .def("reset", &RlBatchedSim::reset, nb::arg("mask"))
         .def("set_env_qpos", &RlBatchedSim::set_env_qpos, nb::arg("env_idx"), nb::arg("qpos"))
         .def("set_env_qvel", &RlBatchedSim::set_env_qvel, nb::arg("env_idx"), nb::arg("qvel"))

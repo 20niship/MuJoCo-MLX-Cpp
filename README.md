@@ -187,6 +187,60 @@ Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセ�
 
 注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定16、0でLOD無効)で変えられる。
 
+
+### 5. Go2物理stepの速度: 履歴の再検証・退行の原因・最適化(RTX 3060、Go2平地、dt 0.005 x decimation 4、ランダムaction、env-steps/s)
+
+測り方: `scripts/bench_physics_vs_others.py`(mjmlx/Isaac Lab/Genesis)、コミット間・設定間の比較は同一条件で**交互に複数回**走らせて平均/最小/最大を見る。GPUを他プロセス(デスクトップ描画など)が使うと全段が約2倍に遅くなり、実行ごとに50k〜110kとばらつく(旧記録の「約53k」はこの状態)ので、**絶対値ではなく同一セッション内の比**で比べる。
+
+**コミット別(4096 env、3〜6回の平均。各コミットを実際にビルドして `dt=0.005 x 4` に揃えて計測)**
+
+| コミット | 内容 | env-steps/s |
+|---|---|---|
+| b0a2367 | PR #33 開始 | 7,200 |
+| 087ef1c | dtをIsaacに合わせ4 substep | 22,500 |
+| a829b7c | solverの共有メモリ化 | 32,000 |
+| 15faba3 | 接触ヤコビをlocal配列(solver約2倍) | 51,000 |
+| 4d35636 | VRAM化(「Isaacの約1.7倍速い」の時点) | 93,000〜107,000 |
+| bb3b606 | 87bfbf9の直前 | 89,000〜97,000 |
+| 87bfbf9 | solver収束を厳しく(SI=16, GTOL=1e-10, CG=30) | 77,000〜83,000 |
+| 91965d9 / af6bd6c | sensor PR #38 | 87,000〜99,000 |
+| 8da6ee2 | 現main(PR #40) | 86,000〜89,000 |
+
+- 当時の高速化の記述は再現できた(4d35636は当時のIsaac Labより速い水準)。
+- 退行の主因は **87bfbf9 のsolver設定**(精度のための収束厳格化)。同一バイナリでSI/GTOL/CGだけ戻すと現main 68k → 80k(SI=8のみ)、GTOLのみ戻すと89k。約10〜15%。
+- sensor PR・camera PRの影響は計測のばらつき(±10%)内で、有意な退行は検出できなかった。
+- 以前の「57k→53k」のばらつきの多くはGPU競合・クロック状態による。
+
+**ボトルネック分析(4096 env、1制御step=4 substep)**
+
+- Vulkanのタイムスタンプで1 dispatchごとのGPU時間を測った(`extern/mlx_vulkan` に一時パッチ。案はPR本文)。GPU時間の約78%が solver 1本、残り(kin/forward/collision/euler)は合計でsubstepあたり約0.9ms。
+- 読み戻し: mlx_vulkanのステージングが非キャッシュのホストメモリで、readbackが約200MB/sしか出ない。`cfrc_ext`(1.4MB)の取得だけで約8ms、1 stepで読む3配列の合計は約11ms。`HOST_CACHED` を選ぶと cfrc 8.5→0.85ms、env.step 48→34ms(実測。サブモジュール側の修正案)。
+- ホスト側: グラフ構築は約0.6ms/substep、Pythonのnumpyは約3.5ms/step。
+- solverのCGは多くの状態で上限(30反復)まで回っていた。Newton反復は平均約3回。
+
+**最適化と効果(4096 env、交互5回平均。baseは現main)**
+
+| 変更 | 効果 |
+|---|---|
+| 読み戻しをGPUで1バッファに詰めて1回転送(`set_pack_spec/read_pack`)、リセット経路の読み戻し/書き込みを集約(出力はビット一致) | 約82k → 112k |
+| solverのNewton方向をCGから共有メモリ上のコレスキーへ(`MJMLX_SOLVER_CG=1`で従来) | 112k → 150k(solver 1回 6.9→3.4ms) |
+| 地形の同じ高さの区間を1 boxに統合(平地は23→1個、衝突ペア739→233) | collision約4分の1 |
+| `step(ctrl, n)`でctrl転送をstepあたり1回に | 転送待ち6回/step削減 |
+| forwardの作業領域をローカル配列に | forward 527→300us |
+| Newton減少量による早期終了(`MJMLX_NTOL`、既定1e-4) | solver 3.47→2.25ms。CPUとの1step差は不変(関節角 平均3.7e-5→4.3e-5 rad、p95 4.9e-6) |
+| (任意)`self_collision=False`(Isaac Lab/Genesisと同じ設定) | さらに約4% |
+
+**Before/After(同一セッション、GPU競合下の値)**
+
+| env数 | 変更前 | 変更後 | 変更後(self衝突なし) | Isaac Lab | Genesis |
+|---|---|---|---|---|---|
+| 256 | 16,455 | 35,712 | 38,382 | 16,615 | 59,705 |
+| 1024 | 38,141 | 78,914 | 80,956 | 57,738 | 154,430 |
+| 4096 | 53,413 | 112,293 | 117,336 | 120,091 | 252,518 |
+
+条件差: Genesisは観測・報酬なしの `scene.step()` x4、mjmlx/Isaacは観測・報酬込みの `env.step`。mjmlxはMuJoCo系の接触モデル(摩擦ピラミッドcondim 6)でGenesisより重い。
+**Genesisには未達**(256/1024/4096でそれぞれ約0.6/0.5/0.45倍)。残り: solverが依然GPU時間の大半(共有メモリ命令数が律速)、小envではホストのグラフ構築とsubstep内の約22 dispatchの直列レイテンシが支配的。次の手はsolverの行列組み立て(H=M+J^T D J)の対称利用とvec4共有メモリ読み、frictionloss/limit行を密Jから外す、kin/forward/collisionの融合、mlx_vulkanのHOST_CACHEDステージング。
+
 ## Architecture
 
 ```

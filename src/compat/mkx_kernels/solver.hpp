@@ -37,6 +37,7 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float time
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
+  const float newton_tol = getenv("MJMLX_NTOL") ? (float)atof(getenv("MJMLX_NTOL")) : 1e-4f;  // Newton減少量(g.s)がtrace(M)のこの倍未満なら収束とみなす(CPUとの差は1e-4でも変わらない)。0で無効
   const int max_efc              = solver_max_efc_for(nv);
   const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
@@ -81,6 +82,7 @@ shared int tg_ncp;
 shared int tg_crow0[129];  // 接触ciの拘束行は [tg_crow0[ci], tg_crow0[ci+1])
 shared float tg_ba;
 shared float tg_g0;
+shared float tg_ntol;
 shared float tg_rr0;
 shared int tg_done;  // 1ならこのenvは収束したのでNewton反復を打ち切る(ワークグループ内で一様)
 shared float tg_rr;
@@ -151,6 +153,7 @@ shared float tg_pAp;
      << "const int MAX_CON = " << max_contacts_per_env << ";\n"
      << "const float TIMESTEP = " << solver_fmt_float(timestep) << "f;\n"
      << "const float GTOL_REL = " << solver_fmt_float(gtol_rel) << "f;\n"
+     << "const float NEWTON_TOL = " << solver_fmt_float(newton_tol) << "f;\n"
      << "const float MJMINVAL_CV = 1e-12f;\n"
      << "const float MJMINVAL_SV = 1e-14f;\n"
      << "const float MJMINIMP = 0.0001f;\n"
@@ -499,7 +502,8 @@ barrier(); memoryBarrierBuffer();
 barrier(); memoryBarrierBuffer();
 
 SABL2
-if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0; }
+if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); tg_g0 = gn; tg_done = 0;
+  float tr = 0.0f; for (int i = 0; i < NV; i++) tr += QMV(i*NV+i); tg_ntol = NEWTON_TOL * tr; }
 barrier(); memoryBarrierBuffer(); memoryBarrierShared();
 for (int iter = 0; iter < NSOLVE; iter++) {
 CG_BEGIN
@@ -735,7 +739,7 @@ if (tid == 0u) {
     if (tid == 0u) {
         tg_ba = ba_local;
         // 1反復のコスト改善が無ければ収束とみなす。
-        tg_done = (ba_local == 0.0f) ? 1 : 0;
+        tg_done = (ba_local == 0.0f || -(lg+lc) < tg_ntol) ? 1 : 0;
     }
     barrier();
 )GLSL";

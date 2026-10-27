@@ -70,11 +70,16 @@ class StairsTerrain:
         return x, y
 
     def to_mjcf_bodies(self) -> str:
-        """区間ごとのboxをworldbody直下のgeomとして書き出す(高さ0の区間は素通りできる薄い床にする)。"""
+        """区間ごとのboxをworldbody直下のgeomとして書き出す(高さ0の区間は素通りできる薄い床にする)。天面高さが同じ隣り合う区間は1つのboxにまとめる(衝突ペア数がboxの数に比例するため。平地は1個になる)。"""
         parts = []
+        spans: list[list[float]] = []
         for i in range(len(self.tops)):
-            x0, x1 = self.edges[i], self.edges[i + 1]
-            top = max(self.tops[i], 0.005)
+            top = max(float(self.tops[i]), 0.005)
+            if spans and spans[-1][2] == top:
+                spans[-1][1] = float(self.edges[i + 1])
+            else:
+                spans.append([float(self.edges[i]), float(self.edges[i + 1]), top])
+        for x0, x1, top in spans:
             cx = (x0 + x1) / 2.0
             hx = (x1 - x0) / 2.0
             parts.append(

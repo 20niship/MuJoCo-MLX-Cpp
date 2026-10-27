@@ -1233,13 +1233,15 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
     }
 }
 
-MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) {
+MJMLX_API void mjmlx_batched_step_n(MjmlxBatchedSim* sim, const float* ctrl_flat, int n) {
     if (!sim) return;
 
     if (sim->cpu_mode) {
-        cpu_sync_state(sim);
-        cpu_batched_step(sim, ctrl_flat, 1);
-        cpu_gather_state(sim);
+        for (int i = 0; i < n; i++) {
+            cpu_sync_state(sim);
+            cpu_batched_step(sim, ctrl_flat, 1);
+            cpu_gather_state(sim);
+        }
         return;
     }
 
@@ -1248,22 +1250,27 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     int nu = s.model->nu;
     int ctrl_dim = std::max(1, nu);
 
+    // 同じctrlをn回使うので配列は1つだけ作る(substepごとに作るとホスト->GPU転送のたびにキューの完了待ちが入る)
     mx::array ctrl = (ctrl_flat && nu > 0)
         ? mx::reshape(mx::array(ctrl_flat, {B * nu}, mx::float32), {B, nu})
         : mx::zeros({B, ctrl_dim});
 
-    if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
-    auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
-    s.qpos = results[0];
-    s.qvel = results[1];
-    if (results.size() > 2) s.xpos = results[2];
-    if (results.size() > 3) s.xquat = results[3];
-    if (results.size() > 4) s.subtree_com = results[4];
-    if (results.size() > 5) s.cinert = results[5];
-    if (results.size() > 6) s.cvel = results[6];
-    if (results.size() > 7) s.qfrc_actuator = results[7];
-    if (results.size() > 8) s.cfrc_ext = results[8];
+    for (int i = 0; i < n; i++) {
+        if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
+        auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
+        s.qpos = results[0];
+        s.qvel = results[1];
+        if (results.size() > 2) s.xpos = results[2];
+        if (results.size() > 3) s.xquat = results[3];
+        if (results.size() > 4) s.subtree_com = results[4];
+        if (results.size() > 5) s.cinert = results[5];
+        if (results.size() > 6) s.cvel = results[6];
+        if (results.size() > 7) s.qfrc_actuator = results[7];
+        if (results.size() > 8) s.cfrc_ext = results[8];
+    }
 }
+
+MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) { mjmlx_batched_step_n(sim, ctrl_flat, 1); }
 
 MJMLX_API void mjmlx_batched_get_state(
     const MjmlxBatchedSim* sim, float* qpos_out, float* qvel_out,

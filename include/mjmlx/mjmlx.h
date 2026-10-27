@@ -170,6 +170,12 @@ MJMLX_API void mjmlx_batched_step(
     MjmlxBatchedSim* sim,
     const float* ctrl);
 
+// 同じctrlでn回stepする。GPU実行ではctrlのホスト->GPU転送が1回で済む。
+MJMLX_API void mjmlx_batched_step_n(
+    MjmlxBatchedSim* sim,
+    const float* ctrl,
+    int n);
+
 // Reset environments where mask[i] != 0.
 // mask: int[num_envs] -- nonzero = reset that env to initial state
 MJMLX_API void mjmlx_batched_reset(

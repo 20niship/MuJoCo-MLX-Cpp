@@ -84,7 +84,7 @@ def _go2_xml_path() -> str:
     )
 
 
-def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
+def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collision: bool = True) -> None:
     src_path = os.path.abspath(_go2_xml_path())
     assets_dir = os.path.join(os.path.dirname(src_path), "assets")
     with open(src_path) as f:
@@ -95,6 +95,8 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
+    if not self_collision:  # 脚・胴体同士の衝突を切って地形との接触だけにする(Isaac LabのUNITREE_GO2_CFGはenabled_self_collisions=False)。衝突ペアが約7分の1になる
+        xml = xml.replace('<default class="collision">\n        <geom group="3"/>', '<default class="collision">\n        <geom group="3" conaffinity="0"/>', 1)
     for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
         old, new = kv.split("->", 1)
         xml = xml.replace(old, new)
@@ -124,11 +126,12 @@ class MjmlxGo2Env(VecEnv):
         device: str = "cpu",
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
         use_sensors: bool = False,
+        self_collision: bool = True,
     ):
         self._native = native_module
         self._w = PRESETS[reward_preset]
         self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
-        build_terrain_model_xml(self.terrain, generated_xml_path)
+        build_terrain_model_xml(self.terrain, generated_xml_path, self_collision=self_collision)
 
         self._model = native_module.load_model(generated_xml_path)
         self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
@@ -280,8 +283,7 @@ class MjmlxGo2Env(VecEnv):
         ctrl_target = DEFAULT_JOINT_POS + ACTION_SCALE * action
         ctrl = np.clip(ctrl_target, CTRL_LOW, CTRL_HIGH)
 
-        for _ in range(DECIMATION):
-            self._sim.step(ctrl)
+        self._sim.step(ctrl, DECIMATION)
         if self._pack is not None:
             pk = self._sim.read_pack()
             nq, nv = self.nq, self.nv

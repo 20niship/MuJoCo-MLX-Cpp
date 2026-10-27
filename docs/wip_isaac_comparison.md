@@ -222,3 +222,8 @@
 - `scripts/mjmlx_go2_env.py`: 報酬プリセット(`relaxed` / `isaac_flat`)と `flat_orientation` 項
 - `scripts/train_go2_ppo.py`: `--reward-preset`
 - `scripts/play_go2_cmd_vel.py`: `--reward-preset`
+
+### 実験16: 履歴の再検証と退行の原因(2026-10-28)
+- 4d35636の「Isaac Labより速い」は再現できた。以降の退行は主に87bfbf9のsolver収束厳格化(約10〜15%)で、sensor/cameraは誤差内。詳細・表は README「Performance measurement 5.」。
+- Vulkanタイムスタンプで測ると、1制御stepのGPU時間(約18ms、競合下)の約78%がsolver。env.stepの読み戻しはステージングが非キャッシュで約200MB/s(mlx_vulkan側でHOST_CACHEDを選べば約3倍速い)。
+- 対策: 読み戻しのGPU側集約、solverのNewton方向をコレスキー化、早期終了(`MJMLX_NTOL`)、地形box統合、`step(ctrl, n)`。
