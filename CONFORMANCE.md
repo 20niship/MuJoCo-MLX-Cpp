@@ -357,7 +357,7 @@ MuJoCo-MLX-Cpp's solver supports:
 
 | Subsystem | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |-----------|----------|-----|----------------|
-| **Sensors** (49 types, 1,542 lines) | Full | 787 lines, many types | **None** (DEFERRED) |
+| **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 21 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37) |
 | **Fixed tendons** (length, velocity, J, passive) | Full | Yes | Yes (Phase 5.1) |
 | **Spatial tendons** (wrapping geometry) | Full | Yes | **No** (DEFERRED) |
 | **Tendon limits + friction** | Full | Yes | Yes (Phase 5.4-5.5) |
@@ -416,7 +416,7 @@ Remaining warnings:
 |----------|-------------|
 | Model has MUSCLE dynamics | **Warning emitted.** Not implemented. |
 | Model has spatial tendons | **Warning emitted.** Only fixed tendons supported. |
-| Model has sensors | **Warning emitted.** Sensors not computed. |
+| Model has sensors | Computed on the batched sim (`mjmlx_batched_get_sensordata`, MuJoCo `sensor_adr` layout). Unsupported types warn and stay 0. Single-env path does not compute sensors. |
 | Model has TENDON equality constraints | **Warning emitted.** Not implemented. |
 | Model has SDF geoms | **Warning emitted.** Not supported. |
 
@@ -596,7 +596,7 @@ remaining conformance gap:
 | RK4 | `mj_RungeKutta` | `integrate_rk4()` | Full parity (scalar path) |
 | Implicit/Fast | `mj_implicit` | `integrate_implicit()` | Full parity (scalar path) |
 | Flex | `mj_flex` | -- | DEFERRED |
-| Sensor | `mj_sensorPos/Vel/Acc` | -- | DEFERRED |
+| Sensor | `mj_sensorPos/Vel/Acc` | `mjmlx_batched_get_sensordata` | Partial (accelerometer is a 1-step velocity difference, like Isaac Lab IMU) |
 | Inverse | `mj_inverse` | -- | DEFERRED |
 
 ### Summary Statistics
@@ -609,7 +609,7 @@ remaining conformance gap:
 | Transmission types | 6 | 4 | 3 (JOINT, TENDON, SITE) |
 | Gain types | 4 | 3 | 2 (FIXED, AFFINE) |
 | Dynamics types | 6 | 5 | 4 (NONE, INTEGRATOR, FILTER, FILTEREXACT) |
-| Sensor types | 49 | ~30 | 0 (DEFERRED) |
+| Sensor types | 49 | ~30 | 21 (batched GPU) |
 | Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
 | Batched GPU sim | No | Yes (CUDA/TPU) | Yes (GPU, 73K SPS training) |
