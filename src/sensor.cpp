@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <set>
 
 namespace mjmlx {
 
@@ -80,6 +81,10 @@ struct SensorCtx {
     std::array<float, 3> magnetic{0, -0.5f, 0};
     std::vector<SensorDesc> sensors;
     std::vector<int> body_rootid;
+    // センサが参照するbodyだけをデバイス側で抜き出してから読み戻す(全bodyのxpos/cvel等の読み戻しは4096envで数十msかかる)
+    std::vector<int> used_bodies, com_bodies;  // 昇順・重複なし
+    std::vector<int> bmap, cmap;               // body id -> 上の配列内の位置(無ければ-1)
+    std::optional<mx::array> used_idx, com_idx;
     bool needs_prev = false;  // accelerometerがあるときだけstep前の出力を保持する
 
     // 直近stepへの入力のqpos/qvel(xpos等の出力はこの状態に対応する)
@@ -179,6 +184,25 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
                     nm ? nm : "", d.type);
         ctx->sensors.push_back(d);
     }
+
+    std::set<int> used, coms;
+    for (const auto& d : ctx->sensors) {
+        if (!d.supported) continue;
+        bool framed = d.type == mjSENS_GYRO || d.type == mjSENS_VELOCIMETER || d.type == mjSENS_ACCELEROMETER || d.type == mjSENS_MAGNETOMETER ||
+                      (d.type >= mjSENS_FRAMEPOS && d.type <= mjSENS_FRAMEANGVEL);
+        if (framed) { used.insert(d.frame.body); coms.insert(ctx->body_rootid[d.frame.body]); }
+        if (d.type == mjSENS_SUBTREECOM) coms.insert(d.objid);
+    }
+    if (used.empty()) used.insert(0);
+    if (coms.empty()) coms.insert(0);
+    ctx->used_bodies.assign(used.begin(), used.end());
+    ctx->com_bodies.assign(coms.begin(), coms.end());
+    ctx->bmap.assign(m->nbody, -1);
+    ctx->cmap.assign(m->nbody, -1);
+    for (size_t i = 0; i < ctx->used_bodies.size(); i++) ctx->bmap[ctx->used_bodies[i]] = (int)i;
+    for (size_t i = 0; i < ctx->com_bodies.size(); i++) ctx->cmap[ctx->com_bodies[i]] = (int)i;
+    ctx->used_idx = mx::array(ctx->used_bodies.data(), mx::Shape{(int)ctx->used_bodies.size()}, mx::int32);
+    ctx->com_idx = mx::array(ctx->com_bodies.data(), mx::Shape{(int)ctx->com_bodies.size()}, mx::int32);
     return ctx;
 }
 
@@ -210,11 +234,12 @@ namespace {
 // 1envぶんのbatched出力(host上)
 struct EnvKin {
     const float* xpos; const float* xquat; const float* com; const float* cvel;
-    const std::vector<int>& rootid;
+    const SensorCtx& ctx;
 
     WorldFrame frame(const ObjFrame& f) const {
-        const float* bp = xpos + 3 * f.body;
-        const float* bq = xquat + 4 * f.body;
+        const int bi = ctx.bmap[f.body];
+        const float* bp = xpos + 3 * bi;
+        const float* bq = xquat + 4 * bi;
         Q4 q{bq[0], bq[1], bq[2], bq[3]};
         M3 Rb = quat_to_mat(q);
         V3 lp{f.pos[0], f.pos[1], f.pos[2]};
@@ -226,8 +251,8 @@ struct EnvKin {
         w.pos = {bp[0] + off[0], bp[1] + off[1], bp[2] + off[2]};
         w.mat = mat_mul(Rb, Rl);
         w.quat = quat_mul(q, lq);
-        const float* cv = cvel + 6 * f.body;
-        const float* c = com + 3 * rootid[f.body];
+        const float* cv = cvel + 6 * bi;
+        const float* c = com + 3 * ctx.cmap[ctx.body_rootid[f.body]];
         w.ang_vel = {cv[0], cv[1], cv[2]};
         V3 v{cv[3], cv[4], cv[5]};
         w.lin_vel = v + cross(w.ang_vel, w.pos - V3{c[0], c[1], c[2]});
@@ -238,29 +263,44 @@ struct EnvKin {
 }  // namespace
 
 void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& out) {
-    const int B = ctx.B, nb = ctx.nbody, nsd = ctx.nsensordata;
+    const int B = ctx.B, nsd = ctx.nsensordata;
     const mx::array& in_qpos = ctx.in_qpos ? *ctx.in_qpos : sim.qpos;
     const mx::array& in_qvel = ctx.in_qvel ? *ctx.in_qvel : sim.qvel;
     bool use_prev = ctx.needs_prev && ctx.have_cur && ctx.prev_xpos.has_value();
-    if (use_prev)
-        mx::eval({in_qpos, in_qvel, sim.xpos, sim.xquat, sim.subtree_com, sim.cvel, sim.qfrc_actuator,
-                  *ctx.prev_xpos, *ctx.prev_xquat, *ctx.prev_subtree_com, *ctx.prev_cvel});
-    else
-        mx::eval({in_qpos, in_qvel, sim.xpos, sim.xquat, sim.subtree_com, sim.cvel, sim.qfrc_actuator});
+    auto pick = [&](const mx::array& a, const mx::array& idx) { return mx::take(a, idx, 1); };
+    const int nu_ = (int)ctx.used_bodies.size(), nc_ = (int)ctx.com_bodies.size();
+    mx::array g_xpos = pick(sim.xpos, *ctx.used_idx), g_xquat = pick(sim.xquat, *ctx.used_idx),
+              g_cvel = pick(sim.cvel, *ctx.used_idx), g_com = pick(sim.subtree_com, *ctx.com_idx);
+    std::optional<mx::array> p_xpos, p_xquat, p_cvel, p_com;
+    if (use_prev) {
+        p_xpos = pick(*ctx.prev_xpos, *ctx.used_idx); p_xquat = pick(*ctx.prev_xquat, *ctx.used_idx);
+        p_cvel = pick(*ctx.prev_cvel, *ctx.used_idx); p_com = pick(*ctx.prev_subtree_com, *ctx.com_idx);
+        mx::eval({in_qpos, in_qvel, sim.qfrc_actuator, g_xpos, g_xquat, g_cvel, g_com, *p_xpos, *p_xquat, *p_cvel, *p_com});
+    } else {
+        mx::eval({in_qpos, in_qvel, sim.qfrc_actuator, g_xpos, g_xquat, g_cvel, g_com});
+    }
 
     const float* qpos = in_qpos.data<float>();
     const float* qvel = in_qvel.data<float>();
     const float* qfa = sim.qfrc_actuator.size() > 0 ? sim.qfrc_actuator.data<float>() : nullptr;
     const float* pvalid = use_prev ? ctx.prev_valid.data() : nullptr;
 
+    // data<float>()は呼ぶたびにデバイスから読み戻すので、ループの外で1回だけ取る
+    const float* xpos = g_xpos.data<float>();
+    const float* xquat = g_xquat.data<float>();
+    const float* com = g_com.data<float>();
+    const float* cvel = g_cvel.data<float>();
+    const float* pxpos = use_prev ? p_xpos->data<float>() : nullptr;
+    const float* pxquat = use_prev ? p_xquat->data<float>() : nullptr;
+    const float* pcom = use_prev ? p_com->data<float>() : nullptr;
+    const float* pcvel = use_prev ? p_cvel->data<float>() : nullptr;
+
     out.assign((size_t)B * nsd, 0.0f);
     for (int b = 0; b < B; b++) {
-        EnvKin now{sim.xpos.data<float>() + (size_t)b * nb * 3, sim.xquat.data<float>() + (size_t)b * nb * 4,
-                   sim.subtree_com.data<float>() + (size_t)b * nb * 3, sim.cvel.data<float>() + (size_t)b * nb * 6, ctx.body_rootid};
+        EnvKin now{xpos + (size_t)b * nu_ * 3, xquat + (size_t)b * nu_ * 4, com + (size_t)b * nc_ * 3, cvel + (size_t)b * nu_ * 6, ctx};
         std::optional<EnvKin> prev;
         if (use_prev && pvalid[b] > 0.5f)
-            prev.emplace(EnvKin{ctx.prev_xpos->data<float>() + (size_t)b * nb * 3, ctx.prev_xquat->data<float>() + (size_t)b * nb * 4,
-                          ctx.prev_subtree_com->data<float>() + (size_t)b * nb * 3, ctx.prev_cvel->data<float>() + (size_t)b * nb * 6, ctx.body_rootid});
+            prev.emplace(EnvKin{pxpos + (size_t)b * nu_ * 3, pxquat + (size_t)b * nu_ * 4, pcom + (size_t)b * nc_ * 3, pcvel + (size_t)b * nu_ * 6, ctx});
         const float* qp = qpos + (size_t)b * ctx.nq;
         const float* qv = qvel + (size_t)b * ctx.nv;
         float* o = out.data() + (size_t)b * nsd;
@@ -282,7 +322,7 @@ void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& o
                     break;
                 }
                 case mjSENS_BALLANGVEL: for (int i = 0; i < 3; i++) y[i] = qv[d.dofadr + i]; break;
-                case mjSENS_SUBTREECOM: for (int i = 0; i < 3; i++) y[i] = now.com[3 * d.objid + i]; break;
+                case mjSENS_SUBTREECOM: for (int i = 0; i < 3; i++) y[i] = now.com[3 * ctx.cmap[d.objid] + i]; break;
                 case mjSENS_FRAMEPOS: put3(now.frame(d.frame).pos); break;
                 case mjSENS_FRAMEQUAT: {
                     Q4 q = now.frame(d.frame).quat;
