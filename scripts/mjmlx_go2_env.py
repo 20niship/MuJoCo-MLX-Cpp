@@ -15,6 +15,7 @@ from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
 PHYSICS_DT = 0.005  # Isaac LabのGo2と同じdt(0.005s x decimation 4)。0.01以上ではPD(kp=50,armature=0.01)が陽的積分で不安定
 DECIMATION = 4  # 4*0.005 = 0.02s -> 50Hz制御
 CONTROL_DT = PHYSICS_DT * DECIMATION
+INTEGRATOR = os.environ.get("MJMLX_GO2_INTEGRATOR", "")  # 空ならXMLのまま(euler、eulerdamp無効=PDは陽的)。"implicitfast"でPDを陰的に扱う(Isaac LabのPDアクチュエータ相当、CPU/GPU差は同程度)
 EPISODE_LENGTH_S = 20.0
 MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
 
@@ -93,6 +94,11 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
+    if INTEGRATOR:
+        if 'integrator="' in xml:
+            xml = re.sub(r'integrator="[^"]*"', f'integrator="{INTEGRATOR}"', xml, count=1)
+        else:
+            xml = xml.replace('<option ', f'<option integrator="{INTEGRATOR}" ', 1)
     terrain_geoms = f"<body name=\"terrain\">\n    {terrain.to_mjcf_bodies()}\n  </body>\n</worldbody>"
     xml = xml.replace("</worldbody>", terrain_geoms)
     with open(out_path, "w") as f:
