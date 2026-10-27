@@ -1,5 +1,5 @@
 // batched GPUのsensordata vs MuJoCo C。各step前のGPUの状態をmjDataに入れてmj_forwardした値を参照にするので、物理のCPU/GPU差とは切り分けてセンサ式だけを検証する。
-// Usage: test_sensors <model.xml> <steps> <tol> [tol_acc]   tol_acc省略時はaccelerometerを比較しない(接触ありは速度差分が衝撃で乖離するため)
+// Usage: test_sensors <model.xml> <steps> <tol> [tol_acc] [qnoise=0.05] [vnoise=0.5] [lift_z=0] [ctrl_amp=0.3] [solver_iters=0]   tol_acc=0ならaccelerometerを比較しない。実ロボットは小さいnoiseにしてfree jointをlift_zだけ持ち上げる   tol_acc省略時はaccelerometerを比較しない(接触ありは速度差分が衝撃で乖離するため)
 // accelerometerは速度の1step差分(Isaac Lab IMUと同じ)なのでMuJoCoの厳密値とは1step分遅れた近似になる。
 // sensorごと(名前単位)に全env・全stepでのmax|diff|を出力し、型ごとの許容を超えたらFAIL。
 
@@ -13,8 +13,10 @@ int main(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s model.xml steps tol [tol_acc]\n", argv[0]); return 2; }
     const int steps = atoi(argv[2]);
     const double tol = atof(argv[3]);
-    const bool check_acc = argc > 4;
-    const double tol_acc = check_acc ? atof(argv[4]) : 0;
+    const double tol_acc = argc > 4 ? atof(argv[4]) : 0;
+    const bool check_acc = tol_acc > 0;
+    const float qnoise = argc > 5 ? (float)atof(argv[5]) : 0.05f, vnoise = argc > 6 ? (float)atof(argv[6]) : 0.5f, lift_z = argc > 7 ? (float)atof(argv[7]) : 0.f, ctrl_amp = argc > 8 ? (float)atof(argv[8]) : 0.3f;
+    const int solver_iters = argc > 9 ? atoi(argv[9]) : 0;
     const int B = 6;
 
     auto* model = mjmlx_load_model(argv[1]);
@@ -24,7 +26,7 @@ int main(int argc, char** argv) {
     const int nq = info.nq, nv = info.nv, nu = info.nu, nsd = mj->nsensordata;
 
     MjmlxBatchedConfig cg = {};
-    cg.num_envs = B; cg.use_gpu = 1; cg.integrator = MJMLX_INTEGRATOR_EULER;
+    cg.num_envs = B; cg.use_gpu = 1; cg.solver_iterations = solver_iters; cg.integrator = MJMLX_INTEGRATOR_EULER;
     auto* gpu = mjmlx_batched_create(model, &cg);
     mjData* d = mj_makeData(mj);
     if (!gpu) { fprintf(stderr, "FAIL: create\n"); return 1; }
@@ -38,8 +40,9 @@ int main(int argc, char** argv) {
     int a, b;
     mjmlx_batched_get_state(gpu, q.data(), v.data(), &a, &b);
     for (int e = 0; e < B; e++) {
-        for (int i = 0; i < nq; i++) q[e * nq + i] += 0.05f * nd(rng);
-        for (int i = 0; i < nv; i++) v[e * nv + i] = 0.5f * nd(rng);
+        for (int i = 0; i < nq; i++) q[e * nq + i] += qnoise * nd(rng);
+        for (int i = 0; i < nv; i++) v[e * nv + i] = vnoise * nd(rng);
+        if (mj->njnt > 0 && mj->jnt_type[0] == mjJNT_FREE) q[e * nq + 2] += lift_z;
         for (int j = 0; j < mj->njnt; j++) {  // free/ballの四元数は正規化し直す
             int t = mj->jnt_type[j], adr = mj->jnt_qposadr[j] + (t == mjJNT_FREE ? 3 : 0);
             if (t == mjJNT_FREE || t == mjJNT_BALL) {
@@ -58,7 +61,7 @@ int main(int argc, char** argv) {
     std::vector<double> step_err_acc;
     bool finite = true;
     for (int t = 0; t < steps; t++) {
-        for (int e = 0; e < B; e++) for (int j = 0; j < nu; j++) ctrl[e * nu + j] = 0.3f * std::sin(0.05f * t + j + e);
+        for (int e = 0; e < B; e++) for (int j = 0; j < nu; j++) ctrl[e * nu + j] = ctrl_amp * std::sin(0.05f * t + j + e);
         std::vector<float> q0(B * nq), v0(B * nv);
         mjmlx_batched_get_state(gpu, q0.data(), v0.data(), &a, &b);
         mjmlx_batched_step(gpu, nu ? ctrl.data() : nullptr);

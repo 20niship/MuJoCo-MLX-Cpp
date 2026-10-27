@@ -327,6 +327,12 @@ if(MJMLX_BUILD_TESTS)
     mjmlx_add_model_test(g1_landing ${_MG}/unitree_g1/scene.xml --seconds 1 --lift 0.1 --ctrl sin --bodies pelvis,left_ankle_roll_link,right_wrist_yaw_link --tol-joint 0.1 --tol-pos 0.15 --tol-rot 0.5)
     mjmlx_add_model_test(h1_freefall ${_MG}/unitree_h1/scene.xml --seconds 0.6 --lift 3 --ctrl sin --bodies pelvis,left_ankle_link,right_elbow_link --tol-joint 0.35 --tol-pos 0.05 --tol-rot 0.15)
 
+    # 実ロボットのMJCF内蔵<sensor>のGPU値 vs MuJoCo C(着地を含む100step、accelerometerは接触の衝撃で差分近似が乖離するため比較しない)。
+    if(EXISTS "${_EXT}/${_MG}/unitree_g1/scene.xml")
+        add_test(NAME model_sensors_g1 COMMAND test_sensors "${_EXT}/${_MG}/unitree_g1/scene.xml" 100 1e-3 0 0 0 0.1 0)
+        set_tests_properties(model_sensors_g1 PROPERTIES LABELS "models" TIMEOUT 600)
+    endif()
+
     if(MJMLX_TEST_MODEL)
         add_test(NAME io COMMAND test_io ${MJMLX_TEST_MODEL})
         add_test(NAME batched COMMAND test_batched ${MJMLX_TEST_MODEL} 64 5)
