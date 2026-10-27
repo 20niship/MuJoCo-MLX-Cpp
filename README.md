@@ -162,7 +162,7 @@ just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動
 
 `just check-video-export` が生成する、piper / openarm / go2 / g1 の4ロボットを左CPU・右GPUで並べたタイル動画(3秒)。
 
-(動画リンクは準備中)
+https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
 
 動画はリポジトリには含めない(サイズが大きいため)。上のコマンドで `runs/video/compare.mp4` に生成される。arm2種はCPUとGPUが一致し、go2/g1は着地後に接触解の差で軌道が分かれる。
 長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
