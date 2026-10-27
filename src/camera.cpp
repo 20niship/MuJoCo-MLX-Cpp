@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -138,8 +140,8 @@ namespace {
 
 const char* kCommon = R"(
 layout(push_constant) uniform PC {
-  uint B; uint ncam; uint nvis; uint tiles_x; uint tiles_y; uint nlights; uint nbody; uint pad0;
-  float aspect; float znear; float zfar; float pad1;
+  uint B; uint ncam; uint nvis; uint tiles_x; uint tiles_y; uint nlights; uint nbody; uint H;
+  float aspect; float znear; float zfar; float lodk;
 } pc;
 )";
 
@@ -186,15 +188,53 @@ void main() {
 }
 )";
 
+// (env,cam,geom)毎にフラスタム(球)カリングとLOD選択を行い、indirectコマンドをGPU上で書く(CPUへは戻さない)。
+const char* kCull = R"(
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer GX { float geom_xpos[]; };
+layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };
+layout(std430, binding = 2) readonly buffer CP { vec4 cam[]; };
+struct G { vec4 rgba; vec4 ms; uvec4 ids; vec4 tx; };
+layout(std430, binding = 3) readonly buffer GT { G gt[]; };
+struct Lod { vec4 sphere; uvec4 lod[4]; };
+layout(std430, binding = 9) readonly buffer LD { Lod lods[]; };
+layout(std430, binding = 10) writeonly buffer IC { uint cmds[]; };
+)" "$COMMON" R"(
+void main() {
+  uint k = gl_GlobalInvocationID.x;
+  if (k >= pc.B * pc.ncam * pc.nvis) return;
+  uint vis = k % pc.nvis, ec = k / pc.nvis, e = ec / pc.ncam;
+  uint g = gt[vis].ids.x;
+  vec3 gp = vec3(geom_xpos[(g * 3u + 0u) * pc.B + e], geom_xpos[(g * 3u + 1u) * pc.B + e], geom_xpos[(g * 3u + 2u) * pc.B + e]);
+  mat3 R;
+  for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = geom_xmat[(g * 9u + 3u * i + j) * pc.B + e];
+  Lod L = lods[vis];
+  float r = L.sphere.w;
+  vec3 d = gp + R * L.sphere.xyz - cam[ec * 4u].xyz;
+  vec3 v = vec3(dot(cam[ec * 4u + 1u].xyz, d), dot(cam[ec * 4u + 2u].xyz, d), dot(cam[ec * 4u + 3u].xyz, d));
+  float w = -v.z, f = cam[ec * 4u].w, fx = f / pc.aspect;
+  bool vis_ok = (w + r > pc.znear) && (w - r < pc.zfar)
+      && ((abs(v.x) * fx - w) * inversesqrt(fx * fx + 1.0) <= r) && ((abs(v.y) * f - w) * inversesqrt(f * f + 1.0) <= r);
+  float pr = r * f / max(w, 1e-3) * 0.5 * float(pc.H);
+  float area = 3.14159 * pr * pr * pc.lodk;
+  uint l = 0u;
+  if (pc.lodk > 0.0) { for (l = 0u; l < 3u; l++) if (float(L.lod[l].y / 3u) <= area) break; }
+  uint b = k * 5u;
+  cmds[b] = L.lod[l].y; cmds[b + 1u] = vis_ok ? 1u : 0u; cmds[b + 2u] = L.lod[l].x; cmds[b + 3u] = L.lod[l].z; cmds[b + 4u] = k;
+}
+)";
+
 // 1ドローで複数タイルを描くため、タイル境界はviewportでなくgl_ClipDistanceでクリップする。
 const char* kVert = R"(
 #version 450
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_nrm;
+layout(location = 2) in vec2 in_uv;
 layout(std430, binding = 0) readonly buffer GX { float geom_xpos[]; };
 layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };
 layout(std430, binding = 2) readonly buffer CP { vec4 cam[]; };
-struct G { vec4 rgba; vec4 ms; uvec4 ids; };
+struct G { vec4 rgba; vec4 ms; uvec4 ids; vec4 tx; };
 layout(std430, binding = 3) readonly buffer GT { G gt[]; };
 )" "$COMMON" R"(
 layout(location = 0) out vec3 v_world;
@@ -202,6 +242,7 @@ layout(location = 1) out vec3 v_nrm;
 layout(location = 2) out float v_depth;
 layout(location = 3) flat out uint v_vis;
 layout(location = 4) flat out uint v_cam;
+layout(location = 5) out vec2 v_uv;
 out float gl_ClipDistance[4];
 void main() {
   uint idx = uint(gl_InstanceIndex);
@@ -212,7 +253,7 @@ void main() {
   mat3 R;
   for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = geom_xmat[(g * 9u + 3u * i + j) * pc.B + e];
   vec3 world = gp + R * in_pos;
-  v_world = world; v_nrm = R * in_nrm; v_vis = vis; v_cam = ec;
+  v_world = world; v_nrm = R * in_nrm; v_vis = vis; v_cam = ec; v_uv = in_uv;
 
   vec4 c0 = cam[ec * 4u];
   vec3 d = world - c0.xyz;
@@ -242,19 +283,28 @@ layout(location = 1) in vec3 v_nrm;
 layout(location = 2) in float v_depth;
 layout(location = 3) flat in uint v_vis;
 layout(location = 4) flat in uint v_cam;
+layout(location = 5) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 layout(location = 1) out float o_depth;
 layout(std430, binding = 2) readonly buffer CP { vec4 cam[]; };
-struct G { vec4 rgba; vec4 ms; uvec4 ids; };
+struct G { vec4 rgba; vec4 ms; uvec4 ids; vec4 tx; };
 layout(std430, binding = 3) readonly buffer GT { G gt[]; };
 struct L { vec4 pos; vec4 dir; vec4 diffuse; vec4 ambient; vec4 specular; };
 layout(std430, binding = 4) readonly buffer LT { L lights[]; };
+layout(std430, binding = 8) readonly buffer TX { uint texels[]; };
 )" "$COMMON" R"(
 void main() {
   G g = gt[v_vis];
   vec3 V = normalize(cam[v_cam * 4u].xyz - v_world);
   vec3 N = normalize(v_nrm);
   if (dot(N, V) < 0.0) N = -N;
+  vec3 base = g.rgba.xyz;
+  if (g.ids.y != 0u) {
+    uint w = g.ids.w >> 16, h = g.ids.w & 0xffffu;
+    vec2 f = fract(v_uv);
+    uint px = texels[g.ids.z + min(uint(f.y * float(h)), h - 1u) * w + min(uint(f.x * float(w)), w - 1u)];
+    base *= vec3(float(px & 255u), float((px >> 8) & 255u), float((px >> 16) & 255u)) / 255.0;
+  }
   float shin = max(g.ms.y * 128.0, 1.0);
   vec3 col = vec3(0.0);
   for (uint i = 0u; i < pc.nlights; i++) {
@@ -263,7 +313,7 @@ void main() {
     vec3 Ld = type == 2 ? cam[v_cam * 4u + 3u].xyz : (type == 1 ? -normalize(l.dir.xyz) : normalize(l.pos.xyz - v_world));
     float nd = max(dot(N, Ld), 0.0);
     float sp = nd > 0.0 ? pow(max(dot(N, normalize(Ld + V)), 0.0), shin) : 0.0;
-    col += l.ambient.xyz * g.rgba.xyz + l.diffuse.xyz * nd * g.rgba.xyz + l.specular.xyz * sp * g.ms.x;
+    col += l.ambient.xyz * base + l.diffuse.xyz * nd * base + l.specular.xyz * sp * g.ms.x;
   }
   o_color = vec4(clamp(col, 0.0, 1.0), 1.0);
   o_depth = v_depth;
@@ -304,7 +354,7 @@ std::vector<uint32_t> compile_glsl(const std::string& source, const char* stage)
 
 // ── ジオメトリ(geomローカル座標)────────────────────────────────────────────────
 
-struct Vtx { float p[3]; float n[3]; };
+struct Vtx { float p[3]; float n[3]; float uv[2]; };
 struct Mesh { std::vector<Vtx> v; std::vector<uint32_t> i; };
 
 struct ProfilePt { float r, z, nr, nz; };
@@ -398,6 +448,93 @@ Mesh make_primitive(int type, const float* s) {
     return {};
 }
 
+// 平面状のUV(MuJoCoのplane/box/hfieldの2Dテクスチャ写像: 中心がu=0.5, vは+y側が小さい)。
+void apply_planar_uv(Mesh& m, float hx, float hy, const float* rep, bool uniform) {
+    for (auto& v : m.v) {
+        v.uv[0] = (uniform ? v.p[0] * rep[0] / 2 : rep[0] * v.p[0] / (2 * hx)) + 0.5f;
+        v.uv[1] = 0.5f - (uniform ? v.p[1] * rep[1] / 2 : rep[1] * v.p[1] / (2 * hy));
+    }
+}
+
+void smooth_normals(Mesh& m) {
+    std::vector<float> acc(m.v.size() * 3, 0.0f);
+    for (size_t t = 0; t + 2 < m.i.size(); t += 3) {
+        const float *a = m.v[m.i[t]].p, *b = m.v[m.i[t + 1]].p, *c = m.v[m.i[t + 2]].p;
+        float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        for (int k = 0; k < 3; k++) for (int j = 0; j < 3; j++) acc[m.i[t + k] * 3 + j] += n[j];
+    }
+    for (size_t v = 0; v < m.v.size(); v++) {
+        float* n = &acc[v * 3];
+        float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l < 1e-20f) { n[0] = 0; n[1] = 0; n[2] = 1; l = 1; }
+        for (int j = 0; j < 3; j++) m.v[v].n[j] = n[j] / l;
+    }
+}
+
+// 頂点クラスタリングによる簡略化(格子セルごとに頂点を平均、縮退三角形を捨てる)。法線は作り直す。
+Mesh cluster_simplify(const Mesh& src, float cell, const float* lo) {
+    std::map<uint64_t, uint32_t> cellid;
+    std::vector<float> sum;
+    std::vector<uint32_t> cnt, remap(src.v.size());
+    for (size_t i = 0; i < src.v.size(); i++) {
+        int64_t q[3];
+        for (int k = 0; k < 3; k++) q[k] = (int64_t)std::floor((src.v[i].p[k] - lo[k]) / cell);
+        uint64_t key = ((uint64_t)q[0] & 0x1fffff) | ((uint64_t)q[1] & 0x1fffff) << 21 | ((uint64_t)q[2] & 0x1fffff) << 42;
+        auto it = cellid.find(key);
+        if (it == cellid.end()) { it = cellid.emplace(key, (uint32_t)cnt.size()).first; cnt.push_back(0); sum.insert(sum.end(), {0, 0, 0}); }
+        remap[i] = it->second;
+        cnt[it->second]++;
+        for (int k = 0; k < 3; k++) sum[it->second * 3 + k] += src.v[i].p[k];
+    }
+    Mesh out;
+    out.v.resize(cnt.size());
+    for (size_t c = 0; c < cnt.size(); c++) { Vtx v{}; for (int k = 0; k < 3; k++) v.p[k] = sum[c * 3 + k] / cnt[c]; out.v[c] = v; }
+    for (size_t t = 0; t + 2 < src.i.size(); t += 3) {
+        uint32_t a = remap[src.i[t]], b = remap[src.i[t + 1]], c = remap[src.i[t + 2]];
+        if (a != b && b != c && a != c) out.i.insert(out.i.end(), {a, b, c});
+    }
+    smooth_normals(out);
+    return out;
+}
+
+// 三角形数がratio*元の数以下になる最小のセルサイズを二分探索して簡略化する。
+Mesh lod_for_ratio(const Mesh& src, double ratio) {
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (auto& v : src.v) for (int k = 0; k < 3; k++) { lo[k] = std::min(lo[k], v.p[k]); hi[k] = std::max(hi[k], v.p[k]); }
+    float ext = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-6f});
+    size_t target = (size_t)(src.i.size() * ratio);
+    float a = ext / 1024, b = ext;
+    Mesh best = cluster_simplify(src, b, lo);
+    for (int it = 0; it < 14; it++) {
+        float mid = std::sqrt(a * b);
+        Mesh m = cluster_simplify(src, mid, lo);
+        if (m.i.size() <= target) { best = std::move(m); b = mid; } else a = mid;
+    }
+    return best;
+}
+
+// 高さ格子: x=(2c/(ncol-1)-1)*size0, y=(2r/(nrow-1)-1)*size1, z=data*size2。側面のskirtは作らない。
+Mesh make_hfield(const mjModel* m, int id) {
+    Mesh out;
+    int nr = m->hfield_nrow[id], nc = m->hfield_ncol[id];
+    const float* data = m->hfield_data + m->hfield_adr[id];
+    float sx = (float)m->hfield_size[4 * id], sy = (float)m->hfield_size[4 * id + 1], sz = (float)m->hfield_size[4 * id + 2];
+    for (int r = 0; r < nr; r++)
+        for (int c = 0; c < nc; c++) {
+            Vtx v{};
+            v.p[0] = (2.0f * c / (nc - 1) - 1) * sx; v.p[1] = (2.0f * r / (nr - 1) - 1) * sy; v.p[2] = data[r * nc + c] * sz;
+            out.v.push_back(v);
+        }
+    for (int r = 0; r + 1 < nr; r++)
+        for (int c = 0; c + 1 < nc; c++) {
+            uint32_t a = r * nc + c, b = a + 1, d = a + nc, e = d + 1;
+            out.i.insert(out.i.end(), {a, b, e, a, e, d});
+        }
+    smooth_normals(out);
+    return out;
+}
+
 Mesh make_mesh(const mjModel* m, int id) {
     Mesh out;
     int va = m->mesh_vertadr[id], vn = m->mesh_vertnum[id], fa = m->mesh_faceadr[id], fn = m->mesh_facenum[id];
@@ -431,10 +568,11 @@ void vk_check(VkResult r, const char* what) {
 struct GpuBuf { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; size_t size = 0; };
 
 // std430のvec4/uvec4配列と合わせるための構造体(CPU側)。
-struct GeomRec { float rgba[4]; float ms[4]; uint32_t ids[4]; };
+struct GeomRec { float rgba[4]; float ms[4]; uint32_t ids[4]; float tx[4]; };
 struct LightRec { float pos[4], dir[4], diffuse[4], ambient[4], specular[4]; };
 struct CamConst { float a[4], b[4], rl[3][4], rw[3][4]; int32_t ids[4]; };
-struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, pad0; float aspect, znear, zfar, pad1; };
+struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, H; float aspect, znear, zfar, lodk; };
+struct LodRec { float sphere[4]; uint32_t lod[4][4]; };
 
 } // namespace
 
@@ -444,12 +582,12 @@ struct MjmlxCameraRenderer {
     int B = 0, ncam = 0, W = 0, H = 0, nbody = 0, ngeom = 0;
     uint32_t nvis = 0, nlights = 0, tiles_x = 0, tiles_y = 0, ntiles = 0;
     uint32_t img_w = 0, img_h = 0;
-    float znear = 0.01f, zfar = 100.0f;
+    float znear = 0.01f, zfar = 100.0f, lodk = 16.0f;
     int draw_calls = 0;
     uint32_t draw_count = 0;
     std::vector<float> clear_rgb = {0.2f, 0.3f, 0.4f};
 
-    GpuBuf vbo, ibo, indirect, gtab, lights, camc, campose;
+    GpuBuf vbo, ibo, indirect, gtab, lights, camc, campose, texbuf, lodbuf;
     VkImage img_color = VK_NULL_HANDLE, img_depth = VK_NULL_HANDLE, img_zbuf = VK_NULL_HANDLE;
     VkDeviceMemory mem_color = VK_NULL_HANDLE, mem_depth = VK_NULL_HANDLE, mem_zbuf = VK_NULL_HANDLE;
     VkImageView view_color = VK_NULL_HANDLE, view_depth = VK_NULL_HANDLE, view_zbuf = VK_NULL_HANDLE;
@@ -457,14 +595,14 @@ struct MjmlxCameraRenderer {
     VkFramebuffer fb = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
-    VkPipeline gfx = VK_NULL_HANDLE, comp = VK_NULL_HANDLE;
-    VkShaderModule m_vert = VK_NULL_HANDLE, m_frag = VK_NULL_HANDLE, m_comp = VK_NULL_HANDLE;
+    VkPipeline gfx = VK_NULL_HANDLE, comp = VK_NULL_HANDLE, cull = VK_NULL_HANDLE;
+    VkShaderModule m_cull = VK_NULL_HANDLE, m_vert = VK_NULL_HANDLE, m_frag = VK_NULL_HANDLE, m_comp = VK_NULL_HANDLE;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorSet dset = VK_NULL_HANDLE;
     GpuBuf rb_color, rb_depth;
+    void *rb_color_ptr = nullptr, *rb_depth_ptr = nullptr;
+    VkQueryPool qpool = VK_NULL_HANDLE;
     bool rendered = false, read_back = false;
-    std::vector<uint8_t> rgb;
-    std::vector<float> depth;
 
     uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags props) const {
         VkPhysicalDeviceMemoryProperties mp;
@@ -557,14 +695,16 @@ struct MjmlxCameraRenderer {
     ~MjmlxCameraRenderer() {
         if (!h.device) return;
         vkDeviceWaitIdle(h.device);
+        if (qpool) vkDestroyQueryPool(h.device, qpool, nullptr);
         if (h.command_pool) vkDestroyCommandPool(h.device, h.command_pool, nullptr);
-        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &rb_color, &rb_depth}) destroy(*b);
+        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &lodbuf, &rb_color, &rb_depth}) destroy(*b);
         if (dpool) vkDestroyDescriptorPool(h.device, dpool, nullptr);
         if (gfx) vkDestroyPipeline(h.device, gfx, nullptr);
         if (comp) vkDestroyPipeline(h.device, comp, nullptr);
+        if (cull) vkDestroyPipeline(h.device, cull, nullptr);
         if (pipe_layout) vkDestroyPipelineLayout(h.device, pipe_layout, nullptr);
         if (set_layout) vkDestroyDescriptorSetLayout(h.device, set_layout, nullptr);
-        for (auto sm : {m_vert, m_frag, m_comp}) if (sm) vkDestroyShaderModule(h.device, sm, nullptr);
+        for (auto sm : {m_vert, m_frag, m_comp, m_cull}) if (sm) vkDestroyShaderModule(h.device, sm, nullptr);
         if (fb) vkDestroyFramebuffer(h.device, fb, nullptr);
         if (render_pass) vkDestroyRenderPass(h.device, render_pass, nullptr);
         for (auto v : {view_color, view_depth, view_zbuf}) if (v) vkDestroyImageView(h.device, v, nullptr);
@@ -589,28 +729,55 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     std::vector<Vtx> vtx;
     std::vector<uint32_t> idx;
     struct Range { uint32_t first, count; int32_t voff; };
-    std::vector<Range> ranges;
+    struct LodSet { Range lod[4]; float sphere[4]; };
+    std::vector<LodSet> ranges;
     std::vector<GeomRec> grecs;
-    std::map<int, Range> mesh_cache;
+    std::map<int, LodSet> mesh_cache;
+    const char* lod_env = std::getenv("MJMLX_CAM_LOD");
+    const bool use_lod = !(lod_env && std::atoi(lod_env) == 0);
+    std::map<int, uint32_t> tex_off;
+    std::vector<uint32_t> texels;
     for (int g = 0; g < m->ngeom; g++) {
-        if (m->geom_group[g] > 2 || m->geom_type[g] == mjGEOM_HFIELD) continue;
-        Range r;
+        if (m->geom_group[g] > 2) continue;
+        LodSet r;
         bool is_mesh = m->geom_type[g] == mjGEOM_MESH;
+        int mid = m->geom_matid[g];
+        int tid = (mid >= 0 && (m->geom_type[g] == mjGEOM_PLANE || m->geom_type[g] == mjGEOM_BOX || m->geom_type[g] == mjGEOM_HFIELD)) ? m->mat_texid[mid * mjNTEXROLE + mjTEXROLE_RGB] : -1;
+        if (tid >= 0 && m->tex_type[tid] != mjTEXTURE_2D) tid = -1;
         auto cached = is_mesh ? mesh_cache.find(m->geom_dataid[g]) : mesh_cache.end();
         if (cached != mesh_cache.end()) r = cached->second;
         else {
             float s[3] = {(float)m->geom_size[3 * g], (float)m->geom_size[3 * g + 1], (float)m->geom_size[3 * g + 2]};
-            Mesh me = is_mesh ? make_mesh(m, m->geom_dataid[g]) : make_primitive(m->geom_type[g], s);
+            Mesh me = is_mesh ? make_mesh(m, m->geom_dataid[g]) : m->geom_type[g] == mjGEOM_HFIELD ? make_hfield(m, m->geom_dataid[g]) : make_primitive(m->geom_type[g], s);
             if (me.i.empty()) continue;
+            if (tid >= 0) {
+                bool hf = m->geom_type[g] == mjGEOM_HFIELD;
+                float hx = hf ? (float)m->hfield_size[4 * m->geom_dataid[g]] : (s[0] > 0 ? s[0] : 100.0f), hy = hf ? (float)m->hfield_size[4 * m->geom_dataid[g] + 1] : (s[1] > 0 ? s[1] : 100.0f);
+                apply_planar_uv(me, hx, hy, &m->mat_texrepeat[2 * mid], m->mat_texuniform[mid] != 0);
+            }
             if (!is_mesh) orient_outward(me);
-            r = {(uint32_t)idx.size(), (uint32_t)me.i.size(), (int32_t)vtx.size()};
-            vtx.insert(vtx.end(), me.v.begin(), me.v.end());
-            idx.insert(idx.end(), me.i.begin(), me.i.end());
+            auto append = [&](const Mesh& mm) {
+                Range rg{(uint32_t)idx.size(), (uint32_t)mm.i.size(), (int32_t)vtx.size()};
+                vtx.insert(vtx.end(), mm.v.begin(), mm.v.end());
+                idx.insert(idx.end(), mm.i.begin(), mm.i.end());
+                return rg;
+            };
+            r.lod[0] = append(me);
+            for (int l = 1; l < 4; l++) {
+                // 小さいメッシュと非meshは簡略化しない(LOD0と同じ範囲)。
+                if (is_mesh && use_lod && me.i.size() > 768) r.lod[l] = append(lod_for_ratio(me, std::pow(0.25, l)));
+                else r.lod[l] = r.lod[0];
+            }
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            for (auto& v : me.v) for (int k = 0; k < 3; k++) { lo[k] = std::min(lo[k], v.p[k]); hi[k] = std::max(hi[k], v.p[k]); }
+            float rad = 0;
+            for (int k = 0; k < 3; k++) r.sphere[k] = 0.5f * (lo[k] + hi[k]);
+            for (auto& v : me.v) { float dd = 0; for (int k = 0; k < 3; k++) dd += (v.p[k] - r.sphere[k]) * (v.p[k] - r.sphere[k]); rad = std::max(rad, dd); }
+            r.sphere[3] = std::sqrt(rad) * 1.001f;
             if (is_mesh) mesh_cache[m->geom_dataid[g]] = r;
         }
         ranges.push_back(r);
         GeomRec gr{};
-        int mid = m->geom_matid[g];
         const float* rgba = &m->geom_rgba[4 * g];
         bool def = rgba[0] == 0.5f && rgba[1] == 0.5f && rgba[2] == 0.5f && rgba[3] == 1.0f;
         const float* use = (mid >= 0 && def) ? &m->mat_rgba[4 * mid] : rgba;
@@ -618,12 +785,24 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         gr.ms[0] = mid >= 0 ? m->mat_specular[mid] : 0.5f;
         gr.ms[1] = mid >= 0 ? m->mat_shininess[mid] : 0.5f;
         gr.ids[0] = (uint32_t)g;
+        if (tid >= 0) {
+            if (!tex_off.count(tid)) {
+                int tw = m->tex_width[tid], th = m->tex_height[tid], nch = m->tex_nchannel[tid];
+                tex_off[tid] = (uint32_t)texels.size();
+                const unsigned char* src = m->tex_data + m->tex_adr[tid];
+                for (int k = 0; k < tw * th; k++) {
+                    const unsigned char* q = src + k * nch;
+                    texels.push_back(q[0] | (uint32_t)q[nch > 1 ? 1 : 0] << 8 | (uint32_t)q[nch > 2 ? 2 : 0] << 16 | 0xff000000u);
+                }
+            }
+            gr.ids[1] = 1; gr.ids[2] = tex_off[tid]; gr.ids[3] = ((uint32_t)m->tex_width[tid] << 16) | (uint32_t)m->tex_height[tid];
+        }
         grecs.push_back(gr);
     }
     nvis = (uint32_t)ranges.size();
     if (std::getenv("MJMLX_CAM_PROF")) {
         uint64_t tri = 0;
-        for (auto& rg : ranges) tri += rg.count / 3;
+        for (auto& rg : ranges) tri += rg.lod[0].count / 3;
         fprintf(stderr, "[cam] visible geoms=%u triangles/env=%llu vertices(shared)=%zu\n", nvis, (unsigned long long)tri, vtx.size());
     }
     if (nvis == 0) throw std::runtime_error("mjmlx_camera: no visible geoms (group 0-2)");
@@ -631,12 +810,13 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     // 全(env,cam)x可視geomのindirectコマンド。instance indexで(env,cam,geom)を引く。
     ntiles = (uint32_t)B * ncam;
     draw_count = ntiles * nvis;
-    std::vector<VkDrawIndexedIndirectCommand> cmds(draw_count);
-    for (uint32_t t = 0; t < ntiles; t++)
-        for (uint32_t v = 0; v < nvis; v++) {
-            uint32_t k = t * nvis + v;
-            cmds[k] = {ranges[v].count, 1, ranges[v].first, ranges[v].voff, k};
+    std::vector<LodRec> lods(nvis);
+    for (uint32_t v = 0; v < nvis; v++) {
+        for (int k = 0; k < 4; k++) lods[v].sphere[k] = ranges[v].sphere[k];
+        for (int l = 0; l < 4; l++) {
+            lods[v].lod[l][0] = ranges[v].lod[l].first; lods[v].lod[l][1] = ranges[v].lod[l].count; lods[v].lod[l][2] = (uint32_t)ranges[v].lod[l].voff;
         }
+    }
 
     // タイル配置(ほぼ正方形)。
     tiles_x = (uint32_t)std::ceil(std::sqrt((double)ntiles));
@@ -698,7 +878,10 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
 
     vbo = make_device_buf(vtx.data(), vtx.size() * sizeof(Vtx), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     ibo = make_device_buf(idx.data(), idx.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    indirect = make_device_buf(cmds.data(), cmds.size() * sizeof(VkDrawIndexedIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    indirect = make_buf((size_t)draw_count * sizeof(VkDrawIndexedIndirectCommand), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    lodbuf = make_device_buf(lods.data(), lods.size() * sizeof(LodRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (texels.empty()) texels.push_back(0);
+    texbuf = make_device_buf(texels.data(), texels.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     gtab = make_device_buf(grecs.data(), grecs.size() * sizeof(GeomRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     lights = make_device_buf(lrecs.data(), lrecs.size() * sizeof(LightRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     camc = make_device_buf(ccs.data(), ccs.size() * sizeof(CamConst), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -744,16 +927,16 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vk_check(vkCreateFramebuffer(h.device, &fbi, nullptr, &fb), "vkCreateFramebuffer");
 
     // ディスクリプタ: 0 geom_xpos, 1 geom_xmat, 2 campose, 3 geom表, 4 光源, 5 body_xpos, 6 body_xmat, 7 カメラ定数。
-    VkDescriptorSetLayoutBinding lb[8];
-    for (uint32_t i = 0; i < 8; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutBinding lb[11];
+    for (uint32_t i = 0; i < 11; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 8; sli.pBindings = lb;
+    sli.bindingCount = 11; sli.pBindings = lb;
     vk_check(vkCreateDescriptorSetLayout(h.device, &sli, nullptr, &set_layout), "vkCreateDescriptorSetLayout");
     VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushC)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &set_layout; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
     vk_check(vkCreatePipelineLayout(h.device, &pli, nullptr, &pipe_layout), "vkCreatePipelineLayout");
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
     vk_check(vkCreateDescriptorPool(h.device, &dpi, nullptr, &dpool), "vkCreateDescriptorPool");
@@ -762,17 +945,24 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vk_check(vkAllocateDescriptorSets(h.device, &dai, &dset), "vkAllocateDescriptorSets");
     VkDescriptorBufferInfo bi[3] = {{campose.buf, 0, VK_WHOLE_SIZE}, {gtab.buf, 0, VK_WHOLE_SIZE}, {lights.buf, 0, VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo bc{camc.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[4]{};
-    uint32_t bind[4] = {2, 3, 4, 7};
-    const VkDescriptorBufferInfo* infos[4] = {&bi[0], &bi[1], &bi[2], &bc};
-    for (int i = 0; i < 4; i++) {
+    VkDescriptorBufferInfo bt{texbuf.buf, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bl{lodbuf.buf, 0, VK_WHOLE_SIZE}, bic{indirect.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[7]{};
+    uint32_t bind[7] = {2, 3, 4, 7, 8, 9, 10};
+    const VkDescriptorBufferInfo* infos[7] = {&bi[0], &bi[1], &bi[2], &bc, &bt, &bl, &bic};
+    for (int i = 0; i < 7; i++) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = dset; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = infos[i];
     }
-    vkUpdateDescriptorSets(h.device, 4, w, 0, nullptr);
+    vkUpdateDescriptorSets(h.device, 7, w, 0, nullptr);
 
     // パイプライン。
     m_comp = make_module(compile_glsl(with_common(kCamComp), "comp"));
+    m_cull = make_module(compile_glsl(with_common(kCull), "comp"));
+    VkComputePipelineCreateInfo cpi2{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi2.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_cull, "main", nullptr};
+    cpi2.layout = pipe_layout;
+    vk_check(vkCreateComputePipelines(h.device, VK_NULL_HANDLE, 1, &cpi2, nullptr, &cull), "vkCreateComputePipelines(cull)");
     m_vert = make_module(compile_glsl(with_common(kVert), "vert"));
     m_frag = make_module(compile_glsl(with_common(kFrag), "frag"));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -784,9 +974,9 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, m_vert, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m_frag, "main", nullptr}};
     VkVertexInputBindingDescription vb{0, sizeof(Vtx), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}};
+    VkVertexInputAttributeDescription va[3] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}, {2, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb; vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = va;
+    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb; vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = va;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, (float)img_w, (float)img_h, 0, 1};
@@ -794,6 +984,7 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &sc;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.rasterizerDiscardEnable = (std::getenv("MJMLX_CAM_EXP") && std::string(std::getenv("MJMLX_CAM_EXP")) == "discard") ? VK_TRUE : VK_FALSE; // 計測用: 頂点処理のみの時間
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_BACK_BIT; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -808,6 +999,16 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pDepthStencilState = &ds; gpi.pColorBlendState = &cb;
     gpi.layout = pipe_layout; gpi.renderPass = render_pass; gpi.subpass = 0;
     vk_check(vkCreateGraphicsPipelines(h.device, VK_NULL_HANDLE, 1, &gpi, nullptr, &gfx), "vkCreateGraphicsPipelines");
+}
+
+// マップしたGPU可視メモリの読み出しは単一スレッドだと約1GB/sしか出ないので、複数スレッドで分担する。
+template <class F> static void parallel_chunks(size_t n, F fn) {
+    unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    if (n < (1u << 16)) nt = 1;
+    std::vector<std::thread> th;
+    for (unsigned t = 1; t < nt; t++) th.emplace_back([=] { fn(n * t / nt, n * (t + 1) / nt); });
+    fn(0, n / nt);
+    for (auto& x : th) x.join();
 }
 
 // ── C API ────────────────────────────────────────────────────────────────────
@@ -826,6 +1027,7 @@ MJMLX_API MjmlxCameraRenderer* mjmlx_camera_create(MjmlxBatchedSim* sim, int wid
         mjmlx::camera_prepare_device();
         if (!g_dev.valid) throw std::runtime_error("camera unsupported on this Vulkan setup: " + g_dev.reason);
         r->h = g_dev;
+        if (const char* e = std::getenv("MJMLX_CAM_LOD_K")) r->lodk = (float)std::atof(e);
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = g_dev.queue_family;
         vk_check(vkCreateCommandPool(g_dev.device, &pi, nullptr, &r->h.command_pool), "vkCreateCommandPool");
@@ -865,10 +1067,17 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
         }
         vkUpdateDescriptorSets(r->h.device, 4, w, 0, nullptr);
 
-        PushC pc{(uint32_t)r->B, (uint32_t)r->ncam, r->nvis, r->tiles_x, r->tiles_y, r->nlights, (uint32_t)r->nbody, 0, (float)r->W / (float)r->H, r->znear, r->zfar, 0};
+        PushC pc{(uint32_t)r->B, (uint32_t)r->ncam, r->nvis, r->tiles_x, r->tiles_y, r->nlights, (uint32_t)r->nbody, (uint32_t)r->H, (float)r->W / (float)r->H, r->znear, r->zfar, r->lodk};
         r->draw_calls = 0;
+        const bool prof = std::getenv("MJMLX_CAM_PROF") != nullptr;
+        if (prof && !r->qpool) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 4;
+            vk_check(vkCreateQueryPool(r->h.device, &qi, nullptr, &r->qpool), "vkCreateQueryPool");
+        }
         r->one_shot([&](VkCommandBuffer c) {
             auto stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+            if (prof) { vkCmdResetQueryPool(c, r->qpool, 0, 4); vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r->qpool, 0); }
             vkCmdPushConstants(c, r->pipe_layout, stages, 0, sizeof(pc), &pc);
             vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0, nullptr);
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->comp);
@@ -877,6 +1086,12 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->cull);
+            vkCmdDispatch(c, (r->draw_count + 63) / 64, 1, 1);
+            VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb2.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
+            if (prof) vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r->qpool, 1);
             VkClearValue cv[3]{};
             for (int k = 0; k < 3; k++) cv[0].color.float32[k] = r->clear_rgb[k];
             cv[0].color.float32[3] = 1.0f;
@@ -893,9 +1108,16 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             vkCmdDrawIndexedIndirect(c, r->indirect.buf, 0, r->draw_count, sizeof(VkDrawIndexedIndirectCommand));
             r->draw_calls++;
             vkCmdEndRenderPass(c);
+            if (prof) vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r->qpool, 2);
         });
         if (std::getenv("MJMLX_CAM_PROF")) {
             auto t_c = std::chrono::steady_clock::now();
+            uint64_t ts[3] = {0, 0, 0};
+            vkGetQueryPoolResults(r->h.device, r->qpool, 0, 3, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            VkPhysicalDeviceProperties pp;
+            vkGetPhysicalDeviceProperties(r->h.physical, &pp);
+            double ns = pp.limits.timestampPeriod;
+            fprintf(stderr, "[cam] GPU: pose+cull_compute=%.3fms render_pass(clear+draw)=%.3fms\n", (ts[1] - ts[0]) * ns * 1e-6, (ts[2] - ts[1]) * ns * 1e-6);
             fprintf(stderr, "[cam] kin=%.2fms gpu(compute+draw)=%.2fms\n", std::chrono::duration<double, std::milli>(t_b - t_a).count(), std::chrono::duration<double, std::milli>(t_c - t_b).count());
         }
         r->rendered = true; r->read_back = false;
@@ -913,39 +1135,39 @@ static void camera_readback(MjmlxCameraRenderer* r) {
     if (!r->rb_color.buf) {
         r->rb_color = r->make_buf(npx * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         r->rb_depth = r->make_buf(npx * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        // 毎回mapするとページフォルトで遅いので常時マップしておく。
+        vk_check(vkMapMemory(r->h.device, r->rb_color.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_color_ptr), "vkMapMemory");
+        vk_check(vkMapMemory(r->h.device, r->rb_depth.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_depth_ptr), "vkMapMemory");
     }
     std::vector<VkBufferImageCopy> regs(r->ntiles);
     for (uint32_t t = 0; t < r->ntiles; t++) {
         regs[t] = {(VkDeviceSize)t * r->W * r->H * 4, (uint32_t)r->W, (uint32_t)r->H, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                    {(int32_t)((t % r->tiles_x) * r->W), (int32_t)((t / r->tiles_x) * r->H), 0}, {(uint32_t)r->W, (uint32_t)r->H, 1}};
     }
+    auto tr0 = std::chrono::steady_clock::now();
     r->one_shot([&](VkCommandBuffer c) {
         vkCmdCopyImageToBuffer(c, r->img_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_color.buf, r->ntiles, regs.data());
         vkCmdCopyImageToBuffer(c, r->img_depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_depth.buf, r->ntiles, regs.data());
     });
-    void* p;
-    vkMapMemory(r->h.device, r->rb_color.mem, 0, VK_WHOLE_SIZE, 0, &p);
-    r->rgb.resize(npx * 3);
-    const uint8_t* src = static_cast<const uint8_t*>(p);
-    for (size_t i = 0; i < npx; i++) { r->rgb[3 * i] = src[4 * i]; r->rgb[3 * i + 1] = src[4 * i + 1]; r->rgb[3 * i + 2] = src[4 * i + 2]; }
-    vkUnmapMemory(r->h.device, r->rb_color.mem);
-    vkMapMemory(r->h.device, r->rb_depth.mem, 0, VK_WHOLE_SIZE, 0, &p);
-    r->depth.assign(static_cast<const float*>(p), static_cast<const float*>(p) + npx);
-    vkUnmapMemory(r->h.device, r->rb_depth.mem);
+    auto tr1 = std::chrono::steady_clock::now();
+    if (std::getenv("MJMLX_CAM_PROF")) fprintf(stderr, "[cam] readback: gpu_copy(submit+wait)=%.2fms\n", std::chrono::duration<double, std::milli>(tr1 - tr0).count());
     r->read_back = true;
 }
 
 MJMLX_API int mjmlx_camera_get_rgb(MjmlxCameraRenderer* r, uint8_t* out) {
     if (!r || !r->rendered || !out) return -1;
     try { camera_readback(r); } catch (const std::exception& e) { fprintf(stderr, "mjmlx_camera_get_rgb error: %s\n", e.what()); return -1; }
-    std::memcpy(out, r->rgb.data(), r->rgb.size());
+    size_t npx = (size_t)r->ntiles * r->W * r->H;
+    const uint32_t* src = static_cast<const uint32_t*>(r->rb_color_ptr);
+    parallel_chunks(npx, [=](size_t a, size_t b) { for (size_t i = a; i < b; i++) { uint32_t v = src[i]; out[3 * i] = (uint8_t)v; out[3 * i + 1] = (uint8_t)(v >> 8); out[3 * i + 2] = (uint8_t)(v >> 16); } });
     return 0;
 }
 
 MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer* r, float* out) {
     if (!r || !r->rendered || !out) return -1;
     try { camera_readback(r); } catch (const std::exception& e) { fprintf(stderr, "mjmlx_camera_get_depth error: %s\n", e.what()); return -1; }
-    std::memcpy(out, r->depth.data(), r->depth.size() * sizeof(float));
+    const char* dsrc = static_cast<const char*>(r->rb_depth_ptr);
+    parallel_chunks((size_t)r->ntiles * r->W * r->H * sizeof(float), [=](size_t a, size_t b) { std::memcpy(reinterpret_cast<char*>(out) + a, dsrc + a, b - a); });
     return 0;
 }
 

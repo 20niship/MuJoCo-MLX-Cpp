@@ -167,6 +167,26 @@ https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
 動画はリポジトリには含めない(サイズが大きいため)。上のコマンドで `runs/video/compare.mp4` に生成される。arm2種はCPUとGPUが一致し、go2/g1は着地後に接触解の差で軌道が分かれる。
 長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
 
+### 4. カメラ描画速度(Isaac Lab TiledCameraと比較)
+```bash
+uv run python scripts/bench_camera_vs_isaac.py --build-dir build            # 両方測ってJSON(runs/camera_vs_isaac.json)と表を出す
+uv run python scripts/bench_camera_vs_isaac.py --only mjmlx --envs 256 --sizes 64   # こちらだけ
+```
+Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセス、RTX機能を全て切り、Go2平地env、TiledCamera 1台/env、rgb+distance_to_camera)を子プロセスで呼ぶ。RTX 3060 12GB、Go2、1カメラ/env、env-frames/s(描画のみ)と env-steps/s(物理4substep+描画1回):
+
+| envs | px | mjmlx 描画のみ(GPU) 旧→新 | mjmlx 描画+CPU読出 旧→新 | Isaac 描画のみ | mjmlx 物理+描画 旧→新 | Isaac 物理+描画 |
+|---|---|---|---|---|---|---|
+| 64 | 64 | 1,718 → **40,630** | 1,531 → **27,520** | 3,298 | 1,161 → **4,180** | 2,238 |
+| 64 | 128 | 1,708 → **17,206** | 1,190 → **10,595** | 1,557 | 960 → **3,563** | 1,179 |
+| 256 | 64 | 1,960 → **50,956** | 1,762 → **34,094** | 5,490 | 1,390 → **10,972** | 4,133 |
+| 256 | 128 | 1,898 → **18,567** | 1,090 → **9,367** | 2,427 | 1,010 → **6,196** | 2,240 |
+| 1024 | 64 | 2,763 → **53,466** | 1,737 → **31,618** | 7,924 | 1,499 → **17,604** | 7,278 |
+| 1024 | 128 | 2,794 → **18,832** | 1,214 → **8,816** | skip | 1,138 → **7,363** | skip |
+| 4096 | 64 | 3,882 → **55,908** | 1,949 → **29,512** | skip | 1,797 → **19,608** | skip |
+| 4096 | 128 | 3,867 → **22,578** | 1,397 → **8,631** | skip | 1,319 → **7,423** | skip |
+
+注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定16、0でLOD無効)で変えられる。
+
 ## Architecture
 
 ```
