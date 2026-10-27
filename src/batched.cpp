@@ -301,7 +301,7 @@ static mx::array build_collision_pair_data(const Model& m) {
         }
     }
 
-    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
+    // Build pair data: g1, g2, type1, type2, margin(検出しきい値), rbound_sum
     std::vector<float> data(npairs * 6);
     for (int p = 0; p < npairs; p++) {
         const auto& cp = c.collision_pairs[p];
@@ -309,8 +309,8 @@ static mx::array build_collision_pair_data(const Model& m) {
         data[p*6+1] = (float)cp.g2;
         data[p*6+2] = (float)cp.type1;
         data[p*6+3] = (float)cp.type2;
-        data[p*6+4] = cp.margin + cp.gap;
-        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
+        data[p*6+4] = cp.margin;
+        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin;
     }
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
@@ -390,7 +390,7 @@ static mx::array build_solver_pair_props(const Model& m) {
         data[p*18+0] = (float)cp.body1;
         data[p*18+1] = (float)cp.body2;
         data[p*18+2] = (float)cp.condim;
-        data[p*18+3] = cp.margin + cp.gap;
+        data[p*18+3] = cp.margin - cp.gap;  // includemargin: dist < includemarginで拘束行を作り、拘束のposは dist - includemargin
         for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
         data[p*18+9] = cp.solref[0];
         data[p*18+10] = cp.solref[1];

@@ -170,6 +170,13 @@
 - 結果(1制御step後、接触あり): 関節角 平均 5.1e-3 → **3.0e-3 rad**(p95 9.5e-3 → 4.8e-3)、胴体速度 平均 6.3e-2 → **3.1e-2**(p95 1.45e-1 → 5.3e-2)。
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 
+### 実験19: 接触の margin/gap の扱いをMuJoCoに合わせる(CPU/GPU差が約8分の1)
+- 切り分け: XMLの `margin="0.001"` を `0` にすると1 step後の差が 3.0e-3 → 4.3e-4 rad に下がる → marginの扱いがCPUと違う。他の候補(`impratio`、foot摩擦の `0.02 0.01`、solimp、CPUのNewton反復数)は影響が小さいか変わらなかった。
+- 原因(3点): (1) 接触のmargin/gapを2geomの**和**にしていた(MuJoCoは `mju_max`)。(2) solverの接触の有効判定のしきい値を `margin + gap` にしていた(MuJoCoは `includemargin = margin - gap`)。(3) 拘束の `pos` が `dist` のままだった(MuJoCoは `pos = dist - includemargin`)。ここの(3)が大きく、marginが0.001でも接触の反発の基準位置が1 mmずれていた。
+- 修正: `io.cpp` でmargin/gapを最大値に、`batched.cpp` で検出しきい値は `margin`・solver側は `includemargin = margin - gap`、solverで `pos = dist - includemargin`。
+- 結果(1制御step後、接触あり): 関節角 平均 3.0e-3 → **3.8e-4 rad**(p95 4.7e-3 → 4.7e-4)、胴体速度 平均 3.1e-2 → 1.25e-2(p95 5.3e-2 → 1.6e-2)。実験13(eulerdamp)と実験18(condim 6)と合わせ、着手時の平均 1.4e-2 rad から約1/37。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall / batched_collision_primitives 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

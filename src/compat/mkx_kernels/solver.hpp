@@ -331,7 +331,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     float invw_t = pair_props[pp+16];
 
     bool contact_active = (c_dist < pair_margin_v);
-    float pos = c_dist;
+    float pos = c_dist - pair_margin_v;  // pair_props[3]=includemargin(margin-gap)
 
     float tc = solref0;
 )GLSL";
