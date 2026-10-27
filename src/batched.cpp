@@ -715,7 +715,8 @@ static std::vector<mx::array> mkx_vmap_batch0(
 }
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override, const void* owner) {
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override, const void* owner,
+                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out) {
     m.init_cache();
     auto ctx = build_context(m, solver_iterations_override);
     int B = num_envs;
@@ -746,6 +747,23 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
     }
 
     if (has_kin && (has_euler || has_euler_dm) && use_gpu) {
+
+        if (kinematics_out) {
+            *kinematics_out = [ctx, B, nb, nj, ng](const mx::array& qpos) {
+                std::vector<mx::Shape> shapes = {
+                    {B * nb * 3}, {B * nb * 4}, {B * nb * 9}, {B * nb * 3}, {B * nb * 9},
+                    (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1}, (nj > 0) ? mx::Shape{B * nj * 3} : mx::Shape{1},
+                    (ng > 0) ? mx::Shape{B * ng * 3} : mx::Shape{1}, (ng > 0) ? mx::Shape{B * ng * 9} : mx::Shape{1},
+                };
+                auto raw = (*ctx->kin_kernel)(
+                    mx::fast::kernel_inputs({ctx->body_parentid, ctx->body_pos, ctx->body_quat, ctx->body_ipos, ctx->body_iquat,
+                     ctx->body_jntadr, ctx->body_jntnum, ctx->jnt_type_arr, ctx->jnt_qposadr_arr, ctx->jnt_pos_arr, ctx->jnt_axis_arr,
+                     ctx->qpos0, ctx->geom_bodyid_arr, ctx->geom_pos_arr, ctx->geom_quat_arr, mx::astype(mx::flatten(qpos), mx::float32)}),
+                    mx::fast::kernel_shapes(shapes),
+                    std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "KIN", 64u), 1, 1});
+                return mx::fast::kernel_outputs(raw);
+            };
+        }
 
         // For large models (nv > 80), use all-GPU pipeline:
         //   GPU kin → GPU forward → GPU euler_devmem
@@ -1203,7 +1221,8 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             }
 
             handle->sim.compiled_step = mjmlx::make_batched_step(
-                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim);
+                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim, &handle->sim.kinematics);
+            handle->mj_model = model->mj_model;
             handle->sim.sensor = mjmlx::make_sensor_ctx(model->mj_model, B);
         }
 

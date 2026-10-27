@@ -578,6 +578,9 @@ struct BatchedSim {
     // Compiled+vmapped step function
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step;
 
+    // カメラ描画用: qpos(B*nq)からGPU運動学カーネルだけを再実行する(stepには含めない)。出力はkernelの9出力(SoA: 要素(成分,env)は成分*B+env)。
+    std::function<std::vector<mx::array>(const mx::array&)> kinematics;
+
     // sensor (MJCF <sensor>)。nsensor==0なら空で、stepに追加コストはない
     std::shared_ptr<SensorCtx> sensor;
 };
@@ -590,6 +593,9 @@ void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& o
 int sensor_nsensordata(const SensorCtx& ctx);
 
 // ── Module functions (internal C++ API) ──────────────────────
+
+// camera.cpp / camera_stub.cpp: mkxの初期化前にgraphics+compute queueとindirect描画featureを持つデバイスを注入する(不可なら何もしない)
+void camera_prepare_device();
 
 // io.cpp
 Model load_model(const char* xml_path);
@@ -639,7 +645,8 @@ Data rne_post_constraint(const Model& m, Data d);
 
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
-make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0, const void* owner = nullptr);
+make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0, const void* owner = nullptr,
+                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out = nullptr);
 
 // ── Vmap-compatible functions (pure MLX graph, no eval/data) ──
 
@@ -686,6 +693,7 @@ struct MjmlxBatchedSim {
 
     // CPU batched path: dispatch_apply over N mjData* (fast C MuJoCo)
     bool cpu_mode = false;
+    mjModel* mj_model = nullptr;            // GPUパスでカメラ描画が参照する(borrowed, レンダラ作成時にコピーするので作成後は不要)
     mjModel* cpu_model = nullptr;           // borrowed from MjmlxModel, not owned
     std::vector<mjData*> cpu_datas;
     mutable std::vector<float> sensordata_buf;  // get_sensordataの返却用
