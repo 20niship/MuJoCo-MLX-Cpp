@@ -94,6 +94,9 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
+    for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
+        old, new = kv.split("->", 1)
+        xml = xml.replace(old, new)
     if INTEGRATOR:
         if 'integrator="' in xml:
             xml = re.sub(r'integrator="[^"]*"', f'integrator="{INTEGRATOR}"', xml, count=1)

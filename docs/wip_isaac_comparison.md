@@ -164,6 +164,12 @@
 - 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
 - 注意: 親リポジトリのサブモジュールポインタを `5e658dd` に更新。CIは `perf/device-local-buffers` のコミットをfetchできる必要がある。
 
+### 実験18: GPU solverにcondim 4/6(ねじり・転がり摩擦)を追加(CPU/GPU差が約半分)
+- 切り分け: Go2のXMLの足geom `condim="6"` を `3` にすると、1 step後のCPU/GPU差が約半分になる(関節角 5.1e-3 → 2.7e-3 rad、胴体速度 6.3e-2 → 2.4e-2)。GPU solverはcondim>=3を一律に4行(接線2方向×±)として扱っており、ねじり・転がり摩擦行を持たなかった。
+- 実装(共有メモリ版・ピラミッド錐): 接触あたり `2*(condim-1)` 行。方向0,1=接線(並進)、2=ねじり(法線まわりの回転ヤコビアン)、3,4=転がり(接線1,2まわり)。各方向で `J_normal ± mu_k*J_k`。全行で同じD(mu0基準)を使う。CPUのスカラー実装(`src/constraint.cpp`)と同じ定式化。拘束行の上限(96)に合わせて接触の打ち切りを `MAX_EFC-10` に。
+- 結果(1制御step後、接触あり): 関節角 平均 5.1e-3 → **3.0e-3 rad**(p95 9.5e-3 → 4.8e-3)、胴体速度 平均 6.3e-2 → **3.1e-2**(p95 1.45e-1 → 5.3e-2)。
+- 検証: humanoid / high_dof / contact_stress / piper / go2_freefall / go2_landing / g1_landing / h1_freefall 通過。
+
 ## 次にやること(優先順)
 
 1. **前進が静止する原因を調べる**: 前進cmdだけ0になる。`flat_isaacpreset` の最新ckptで、cmd方向ごとの学習中の報酬・脚の接地(`foot_contact_frac`)を見る。前進時のスポーン位置(向き)の偏りも確認。

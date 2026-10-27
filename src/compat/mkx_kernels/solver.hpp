@@ -143,6 +143,7 @@ shared float tg_pAp;
      << "const int NLIM = " << nlim << ";\n"
      << "const int NFL = " << nfl << ";\n"
      << "const bool USE_PYR = " << (use_pyramidal ? "true" : "false") << ";\n"
+     << "const bool PYR_FULL = " << (use_shared && use_pyramidal ? "true" : "false") << ";  // 共有メモリ版はcondim 4/6(ねじり・転がり摩擦)も 2*(condim-1) 本の摩擦行として扱う(CPUのスカラー実装と同じ)\n"
      << "const int MAX_EFC_N = " << max_efc << ";\n"
      << "const int NSOLVE = " << solver_iters << ";\n"
      << "const int CON_STRIDE = " << contact_stride << ";\n"
@@ -194,6 +195,8 @@ shared float tg_pAp;
        << "#define Mv_arr(i)    solver_scratch[s_off + " << S_MV << " + (i)]\n"
        << "#define Jv_arr(i)    solver_scratch[s_off + " << S_JV << " + (i)]\n";
   }
+  if(use_shared) ss << "#define JACR_DECL float jr_l[NV*3];\n#define JACR_ADD(di,x,y,z) { jr_l[(di)*3] += (x); jr_l[(di)*3+1] += (y); jr_l[(di)*3+2] += (z); }\n#define JACR_SUB(di,x,y,z) { jr_l[(di)*3] -= (x); jr_l[(di)*3+1] -= (y); jr_l[(di)*3+2] -= (z); }\n#define JACR_ZERO for (int di_ = 0; di_ < NV*3; di_++) jr_l[di_] = 0.0f;\n#define JACR(i) jr_l[(i)]\n";
+  else ss << "#define JACR_DECL\n#define JACR_ADD(di,x,y,z)\n#define JACR_SUB(di,x,y,z)\n#define JACR_ZERO\n#define JACR(i) 0.0f\n";
   if(use_shared) ss << "#define JACP_DECL float jp_l[NV*3];\n#define jacp_tmp(i)  jp_l[(i)]\n\n";  // スレッド専用なのでlocal配列(globalのscratchは散らばって遅い)
   else ss << "#define JACP_DECL\n#define jacp_tmp(i)  solver_scratch[s_off + " << S_JACP << " + int(tid)*NV*3 + (i)]\n\n";
 
@@ -287,13 +290,13 @@ int ncp = 0;
 {
     // 各接触が使う拘束行数(ピラミッド錐でcondim>=3なら4行、他は1行、非アクティブは0)を先に数えて行オフセットを決める。
     int r_run = nefc;
-    for (int ci = 0; ci < ncon && r_run < MAX_EFC_N - 4; ci++) {
+    for (int ci = 0; ci < ncon && r_run < MAX_EFC_N - 10; ci++) {
         int ci_o = int(con_off) + ci * CON_STRIDE;
         int pp_ = int(contact_data_in[ci_o+7]) * 18;
         bool act_ = contact_data_in[ci_o+6] < pair_props[pp_+3];
         int cd_ = int(pair_props[pp_+2]);
         tg_crow0[ci] = r_run; ncp = ci + 1;
-        r_run += act_ ? ((USE_PYR && cd_ >= 3) ? 4 : 1) : 0;
+        r_run += act_ ? (PYR_FULL ? (cd_ >= 2 ? 2*(cd_-1) : 1) : ((USE_PYR && cd_ >= 3) ? 4 : 1)) : 0;
     }
     tg_crow0[ncp] = r_run; tg_ncp = ncp; tg_nefc = r_run;
 }
@@ -354,7 +357,9 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     if (imp_x_val > 1.0f) imp_val = dmax_v;
 
     JACP_DECL
+    JACR_DECL
     for (int di = 0; di < NV*3; di++) jacp_tmp(di) = 0.0f;
+    JACR_ZERO
 
     {
         int rid = int(body_rootid_buf[body2]);
@@ -368,6 +373,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
             jacp_tmp(di*3+0) += lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) += ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) += lz + (ax*oy - ay*ox);
+            JACR_ADD(di, ax, ay, az)
         }
     }
     {
@@ -382,6 +388,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
             jacp_tmp(di*3+0) -= lx + (ay*oz - az*oy);
             jacp_tmp(di*3+1) -= ly + (az*ox - ax*oz);
             jacp_tmp(di*3+2) -= lz + (ax*oy - ay*ox);
+            JACR_SUB(di, ax, ay, az)
         }
     }
 )GLSL";
@@ -398,7 +405,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     else tt1 = msl_cross(nn, vec3(0,1,0));
     tt1 = msl_norm(tt1); tt2 = msl_cross(nn, tt1);
 
-    if (condim >= 3 && contact_active) {
+    if (PYR_FULL ? (condim >= 2 && contact_active) : (condim >= 3 && contact_active)) {
         float mu0 = fri0, mu0_sq = mu0*mu0;
         float invw_py = invw_t + mu0_sq*invw_t;
         float r_first = max(invw_py*(1.0f-imp_val)/imp_val, MJMINVAL_CV);
@@ -406,6 +413,28 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     ss << "        float r_py = max(2.0f*mu0_sq/" << solver_fmt_float(impratio) << "f*r_first, MJMINVAL_CV);\n";
     ss << R"GLSL(
         float D_py = 1.0f/r_py;
+        if (PYR_FULL) {
+            // 全方向: 0,1=接線(並進)、2=ねじり(法線まわり)、3,4=転がり(接線1,2まわり)。各方向でJ_normal ± mu_k*J_k の2行。
+            int ndir = condim - 1;
+            for (int tk = 0; tk < ndir; tk++) {
+                float mu_k = pair_props[pp+4+tk];
+                vec3 dir = (tk == 0 || tk == 3) ? tt1 : ((tk == 1 || tk == 4) ? tt2 : nn);
+                for (int sg_i = 0; sg_i < 2; sg_i++) {
+                    float sg = (sg_i == 0) ? 1.0f : -1.0f;
+                    float jdot = 0.0f;
+                    for (int di = 0; di < NV; di++) {
+                        float jt = (tk < 2) ? dir.x*jacp_tmp(di*3)+dir.y*jacp_tmp(di*3+1)+dir.z*jacp_tmp(di*3+2)
+                                            : dir.x*JACR(di*3)+dir.y*JACR(di*3+1)+dir.z*JACR(di*3+2);
+                        float jv = j_normal_arr[di] + sg*mu_k*jt;
+                        J(row,di) = jv;
+                        jdot += jv*qvel_in[qv_off+di];
+                    }
+                    efc_D(row) = D_py;
+                    efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
+                    row++;
+                }
+            }
+        } else {
         float mu_vals[2] = float[](fri0, fri1);
         for (int tk = 0; tk < 2; tk++) {
             float mu_k = mu_vals[tk];
@@ -428,6 +457,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
             efc_D(row) = D_py;
             efc_aref(row) = -b_val*jdot - k_val*imp_val*pos;
             row++;
+        }
         }
     } else if (contact_active) {
 )GLSL";
