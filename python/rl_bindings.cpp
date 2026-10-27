@@ -89,6 +89,35 @@ struct RlBatchedSim {
     FloatArray qfrc_actuator() { int n; auto* p = mjmlx_batched_get_qfrc_actuator(handle, &n); return copy_out(p, n, num_envs); }
 };
 
+// カメラレンダラ。sim(の運動学)を参照するためshared_ptrで寿命を揃える。
+struct RlCamera {
+    std::shared_ptr<RlBatchedSim> sim;
+    MjmlxCameraRenderer* handle = nullptr;
+    int width = 0, height = 0;
+    ~RlCamera() { if (handle) mjmlx_camera_free(handle); }
+
+    int ncam() const { return mjmlx_camera_count(handle); }
+    void render() { if (mjmlx_camera_render(handle) != 0) throw std::runtime_error("mjmlx_rl: camera render failed"); }
+
+    nb::ndarray<nb::numpy, uint8_t> rgb() {
+        size_t shape[5] = {static_cast<size_t>(sim->num_envs), static_cast<size_t>(ncam()), static_cast<size_t>(height), static_cast<size_t>(width), 3};
+        size_t n = shape[0] * shape[1] * shape[2] * shape[3] * 3;
+        uint8_t* buf = new uint8_t[n];
+        nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<uint8_t*>(p); });
+        if (mjmlx_camera_get_rgb(handle, buf) != 0) throw std::runtime_error("mjmlx_rl: render() must be called before rgb()");
+        return nb::ndarray<nb::numpy, uint8_t>(buf, 5, shape, owner);
+    }
+
+    nb::ndarray<nb::numpy, float> depth() {
+        size_t shape[4] = {static_cast<size_t>(sim->num_envs), static_cast<size_t>(ncam()), static_cast<size_t>(height), static_cast<size_t>(width)};
+        size_t n = shape[0] * shape[1] * shape[2] * shape[3];
+        float* buf = new float[n];
+        nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        if (mjmlx_camera_get_depth(handle, buf) != 0) throw std::runtime_error("mjmlx_rl: render() must be called before depth()");
+        return nb::ndarray<nb::numpy, float>(buf, 4, shape, owner);
+    }
+};
+
 NB_MODULE(_mjmlx_rl_native, m) {
     m.doc() = "Minimal numpy-facing mjmlx bindings for RL training (no mlx.core dependency at the Python boundary)";
 
@@ -114,6 +143,21 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("xpos", &RlBatchedSim::xpos)
         .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
         .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator);
+
+    nb::class_<RlCamera>(m, "Camera")
+        .def_prop_ro("num_cameras", &RlCamera::ncam)
+        .def_prop_ro("draw_calls", [](const RlCamera& c) { return mjmlx_camera_draw_call_count(c.handle); })
+        .def("render", &RlCamera::render)
+        .def("rgb", &RlCamera::rgb)
+        .def("depth", &RlCamera::depth);
+
+    m.def("create_camera", [](std::shared_ptr<RlBatchedSim> sim, int width, int height) -> std::shared_ptr<RlCamera> {
+        auto cam = std::make_shared<RlCamera>();
+        cam->handle = mjmlx_camera_create(sim->handle, width, height);
+        if (!cam->handle) throw std::runtime_error("mjmlx_rl: failed to create camera renderer (need GPU sim and <camera> in the model)");
+        cam->sim = sim; cam->width = width; cam->height = height;
+        return cam;
+    }, nb::arg("sim"), nb::arg("width"), nb::arg("height"));
 
     m.def("load_model", [](const std::string& xml_path) -> std::shared_ptr<RlModel> {
         auto model = std::make_shared<RlModel>();

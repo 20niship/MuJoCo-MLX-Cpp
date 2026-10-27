@@ -250,6 +250,18 @@ Mesh make_plane(const float* s) {
     return m;
 }
 
+// 背面カリングのため、各三角形の巻き方向を頂点法線(外向き)に合わせる。
+void orient_outward(Mesh& m) {
+    for (size_t t = 0; t + 2 < m.i.size(); t += 3) {
+        const Vtx &a = m.v[m.i[t]], &b = m.v[m.i[t + 1]], &c = m.v[m.i[t + 2]];
+        float e1[3], e2[3], n[3], dot = 0;
+        for (int k = 0; k < 3; k++) { e1[k] = b.p[k] - a.p[k]; e2[k] = c.p[k] - a.p[k]; }
+        n[0] = e1[1] * e2[2] - e1[2] * e2[1]; n[1] = e1[2] * e2[0] - e1[0] * e2[2]; n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        for (int k = 0; k < 3; k++) dot += n[k] * (a.n[k] + b.n[k] + c.n[k]);
+        if (dot < 0) std::swap(m.i[t + 1], m.i[t + 2]);
+    }
+}
+
 Mesh make_primitive(int type, const float* s) {
     const int sl = 32, st = 16;
     switch (type) {
@@ -477,6 +489,7 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
             float s[3] = {(float)m->geom_size[3 * g], (float)m->geom_size[3 * g + 1], (float)m->geom_size[3 * g + 2]};
             Mesh me = is_mesh ? make_mesh(m, m->geom_dataid[g]) : make_primitive(m->geom_type[g], s);
             if (me.i.empty()) continue;
+            if (!is_mesh) orient_outward(me);
             r = {(uint32_t)idx.size(), (uint32_t)me.i.size(), (int32_t)vtx.size()};
             vtx.insert(vtx.end(), me.v.begin(), me.v.end());
             idx.insert(idx.end(), me.i.begin(), me.i.end());
@@ -663,7 +676,7 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &sc;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_BACK_BIT; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
