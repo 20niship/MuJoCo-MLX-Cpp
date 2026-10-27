@@ -267,7 +267,14 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
     }
 }
 
-static mx::array build_collision_pair_data(const Model& m) {
+// GCC 12(CIのDockerイメージ)は、build_contextにインライン展開されたペアデータ作成ループのベクトル化でinternal compiler errorを出すため、この2関数ではベクトル化しない。
+#if defined(__GNUC__) && !defined(__clang__)
+#define MJMLX_NO_VECTORIZE __attribute__((optimize("no-tree-vectorize"), noinline))
+#else
+#define MJMLX_NO_VECTORIZE
+#endif
+
+MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
@@ -380,7 +387,7 @@ static std::vector<float> build_solver_friction_table(const Model& m, int& n_out
     return tab;
 }
 
-static mx::array build_solver_pair_props(const Model& m) {
+MJMLX_NO_VECTORIZE static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
