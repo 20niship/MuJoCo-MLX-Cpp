@@ -274,7 +274,11 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss << "{\n"
        << "  float cv[6]; for (int k=0;k<6;k++) cv[k] = cvel_out[uint(" << pid << "*6+k)*NBATCH+bid];\n";
 
-    for(int di : body_dofs[static_cast<size_t>(b)]) {
+    // cdof_dot = crossMotion(cvel, cdof)。MuJoCo(mj_comVel)は、hinge/slideは1自由度ずつ逐次に、
+    // free(並進3dofは cdof_dot=0 で先に速度に加算、回転3dofは並進加算後の同じcvelでまとめて計算)とballは3自由度を同じcvelで計算してから速度に加算する。
+    // 回転3dofを逐次の速度で計算すると、Σ_{i<j} ω_i ω_j (a_i×a_j) の項が余分に入りジャイロ項が約3倍ずれる。
+    const auto& dofs_b = body_dofs[static_cast<size_t>(b)];
+    auto emit_cdofd = [&](int di) {
       ss << "  {\n"
          << "    float ua[3] = float[](cv[0],cv[1],cv[2]);\n"
          << "    float ul[3] = float[](cv[3],cv[4],cv[5]);\n"
@@ -285,9 +289,27 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
          << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+3)]=ul[1]*va[2]-ul[2]*va[1]+ua[1]*vl[2]-ua[2]*vl[1];\n"
          << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+4)]=ul[2]*va[0]-ul[0]*va[2]+ua[2]*vl[0]-ua[0]*vl[2];\n"
          << "    scratch[SCR_IDX(S_CDOFD+" << di << "*6+5)]=ul[0]*va[1]-ul[1]*va[0]+ua[0]*vl[1]-ua[1]*vl[0];\n"
-         << "    float qv = qvel[v_off+" << di << "];\n"
-         << "    for (int k=0;k<6;k++) cv[k] += scratch[SCR_IDX(S_CDOF+" << di << "*6+k)] * qv;\n"
          << "  }\n";
+    };
+    auto emit_add_vel = [&](int di) {
+      ss << "  { float qv = qvel[v_off+" << di << "]; for (int k=0;k<6;k++) cv[k] += scratch[SCR_IDX(S_CDOF+" << di << "*6+k)] * qv; }\n";
+    };
+    for(size_t k = 0; k < dofs_b.size();) {
+      int jt0 = dof_jtype[static_cast<size_t>(dofs_b[k])];
+      if(jt0 == 0 && k + 6 <= dofs_b.size()) {  // free: 並進3(cdof_dot=0) + 回転3(同じcvelでまとめて)
+        for(size_t t = 0; t < 3; t++) emit_add_vel(dofs_b[k + t]);
+        for(size_t t = 3; t < 6; t++) emit_cdofd(dofs_b[k + t]);
+        for(size_t t = 3; t < 6; t++) emit_add_vel(dofs_b[k + t]);
+        k += 6;
+      } else if(jt0 == 1 && k + 3 <= dofs_b.size()) {  // ball: 回転3を同じcvelでまとめて
+        for(size_t t = 0; t < 3; t++) emit_cdofd(dofs_b[k + t]);
+        for(size_t t = 0; t < 3; t++) emit_add_vel(dofs_b[k + t]);
+        k += 3;
+      } else {  // hinge/slide: 1自由度ずつ
+        emit_cdofd(dofs_b[k]);
+        emit_add_vel(dofs_b[k]);
+        k += 1;
+      }
     }
 
     ss << "  for (int k=0;k<6;k++) cvel_out[uint(" << b << "*6+k)*NBATCH+bid] = cv[k];\n"

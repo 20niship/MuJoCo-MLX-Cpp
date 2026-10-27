@@ -1,0 +1,67 @@
+<mujoco model="sensors">
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 0.1"/>
+    <body name="torso" pos="0 0 0.6">
+      <freejoint name="root"/>
+      <geom name="torso_g" type="box" size="0.15 0.1 0.05" mass="2"/>
+      <site name="imu" pos="0.03 0.01 0.02" quat="0.9238795 0 0.3826834 0"/>
+      <body name="arm" pos="0.15 0 0">
+        <joint name="shoulder" type="hinge" axis="0 1 0" damping="0.05"/>
+        <geom name="arm_g" type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="0.3"/>
+        <site name="tip" pos="0.2 0 0"/>
+        <body name="fore" pos="0.2 0 0">
+          <joint name="elbow" type="hinge" axis="0 1 0" damping="0.05"/>
+          <geom name="fore_g" type="capsule" fromto="0 0 0 0.15 0 0" size="0.015" mass="0.2"/>
+        </body>
+      </body>
+      <body name="slider" pos="-0.15 0 0">
+        <joint name="slide" type="slide" axis="0 0 1" range="-0.1 0.1" damping="0.5"/>
+        <geom name="slider_g" type="sphere" size="0.03" mass="0.2"/>
+        <site name="slider_site" pos="0 0 -0.03"/>
+      </body>
+      <body name="ball" pos="0 0.15 0">
+        <joint name="ballj" type="ball" damping="0.01"/>
+        <geom name="ball_g" type="box" size="0.02 0.02 0.05" pos="0 0 -0.05" mass="0.3"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="m_shoulder" joint="shoulder" gear="2"/>
+    <motor name="m_elbow" joint="elbow"/>
+    <position name="p_slide" joint="slide" kp="20" gear="1.5"/>
+  </actuator>
+  <sensor>
+    <gyro name="imu_gyro" site="imu"/>
+    <accelerometer name="imu_acc" site="imu"/>
+    <velocimeter name="imu_vel" site="imu"/>
+    <magnetometer name="imu_mag" site="imu"/>
+    <gyro name="tip_gyro" site="tip"/>
+    <accelerometer name="tip_acc" site="tip"/>
+    <velocimeter name="tip_vel" site="tip"/>
+    <framepos name="site_pos" objtype="site" objname="imu"/>
+    <framequat name="site_quat" objtype="site" objname="imu"/>
+    <framexaxis name="site_x" objtype="site" objname="tip"/>
+    <frameyaxis name="site_y" objtype="site" objname="tip"/>
+    <framezaxis name="site_z" objtype="site" objname="tip"/>
+    <framelinvel name="site_linvel" objtype="site" objname="tip"/>
+    <frameangvel name="site_angvel" objtype="site" objname="tip"/>
+    <framepos name="body_pos" objtype="body" objname="arm"/>
+    <framequat name="body_quat" objtype="body" objname="arm"/>
+    <framelinvel name="body_linvel" objtype="body" objname="fore"/>
+    <framepos name="xbody_pos" objtype="xbody" objname="fore"/>
+    <framequat name="geom_quat" objtype="geom" objname="fore_g"/>
+    <framepos name="geom_pos" objtype="geom" objname="slider_g"/>
+    <jointpos name="q_shoulder" joint="shoulder"/>
+    <jointvel name="v_shoulder" joint="shoulder"/>
+    <jointpos name="q_slide" joint="slide"/>
+    <jointvel name="v_slide" joint="slide"/>
+    <jointactuatorfrc name="f_shoulder" joint="shoulder"/>
+    <jointactuatorfrc name="f_slide" joint="slide"/>
+    <ballquat name="ball_quat" joint="ballj"/>
+    <ballangvel name="ball_angvel" joint="ballj"/>
+    <actuatorpos name="ap_shoulder" actuator="m_shoulder"/>
+    <actuatorvel name="av_shoulder" actuator="m_shoulder"/>
+    <subtreecom name="com" body="torso"/>
+  </sensor>
+</mujoco>

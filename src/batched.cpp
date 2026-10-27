@@ -267,7 +267,14 @@ static void prof_stage(const char* name, const std::vector<mx::array>& outs) {
     }
 }
 
-static mx::array build_collision_pair_data(const Model& m) {
+// GCC 12(CIのDockerイメージ)は、build_contextにインライン展開されたペアデータ作成ループのベクトル化でinternal compiler errorを出すため、この2関数ではベクトル化しない。
+#if defined(__GNUC__) && !defined(__clang__)
+#define MJMLX_NO_VECTORIZE __attribute__((optimize("no-tree-vectorize"), noinline))
+#else
+#define MJMLX_NO_VECTORIZE
+#endif
+
+MJMLX_NO_VECTORIZE static mx::array build_collision_pair_data(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
@@ -301,7 +308,7 @@ static mx::array build_collision_pair_data(const Model& m) {
         }
     }
 
-    // Build pair data: g1, g2, type1, type2, margin+gap, rbound_sum
+    // Build pair data: g1, g2, type1, type2, margin(検出しきい値), rbound_sum
     std::vector<float> data(npairs * 6);
     for (int p = 0; p < npairs; p++) {
         const auto& cp = c.collision_pairs[p];
@@ -309,8 +316,8 @@ static mx::array build_collision_pair_data(const Model& m) {
         data[p*6+1] = (float)cp.g2;
         data[p*6+2] = (float)cp.type1;
         data[p*6+3] = (float)cp.type2;
-        data[p*6+4] = cp.margin + cp.gap;
-        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin + cp.gap;
+        data[p*6+4] = cp.margin;
+        data[p*6+5] = geom_rb[cp.g1] + geom_rb[cp.g2] + cp.margin;
     }
     return mx::array(data.data(), {npairs * 6}, mx::float32);
 }
@@ -380,7 +387,7 @@ static std::vector<float> build_solver_friction_table(const Model& m, int& n_out
     return tab;
 }
 
-static mx::array build_solver_pair_props(const Model& m) {
+MJMLX_NO_VECTORIZE static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
     int npairs = (int)c.collision_pairs.size();
@@ -390,7 +397,7 @@ static mx::array build_solver_pair_props(const Model& m) {
         data[p*18+0] = (float)cp.body1;
         data[p*18+1] = (float)cp.body2;
         data[p*18+2] = (float)cp.condim;
-        data[p*18+3] = cp.margin + cp.gap;
+        data[p*18+3] = cp.margin - cp.gap;  // includemargin: dist < includemarginで拘束行を作り、拘束のposは dist - includemargin
         for (int k = 0; k < 5; k++) data[p*18+4+k] = cp.friction[k];
         data[p*18+9] = cp.solref[0];
         data[p*18+10] = cp.solref[1];
@@ -656,7 +663,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
         int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, 3);
-        int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 10;
+        int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 30;  // CPUとの差を小さくするため十分に回す(CG_TOLで早期終了する)
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
         if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
@@ -1216,6 +1223,7 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
             handle->sim.compiled_step = mjmlx::make_batched_step(
                 model->model, B, config->use_gpu, config->solver_iterations, &handle->sim, &handle->sim.kinematics);
             handle->mj_model = model->mj_model;
+            handle->sim.sensor = mjmlx::make_sensor_ctx(model->mj_model, B);
         }
 
         return handle;
@@ -1244,6 +1252,7 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
         ? mx::reshape(mx::array(ctrl_flat, {B * nu}, mx::float32), {B, nu})
         : mx::zeros({B, ctrl_dim});
 
+    if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
     auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
     s.qpos = results[0];
     s.qvel = results[1];
@@ -1341,6 +1350,31 @@ MJMLX_API const float* mjmlx_batched_get_cinert(const MjmlxBatchedSim* sim, int*
     return (sim->sim.cinert.size() > 0) ? sim->sim.cinert.data<float>() : nullptr;
 }
 
+MJMLX_API int mjmlx_batched_nsensordata(const MjmlxBatchedSim* sim) {
+    if (!sim) return 0;
+    if (sim->cpu_mode) return sim->cpu_model->nsensordata;
+    return sim->sim.sensor ? mjmlx::sensor_nsensordata(*sim->sim.sensor) : 0;
+}
+
+MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, int* n_out) {
+    if (n_out) *n_out = 0;
+    if (!sim) return nullptr;
+    int nsd = mjmlx_batched_nsensordata(sim);
+    if (nsd == 0) return nullptr;
+    int B = sim->sim.num_envs;
+    if (n_out) *n_out = B * nsd;
+
+    if (sim->cpu_mode) {
+        sim->sensordata_buf.resize((size_t)B * nsd);
+        for (int i = 0; i < B; i++)
+            for (int j = 0; j < nsd; j++) sim->sensordata_buf[(size_t)i * nsd + j] = (float)sim->cpu_datas[i]->sensordata[j];
+        return sim->sensordata_buf.data();
+    }
+
+    mjmlx::sensor_compute(*sim->sim.sensor, sim->sim, sim->sensordata_buf);
+    return sim->sensordata_buf.data();
+}
+
 MJMLX_API const float* mjmlx_batched_get_cvel(const MjmlxBatchedSim* sim, int* n_out) {
     if (!sim) return nullptr;
     mx::eval(sim->sim.cvel);
@@ -1383,6 +1417,7 @@ MJMLX_API void mjmlx_batched_reset(MjmlxBatchedSim* sim, const int* reset_mask) 
     auto& s = sim->sim;
     int B = s.num_envs;
     int nq = s.model->nq, nv = s.model->nv;
+    if (s.sensor) mjmlx::sensor_mark_reset(*s.sensor, reset_mask, B);
 
     mx::eval(s.qpos, s.qvel);
     std::vector<float> qp(s.qpos.data<float>(), s.qpos.data<float>() + B * nq);

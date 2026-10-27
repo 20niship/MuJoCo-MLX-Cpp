@@ -43,7 +43,7 @@ def main() -> None:
 
     for _ in range(args.warm):
         gpu.step(act())
-    dq, dv, ncont = [], [], []
+    dq, dv, ncont, dvl, dva = [], [], [], [], []
     for s in range(args.samples):
         q, v = gpu._sim.state()
         q, v = q.copy(), v.copy()
@@ -59,10 +59,12 @@ def main() -> None:
         qg, vg = gpu._sim.state()
         dq.append(np.abs(qc - qg)[:, 7:19].max(axis=1))   # 関節角の最大差
         dv.append(np.abs(vc - vg)[:, :6].max(axis=1))     # 胴体速度の最大差
+        dvl.append(np.abs(vc - vg)[:, :3].max(axis=1)); dva.append(np.abs(vc - vg)[:, 3:6].max(axis=1))
         for _ in range(10):
             gpu.step(act())
-    dq, dv = np.concatenate(dq), np.concatenate(dv)
+    dq, dv, dvl, dva = np.concatenate(dq), np.concatenate(dv), np.concatenate(dvl), np.concatenate(dva)
     print(f"envs x samples={dq.size}  joint-pos diff[rad]: mean={dq.mean():.2e} p95={np.percentile(dq, 95):.2e} max={dq.max():.2e}")
+    print(f"                       base lin-vel diff[m/s]: mean={dvl.mean():.2e} p95={np.percentile(dvl, 95):.2e}   ang-vel diff[rad/s]: mean={dva.mean():.2e} p95={np.percentile(dva, 95):.2e}")
     print(f"                       base-vel diff[m/s,rad/s]: mean={dv.mean():.2e} p95={np.percentile(dv, 95):.2e} max={dv.max():.2e}")
 
 
