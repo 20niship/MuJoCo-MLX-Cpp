@@ -246,6 +246,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_robustness tests/test_robustness.cpp)
+    target_link_libraries(test_robustness PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_robustness PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     add_executable(test_sdf_mesh tests/test_sdf_mesh.cpp)
     target_link_libraries(test_sdf_mesh PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_sdf_mesh PRIVATE
@@ -361,6 +368,39 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME gpu_vs_cpu_tendon_pulley COMMAND test_gpu_vs_cpu ${_M}/tendon_pulley.xml 1e-4 1e-4 1e-3)
     add_test(NAME gpu_vs_cpu_tendon_pulley_traj COMMAND test_gpu_vs_cpu ${_M}/tendon_pulley.xml --seconds 3 --ctrl sin --tol-joint 1e-3)
     set_tests_properties(gpu_vs_cpu_tendon_arm26 gpu_vs_cpu_tendon_arm26_step gpu_vs_cpu_tendon_sphere gpu_vs_cpu_tendon_pulley gpu_vs_cpu_tendon_pulley_traj PROPERTIES LABELS "correctness")
+
+    # GPUバッチの健全性(発散・env間不一致・B依存・反復不一致・MuJoCo C比)をnvと拘束の構成ごとに見る。tests/test_robustness.cpp
+    # CI(-R gpu_vs_cpu)は代表だけ(CIのlavapipeはシェーダコンパイルが遅く1ケース約20秒)。全nvの総当たりはrobust_full_*(ラベルrobust_full)。
+    # 既知の失敗(limit/frictionloss/contactで特定のnvだけ発散や非決定、nv>32のtendon等)はrobust_known_issue_*(ラベルknown_issue)に分ける。直ったら通常側へ移す。
+    add_test(NAME gpu_vs_cpu_robust_free COMMAND test_robustness --cfg free --nv 1,9,33)
+    add_test(NAME gpu_vs_cpu_robust_tendon COMMAND test_robustness --cfg tendon --nv 3,17)
+    add_test(NAME gpu_vs_cpu_robust_floss COMMAND test_robustness --cfg floss --nv 3,32)
+    add_test(NAME gpu_vs_cpu_robust_limit COMMAND test_robustness --cfg limit --nv 3,16)
+    add_test(NAME gpu_vs_cpu_robust_contact COMMAND test_robustness --cfg contact --nv 3)
+    # solver実装の切替(共有メモリ版/グローバル版)でも同じ結果になること。
+    add_test(NAME gpu_vs_cpu_robust_global_solver COMMAND test_robustness --case free:17 --case tendon:9 --case floss:17)
+    set_tests_properties(gpu_vs_cpu_robust_global_solver PROPERTIES ENVIRONMENT "MJMLX_SOLVER_SHARED=0")
+    # lavapipeのスレッド数を1にしても同じ結果になること(実GPUでは無害)。CIのCPUと手元のCPUで挙動が割れる障害の再現条件を振る。
+    add_test(NAME gpu_vs_cpu_robust_lp_threads1 COMMAND test_robustness --case free:9 --case tendon:3)
+    set_tests_properties(gpu_vs_cpu_robust_lp_threads1 PROPERTIES ENVIRONMENT "LP_NUM_THREADS=1")
+    set_tests_properties(gpu_vs_cpu_robust_free gpu_vs_cpu_robust_tendon gpu_vs_cpu_robust_floss gpu_vs_cpu_robust_limit gpu_vs_cpu_robust_contact gpu_vs_cpu_robust_global_solver gpu_vs_cpu_robust_lp_threads1 PROPERTIES LABELS "correctness;robust")
+    add_test(NAME robust_full_free COMMAND test_robustness --cfg free)
+    add_test(NAME robust_full_tendon COMMAND test_robustness --cfg tendon --nv 1,3,4,7,8,9,16,17,31,32)
+    add_test(NAME robust_full_floss COMMAND test_robustness --cfg floss --nv 1,3,4,7,8,16,32,33)
+    add_test(NAME robust_full_limit COMMAND test_robustness --cfg limit --nv 1,3,4,7,8,16,32)
+    add_test(NAME robust_full_contact COMMAND test_robustness --cfg contact --nv 3,4)
+    add_test(NAME robust_full_global_solver COMMAND test_robustness --case free:3,9,17,33 --case tendon:3,9 --case floss:3,17 --case limit:3,9 --case contact:3)
+    set_tests_properties(robust_full_global_solver PROPERTIES ENVIRONMENT "MJMLX_SOLVER_SHARED=0")
+    add_test(NAME robust_full_lp_threads1 COMMAND test_robustness --case free:3,9 --case tendon:3,9 --case limit:3 --case floss:3)
+    set_tests_properties(robust_full_lp_threads1 PROPERTIES ENVIRONMENT "LP_NUM_THREADS=1")
+    set_tests_properties(robust_full_free robust_full_tendon robust_full_floss robust_full_limit robust_full_contact robust_full_global_solver robust_full_lp_threads1 PROPERTIES LABELS "robust_full")
+    add_test(NAME robust_known_issue_limit COMMAND test_robustness --cfg limit --nv 9,17,31,33)
+    add_test(NAME robust_known_issue_floss COMMAND test_robustness --cfg floss --nv 9,17,31)
+    add_test(NAME robust_known_issue_contact COMMAND test_robustness --cfg contact --nv 1,7,8,9,16,17,31,32,33)
+    add_test(NAME robust_known_issue_tendon COMMAND test_robustness --cfg tendon --nv 33)
+    add_test(NAME robust_known_issue_global_solver COMMAND test_robustness --case floss:9 --case limit:16,17 --case tendon:16,17 --case contact:1,8,9,16,17)
+    set_tests_properties(robust_known_issue_global_solver PROPERTIES ENVIRONMENT "MJMLX_SOLVER_SHARED=0")
+    set_tests_properties(robust_known_issue_limit robust_known_issue_floss robust_known_issue_contact robust_known_issue_tendon robust_known_issue_global_solver PROPERTIES LABELS "known_issue")
 
     # SDFギア(SDF-SDF衝突)。SDFプラグイン(libsdf_plugin)がMuJoCo配布物に無ければ登録しない。
     find_library(MJMLX_SDF_PLUGIN sdf_plugin PATHS "${MUJOCO_ROOT}/plugin" "${MUJOCO_ROOT}/lib/plugin" NO_DEFAULT_PATH)
