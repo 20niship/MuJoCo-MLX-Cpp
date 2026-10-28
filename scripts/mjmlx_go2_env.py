@@ -106,7 +106,7 @@ def _go2_xml_path() -> str:
     )
 
 
-def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collision: bool = True) -> None:
+def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
     src_path = os.path.abspath(_go2_xml_path())
     assets_dir = os.path.join(os.path.dirname(src_path), "assets")
     with open(src_path) as f:
@@ -117,8 +117,6 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collisio
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
-    if not self_collision:  # 脚・胴体同士の衝突を切って地形との接触だけにする(Isaac LabのUNITREE_GO2_CFGはenabled_self_collisions=False)。衝突ペアが約7分の1になる
-        xml = xml.replace('<default class="collision">\n        <geom group="3"/>', '<default class="collision">\n        <geom group="3" conaffinity="0"/>', 1)
     for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
         old, new = kv.split("->", 1)
         xml = xml.replace(old, new)
@@ -131,6 +129,77 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collisio
     xml = xml.replace("</worldbody>", terrain_geoms)
     with open(out_path, "w") as f:
         f.write(xml)
+
+
+TERM_NAMES = ["track_lin", "track_ang", "lin_vel_z", "ang_vel_xy", "dof_acc", "action_rate", "feet_air_time", "torque", "flat_orientation"]
+METRIC_NAMES = [f"Reward/{k}" for k in TERM_NAMES] + [
+    "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/action_abs", "Metrics/action_rate_abs",
+    "Metrics/ctrl_saturated_frac", "Metrics/joint_vel_abs", "Metrics/joint_pos_dev", "Metrics/base_tilt", "Metrics/feet_air_time",
+    "Metrics/joint_torque_abs", "Metrics/foot_contact_frac", "Termination/base_contact", "Termination/blew_up", "Termination/out_of_terrain", "Termination/time_out",
+]
+
+
+def _make_step_fns(w: dict, terrain_length: float, default_pos: torch.Tensor, ctrl_low: torch.Tensor, ctrl_high: torch.Tensor):
+    """1 stepの観測・報酬・終了判定をまとめた純粋関数を作る。小さいtorch演算が数百個に分かれると起動オーバーヘッドが支配的なので、cudaではtorch.compileで融合する。"""
+
+    def ctrl_fn(action):
+        ctrl_target = default_pos + ACTION_SCALE * action
+        ctrl = torch.minimum(torch.maximum(ctrl_target, ctrl_low), ctrl_high)
+        return ctrl, (ctrl_target != ctrl).float().mean()
+
+    def core(qpos, qvel, contact_force, torque_sq, torque_abs_mean, ctrl_sat, action, last_action, prev_joint_vel, feet_air, last_foot_contact, commands, truncated, ov_base, ov_foot, ov_lin, ov_ang, ov_grav):
+        blew_up = ~(torch.cat([qpos, qvel], dim=1).abs().amax(dim=1) <= 1000.0)  # NaN/infはamaxがNaN/infで比較がFalseになる
+        base_contact = (contact_force[:, 0] > BASE_CONTACT_FORCE_THRESHOLD) if ov_base is None else ov_base
+        foot_contact = (contact_force[:, 1:] > BASE_CONTACT_FORCE_THRESHOLD) if ov_foot is None else ov_foot
+        quat = qpos[:, 3:7]
+        base_lin_vel = _quat_rotate_inverse_t(quat, qvel[:, 0:3]) if ov_lin is None else ov_lin
+        base_ang_vel = qvel[:, 3:6] if ov_ang is None else ov_ang
+        joint_vel = qvel[:, 6:18]
+        projected_gravity = _projected_gravity_t(quat) if ov_grav is None else ov_grav
+        cmd = commands
+        d_lin = cmd[:, 0:2] - base_lin_vel[:, 0:2]
+        lin_err = (d_lin * d_lin).sum(dim=1)
+        ang_err = (cmd[:, 2] - base_ang_vel[:, 2]) ** 2
+        r_track_lin = W_TRACK_LIN * torch.exp(-lin_err / TRACK_STD_SQ)
+        r_track_ang = W_TRACK_ANG * torch.exp(-ang_err / TRACK_STD_SQ)
+        # 接触衝撃の瞬間は速度が物理的に大きく跳ねうるので、二乗前にクリップしてreward発散を防ぐ
+        r_lin_vel_z = w["lin_vel_z"] * base_lin_vel[:, 2].clamp(-20.0, 20.0) ** 2
+        r_ang_vel_xy = w["ang_vel_xy"] * (base_ang_vel[:, 0:2].clamp(-50.0, 50.0) ** 2).sum(dim=1)
+        joint_acc = ((joint_vel - prev_joint_vel) / CONTROL_DT).clamp(-500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
+        r_dof_acc = w["dof_acc"] * (joint_acc**2).sum(dim=1)
+        d_act = action - last_action
+        r_action_rate = w["action_rate"] * (d_act * d_act).sum(dim=1)
+        contact_filt = foot_contact | last_foot_contact
+        first_contact = (feet_air > 0.0) & contact_filt
+        feet_air = feet_air + CONTROL_DT
+        r_air_time = w["feet_air_time"] * ((feet_air - FEET_AIR_TIME_TARGET) * first_contact).sum(dim=1)
+        r_air_time = r_air_time * (cmd[:, 0:2].norm(dim=1) > 0.1)
+        feet_air_new = feet_air * ~contact_filt
+        tilt2 = (projected_gravity[:, 0:2] ** 2).sum(dim=1)
+        r_flat_orient = w["flat_orientation"] * tilt2
+        r_torque = w["torque"] * torque_sq
+        terms = torch.stack([r_track_lin, r_track_ang, r_lin_vel_z, r_ang_vel_xy, r_dof_acc, r_action_rate, r_air_time, r_torque, r_flat_orient])
+        rewards = terms.sum(dim=0)
+        # 未知の接触イベント等でどれかの項が想定外に暴れてもvalue関数の発散を防ぐ最終防衛ライン
+        rewards = torch.where(blew_up, torch.zeros_like(rewards), rewards.clamp(-50.0, 50.0))
+        # 通路の外へ出たら地形が無いので落下して学習に使えない: 終了にする
+        out_of_terrain = (qpos[:, 1].abs() > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > terrain_length)
+        dones = truncated | base_contact | blew_up | out_of_terrain
+        obs = torch.cat([base_lin_vel, base_ang_vel, projected_gravity, cmd, qpos[:, 7:19] - default_pos, qvel[:, 6:18], last_action], dim=1)
+        f = lambda x: x.float().mean()
+        metrics = torch.stack(list(terms.mean(dim=1)) + [
+            lin_err.sqrt().mean(), ang_err.sqrt().mean(), cmd.norm(dim=1).mean(), qpos[:, 2].mean(), action.abs().mean(), d_act.abs().mean(),
+            ctrl_sat, joint_vel.abs().mean(), (qpos[:, 7:19] - default_pos).abs().mean(), tilt2.sqrt().mean(), feet_air.mean(),
+            torch.as_tensor(torque_abs_mean, dtype=torch.float32, device=qpos.device), f(foot_contact), f(base_contact), f(blew_up), f(out_of_terrain), f(truncated),
+        ])
+        return obs, rewards, dones, terms, feet_air_new, foot_contact, metrics, joint_vel.clone(), action.clone()
+
+    if os.environ.get("MJMLX_ENV_COMPILE", "1") != "0" and default_pos.is_cuda:
+        try:
+            return torch.compile(ctrl_fn), torch.compile(core)
+        except Exception:  # noqa: BLE001  # ponytail: compile不可の環境ではeagerで動かす
+            pass
+    return ctrl_fn, core
 
 
 class MjmlxGo2Env(VecEnv):
@@ -149,13 +218,15 @@ class MjmlxGo2Env(VecEnv):
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
         use_sensors: bool = False,
         self_collision: bool = True,
+        max_condim: int = 0,
     ):
         self._native = native_module
         self._w = PRESETS[reward_preset]
         self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
-        build_terrain_model_xml(self.terrain, generated_xml_path, self_collision=self_collision)
+        build_terrain_model_xml(self.terrain, generated_xml_path)
 
-        self._model = native_module.load_model(generated_xml_path)
+        # self_collision=False/max_condim>0は読み込み時にモデルへ適用する簡略化オプション(MJCFファイルは変更しない。精度への影響はREADME参照)
+        self._model = native_module.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
         self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
         self.nq = self._model.nq
         self.nv = self._model.nv
@@ -175,6 +246,9 @@ class MjmlxGo2Env(VecEnv):
                 self._pack = self._sim.set_pack_spec(np.array([BASE_BODY_IDX, *FOOT_BODY_IDX], dtype=np.int32), 6, 12)
             except RuntimeError:
                 pass
+        if self._pack is not None:
+            self._pk_pin = torch.empty((num_envs, self._pack), dtype=torch.float32, pin_memory=torch.cuda.is_available())
+            self._pk_np = self._pk_pin.numpy()
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
         self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
@@ -199,6 +273,7 @@ class MjmlxGo2Env(VecEnv):
         self._prev_joint_vel = torch.zeros((num_envs, self.nu), device=dev)
         self._feet_air_time = torch.zeros((num_envs, 4), device=dev)
         self._last_foot_contact = torch.zeros((num_envs, 4), dtype=torch.bool, device=dev)
+        self._ctrl_fn, self._core = _make_step_fns(self._w, float(self.terrain.total_length), self._default_pos, self._ctrl_low, self._ctrl_high)
         self._next_push_step = self._rng.integers(*PUSH_INTERVAL_STEPS, size=num_envs)
 
         all_mask = np.ones(num_envs, dtype=np.int32)
@@ -306,18 +381,17 @@ class MjmlxGo2Env(VecEnv):
         # 観測・報酬・終了判定はself.device(cudaならGPU)上のtorchで計算する。ホストに残るのは物理への入出力と、リセット/押しの乱数処理だけ
         N, nq, nv = self.num_envs, self.nq, self.nv
         action = actions.detach().to(self.device, dtype=torch.float32)  # IsaacLab同様clipしない(関節目標のみ制御範囲へclip)
-        ctrl_target = self._default_pos + ACTION_SCALE * action
-        ctrl = torch.minimum(torch.maximum(ctrl_target, self._ctrl_low), self._ctrl_high)
-
+        ctrl, ctrl_sat = self._ctrl_fn(action)
         self._sim.step(np.ascontiguousarray(ctrl.cpu().numpy()), DECIMATION)
+        ov_base = ov_foot = ov_lin = ov_ang = ov_grav = None
         if self._pack is not None:
-            pk = self._sim.read_pack()
-            pk_t = self._to_dev(pk)
+            self._sim.read_pack_into(self._pk_np)  # ピン留めバッファへ直接読む
+            pk = self._pk_np
+            pk_t = self._pk_pin.to(self.device, non_blocking=True)
             qpos_h, qvel_h = pk[:, :nq], pk[:, nq:nq + nv]
             qpos, qvel = pk_t[:, :nq], pk_t[:, nq:nq + nv]
             contact_force = pk_t[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
             torque_sq, torque_abs_mean = pk_t[:, nq + nv + 5], pk_t[:, nq + nv + 6].sum() / (N * 12)
-            blew_up = ~(pk_t[:, :nq + nv].abs().amax(dim=1) <= 1000.0)  # NaN/infはamaxがNaN/infで比較がFalseになる
         else:
             qpos_h, qvel_h = self._sim.state()
             qpos, qvel = self._to_dev(qpos_h), self._to_dev(qvel_h)
@@ -328,81 +402,22 @@ class MjmlxGo2Env(VecEnv):
             except AttributeError:
                 joint_torque = torch.zeros((N, 12), device=self.device)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
             torque_sq, torque_abs_mean = (joint_torque**2).sum(dim=1), joint_torque.abs().mean()
-            blew_up = ~(torch.cat([qpos, qvel], dim=1).abs().amax(dim=1) <= 1000.0)
         if self._hub is not None:
             self._hub.read()
             self._feet_contact_sensor.update(CONTROL_DT)
             self._base_contact_sensor.update(CONTROL_DT)
-            base_contact = self._base_contact_sensor.is_contact[:, 0].to(self.device)
-            foot_contact = self._feet_contact_sensor.is_contact.to(self.device)
-        else:
-            base_contact = contact_force[:, 0] > BASE_CONTACT_FORCE_THRESHOLD
-            foot_contact = contact_force[:, 1:] > BASE_CONTACT_FORCE_THRESHOLD
-
-        quat = qpos[:, 3:7]
-        base_lin_vel = _quat_rotate_inverse_t(quat, qvel[:, 0:3])
-        base_ang_vel = qvel[:, 3:6]
-        joint_vel = qvel[:, 6:18]
-        projected_gravity = _projected_gravity_t(quat)
-
-        cmd = self._commands
-        w = self._w
-        d_lin = cmd[:, 0:2] - base_lin_vel[:, 0:2]
-        lin_err = (d_lin * d_lin).sum(dim=1)
-        ang_err = (cmd[:, 2] - base_ang_vel[:, 2]) ** 2
-        r_track_lin = W_TRACK_LIN * torch.exp(-lin_err / TRACK_STD_SQ)
-        r_track_ang = W_TRACK_ANG * torch.exp(-ang_err / TRACK_STD_SQ)
-        # 接触衝撃の瞬間は速度が物理的に大きく跳ねうるので、二乗前にクリップしてreward発散を防ぐ
-        r_lin_vel_z = w["lin_vel_z"] * base_lin_vel[:, 2].clamp(-20.0, 20.0) ** 2
-        r_ang_vel_xy = w["ang_vel_xy"] * (base_ang_vel[:, 0:2].clamp(-50.0, 50.0) ** 2).sum(dim=1)
-        joint_acc = ((joint_vel - self._prev_joint_vel) / CONTROL_DT).clamp(-500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
-        r_dof_acc = w["dof_acc"] * (joint_acc**2).sum(dim=1)
-        d_act = action - self._last_action
-        r_action_rate = w["action_rate"] * (d_act * d_act).sum(dim=1)
-
-        contact_filt = foot_contact | self._last_foot_contact
-        first_contact = (self._feet_air_time > 0.0) & contact_filt
-        self._feet_air_time = self._feet_air_time + CONTROL_DT
-        r_air_time = w["feet_air_time"] * ((self._feet_air_time - FEET_AIR_TIME_TARGET) * first_contact).sum(dim=1)
-        r_air_time = r_air_time * (cmd[:, 0:2].norm(dim=1) > 0.1)
-        self._feet_air_time = self._feet_air_time * ~contact_filt
-        self._last_foot_contact = foot_contact
-
-        tilt2 = (projected_gravity[:, 0:2] ** 2).sum(dim=1)
-        r_flat_orient = w["flat_orientation"] * tilt2
-        r_torque = w["torque"] * torque_sq
-
-        terms = {
-            "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
-            "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque, "flat_orientation": r_flat_orient,
-        }
-        self.last_reward_terms = terms
-        rewards = r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque + r_flat_orient
-        # 未知の接触イベント等でどれかの項が想定外に暴れてもvalue関数の発散を防ぐ最終防衛ライン
-        rewards = torch.where(blew_up, torch.zeros_like(rewards), rewards.clamp(-50.0, 50.0))
+            ov_base = self._base_contact_sensor.is_contact[:, 0].to(self.device)
+            ov_foot = self._feet_contact_sensor.is_contact.to(self.device)
+            ov_lin, ov_ang, ov_grav = (t.to(self.device) for t in (self._imu.lin_vel_b, self._imu.ang_vel_b, self._imu.projected_gravity_b))
 
         self._elapsed += 1
         truncated = self._to_dev(self._elapsed >= MAX_EPISODE_STEPS)
-        # 通路の外へ出たら地形が無いので落下して学習に使えない: 終了にする
-        out_of_terrain = (qpos[:, 1].abs() > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > self.terrain.total_length)
-        terminated = base_contact | blew_up | out_of_terrain
-        dones = truncated | terminated
-
-        obs = self._obs(qpos, qvel, from_sensors=self._hub is not None)
-        # ログ用の指標(リセット前の値)。まとめて1回の転送でホストへ戻す
-        metric_names = [f"Reward/{k}" for k in terms] + [
-            "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/action_abs", "Metrics/action_rate_abs",
-            "Metrics/ctrl_saturated_frac", "Metrics/joint_vel_abs", "Metrics/joint_pos_dev", "Metrics/base_tilt", "Metrics/feet_air_time",
-            "Metrics/joint_torque_abs", "Metrics/foot_contact_frac", "Termination/base_contact", "Termination/blew_up", "Termination/out_of_terrain", "Termination/time_out",
-        ]
-        metric_vals = [v.mean() for v in terms.values()] + [
-            lin_err.sqrt().mean(), ang_err.sqrt().mean(), cmd.norm(dim=1).mean(), qpos[:, 2].mean(), action.abs().mean(), d_act.abs().mean(),
-            (ctrl_target != ctrl).float().mean(), joint_vel.abs().mean(), (qpos[:, 7:19] - self._default_pos).abs().mean(), tilt2.sqrt().mean(), self._feet_air_time.mean(),
-            torch.as_tensor(torque_abs_mean, device=self.device, dtype=torch.float32), foot_contact.float().mean(), base_contact.float().mean(), blew_up.float().mean(),
-            out_of_terrain.float().mean(), truncated.float().mean(),
-        ]
-        self._last_action = action.clone()
-        self._prev_joint_vel = joint_vel.clone()
+        obs, rewards, dones, terms, feet_air, foot_contact, metrics, joint_vel, last_action = self._core(
+            qpos, qvel, contact_force, torque_sq, torque_abs_mean, ctrl_sat, action, self._last_action, self._prev_joint_vel, self._feet_air_time,
+            self._last_foot_contact, self._commands, truncated, ov_base, ov_foot, ov_lin, ov_ang, ov_grav)
+        self.last_reward_terms = dict(zip(TERM_NAMES, terms))
+        self._feet_air_time, self._last_foot_contact = feet_air, foot_contact
+        self._last_action, self._prev_joint_vel = last_action, joint_vel
 
         dones_h = dones.cpu().numpy()  # リセット対象の確定(ホストの乱数処理に必要)
         push_due = self._elapsed >= self._next_push_step
@@ -423,7 +438,7 @@ class MjmlxGo2Env(VecEnv):
             self._sim.set_state(qpos2, qvel2)
 
         # rsl_rl が iteration ごとに平均して tensorboard/標準出力へ書く。報酬は項ごとのstep平均(重み込み)、Metricsは追従誤差など
-        log = dict(zip(metric_names, torch.stack(metric_vals).tolist()))
+        log = dict(zip(METRIC_NAMES, metrics.tolist()))
         extras = {"time_outs": truncated, "log": log}
         return self._obs_tensordict(obs), rewards, dones.long(), extras
 

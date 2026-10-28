@@ -16,9 +16,11 @@
 // Port of Python mjmlx._src.io (put_model, make_data, put_data).
 
 #include "internal.h"
+#include "mjmlx/mjmlx.h"
 #include <mujoco/mujoco.h>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 #include <unistd.h>
 
@@ -439,10 +441,38 @@ static void validate_model(const mjModel* m) {
 
 // Load a MuJoCo C model and convert to internal Model.
 // Returns {Model, mjModel*} pair -- caller owns the mjModel*.
-std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
+std::pair<Model, mjModel*> load_model_pair(const char* xml_path, const ModelLoadOptions& opts) {
     camera_prepare_device(); // mkxが最初にVulkanを使う前(配列確保前)に呼ぶ必要がある
     char error[1000] = "";
-    mjModel* m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+    mjModel* m = nullptr;
+    if (opts.self_collision && opts.max_condim <= 0) {
+        m = mj_loadXML(xml_path, nullptr, error, sizeof(error));
+    } else {
+        // オプション指定時はMJCFをspecとして読み、ロボットのgeomを書き換えてからコンパイルする(元ファイルは変更しない)
+        mjSpec* spec = mj_parseXML(xml_path, nullptr, error, sizeof(error));
+        if (!spec) throw std::runtime_error(std::string("mj_parseXML failed: ") + error);
+        // 「ロボット」= 関節を持つbodyとその子孫。地形などの静的body(関節なし)のgeomは書き換えない
+        mjsBody* world = mjs_findBody(spec, "world");
+        std::unordered_set<mjsBody*> jointed;
+        for (mjsElement* e = mjs_firstElement(spec, mjOBJ_JOINT); e; e = mjs_nextElement(spec, e)) jointed.insert(mjs_getParent(e));
+        for (mjsElement* e = mjs_firstElement(spec, mjOBJ_GEOM); e; e = mjs_nextElement(spec, e)) {
+            bool robot = false;
+            for (mjsBody* b = mjs_getParent(e); b && b != world; b = mjs_getParent(b->element)) {
+                if (jointed.count(b)) { robot = true; break; }
+            }
+            if (!robot) continue;
+            mjsGeom* g = mjs_asGeom(e);
+            if (!opts.self_collision) g->conaffinity = 0;
+            if (opts.max_condim > 0 && g->condim > opts.max_condim) g->condim = opts.max_condim;
+        }
+        m = mj_compile(spec, nullptr);
+        if (!m) {
+            std::string msg = mjs_getError(spec);
+            mj_deleteSpec(spec);
+            throw std::runtime_error("mj_compile failed: " + msg);
+        }
+        mj_deleteSpec(spec);
+    }
     if (!m) {
         throw std::runtime_error(std::string("mj_loadXML failed: ") + error);
     }
@@ -451,7 +481,7 @@ std::pair<Model, mjModel*> load_model_pair(const char* xml_path) {
     return {std::move(model), m};
 }
 
-std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string) {
+std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string, const ModelLoadOptions& opts) {
     char tmppath[] = "/tmp/mjmlx_model_XXXXXX.xml";
     int fd = mkstemps(tmppath, 4);
     if (fd < 0) throw std::runtime_error("Failed to create temp file for XML");
@@ -463,7 +493,7 @@ std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string) {
         throw std::runtime_error("Failed to write XML to temp file");
     }
     try {
-        auto result = load_model_pair(tmppath);
+        auto result = load_model_pair(tmppath, opts);
         unlink(tmppath);
         return result;
     } catch (...) {
@@ -1606,10 +1636,22 @@ void Model::init_cache() const {
 
 extern "C" {
 
-MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
+static mjmlx::ModelLoadOptions to_load_options(const MjmlxModelOptions* o) {
+    mjmlx::ModelLoadOptions r;
+    if (o) { r.self_collision = o->self_collision != 0; r.max_condim = o->max_condim; }
+    return r;
+}
+
+MJMLX_API MjmlxModelOptions mjmlx_default_model_options(void) { return MjmlxModelOptions{1, 0}; }
+
+MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) { return mjmlx_load_model_ex(xml_path, nullptr); }
+
+MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string) { return mjmlx_load_model_from_string_ex(xml_string, nullptr); }
+
+MJMLX_API MjmlxModel* mjmlx_load_model_ex(const char* xml_path, const MjmlxModelOptions* options) {
     try {
         auto* handle = new MjmlxModel();
-        auto [model, mj] = mjmlx::load_model_pair(xml_path);
+        auto [model, mj] = mjmlx::load_model_pair(xml_path, to_load_options(options));
         handle->model = std::move(model);
         handle->mj_model = mj;
         return handle;
@@ -1619,10 +1661,10 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path) {
     }
 }
 
-MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string) {
+MJMLX_API MjmlxModel* mjmlx_load_model_from_string_ex(const char* xml_string, const MjmlxModelOptions* options) {
     try {
         auto* handle = new MjmlxModel();
-        auto [model, mj] = mjmlx::load_model_from_string_pair(xml_string);
+        auto [model, mj] = mjmlx::load_model_from_string_pair(xml_string, to_load_options(options));
         handle->model = std::move(model);
         handle->mj_model = mj;
         return handle;

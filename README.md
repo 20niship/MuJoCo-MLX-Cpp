@@ -301,6 +301,62 @@ Vulkanタイムスタンプによる16384 envの内訳: GPU 約36ms/step(solver 
 **重要: 計測条件でGPUクロックが約2倍変わる。** CUDAコンテキストを持たないcpu deviceのベンチでは、Vulkan計算だけのGPU使用率が低くSMクロックが上がらない(計測中の平均SMクロック 約550MHz)。`device=cuda`(学習と同じ)ではtorchの活動でクロックが上がり(約1140MHz)、同じコードが約1.5〜1.6倍速い(4096 envで cpu device 195k → cuda device 308k)。GenesisはCUDA上で動くため、学習時の条件(cuda device)で比べるのが公平で、その条件ではGenesisの過去値を全env数で上回った(256 envはほぼ同等)。cpu deviceのベンチ値(前節まで)は低クロック状態の値。
 未実施: solverの単位行の疎化、カーネル融合(ts計測ではdispatch間の隙間はほぼ無く効果は小さい見込み)、mlx_vulkanのグラフキャッシュ(PR #6。入力・ctrlを永続バッファに置く設計変更が必要で、削れるのはホストのグラフ構築 約1ms/stepのみ)。
 
+
+### 9. ホスト側のオーバーヘッド削減と高速モード(暫定値、すべて `device=cuda`・SMクロック約1840MHz)
+
+#47 に対する同一セッション・交互3回(平均 env-steps/s):
+
+| env数 | Before(#47) | After(既定設定) | 倍率 | 高速モード | 倍率 |
+|---|---|---|---|---|---|
+| 4096 | 318,967 | 409,549 | 1.28倍 | 480,278 | 1.50倍 |
+| 16384 | 432,840 | 526,102 | 1.22倍 | 649,196 | 1.50倍 |
+
+高速モード = 読み込み時オプション `self_collision=False, max_condim=3`(下記「シミュレーション簡略化オプション」。既定は従来どおり正確なモデル)。
+
+最適化ごとの効果(`env.step` の内訳、4096 env / 16384 env の ms):
+
+| 変更 | 4096 env | 16384 env |
+|---|---|---|
+| (起点 #47) | 12.16 | 37.92 |
+| `env.step` の観測・報酬を `torch.compile` で融合(「その他」3.48→1.65ms) | 10.28 | 36.25 |
+| 接触無し経路用の `cfrc_ext` ゼロ配列(毎substep 1.4MB)の確保をやめる(グラフ構築 1.34→0.40ms) | 9.38 | 31.33 |
+| `read_pack_into`(ピン留めバッファへ直接読む、H2Dを非同期に) | 9.26 | 30.65 |
+
+分析: ブースト状態ではGPU時間は4096 envで約6.1ms/step(solver 約75%)、ホスト側が約3.2msだった。`mx::zeros` による毎substepのホストでのゼロ埋めがグラフ構築の大半(約250us/substep)で、これを除くとmlx_vulkanのグラフキャッシュ(replay)で削れるものは残らない。dispatch間の隙間はほぼ無く、カーネル融合の見込み効果も小さい。ブロック幅・スレッドグループ・NTOL/共有メモリ上限の再調整は効果なし。
+既定設定で目標(4096 env 470k)に届かなかった理由はsolverの共有メモリ命令数が律速のためで、残る手は18スレッド/envから32スレッド/envへの変更や単位行の疎化(いずれも10%前後の見込み)。
+
+
+### 10. シミュレーション簡略化オプション(読み込み時、既定は正確なモデルのまま)
+
+速度のために接触モデルを簡略化するオプション。**MJCFファイルは変更せず**、読み込み時にメモリ上のモデルを上書きしてからコンパイルする(関節を持つbodyとその子孫=ロボットのgeomだけが対象で、地形などの静的bodyのgeomは触らない)。既定(`self_collision=True, max_condim=0`)は従来と完全に同じ挙動。
+
+| オプション | 内容 | 精度への影響 |
+|---|---|---|
+| `self_collision=False` | ロボットのgeom同士の衝突を切る(geomの `conaffinity` を0に)。Isaac Labの `enabled_self_collisions=False` と同じ。ロボットのgeomは `contype!=0`(MuJoCo既定は1)が前提 | 脚と胴体などの自己接触が起きなくなる(通常の歩行では稀)。衝突ペアが約1/10(Go2: 233→23) |
+| `max_condim=3` | ロボットのgeomの `condim` を3以下にする。足(condim 6)の**ねじり摩擦・転がり摩擦が無くなり**並進摩擦のみになる(Isaac Lab/Genesisと同じ) | 足の接触の拘束行が10→4行でsolverが速い。足先で滑る・回る挙動がわずかに変わる。CPU(MuJoCo C)との比較は同じオプションを両方に渡して行う |
+
+使い方:
+```c
+MjmlxModelOptions opt = mjmlx_default_model_options();   // {self_collision=1, max_condim=0}
+opt.self_collision = 0; opt.max_condim = 3;
+MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);      // mjmlx_load_model_from_string_ex もある。既存のmjmlx_load_modelは従来どおり
+```
+```python
+model = native.load_model(path, self_collision=False, max_condim=3)           # 低レベル
+env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)       # Go2環境
+```
+CLI: `bench_go2_step.py --no-self-collision --max-condim 3`、`train_go2_ppo.py --no-self-collision --max-condim 3`、`compare_cpu_gpu_go2.py --max-condim 3`。
+
+速度(4096 env / 16384 env、device=cuda、SMクロック1837MHz、同一セッション交互3回の平均 env-steps/s):
+
+| | 4096 env | 16384 env |
+|---|---|---|
+| 既定(正確) | 409,103 | 527,604 |
+| `max_condim=3` | 467,660(1.15倍) | 638,882(1.21倍) |
+| `self_collision=False, max_condim=3` | 481,351(1.17倍) | 648,499(1.23倍) |
+
+CPUとの1step差(関節角、`compare_cpu_gpu_go2.py`): 既定は 平均3.6e-5 rad・p95 8e-7 rad、`--max-condim 3`(CPU・GPUの両方に同じオプション)は 平均1.4e-5 rad・p95 5e-7 rad。GPUとCPUが同じ簡略モデルを解いているかの確認であり、簡略化自体による本来の物理との差(足のねじり・転がり摩擦の欠落)は含まない。
+
 ## Architecture
 
 ```
