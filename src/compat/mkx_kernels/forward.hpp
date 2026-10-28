@@ -9,6 +9,8 @@
 
 #include <mkx/ops/fast_kernel.hpp>
 
+#include "tendon.hpp"
+
 // MuJoCo-MLX-Cpp
 // make_forward_source(CRB法での質量行列組み立て+RNEでのqfrc_bias算出)の逐語GLSL移植。mkxにはMuJoCoのModel型が無いため、元コードがポインタで直接読んでいたモデル定数はホスト配列を引数で渡す設計にした。act_bias1/act_bias2は元のMSLでも本体未参照の死んだ定数のため省略、初期化子リスト`{a,b,c}`はGLSL非対応のため`TYPE[](a,b,c)`構文に置換した。
 
@@ -48,8 +50,9 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
                                              const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0,
                                              const std::vector<float>& act_gain1, const std::vector<float>& act_gain2, const std::vector<float>& act_bias1, const std::vector<float>& act_bias2,
-                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp) {
+                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp, const TendonHost* th = nullptr) {
   using namespace detail_forward;
+  const bool has_ten = th && th->nten > 0;
 
   int off_crb          = 0;
   int off_cdof         = nb * 10;
@@ -60,7 +63,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   int off_submass      = off_subpos + nb * 3;
   int off_qfrc_bias    = off_submass + nb;
   int off_qfrc_passive = off_qfrc_bias + nv;
-  int scratch_per_env  = off_qfrc_passive + nv;
+  int off_ten          = off_qfrc_passive + nv;
+  int scratch_per_env  = off_ten + (has_ten ? tendon_scratch_floats(th->nten, nv) : 0);
 
   std::ostringstream ss;
 
@@ -99,6 +103,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "const int S_SUBM = " << off_submass << ";\n"
      << "const int S_BIAS = " << off_qfrc_bias << ";\n"
      << "const int S_PASS = " << off_qfrc_passive << ";\n\n";
+  if(has_ten) ss << "const int S_TEN = " << off_ten << ";\n\n";
 
   ss << "const int body_par[" << nb << "] = " << int_array_literal(body_parentid) << ";\n";
   ss << "const int body_root[" << nb << "] = " << int_array_literal(body_rootid) << ";\n";
@@ -122,6 +127,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss << "const float act_gear[" << nu << "] = " << float_array_literal(act_gear) << ";\n";
     ss << "const int act_qa[" << nu << "] = " << int_array_literal(act_qposadr) << ";\n";
     ss << "const int act_da[" << nu << "] = " << int_array_literal(act_dofadr) << ";\n";
+    if(has_ten && th->has_tendon_actuator) ss << "const int act_ten[" << nu << "] = " << int_array_literal(th->act_tendon) << ";\n";
   }
 
   ss << "const int dof_jtype[" << nv << "] = " << int_array_literal(dof_jtype) << ";\n";
@@ -219,6 +225,8 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  }\n"
      << "  for (int k=0;k<6;k++) scratch[SCR_IDX(S_CDOF + di*6+k)] = c6[k];\n"
      << "}\n\n";
+
+  if(has_ten) emit_tendon_phase(ss, *th, nv, body_parentid, body_dofs);
 
   // ═══ Phase B: CRB → mass matrix ═══
   ss << "// Phase B: CRB + mass matrix\n";
@@ -391,15 +399,23 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "  if (dof_damp[di] != 0.0f) f -= dof_damp[di] * qvel[v_off+di];\n"
      << "  scratch[SCR_IDX(S_PASS+di)] = f;\n"
      << "}\n";
+  if(has_ten) emit_tendon_passive(ss, *th, nv);
 
+  const bool ten_act = has_ten && th->has_tendon_actuator;
   if(nu > 0) {
+    // tendon transmissionのactuatorは長さ・速度・momentをtendonのlength/velocity/Jから取る(spatialは時変)。
     ss << "for (int di=0;di<NV;di++) {\n"
        << "  float fa = 0.0f;\n"
        << "  for (int ai=0;ai<NU;ai++) {\n"
-       << "    float mom = act_moment[ai*NV+di];\n"
-       << "    if (mom != 0.0f) {\n"
-       << "      float len = qpos[q_off+act_qa[ai]] * act_gear[ai];\n"
-       << "      float vel = qvel[v_off+act_da[ai]] * act_gear[ai];\n"
+       << "    float mom = act_moment[ai*NV+di];\n";
+    if(ten_act) ss << "    int tn = act_ten[ai];\n"
+                   << "    if (tn >= 0) mom = act_gear[ai] * scratch[SCR_IDX(S_TEN+tn*(NV+2)+2+di)];\n";
+    ss << "    if (mom != 0.0f) {\n";
+    if(ten_act) ss << "      float len = (tn >= 0) ? scratch[SCR_IDX(S_TEN+tn*(NV+2))] * act_gear[ai] : qpos[q_off+act_qa[ai]] * act_gear[ai];\n"
+                   << "      float vel = (tn >= 0) ? scratch[SCR_IDX(S_TEN+tn*(NV+2)+1)] * act_gear[ai] : qvel[v_off+act_da[ai]] * act_gear[ai];\n";
+    else ss << "      float len = qpos[q_off+act_qa[ai]] * act_gear[ai];\n"
+            << "      float vel = qvel[v_off+act_da[ai]] * act_gear[ai];\n";
+    ss
        << "      float gain = act_g0[ai] + act_g1[ai]*len + act_g2[ai]*vel;\n"
        << "      float bias = act_b0[ai] + act_b1[ai]*len + act_b2[ai]*vel;\n"
        << "      float force = gain * ctrl[u_off+ai] + bias;\n"
@@ -437,6 +453,9 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "for (int di=0;di<NV;di++) for (int k=0;k<6;k++)\n"
      << "  cdof_out[uint(di*6+k)*NBATCH+bid] = scratch[SCR_IDX(S_CDOF+di*6+k)];\n";
 
+  // solverがtendonのlimit/frictionに使うため、Phase Tの結果(SoA)を出力に書く。
+  if(has_ten) ss << "for (int i=0;i<" << tendon_scratch_floats(th->nten, nv) << ";i++) ten_out[uint(i)*NBATCH+bid] = scratch[SCR_IDX(S_TEN+i)];\n";
+
   (void)dt;
 
   // 作業領域(scratch)はスレッドごとの配列(ローカルメモリ)に置く。グローバルのscratchだと依存した読み書きが1回ごとにL2レイテンシ(数百cycle)を待ち、forwardの時間の大半を占めた。MJMLX_FWD_GLOBAL_SCRATCH=1で従来のグローバル版。
@@ -447,7 +466,17 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     for(size_t q = src.find(from); q != std::string::npos; q = src.find(from, q)) { src.replace(q, from.size(), to); q += to.size(); }
     src = "float scrl[" + std::to_string(scratch_per_env) + "];\n" + src;
   }
-  return mkx::fast::compute_kernel("mjmlx_forward", {"xipos", "ximat", "xanchor", "xaxis", "xmat", "qpos", "qvel", "ctrl", "act_moment"}, {"qM_out", "qfrc_smooth_out", "subtree_com_out", "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"}, src, "");
+  std::vector<std::string> in_names = {"xipos", "ximat", "xanchor", "xaxis", "xmat", "qpos", "qvel", "ctrl", "act_moment"};
+  std::vector<std::string> out_names = {"qM_out", "qfrc_smooth_out", "subtree_com_out", "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"};
+  std::string header;
+  if(has_ten) {
+    out_names.push_back("ten_out");
+    if(th->has_spatial) {
+      for(const char* n : {"xpos", "geom_xpos", "geom_xmat"}) in_names.push_back(n);
+      header = tendon_glsl_header(*th);
+    }
+  }
+  return mkx::fast::compute_kernel("mjmlx_forward", in_names, out_names, src, header);
 }
 
 } // namespace mjmlx::mkx_kernels

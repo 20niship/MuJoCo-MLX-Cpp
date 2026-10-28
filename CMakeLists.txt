@@ -246,6 +246,10 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(bench_tendon tests/bench_tendon.cpp)
+    target_link_libraries(bench_tendon PRIVATE mjmlx)
+    target_include_directories(bench_tendon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
     add_executable(test_gpu_accuracy tests/test_gpu_accuracy.cpp)
     target_link_libraries(test_gpu_accuracy PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(test_gpu_accuracy PRIVATE
@@ -328,6 +332,14 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME gpu_vs_cpu_high_dof COMMAND test_gpu_vs_cpu ${_M}/high_dof_tree.xml 0.5 0.5 3.0)
     add_test(NAME gpu_vs_cpu_contact_stress COMMAND test_gpu_vs_cpu ${_M}/contact_stress.xml 1e-2 5e-2 0.5)
     set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
+
+    # tendon(固定/空間)のGPUバッチ vs MuJoCo C。arm26はcylinder wrap+sidesite+2geom、sphereは球wrap+sidesite+spring、pulleyは滑車+limit+frictionloss+tendon駆動actuator。
+    add_test(NAME gpu_vs_cpu_tendon_arm26 COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
+    add_test(NAME gpu_vs_cpu_tendon_arm26_step COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml 1e-4 1e-4 1e-3)
+    add_test(NAME gpu_vs_cpu_tendon_sphere COMMAND test_gpu_vs_cpu ${_M}/tendon_sphere.xml 1e-4 1e-4 1e-2)
+    add_test(NAME gpu_vs_cpu_tendon_pulley COMMAND test_gpu_vs_cpu ${_M}/tendon_pulley.xml 1e-4 1e-4 1e-3)
+    add_test(NAME gpu_vs_cpu_tendon_pulley_traj COMMAND test_gpu_vs_cpu ${_M}/tendon_pulley.xml --seconds 3 --ctrl sin --tol-joint 1e-3)
+    set_tests_properties(gpu_vs_cpu_tendon_arm26 gpu_vs_cpu_tendon_arm26_step gpu_vs_cpu_tendon_sphere gpu_vs_cpu_tendon_pulley gpu_vs_cpu_tendon_pulley_traj PROPERTIES LABELS "correctness")
 
     # SDFギア(SDF-SDF衝突)。SDFプラグイン(libsdf_plugin)がMuJoCo配布物に無ければ登録しない。
     find_library(MJMLX_SDF_PLUGIN sdf_plugin PATHS "${MUJOCO_ROOT}/plugin" "${MUJOCO_ROOT}/lib/plugin" NO_DEFAULT_PATH)
