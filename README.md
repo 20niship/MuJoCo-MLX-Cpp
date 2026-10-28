@@ -284,6 +284,23 @@ Genesisの8192/16384 envは各1回の測定(8192: 約288k、16384: 約313k)で�
 Vulkanタイムスタンプによる16384 envの内訳: GPU 約36ms/step(solver 約72%、forward 約14%、kinematics 約6%、collision 約5%)、残りはホスト(readback・numpy)。大env数ではGPU時間そのもの(solverの共有メモリ命令数、forwardのローカルメモリ)が律速で、次の手はsolverのJから単位行(frictionloss/limit)を外す疎化、forward/kinematics/collisionの融合、env.stepの観測・報酬のGPU(torch)化。
 **この参照更新はmlx_vulkan #12 のマージ後に、mainのマージコミットへ更新するまでmainにマージしない。**
 
+
+### 8. 観測・報酬のtorch(GPU)化とGPUクロックの影響(暫定値)
+
+`env.step` の観測・報酬・終了判定を `device` 上のtorchで計算するようにした(ホストに残るのは物理への入出力とリセット/押しの乱数処理のみ。cpu deviceでは従来とobs 1.5e-7、reward 5e-7まで一致)。ランダムaction、同一セッション・交互3回、`device=cuda`(`PYTHONPATH=~/torch-cu126`、学習時と同じ条件)での平均 env-steps/s:
+
+| env数 | Before(main) | After | 倍率 | Genesis(過去値) |
+|---|---|---|---|---|
+| 256 | 67,515 | 63,297 | 0.94倍 | 約60k |
+| 1,024 | 173,874 | 192,823 | 1.11倍 | 約154k |
+| 4,096 | 307,812 | 311,661 | 1.01倍 | 約252k |
+| 16,384 | 348,304 | 426,645 | 1.23倍 | 約313k |
+
+小env数ではtorchの細かいカーネル起動が増えて僅かに遅く(256 envで0.94倍)、大env数ほど効く。Isaac Lab/Genesisは再計測しておらず過去値。
+
+**重要: 計測条件でGPUクロックが約2倍変わる。** CUDAコンテキストを持たないcpu deviceのベンチでは、Vulkan計算だけのGPU使用率が低くSMクロックが上がらない(計測中の平均SMクロック 約550MHz)。`device=cuda`(学習と同じ)ではtorchの活動でクロックが上がり(約1140MHz)、同じコードが約1.5〜1.6倍速い(4096 envで cpu device 195k → cuda device 308k)。GenesisはCUDA上で動くため、学習時の条件(cuda device)で比べるのが公平で、その条件ではGenesisの過去値を全env数で上回った(256 envはほぼ同等)。cpu deviceのベンチ値(前節まで)は低クロック状態の値。
+未実施: solverの単位行の疎化、カーネル融合(ts計測ではdispatch間の隙間はほぼ無く効果は小さい見込み)、mlx_vulkanのグラフキャッシュ(PR #6。入力・ctrlを永続バッファに置く設計変更が必要で、削れるのはホストのグラフ構築 約1ms/stepのみ)。
+
 ## Architecture
 
 ```

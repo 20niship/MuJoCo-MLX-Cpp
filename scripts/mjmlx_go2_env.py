@@ -76,6 +76,18 @@ def _rowdot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.einsum("ij,ij->i", a, b)
 
 
+def _quat_rotate_inverse_t(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """ワールド座標系のvをbody座標系へ(qの逆回転)。q: (N,4)wxyz, v: (N,3)。"""
+    w, xyz = q[:, :1], q[:, 1:]
+    t = 2.0 * torch.cross(-xyz, v, dim=1)
+    return v + w * t + torch.cross(-xyz, t, dim=1)
+
+
+def _projected_gravity_t(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return torch.stack([2.0 * (w * y - x * z), -2.0 * (y * z + w * x), 2.0 * (x * x + y * y) - 1.0], dim=1)
+
+
 def _yaw_to_quat(yaw: np.ndarray) -> np.ndarray:
     half = yaw / 2.0
     return np.stack([np.cos(half), np.zeros_like(yaw), np.zeros_like(yaw), np.sin(half)], axis=1).astype(np.float32)
@@ -178,11 +190,15 @@ class MjmlxGo2Env(VecEnv):
         self.cmd_vel_max = cmd_vel_max
         self._rng = np.random.default_rng(seed)
         self._elapsed = np.zeros(num_envs, dtype=np.int64)
-        self._commands = np.zeros((num_envs, 3), dtype=np.float32)
-        self._last_action = np.zeros((num_envs, self.nu), dtype=np.float32)
-        self._prev_joint_vel = np.zeros((num_envs, self.nu), dtype=np.float32)
-        self._feet_air_time = np.zeros((num_envs, 4), dtype=np.float32)
-        self._last_foot_contact = np.zeros((num_envs, 4), dtype=bool)
+        dev = self.device
+        self._default_pos = torch.from_numpy(DEFAULT_JOINT_POS).to(dev)
+        self._ctrl_low = torch.from_numpy(CTRL_LOW).to(dev)
+        self._ctrl_high = torch.from_numpy(CTRL_HIGH).to(dev)
+        self._commands = torch.zeros((num_envs, 3), device=dev)
+        self._last_action = torch.zeros((num_envs, self.nu), device=dev)
+        self._prev_joint_vel = torch.zeros((num_envs, self.nu), device=dev)
+        self._feet_air_time = torch.zeros((num_envs, 4), device=dev)
+        self._last_foot_contact = torch.zeros((num_envs, 4), dtype=torch.bool, device=dev)
         self._next_push_step = self._rng.integers(*PUSH_INTERVAL_STEPS, size=num_envs)
 
         all_mask = np.ones(num_envs, dtype=np.int32)
@@ -245,39 +261,38 @@ class MjmlxGo2Env(VecEnv):
         qvel[idx, 6:18] = 0.0
 
         self._elapsed[idx] = 0
-        self._commands[idx] = self._sample_commands(n)
-        self._last_action[idx] = 0.0
-        self._prev_joint_vel[idx] = 0.0
-        self._feet_air_time[idx] = 0.0
-        self._last_foot_contact[idx] = False
+        idx_t = torch.from_numpy(idx).to(self.device)
+        self._commands[idx_t] = torch.from_numpy(self._sample_commands(n)).to(self.device)
+        self._last_action[idx_t] = 0.0
+        self._prev_joint_vel[idx_t] = 0.0
+        self._feet_air_time[idx_t] = 0.0
+        self._last_foot_contact[idx_t] = False
         self._next_push_step[idx] = self._elapsed[idx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=n)
 
-    def _obs(self, qpos: np.ndarray, qvel: np.ndarray, from_sensors: bool = False, rows: np.ndarray | None = None) -> np.ndarray:
-        """rowsを渡すとそのenvだけの観測(qpos/qvelもその行分を渡す)。"""
+    def _obs(self, qpos: torch.Tensor, qvel: torch.Tensor, rows: torch.Tensor | None = None, from_sensors: bool = False) -> torch.Tensor:
+        """観測(N,48)。rowsを渡すとそのenvだけ(qpos/qvelもその行分を渡す)。"""
         cmd = self._commands if rows is None else self._commands[rows]
         last_action = self._last_action if rows is None else self._last_action[rows]
         if from_sensors:
-            base_lin_vel = self._imu.lin_vel_b.cpu().numpy()
-            base_ang_vel = self._imu.ang_vel_b.cpu().numpy()
-            projected_gravity = self._imu.projected_gravity_b.cpu().numpy()
+            base_lin_vel = self._imu.lin_vel_b.to(self.device)
+            base_ang_vel = self._imu.ang_vel_b.to(self.device)
+            projected_gravity = self._imu.projected_gravity_b.to(self.device)
         else:
             quat = qpos[:, 3:7]
-            base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
+            base_lin_vel = _quat_rotate_inverse_t(quat, qvel[:, 0:3])
             base_ang_vel = qvel[:, 3:6]
-            projected_gravity = _projected_gravity(quat)
-        joint_pos_rel = qpos[:, 7:19] - DEFAULT_JOINT_POS
-        joint_vel = qvel[:, 6:18]
-        return np.concatenate(
-            [base_lin_vel, base_ang_vel, projected_gravity, cmd, joint_pos_rel, joint_vel, last_action],
-            axis=1,
-        ).astype(np.float32)
+            projected_gravity = _projected_gravity_t(quat)
+        return torch.cat([base_lin_vel, base_ang_vel, projected_gravity, cmd, qpos[:, 7:19] - self._default_pos, qvel[:, 6:18], last_action], dim=1)
 
-    def _obs_tensordict(self, obs: np.ndarray) -> TensorDict:
-        return TensorDict({"policy": torch.from_numpy(obs).to(self.device)}, batch_size=[self.num_envs])
+    def _obs_tensordict(self, obs: torch.Tensor) -> TensorDict:
+        return TensorDict({"policy": obs}, batch_size=[self.num_envs])
+
+    def _to_dev(self, x: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(np.ascontiguousarray(x)).to(self.device)
 
     def get_observations(self) -> TensorDict:
         qpos, qvel = self._sim.state()
-        return self._obs_tensordict(self._obs(qpos, qvel))
+        return self._obs_tensordict(self._obs(self._to_dev(qpos), self._to_dev(qvel)))
 
     def reset(self) -> tuple[TensorDict, dict]:
         mask = np.ones(self.num_envs, dtype=np.int32)
@@ -285,148 +300,132 @@ class MjmlxGo2Env(VecEnv):
         qpos, qvel = qpos.copy(), qvel.copy()
         self._reset_envs(mask, qpos, qvel)
         self._sim.set_state(qpos, qvel)
-        return self._obs_tensordict(self._obs(qpos, qvel)), {}
+        return self._obs_tensordict(self._obs(self._to_dev(qpos), self._to_dev(qvel))), {}
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        action = actions.detach().cpu().numpy().astype(np.float32)  # IsaacLab同様clipしない(関節目標のみ制御範囲へclip)
-        ctrl_target = DEFAULT_JOINT_POS + ACTION_SCALE * action
-        ctrl = np.clip(ctrl_target, CTRL_LOW, CTRL_HIGH)
+        # 観測・報酬・終了判定はself.device(cudaならGPU)上のtorchで計算する。ホストに残るのは物理への入出力と、リセット/押しの乱数処理だけ
+        N, nq, nv = self.num_envs, self.nq, self.nv
+        action = actions.detach().to(self.device, dtype=torch.float32)  # IsaacLab同様clipしない(関節目標のみ制御範囲へclip)
+        ctrl_target = self._default_pos + ACTION_SCALE * action
+        ctrl = torch.minimum(torch.maximum(ctrl_target, self._ctrl_low), self._ctrl_high)
 
-        self._sim.step(ctrl, DECIMATION)
+        self._sim.step(np.ascontiguousarray(ctrl.cpu().numpy()), DECIMATION)
         if self._pack is not None:
             pk = self._sim.read_pack()
-            nq, nv = self.nq, self.nv
-            qpos, qvel = pk[:, :nq], pk[:, nq:nq + nv]
-            contact_force = pk[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
-            torque_sq, torque_abs_mean = pk[:, nq + nv + 5], float(pk[:, nq + nv + 6].sum()) / (self.num_envs * 12)
+            pk_t = self._to_dev(pk)
+            qpos_h, qvel_h = pk[:, :nq], pk[:, nq:nq + nv]
+            qpos, qvel = pk_t[:, :nq], pk_t[:, nq:nq + nv]
+            contact_force = pk_t[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
+            torque_sq, torque_abs_mean = pk_t[:, nq + nv + 5], pk_t[:, nq + nv + 6].sum() / (N * 12)
+            blew_up = ~(pk_t[:, :nq + nv].abs().amax(dim=1) <= 1000.0)  # NaN/infはamaxがNaN/infで比較がFalseになる
         else:
-            qpos, qvel = self._sim.state()
-            cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
+            qpos_h, qvel_h = self._sim.state()
+            qpos, qvel = self._to_dev(qpos_h), self._to_dev(qvel_h)
+            cfrc = self._to_dev(self._sim.cfrc_ext()).reshape(N, -1, 6)
+            contact_force = cfrc[:, [BASE_BODY_IDX, *FOOT_BODY_IDX], 3:6].norm(dim=2)
+            try:
+                joint_torque = self._to_dev(self._sim.qfrc_actuator())[:, 6:18]
+            except AttributeError:
+                joint_torque = torch.zeros((N, 12), device=self.device)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
+            torque_sq, torque_abs_mean = (joint_torque**2).sum(dim=1), joint_torque.abs().mean()
+            blew_up = ~(torch.cat([qpos, qvel], dim=1).abs().amax(dim=1) <= 1000.0)
         if self._hub is not None:
             self._hub.read()
             self._feet_contact_sensor.update(CONTROL_DT)
             self._base_contact_sensor.update(CONTROL_DT)
-
-        # NaN/infはmaxがNaN/infになり比較がFalseになるので、isfinite+whereを使わずに1回のabs-maxで判定する
-        blew_up = ~(np.abs(pk[:, :nq + nv]).max(axis=1) <= 1000.0) if self._pack is not None else ~((np.abs(qpos).max(axis=1) <= 1000.0) & (np.abs(qvel).max(axis=1) <= 1000.0))
-
-        quat = qpos[:, 3:7]
-        base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
-        base_ang_vel = qvel[:, 3:6]
-        joint_vel = qvel[:, 6:18]
-
-        if self._hub is not None:
-            base_contact = self._base_contact_sensor.is_contact[:, 0].cpu().numpy()
-            foot_contact = self._feet_contact_sensor.is_contact.cpu().numpy()
-        elif self._pack is not None:
+            base_contact = self._base_contact_sensor.is_contact[:, 0].to(self.device)
+            foot_contact = self._feet_contact_sensor.is_contact.to(self.device)
+        else:
             base_contact = contact_force[:, 0] > BASE_CONTACT_FORCE_THRESHOLD
             foot_contact = contact_force[:, 1:] > BASE_CONTACT_FORCE_THRESHOLD
-        else:
-            cfrc = cfrc_ext.reshape(self.num_envs, -1, 6)
-            base_force_norm = np.linalg.norm(cfrc[:, BASE_BODY_IDX, 3:6], axis=1)
-            base_contact = base_force_norm > BASE_CONTACT_FORCE_THRESHOLD
-            foot_force_norm = np.linalg.norm(cfrc[:, FOOT_BODY_IDX, 3:6], axis=2)
-            foot_contact = foot_force_norm > BASE_CONTACT_FORCE_THRESHOLD
+
+        quat = qpos[:, 3:7]
+        base_lin_vel = _quat_rotate_inverse_t(quat, qvel[:, 0:3])
+        base_ang_vel = qvel[:, 3:6]
+        joint_vel = qvel[:, 6:18]
+        projected_gravity = _projected_gravity_t(quat)
 
         cmd = self._commands
+        w = self._w
         d_lin = cmd[:, 0:2] - base_lin_vel[:, 0:2]
-        lin_err = _rowdot(d_lin, d_lin)
+        lin_err = (d_lin * d_lin).sum(dim=1)
         ang_err = (cmd[:, 2] - base_ang_vel[:, 2]) ** 2
-        r_track_lin = W_TRACK_LIN * np.exp(-lin_err / TRACK_STD_SQ)
-        r_track_ang = W_TRACK_ANG * np.exp(-ang_err / TRACK_STD_SQ)
+        r_track_lin = W_TRACK_LIN * torch.exp(-lin_err / TRACK_STD_SQ)
+        r_track_ang = W_TRACK_ANG * torch.exp(-ang_err / TRACK_STD_SQ)
         # 接触衝撃の瞬間は速度が物理的に大きく跳ねうるので、二乗前にクリップしてreward発散を防ぐ
-        r_lin_vel_z = self._w["lin_vel_z"] * np.clip(base_lin_vel[:, 2], -20.0, 20.0) ** 2
-        r_ang_vel_xy = self._w["ang_vel_xy"] * _rowdot(*(2 * [np.clip(base_ang_vel[:, 0:2], -50.0, 50.0)]))
-        joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
-        r_dof_acc = self._w["dof_acc"] * _rowdot(joint_acc, joint_acc)
-        action_prev = self._last_action.copy()
-        r_action_rate = self._w["action_rate"] * _rowdot(*(2 * [action - self._last_action]))
+        r_lin_vel_z = w["lin_vel_z"] * base_lin_vel[:, 2].clamp(-20.0, 20.0) ** 2
+        r_ang_vel_xy = w["ang_vel_xy"] * (base_ang_vel[:, 0:2].clamp(-50.0, 50.0) ** 2).sum(dim=1)
+        joint_acc = ((joint_vel - self._prev_joint_vel) / CONTROL_DT).clamp(-500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
+        r_dof_acc = w["dof_acc"] * (joint_acc**2).sum(dim=1)
+        d_act = action - self._last_action
+        r_action_rate = w["action_rate"] * (d_act * d_act).sum(dim=1)
 
         contact_filt = foot_contact | self._last_foot_contact
         first_contact = (self._feet_air_time > 0.0) & contact_filt
-        self._feet_air_time += CONTROL_DT
-        r_air_time = self._w["feet_air_time"] * np.sum((self._feet_air_time - FEET_AIR_TIME_TARGET) * first_contact, axis=1)
-        r_air_time *= np.linalg.norm(cmd[:, 0:2], axis=1) > 0.1
-        self._feet_air_time *= ~contact_filt
+        self._feet_air_time = self._feet_air_time + CONTROL_DT
+        r_air_time = w["feet_air_time"] * ((self._feet_air_time - FEET_AIR_TIME_TARGET) * first_contact).sum(dim=1)
+        r_air_time = r_air_time * (cmd[:, 0:2].norm(dim=1) > 0.1)
+        self._feet_air_time = self._feet_air_time * ~contact_filt
         self._last_foot_contact = foot_contact
 
-        projected_gravity = _projected_gravity(quat)
-        r_flat_orient = self._w["flat_orientation"] * _rowdot(projected_gravity[:, 0:2], projected_gravity[:, 0:2])
+        tilt2 = (projected_gravity[:, 0:2] ** 2).sum(dim=1)
+        r_flat_orient = w["flat_orientation"] * tilt2
+        r_torque = w["torque"] * torque_sq
 
-        if self._pack is None:
-            try:
-                joint_torque = self._sim.qfrc_actuator()[:, 6:18]
-            except AttributeError:
-                joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
-            torque_sq, torque_abs_mean = np.sum(joint_torque**2, axis=1), float(np.abs(joint_torque).mean())
-        r_torque = self._w["torque"] * torque_sq
-
-        self.last_reward_terms = {
+        terms = {
             "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
             "dof_acc": r_dof_acc, "action_rate": r_action_rate, "feet_air_time": r_air_time, "torque": r_torque, "flat_orientation": r_flat_orient,
         }
-        rewards = (
-            r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque + r_flat_orient
-        )
+        self.last_reward_terms = terms
+        rewards = r_track_lin + r_track_ang + r_lin_vel_z + r_ang_vel_xy + r_dof_acc + r_action_rate + r_air_time + r_torque + r_flat_orient
         # 未知の接触イベント等でどれかの項が想定外に暴れてもvalue関数の発散を防ぐ最終防衛ライン
-        rewards = np.where(blew_up, 0.0, np.clip(rewards, -50.0, 50.0)).astype(np.float32)
+        rewards = torch.where(blew_up, torch.zeros_like(rewards), rewards.clamp(-50.0, 50.0))
 
         self._elapsed += 1
-        truncated = self._elapsed >= MAX_EPISODE_STEPS
+        truncated = self._to_dev(self._elapsed >= MAX_EPISODE_STEPS)
         # 通路の外へ出たら地形が無いので落下して学習に使えない: 終了にする
-        out_of_terrain = (np.abs(qpos[:, 1]) > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > self.terrain.total_length)
+        out_of_terrain = (qpos[:, 1].abs() > CORRIDOR_WIDTH / 2) | (qpos[:, 0] < 0.0) | (qpos[:, 0] > self.terrain.total_length)
         terminated = base_contact | blew_up | out_of_terrain
         dones = truncated | terminated
 
         obs = self._obs(qpos, qvel, from_sensors=self._hub is not None)
-        self._last_action = action.copy()
-        self._prev_joint_vel = joint_vel.copy()
+        # ログ用の指標(リセット前の値)。まとめて1回の転送でホストへ戻す
+        metric_names = [f"Reward/{k}" for k in terms] + [
+            "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/action_abs", "Metrics/action_rate_abs",
+            "Metrics/ctrl_saturated_frac", "Metrics/joint_vel_abs", "Metrics/joint_pos_dev", "Metrics/base_tilt", "Metrics/feet_air_time",
+            "Metrics/joint_torque_abs", "Metrics/foot_contact_frac", "Termination/base_contact", "Termination/blew_up", "Termination/out_of_terrain", "Termination/time_out",
+        ]
+        metric_vals = [v.mean() for v in terms.values()] + [
+            lin_err.sqrt().mean(), ang_err.sqrt().mean(), cmd.norm(dim=1).mean(), qpos[:, 2].mean(), action.abs().mean(), d_act.abs().mean(),
+            (ctrl_target != ctrl).float().mean(), joint_vel.abs().mean(), (qpos[:, 7:19] - self._default_pos).abs().mean(), tilt2.sqrt().mean(), self._feet_air_time.mean(),
+            torch.as_tensor(torque_abs_mean, device=self.device, dtype=torch.float32), foot_contact.float().mean(), base_contact.float().mean(), blew_up.float().mean(),
+            out_of_terrain.float().mean(), truncated.float().mean(),
+        ]
+        self._last_action = action.clone()
+        self._prev_joint_vel = joint_vel.clone()
 
+        dones_h = dones.cpu().numpy()  # リセット対象の確定(ホストの乱数処理に必要)
         push_due = self._elapsed >= self._next_push_step
-        done_idx = np.nonzero(dones)[0]
+        done_idx = np.nonzero(dones_h)[0]
         if push_due.any() or len(done_idx) > 0:
-            qpos2, qvel2 = qpos.copy(), qvel.copy()  # 以降のログ/指標は押す前・リセット前のqpos/qvelを使うので別配列に書く
+            qpos2, qvel2 = qpos_h.copy(), qvel_h.copy()  # 以降の指標は押す前・リセット前の値を使うので別配列に書く
             if push_due.any():
                 pidx = np.nonzero(push_due)[0]
                 qvel2[pidx, 0:2] += self._rng.uniform(-0.5, 0.5, size=(len(pidx), 2))
                 self._next_push_step[pidx] = self._elapsed[pidx] + self._rng.integers(*PUSH_INTERVAL_STEPS, size=len(pidx))
             if len(done_idx) > 0:
-                self._reset_envs(dones.astype(np.int32), qpos2, qvel2)
+                self._reset_envs(dones_h.astype(np.int32), qpos2, qvel2)
                 if self._hub is not None:
-                    self._feet_contact_sensor.reset(torch.from_numpy(dones))
-                    self._base_contact_sensor.reset(torch.from_numpy(dones))
-                obs = obs.copy()
-                obs[done_idx] = self._obs(qpos2[done_idx], qvel2[done_idx], rows=done_idx)
+                    self._feet_contact_sensor.reset(torch.from_numpy(dones_h))
+                    self._base_contact_sensor.reset(torch.from_numpy(dones_h))
+                idx_t = torch.from_numpy(done_idx).to(self.device)
+                obs[idx_t] = self._obs(self._to_dev(qpos2[done_idx]), self._to_dev(qvel2[done_idx]), rows=idx_t)
             self._sim.set_state(qpos2, qvel2)
 
         # rsl_rl が iteration ごとに平均して tensorboard/標準出力へ書く。報酬は項ごとのstep平均(重み込み)、Metricsは追従誤差など
-        log = {f"Reward/{k}": float(np.mean(v)) for k, v in self.last_reward_terms.items()}
-        log.update({
-            "Metrics/lin_vel_error": float(np.sqrt(lin_err).mean()),
-            "Metrics/ang_vel_error": float(np.sqrt(ang_err).mean()),
-            "Metrics/cmd_speed": float(np.linalg.norm(cmd, axis=1).mean()),
-            "Metrics/base_height": float(qpos[:, 2].mean()),
-            "Metrics/action_abs": float(np.abs(action).mean()),
-            "Metrics/action_rate_abs": float(np.abs(action - action_prev).mean()),
-            "Metrics/ctrl_saturated_frac": float((ctrl_target != ctrl).mean()),
-            "Metrics/joint_vel_abs": float(np.abs(joint_vel).mean()),
-            "Metrics/joint_pos_dev": float(np.abs(qpos[:, 7:19] - DEFAULT_JOINT_POS).mean()),
-            "Metrics/base_tilt": float(np.sqrt(_rowdot(projected_gravity[:, :2], projected_gravity[:, :2])).mean()),
-            "Metrics/feet_air_time": float(self._feet_air_time.mean()),
-            "Metrics/joint_torque_abs": torque_abs_mean,
-            "Metrics/foot_contact_frac": float(foot_contact.mean()),
-            "Termination/base_contact": float(base_contact.mean()),
-            "Termination/blew_up": float(blew_up.mean()),
-            "Termination/out_of_terrain": float(out_of_terrain.mean()),
-            "Termination/time_out": float(truncated.mean()),
-        })
-        extras = {"time_outs": torch.from_numpy(truncated).to(self.device), "log": log}
-        return (
-            self._obs_tensordict(obs),
-            torch.from_numpy(rewards).to(self.device),
-            torch.from_numpy(dones).long().to(self.device),
-            extras,
-        )
+        log = dict(zip(metric_names, torch.stack(metric_vals).tolist()))
+        extras = {"time_outs": truncated, "log": log}
+        return self._obs_tensordict(obs), rewards, dones.long(), extras
 
     def close(self) -> None:
         pass
