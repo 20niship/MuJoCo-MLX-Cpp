@@ -21,7 +21,7 @@ def main() -> None:
     ap.add_argument("--preset", default="isaac_flat")
     ap.add_argument("--solver-iters", type=int, default=None)
     ap.add_argument("--lift", type=float, default=0.0, help="胴体を持ち上げて接触を無くした状態で比べる(物理のうち接触以外の差を見る)[m]")
-    ap.add_argument("--foot-condim", type=int, default=6, help="足の摩擦円錐の次元(CPUとGPUの両方に同じ値を使う)")
+    ap.add_argument("--max-condim", type=int, default=0, help="ロボットのgeomのcondim上限(CPUとGPUの両方に同じ値を使う)")
     args = ap.parse_args()
 
     sys.path.insert(0, args.build_dir)
@@ -32,7 +32,7 @@ def main() -> None:
 
     if args.solver_iters is not None:
         e.SOLVER_ITERATIONS = args.solver_iters
-    kw = dict(cmd_vel_min=0.2, cmd_vel_max=1.0, seed=0, terrain_seed=0, flat_terrain=True, reward_preset=args.preset, foot_condim=args.foot_condim)
+    kw = dict(cmd_vel_min=0.2, cmd_vel_max=1.0, seed=0, terrain_seed=0, flat_terrain=True, reward_preset=args.preset, max_condim=args.max_condim)
     gpu = e.MjmlxGo2Env(native, args.envs, use_gpu=True, generated_xml_path="/tmp/go2_cmp_gpu.xml", **kw)
     cpu = e.MjmlxGo2Env(native, args.envs, use_gpu=False, generated_xml_path="/tmp/go2_cmp_cpu.xml", **kw)
     rng = np.random.default_rng(1)

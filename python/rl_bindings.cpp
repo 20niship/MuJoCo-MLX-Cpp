@@ -213,12 +213,15 @@ NB_MODULE(_mjmlx_rl_native, m) {
         return cam;
     }, nb::arg("sim"), nb::arg("width"), nb::arg("height"));
 
-    m.def("load_model", [](const std::string& xml_path) -> std::shared_ptr<RlModel> {
+    m.def("load_model", [](const std::string& xml_path, bool self_collision, int max_condim) -> std::shared_ptr<RlModel> {
         auto model = std::make_shared<RlModel>();
-        model->handle = mjmlx_load_model(xml_path.c_str());
+        MjmlxModelOptions opts = mjmlx_default_model_options();
+        opts.self_collision = self_collision ? 1 : 0;
+        opts.max_condim = max_condim;
+        model->handle = mjmlx_load_model_ex(xml_path.c_str(), &opts);
         if (!model->handle) throw std::runtime_error("mjmlx_rl: failed to load model: " + xml_path);
         return model;
-    }, nb::arg("xml_path"));
+    }, nb::arg("xml_path"), nb::arg("self_collision") = true, nb::arg("max_condim") = 0);
 
     m.def("create_batched", [](std::shared_ptr<RlModel> model, int num_envs, int frame_skip,
                                 bool use_gpu, int solver_iterations) -> std::shared_ptr<RlBatchedSim> {
