@@ -1,0 +1,23 @@
+<!-- SDF(torusプラグイン) vs mesh(立方体、ワールド原点)。MuJoCoのmjc_MeshSDFはmeshの距離をワールド原点方向のレイで求めるため、meshは原点に置く。 -->
+<mujoco>
+  <extension>
+    <plugin plugin="mujoco.sdf.torus">
+      <instance name="torus">
+        <config key="radius1" value="0.15"/>
+        <config key="radius2" value="0.05"/>
+      </instance>
+    </plugin>
+  </extension>
+  <option gravity="0 0 -9.81" timestep="0.002" sdf_iterations="3" sdf_initpoints="10"/>
+  <asset>
+    <mesh name="torus"><plugin instance="torus"/></mesh>
+    <mesh name="cube" vertex="-0.3 -0.3 -0.3  0.3 -0.3 -0.3  0.3 0.3 -0.3  -0.3 0.3 -0.3  -0.3 -0.3 0.3  0.3 -0.3 0.3  0.3 0.3 0.3  -0.3 0.3 0.3"/>
+  </asset>
+  <worldbody>
+    <body><geom type="mesh" mesh="cube" rgba="0 0 1 1"/></body>
+    <body pos="0.02 0.01 0.42">
+      <freejoint/>
+      <geom type="sdf" mesh="torus" rgba=".8 .17 .15 1"><plugin instance="torus"/></geom>
+    </body>
+  </worldbody>
+</mujoco>

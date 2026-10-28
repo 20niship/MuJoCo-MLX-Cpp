@@ -353,6 +353,8 @@ cmake --build build -j$(sysctl -n hw.logicalcpu)
 
 MJCFの`<camera>`/`<light>`/geomのrgbaを使い、全env x 全カメラを`vkCmdDrawIndexedIndirect` 1回でレンダリングする(Phong、RGB+depth)。物理stepとは別パスで、`create_camera`した時のみパイプラインを構築する。
 
+空間tendon(site間・球/円柱wrap)は、`tendon_width`/`tendon_rgba`の円柱として(env,tendon)ごとにGPUで経路を求めて描く(MuJoCo標準レンダラと同じく、wrapは接点間を弦で結び半分の太さで描く)。tendonが無いモデルは従来と同じシェーダ・同じ描画コストで、MuJoCoのカテナリ表示や筋の活性色は未対応。
+
 ```python
 cam = native.create_camera(sim, 128, 128)  # sim: create_batched(use_gpu=True)の戻り値
 cam.render()

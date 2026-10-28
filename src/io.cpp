@@ -18,6 +18,9 @@
 #include "internal.h"
 #include <mujoco/mujoco.h>
 #include <cstring>
+#include <cmath>
+#include <map>
+#include <thread>
 #include <stdexcept>
 #include <vector>
 #include <unistd.h>
@@ -61,28 +64,130 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
 static constexpr double SDF_GRID_CELLS = 2.0e6;  // geomあたりのセル数。軸ごとの分割数はセルがほぼ立方体になるよう配分する
 static constexpr float SDF_GRID_PAD = 1.1f;
 
+
+// メッシュ(三角形集合)の符号付き距離。最近点は三角形ごとの最近点探索(Ericson)、内外はx軸方向に斜めの光線の交差回数の偶奇で決める(閉じたメッシュ前提)。
+struct MeshTris {
+    std::vector<double> v;  // 三角形ごと9個: a(3) b(3) c(3)
+    size_t n() const { return v.size() / 9; }
+};
+
+static MeshTris collect_mesh_tris(const mjModel* m, int mid) {
+    MeshTris t;
+    const int vadr = m->mesh_vertadr[mid], fadr = m->mesh_faceadr[mid], nf = m->mesh_facenum[mid];
+    t.v.resize((size_t)nf * 9);
+    for (int f = 0; f < nf; f++)
+        for (int k = 0; k < 3; k++) {
+            const int vi = vadr + m->mesh_face[3 * (fadr + f) + k];
+            for (int a = 0; a < 3; a++) t.v[(size_t)f * 9 + 3 * k + a] = m->mesh_vert[3 * vi + a];
+        }
+    return t;
+}
+
+static double tri_sqdist(const double* A, const double* B, const double* C, const double* P) {
+    auto sub = [](const double* a, const double* b, double* o) { for (int i = 0; i < 3; i++) o[i] = a[i] - b[i]; };
+    auto dot = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    double ab[3], ac[3], ap[3];
+    sub(B, A, ab); sub(C, A, ac); sub(P, A, ap);
+    double q[3];
+    auto done = [&](const double* c) { double d[3]; sub(P, c, d); return dot(d, d); };
+    const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) return done(A);
+    double bp[3]; sub(P, B, bp);
+    const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) return done(B);
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) { const double t = d1 / (d1 - d3); for (int i = 0; i < 3; i++) q[i] = A[i] + t * ab[i]; return done(q); }
+    double cp[3]; sub(P, C, cp);
+    const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return done(C);
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) { const double t = d2 / (d2 - d6); for (int i = 0; i < 3; i++) q[i] = A[i] + t * ac[i]; return done(q); }
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) { const double t = (d4 - d3) / ((d4 - d3) + (d5 - d6)); for (int i = 0; i < 3; i++) q[i] = B[i] + t * (C[i] - B[i]); return done(q); }
+    const double denom = 1.0 / (va + vb + vc), v = vb * denom, w = vc * denom;
+    for (int i = 0; i < 3; i++) q[i] = A[i] + ab[i] * v + ac[i] * w;
+    return done(q);
+}
+
+static bool ray_hits_tri(const double* o, const double* dir, const double* A, const double* B, const double* C) {
+    double e1[3], e2[3], pv[3], tv[3], qv[3];
+    for (int i = 0; i < 3; i++) { e1[i] = B[i] - A[i]; e2[i] = C[i] - A[i]; tv[i] = o[i] - A[i]; }
+    auto cross = [](const double* a, const double* b, double* r) { r[0] = a[1] * b[2] - a[2] * b[1]; r[1] = a[2] * b[0] - a[0] * b[2]; r[2] = a[0] * b[1] - a[1] * b[0]; };
+    auto dot = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    cross(dir, e2, pv);
+    const double det = dot(e1, pv);
+    if (std::fabs(det) < 1e-14) return false;
+    const double inv = 1.0 / det, u = dot(tv, pv) * inv;
+    if (u < 0 || u > 1) return false;
+    cross(tv, e1, qv);
+    const double w = dot(dir, qv) * inv;
+    if (w < 0 || u + w > 1) return false;
+    return dot(e2, qv) * inv > 0;
+}
+
+static double mesh_signed_distance(const MeshTris& t, const double* x) {
+    double best = 1e300;
+    const double dir[3] = {0.8123, 0.4519, 0.3714};
+    int hits = 0;
+    for (size_t f = 0; f < t.n(); f++) {
+        const double* A = &t.v[f * 9];
+        best = std::min(best, tri_sqdist(A, A + 3, A + 6, x));
+        hits += ray_hits_tri(x, dir, A, A + 3, A + 6);
+    }
+    return (hits & 1) ? -std::sqrt(best) : std::sqrt(best);
+}
+
+static constexpr double MESH_SDF_GRID_CELLS = 4.0e5;  // メッシュ由来の格子(三角形総当たりで焼くため、プラグインより粗くする)
+
 static void bake_sdf_geoms(const mjModel* m, Model& model) {
     std::vector<int> sdf_geoms;
     for (int g = 0; g < m->ngeom; g++)
         if (m->geom_type[g] == mjGEOM_SDF) sdf_geoms.push_back(g);
     if (sdf_geoms.empty()) return;
 
+    // SDFと衝突しうるmesh geomも格子に焼く(MuJoCoのmjc_MeshSDFに相当。meshの距離関数を格子で与える)。
+    std::vector<int> mesh_geoms;
+    {
+        int sdf_con = 0, sdf_aff = 0;
+        for (int g : sdf_geoms) { sdf_con |= m->geom_contype[g]; sdf_aff |= m->geom_conaffinity[g]; }
+        for (int g = 0; g < m->ngeom; g++)
+            if (m->geom_type[g] == mjGEOM_MESH && m->geom_dataid[g] >= 0 && ((m->geom_contype[g] & sdf_aff) || (m->geom_conaffinity[g] & sdf_con)))
+                mesh_geoms.push_back(g);
+    }
+
     std::vector<float> info((size_t)m->ngeom * Model::SDF_INFO_STRIDE, 0.0f);
     for (int g = 0; g < m->ngeom; g++) info[(size_t)g * Model::SDF_INFO_STRIDE] = -1.0f;
     std::vector<float> grid;
+    std::map<int, int> mesh_info_of;  // meshのdataid -> 最初にその格子を焼いたgeom(同じメッシュは格子を共有する)
 
     mjData* d = mj_makeData(m);
-    for (int g : sdf_geoms) {
-        if (m->geom_plugin[g] < 0)
-            throw std::runtime_error("SDF geom without plugin is not supported (geom " + std::to_string(g) + ")");
-        const mjpPlugin* plugin = mjp_getPluginAtSlot(m->plugin[m->geom_plugin[g]]);
-        if (!plugin || !plugin->sdf_distance)
-            throw std::runtime_error("SDF plugin of geom " + std::to_string(g) + " has no sdf_distance");
+    std::vector<int> targets = sdf_geoms;
+    targets.insert(targets.end(), mesh_geoms.begin(), mesh_geoms.end());
+    for (int g : targets) {
+        const bool is_sdf = m->geom_type[g] == mjGEOM_SDF;
+        const mjpPlugin* plugin = nullptr;
+        if (is_sdf && m->geom_plugin[g] >= 0) {
+            plugin = mjp_getPluginAtSlot(m->plugin[m->geom_plugin[g]]);
+            if (!plugin || !plugin->sdf_distance)
+                throw std::runtime_error("SDF plugin of geom " + std::to_string(g) + " has no sdf_distance");
+        } else if (m->geom_dataid[g] < 0) {
+            throw std::runtime_error("SDF geom without plugin or mesh is not supported (geom " + std::to_string(g) + ")");
+        }
+        const bool from_mesh = plugin == nullptr;
 
         float* inf = &info[(size_t)g * Model::SDF_INFO_STRIDE];
+        if (from_mesh) {
+            auto it = mesh_info_of.find(m->geom_dataid[g]);
+            if (it != mesh_info_of.end()) {  // 共有: 先頭・寸法を写す
+                std::memcpy(inf, &info[(size_t)it->second * Model::SDF_INFO_STRIDE], sizeof(float) * Model::SDF_INFO_STRIDE);
+                inf[10] = (float)m->geom_rbound[g];
+                continue;
+            }
+            mesh_info_of[m->geom_dataid[g]] = g;
+        }
         inf[0] = (float)grid.size();
         // 格子は歯面の曲率に対し粗く(補間誤差~0.5mm)偽接触が出るため、gearはGPU側で解析式を直接評価する(属性のみ渡す)
-        const bool is_gear = plugin->name && !strcmp(plugin->name, "mujoco.sdf.gear");
+        const bool is_gear = plugin && plugin->name && !strcmp(plugin->name, "mujoco.sdf.gear");
         if (is_gear) {
             static const char* names[5] = {"alpha", "diameter", "teeth", "thickness", "innerdiameter"};
             static const float defs[5] = {0, 2.8f, 25, .2f, -1};
@@ -101,7 +206,7 @@ static void bake_sdf_geoms(const mjModel* m, Model& model) {
             vol *= 2.0 * inf[7 + a];
         }
         inf[10] = (float)m->geom_rbound[g];
-        const double h = std::cbrt(vol / SDF_GRID_CELLS);
+        const double h = std::cbrt(vol / (from_mesh ? MESH_SDF_GRID_CELLS : SDF_GRID_CELLS));
         int n[3];
         for (int a = 0; a < 3; a++) {
             n[a] = std::max(2, (int)std::ceil(2.0 * inf[7 + a] / h) + 1);
@@ -112,16 +217,29 @@ static void bake_sdf_geoms(const mjModel* m, Model& model) {
         if (is_gear) for (int a = 0; a < 3; a++) { n[a] = 2; inf[11 + a] = 2.0f; }
         grid.resize(base + (size_t)n[0] * n[1] * n[2]);
         if (is_gear) { std::fill(grid.begin() + base, grid.end(), 0.0f); continue; }
-        for (int iz = 0; iz < n[2]; iz++)
-            for (int iy = 0; iy < n[1]; iy++)
-                for (int ix = 0; ix < n[0]; ix++) {
-                    const int idx[3] = {ix, iy, iz};
-                    double x[3];
-                    for (int a = 0; a < 3; a++)
-                        x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (n[a] - 1) - 1.0);
-                    grid[base + ((size_t)iz * n[1] + iy) * n[0] + ix] =
-                        (float)plugin->sdf_distance(x, d, m->geom_plugin[g]);
-                }
+        auto sample_at = [&](int ix, int iy, int iz, const MeshTris* tris) {
+            const int idx[3] = {ix, iy, iz};
+            double x[3];
+            for (int a = 0; a < 3; a++)
+                x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (n[a] - 1) - 1.0);
+            return (float)(tris ? mesh_signed_distance(*tris, x) : plugin->sdf_distance(x, d, m->geom_plugin[g]));
+        };
+        if (from_mesh) {
+            const MeshTris tris = collect_mesh_tris(m, m->geom_dataid[g]);
+            const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            std::vector<std::thread> th;
+            for (unsigned t = 0; t < nt; t++)
+                th.emplace_back([&, t] {
+                    for (int iz = (int)t; iz < n[2]; iz += (int)nt)
+                        for (int iy = 0; iy < n[1]; iy++)
+                            for (int ix = 0; ix < n[0]; ix++) grid[base + ((size_t)iz * n[1] + iy) * n[0] + ix] = sample_at(ix, iy, iz, &tris);
+                });
+            for (auto& t : th) t.join();
+        } else {
+            for (int iz = 0; iz < n[2]; iz++)
+                for (int iy = 0; iy < n[1]; iy++)
+                    for (int ix = 0; ix < n[0]; ix++) grid[base + ((size_t)iz * n[1] + iy) * n[0] + ix] = sample_at(ix, iy, iz, nullptr);
+        }
     }
     mj_deleteData(d);
 
@@ -396,7 +514,7 @@ static void validate_model(const mjModel* m) {
     // SDF geomはSDF同士の衝突のみGPUカーネルで対応(相手がSDF以外の組は接触しない)
     for (int i = 0; i < m->ngeom; i++)
         if (m->geom_type[i] == mjGEOM_SDF) {
-            fprintf(stderr, "[mjmlx WARNING] Model has SDF geoms -- only SDF-SDF collision is supported (batched GPU path).\n");
+            fprintf(stderr, "[mjmlx WARNING] Model has SDF geoms -- SDF-SDF and SDF-mesh collision are supported (batched GPU path).\n");
             break;
         }
     // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
