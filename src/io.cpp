@@ -427,7 +427,7 @@ static void validate_model(const mjModel* m) {
             }
         }
         if (has_spatial)
-            fprintf(stderr, "[mjmlx WARNING] Model has spatial tendons (wrapping geometry) -- only fixed (joint) tendons supported.\n");
+            fprintf(stderr, "[mjmlx WARNING] Model has spatial tendons (site/geom wrapping) -- supported only in the batched GPU path (use_gpu=1); the scalar/vmap paths handle fixed (joint) tendons only.\n");
     }
 
     // Integrator types: Euler, RK4, Implicit, ImplicitFast all supported

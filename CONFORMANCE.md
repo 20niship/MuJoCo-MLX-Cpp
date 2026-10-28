@@ -359,7 +359,7 @@ MuJoCo-MLX-Cpp's solver supports:
 |-----------|----------|-----|----------------|
 | **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 19 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37) |
 | **Fixed tendons** (length, velocity, J, passive) | Full | Yes | Yes (Phase 5.1) |
-| **Spatial tendons** (wrapping geometry) | Full | Yes | **No** (DEFERRED) |
+| **Spatial tendons** (site / pulley / sphere・cylinder wrap / sidesite) | Full | Yes | **Partial** (batched GPU path only; scalar/vmap DEFERRED) |
 | **Tendon limits + friction** | Full | Yes | Yes (Phase 5.4-5.5) |
 | **Inverse dynamics** (298 lines) | `mj_inverse` | 110 lines | **None** (DEFERRED) |
 | **Analytical derivatives** (1,560 lines) | `mjd_transitionFD` | 73 lines (implicit) | Partial (`deriv_smooth_vel` for ImplicitFast) |
@@ -415,7 +415,7 @@ Remaining warnings:
 | Scenario | What happens |
 |----------|-------------|
 | Model has MUSCLE dynamics | **Warning emitted.** Not implemented. |
-| Model has spatial tendons | **Warning emitted.** Only fixed tendons supported. |
+| Model has spatial tendons | **Supported in the batched GPU path** (tendon length/Jacobian, spring/damper, limit, frictionloss, tendon actuators; matches MuJoCo C). Warning emitted for scalar/vmap paths. |
 | Model has sensors | Computed on the batched sim (`mjmlx_batched_get_sensordata`, MuJoCo `sensor_adr` layout). Unsupported types warn and stay 0. Single-env path does not compute sensors. |
 | Model has TENDON equality constraints | **Warning emitted.** Not implemented. |
 | Model has SDF geoms | **Warning emitted.** Not supported. |

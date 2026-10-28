@@ -1,0 +1,44 @@
+<!-- 滑車(pulley)付きspatial tendonとfixed tendon、tendon駆動actuator、tendon limit/frictionloss -->
+<mujoco model="tendon pulley">
+  <option solver="Newton" timestep="0.002" iterations="50"/>
+  <worldbody>
+    <geom type="plane" size="2 2 .01"/>
+    <site name="top" pos="0 0 2"/>
+    <body name="w1" pos="-.4 0 1">
+      <joint name="j1" type="slide" axis="0 0 1" damping="1"/>
+      <geom type="sphere" size=".08" mass="1"/>
+      <site name="s1" pos="0 0 .08"/>
+    </body>
+    <body name="w2" pos=".4 0 1">
+      <joint name="j2" type="slide" axis="0 0 1" damping="1"/>
+      <geom type="sphere" size=".08" mass="1.5"/>
+      <site name="s2" pos="0 0 .08"/>
+    </body>
+    <body name="arm" pos="1.2 0 1">
+      <joint name="hinge" type="hinge" axis="0 1 0" damping=".5" frictionloss="0.02"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".03" mass="1"/>
+      <site name="tip" pos=".3 0 0"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="rope" stiffness="200" damping="2" springlength="1.2" limited="true" range="0 1.6">
+      <site site="s1"/>
+      <site site="top"/>
+      <pulley divisor="2"/>
+      <site site="top"/>
+      <site site="s2"/>
+    </spatial>
+    <fixed name="couple" frictionloss="0.01" limited="true" range="-1 1">
+      <joint joint="j1" coef="1"/>
+      <joint joint="hinge" coef=".5"/>
+    </fixed>
+    <spatial name="cable" stiffness="50" springlength="0.5">
+      <site site="tip"/>
+      <site site="s2"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="pull" tendon="rope" gear="10" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="cab" tendon="cable" gear="5" ctrllimited="true" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
