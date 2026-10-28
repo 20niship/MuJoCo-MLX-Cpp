@@ -2,6 +2,7 @@
 // Vendored from 20niship/mlx-cross-platform tests/mujoco/forward.hpp at commit 3202339e12231f3a68f9ee67e0b6085a33c52286.
 
 #include <array>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -438,7 +439,15 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
 
   (void)dt;
 
-  return mkx::fast::compute_kernel("mjmlx_forward", {"xipos", "ximat", "xanchor", "xaxis", "xmat", "qpos", "qvel", "ctrl", "act_moment"}, {"qM_out", "qfrc_smooth_out", "subtree_com_out", "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"}, ss.str(), "");
+  // 作業領域(scratch)はスレッドごとの配列(ローカルメモリ)に置く。グローバルのscratchだと依存した読み書きが1回ごとにL2レイテンシ(数百cycle)を待ち、forwardの時間の大半を占めた。MJMLX_FWD_GLOBAL_SCRATCH=1で従来のグローバル版。
+  static const bool global_scratch = getenv("MJMLX_FWD_GLOBAL_SCRATCH") != nullptr;
+  std::string src = ss.str();
+  if(!global_scratch) {
+    const std::string from = "scratch[SCR_IDX(", to = "scrl[(";
+    for(size_t q = src.find(from); q != std::string::npos; q = src.find(from, q)) { src.replace(q, from.size(), to); q += to.size(); }
+    src = "float scrl[" + std::to_string(scratch_per_env) + "];\n" + src;
+  }
+  return mkx::fast::compute_kernel("mjmlx_forward", {"xipos", "ximat", "xanchor", "xaxis", "xmat", "qpos", "qvel", "ctrl", "act_moment"}, {"qM_out", "qfrc_smooth_out", "subtree_com_out", "cinert_out", "cvel_out", "qfrc_actuator_out", "scratch", "cdof_out"}, src, "");
 }
 
 } // namespace mjmlx::mkx_kernels

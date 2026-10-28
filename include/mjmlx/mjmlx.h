@@ -170,6 +170,12 @@ MJMLX_API void mjmlx_batched_step(
     MjmlxBatchedSim* sim,
     const float* ctrl);
 
+// 同じctrlでn回stepする。GPU実行ではctrlのホスト->GPU転送が1回で済む。
+MJMLX_API void mjmlx_batched_step_n(
+    MjmlxBatchedSim* sim,
+    const float* ctrl,
+    int n);
+
 // Reset environments where mask[i] != 0.
 // mask: int[num_envs] -- nonzero = reset that env to initial state
 MJMLX_API void mjmlx_batched_reset(
@@ -205,6 +211,10 @@ MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, 
 // Per-env state setters (for custom RSI resets with noise).
 MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx, const float* qpos, int nq);
 MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx, const float* qvel, int nv);
+
+// ホスト読み戻しは配列ごとに遅い(ステージングが非キャッシュ)ので、[qpos, qvel, 指定bodyの接触力ノルム, qfrc_actuator一部]を1転送にまとめる。set_pack_specはstrideを返す(失敗-1)。
+MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof);
+MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out);
 
 // Evaluate qpos + qvel in a single GPU fence. Call before get_qpos/get_qvel to
 // avoid two sequential GPU syncs.

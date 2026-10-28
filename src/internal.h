@@ -697,6 +697,7 @@ struct MjmlxBatchedSim {
     mjModel* cpu_model = nullptr;           // borrowed from MjmlxModel, not owned
     std::vector<mjData*> cpu_datas;
     mutable std::vector<float> sensordata_buf;  // get_sensordataの返却用
+    std::shared_ptr<void> pack;                 // mjmlx_batched_set_pack_specのGPUカーネルと配置(batched.cpp内のPackSpec)
 
     ~MjmlxBatchedSim() {
         for (auto* d : cpu_datas) if (d) mj_deleteData(d);

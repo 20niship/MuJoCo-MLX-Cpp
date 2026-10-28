@@ -48,14 +48,14 @@ struct RlBatchedSim {
     int nq = 0, nv = 0, nu = 0;
     ~RlBatchedSim() { if (handle) mjmlx_batched_free(handle); }
 
-    void step(FloatArray ctrl) {
+    void step(FloatArray ctrl, int n) {
         if (nu > 0) {
             if (ctrl.ndim() != 2 || static_cast<int>(ctrl.shape(0)) != num_envs || static_cast<int>(ctrl.shape(1)) != nu) {
                 throw std::runtime_error("mjmlx_rl: ctrl must have shape (num_envs, nu)");
             }
-            mjmlx_batched_step(handle, ctrl.data());
+            mjmlx_batched_step_n(handle, ctrl.data(), n);
         } else {
-            mjmlx_batched_step(handle, nullptr);
+            mjmlx_batched_step_n(handle, nullptr, n);
         }
     }
 
@@ -103,6 +103,22 @@ struct RlBatchedSim {
         return copy_out(p, n, num_envs);
     }
     FloatArray qfrc_actuator() { int n; auto* p = mjmlx_batched_get_qfrc_actuator(handle, &n); return copy_out(p, n, num_envs); }
+
+    int pack_stride = 0;
+    int set_pack_spec(IntArray body_ids, int dof_lo, int ndof) {
+        pack_stride = mjmlx_batched_set_pack_spec(handle, body_ids.data(), static_cast<int>(body_ids.size()), dof_lo, ndof);
+        if (pack_stride < 0) throw std::runtime_error("mjmlx_rl: set_pack_spec failed (GPU sim and valid body/dof ids required)");
+        return pack_stride;
+    }
+    FloatArray read_pack() {
+        if (pack_stride <= 0) throw std::runtime_error("mjmlx_rl: call set_pack_spec first");
+        size_t n = static_cast<size_t>(num_envs) * pack_stride;
+        float* buf = new float[n];
+        nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        if (mjmlx_batched_get_pack(handle, buf) != 0) throw std::runtime_error("mjmlx_rl: read_pack failed");
+        size_t shape[2] = {static_cast<size_t>(num_envs), static_cast<size_t>(pack_stride)};
+        return FloatArray(buf, 2, shape, owner);
+    }
 };
 
 // カメラレンダラ。sim(の運動学)を参照するためshared_ptrで寿命を揃える。
@@ -160,7 +176,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def_prop_ro("nq", [](const RlBatchedSim& s) { return s.nq; })
         .def_prop_ro("nv", [](const RlBatchedSim& s) { return s.nv; })
         .def_prop_ro("nu", [](const RlBatchedSim& s) { return s.nu; })
-        .def("step", &RlBatchedSim::step, nb::arg("ctrl"))
+        .def("step", &RlBatchedSim::step, nb::arg("ctrl"), nb::arg("n") = 1)
         .def("reset", &RlBatchedSim::reset, nb::arg("mask"))
         .def("set_env_qpos", &RlBatchedSim::set_env_qpos, nb::arg("env_idx"), nb::arg("qpos"))
         .def("set_env_qvel", &RlBatchedSim::set_env_qvel, nb::arg("env_idx"), nb::arg("qvel"))
@@ -171,7 +187,9 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("xpos", &RlBatchedSim::xpos)
         .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
         .def("sensordata", &RlBatchedSim::sensordata)
-        .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator);
+        .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator)
+        .def("set_pack_spec", &RlBatchedSim::set_pack_spec, nb::arg("body_ids"), nb::arg("dof_lo"), nb::arg("ndof"))
+        .def("read_pack", &RlBatchedSim::read_pack);
 
     nb::class_<RlCamera>(m, "Camera")
         .def_prop_ro("num_cameras", &RlCamera::ncam)

@@ -1233,13 +1233,15 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
     }
 }
 
-MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) {
+MJMLX_API void mjmlx_batched_step_n(MjmlxBatchedSim* sim, const float* ctrl_flat, int n) {
     if (!sim) return;
 
     if (sim->cpu_mode) {
-        cpu_sync_state(sim);
-        cpu_batched_step(sim, ctrl_flat, 1);
-        cpu_gather_state(sim);
+        for (int i = 0; i < n; i++) {
+            cpu_sync_state(sim);
+            cpu_batched_step(sim, ctrl_flat, 1);
+            cpu_gather_state(sim);
+        }
         return;
     }
 
@@ -1248,22 +1250,27 @@ MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) 
     int nu = s.model->nu;
     int ctrl_dim = std::max(1, nu);
 
+    // 同じctrlをn回使うので配列は1つだけ作る(substepごとに作るとホスト->GPU転送のたびにキューの完了待ちが入る)
     mx::array ctrl = (ctrl_flat && nu > 0)
         ? mx::reshape(mx::array(ctrl_flat, {B * nu}, mx::float32), {B, nu})
         : mx::zeros({B, ctrl_dim});
 
-    if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
-    auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
-    s.qpos = results[0];
-    s.qvel = results[1];
-    if (results.size() > 2) s.xpos = results[2];
-    if (results.size() > 3) s.xquat = results[3];
-    if (results.size() > 4) s.subtree_com = results[4];
-    if (results.size() > 5) s.cinert = results[5];
-    if (results.size() > 6) s.cvel = results[6];
-    if (results.size() > 7) s.qfrc_actuator = results[7];
-    if (results.size() > 8) s.cfrc_ext = results[8];
+    for (int i = 0; i < n; i++) {
+        if (s.sensor) mjmlx::sensor_before_step(*s.sensor, s);
+        auto results = s.compiled_step({s.qpos, s.qvel, ctrl});
+        s.qpos = results[0];
+        s.qvel = results[1];
+        if (results.size() > 2) s.xpos = results[2];
+        if (results.size() > 3) s.xquat = results[3];
+        if (results.size() > 4) s.subtree_com = results[4];
+        if (results.size() > 5) s.cinert = results[5];
+        if (results.size() > 6) s.cvel = results[6];
+        if (results.size() > 7) s.qfrc_actuator = results[7];
+        if (results.size() > 8) s.cfrc_ext = results[8];
+    }
 }
+
+MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) { mjmlx_batched_step_n(sim, ctrl_flat, 1); }
 
 MJMLX_API void mjmlx_batched_get_state(
     const MjmlxBatchedSim* sim, float* qpos_out, float* qvel_out,
@@ -1394,6 +1401,55 @@ MJMLX_API const float* mjmlx_batched_get_cfrc_ext(const MjmlxBatchedSim* sim, in
     mx::eval(sim->sim.cfrc_ext);
     if (n_out) *n_out = sim->sim.num_envs * sim->sim.model->nbody * 6;
     return (sim->sim.cfrc_ext.size() > 0) ? sim->sim.cfrc_ext.data<float>() : nullptr;
+}
+
+// ── 学習env用のまとめ読み出し(GPUで詰めて1回だけ転送) ──
+namespace {
+struct PackSpec {
+    std::optional<mkx::fast::Kernel<>> kernel;
+    int stride = 0;
+};
+}
+
+MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof) {
+    if (!sim || sim->cpu_mode || nbody_sel < 0 || ndof < 0) return -1;
+    const auto& m = *sim->sim.model;
+    for (int i = 0; i < nbody_sel; i++) if (body_ids[i] < 0 || body_ids[i] >= m.nbody) return -1;
+    if (dof_lo < 0 || dof_lo + ndof > m.nv) return -1;
+    int nq = m.nq, nv = m.nv, nb = m.nbody;
+    int stride = nq + nv + nbody_sel + ndof;
+    std::ostringstream ss;
+    ss << "uint e = gl_GlobalInvocationID.x;\n"
+       << "if (e >= uint(" << sim->sim.num_envs << ")) return;\n"
+       << "uint o = e * " << stride << "u;\n"
+       << "for (int i = 0; i < " << nq << "; i++) pack_out[o + uint(i)] = qpos_in[e * " << nq << "u + uint(i)];\n"
+       << "for (int i = 0; i < " << nv << "; i++) pack_out[o + uint(" << nq << " + i)] = qvel_in[e * " << nv << "u + uint(i)];\n";
+    for (int k = 0; k < nbody_sel; k++) {
+        uint32_t c = static_cast<uint32_t>(body_ids[k]) * 6u + 3u;
+        ss << "{ uint c = e * " << nb * 6 << "u + " << c << "u; vec3 f = vec3(cfrc_in[c], cfrc_in[c+1u], cfrc_in[c+2u]); pack_out[o + " << (nq + nv + k) << "u] = length(f); }\n";
+    }
+    for (int k = 0; k < ndof; k++) ss << "pack_out[o + " << (nq + nv + nbody_sel + k) << "u] = qfa_in[e * " << nv << "u + " << (dof_lo + k) << "u];\n";
+    auto spec = std::make_shared<PackSpec>();
+    spec->kernel = mkx::fast::compute_kernel("mjmlx_pack", {"qpos_in", "qvel_in", "cfrc_in", "qfa_in"}, {"pack_out"}, ss.str(), "");
+    spec->stride = stride;
+    sim->pack = spec;
+    return stride;
+}
+
+MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out) {
+    if (!sim || sim->cpu_mode || !sim->pack || !out) return -1;
+    auto& spec = *static_cast<PackSpec*>(sim->pack.get());
+    auto& s = sim->sim;
+    int B = s.num_envs;
+    auto raw = (*spec.kernel)(
+        mx::fast::kernel_inputs({mx::flatten(s.qpos), mx::flatten(s.qvel), mx::flatten(s.cfrc_ext), mx::flatten(s.qfrc_actuator)}),
+        mx::fast::kernel_shapes({{B * spec.stride}}),
+        std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
+    MX_MARK_PERSISTENT(raw[0], &s);
+    auto packed = mx::fast::kernel_outputs(raw)[0];
+    const float* p = packed.data<float>();
+    std::memcpy(out, p, static_cast<size_t>(B) * spec.stride * sizeof(float));
+    return 0;
 }
 
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim) {
