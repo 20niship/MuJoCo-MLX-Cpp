@@ -31,7 +31,9 @@ inline int solver_max_efc() { static const int v = getenv("MJMLX_MAX_EFC") ? ato
 inline bool solver_use_shared(int nv) { static const bool on = !getenv("MJMLX_SOLVER_SHARED") || atoi(getenv("MJMLX_SOLVER_SHARED")) != 0; return on && nv <= 32; }
 inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(solver_max_efc(), 96) : solver_max_efc(); }
 
-inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
+// H領域はCGの作業ベクトル(r,p,Ap)3本=3*nvも兼ねるため、nv<3でもあふれないようmax(nv*nv, 3*nv)とる。
+inline int solver_h_floats(int nv) { return std::max(nv * nv, 3 * nv); }
+inline int solver_scratch_floats(int nv, int max_efc) { return solver_h_floats(nv) + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
 inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
   using namespace detail_solver;
@@ -44,7 +46,7 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float time
   const int max_contacts_per_env = 128;
 
   int S_H             = 0;
-  int S_J             = S_H + nv * nv;
+  int S_J             = S_H + solver_h_floats(nv);
   int S_D             = S_J + max_efc * nv;
   int S_AREF          = S_D + max_efc;
   int S_FORCE         = S_AREF + max_efc;
@@ -91,7 +93,7 @@ shared float tg_pAp;
 
   if(use_shared) {
     std::ostringstream sh;
-    sh << "shared float sh_H[" << nv * nv << "];\n"
+    sh << "shared float sh_H[" << solver_h_floats(nv) << "];\n"
        << "shared float sh_J[" << max_efc * nv << "];\n"
        << "shared float sh_D[" << max_efc << "];\n"
        << "shared float sh_aref[" << max_efc << "];\n"

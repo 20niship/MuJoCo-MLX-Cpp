@@ -56,6 +56,80 @@ static mx::array to_mx_byte(const unsigned char* data, int n) {
     return mx::array(buf.data(), {n}, mx::int32);
 }
 
+// SDF geomのプラグイン距離関数をgeomローカルの一様格子にベイクする(GPUカーネルから直接プラグインを呼べないため)。
+// 格子はaabbを10%広げた範囲。範囲外はカーネル側でクランプ点までの距離を足して外挿する。
+static constexpr double SDF_GRID_CELLS = 2.0e6;  // geomあたりのセル数。軸ごとの分割数はセルがほぼ立方体になるよう配分する
+static constexpr float SDF_GRID_PAD = 1.1f;
+
+static void bake_sdf_geoms(const mjModel* m, Model& model) {
+    std::vector<int> sdf_geoms;
+    for (int g = 0; g < m->ngeom; g++)
+        if (m->geom_type[g] == mjGEOM_SDF) sdf_geoms.push_back(g);
+    if (sdf_geoms.empty()) return;
+
+    std::vector<float> info((size_t)m->ngeom * Model::SDF_INFO_STRIDE, 0.0f);
+    for (int g = 0; g < m->ngeom; g++) info[(size_t)g * Model::SDF_INFO_STRIDE] = -1.0f;
+    std::vector<float> grid;
+
+    mjData* d = mj_makeData(m);
+    for (int g : sdf_geoms) {
+        if (m->geom_plugin[g] < 0)
+            throw std::runtime_error("SDF geom without plugin is not supported (geom " + std::to_string(g) + ")");
+        const mjpPlugin* plugin = mjp_getPluginAtSlot(m->plugin[m->geom_plugin[g]]);
+        if (!plugin || !plugin->sdf_distance)
+            throw std::runtime_error("SDF plugin of geom " + std::to_string(g) + " has no sdf_distance");
+
+        float* inf = &info[(size_t)g * Model::SDF_INFO_STRIDE];
+        inf[0] = (float)grid.size();
+        // 格子は歯面の曲率に対し粗く(補間誤差~0.5mm)偽接触が出るため、gearはGPU側で解析式を直接評価する(属性のみ渡す)
+        const bool is_gear = plugin->name && !strcmp(plugin->name, "mujoco.sdf.gear");
+        if (is_gear) {
+            static const char* names[5] = {"alpha", "diameter", "teeth", "thickness", "innerdiameter"};
+            static const float defs[5] = {0, 2.8f, 25, .2f, -1};
+            inf[14] = 1.0f;
+            for (int a = 0; a < 5; a++) {
+                const char* v = mj_getPluginConfig(m, m->geom_plugin[g], names[a]);
+                inf[15 + a] = (v && *v) ? (float)atof(v) : defs[a];
+            }
+        }
+        const double* ab = m->geom_aabb + 6 * g;
+        double vol = 1.0;
+        for (int a = 0; a < 3; a++) {
+            inf[1 + a] = (float)ab[a];
+            inf[4 + a] = (float)ab[3 + a];
+            inf[7 + a] = (float)ab[3 + a] * SDF_GRID_PAD;
+            vol *= 2.0 * inf[7 + a];
+        }
+        inf[10] = (float)m->geom_rbound[g];
+        const double h = std::cbrt(vol / SDF_GRID_CELLS);
+        int n[3];
+        for (int a = 0; a < 3; a++) {
+            n[a] = std::max(2, (int)std::ceil(2.0 * inf[7 + a] / h) + 1);
+            inf[11 + a] = (float)n[a];
+        }
+
+        const size_t base = grid.size();
+        if (is_gear) for (int a = 0; a < 3; a++) { n[a] = 2; inf[11 + a] = 2.0f; }
+        grid.resize(base + (size_t)n[0] * n[1] * n[2]);
+        if (is_gear) { std::fill(grid.begin() + base, grid.end(), 0.0f); continue; }
+        for (int iz = 0; iz < n[2]; iz++)
+            for (int iy = 0; iy < n[1]; iy++)
+                for (int ix = 0; ix < n[0]; ix++) {
+                    const int idx[3] = {ix, iy, iz};
+                    double x[3];
+                    for (int a = 0; a < 3; a++)
+                        x[a] = inf[1 + a] + inf[7 + a] * (2.0 * idx[a] / (n[a] - 1) - 1.0);
+                    grid[base + ((size_t)iz * n[1] + iy) * n[0] + ix] =
+                        (float)plugin->sdf_distance(x, d, m->geom_plugin[g]);
+                }
+    }
+    mj_deleteData(d);
+
+    model.has_sdf = true;
+    model.geom_sdf_info = mx::array(info.data(), {(int)info.size()}, mx::float32);
+    model.sdf_grid = mx::array(grid.data(), {(int)grid.size()}, mx::float32);
+}
+
 // Convert an mjModel* to our internal Model struct.
 // The mjModel* is NOT freed here -- caller manages its lifetime.
 static Model convert_model(mjModel* m) {
@@ -90,6 +164,8 @@ static Model convert_model(mjModel* m) {
     model.opt.wind = to_mx_f(m->opt.wind, 3);
     model.opt.viscosity = static_cast<float>(m->opt.viscosity);
     model.opt.density = static_cast<float>(m->opt.density);
+    model.opt.sdf_initpoints = m->opt.sdf_initpoints;
+    model.opt.sdf_iterations = m->opt.sdf_iterations;
 
     // Statistics
     model.stat.meaninertia = static_cast<float>(m->stat.meaninertia);
@@ -292,6 +368,8 @@ static Model convert_model(mjModel* m) {
 
     // Exclude body pairs
     model.nexclude = m->nexclude;
+    bake_sdf_geoms(m, model);
+
     if (m->nexclude > 0) {
         model.exclude_signature = to_mx_i(m->exclude_signature, (int)m->nexclude);
     }
@@ -315,6 +393,12 @@ static void validate_model(const mjModel* m) {
             default: break;
         }
     }
+    // SDF geomはSDF同士の衝突のみGPUカーネルで対応(相手がSDF以外の組は接触しない)
+    for (int i = 0; i < m->ngeom; i++)
+        if (m->geom_type[i] == mjGEOM_SDF) {
+            fprintf(stderr, "[mjmlx WARNING] Model has SDF geoms -- only SDF-SDF collision is supported (batched GPU path).\n");
+            break;
+        }
     // MESH geom collision is now supported via GJK/EPA (Phase 3.3)
     // BOX geom collision is now supported (Phase 3.1)
     // HFIELD geom collision is now supported (Phase 3.4)
@@ -1200,6 +1284,8 @@ void Model::init_cache() const {
                 max_contacts = 8; // conservative fallback
             }
         }
+        else if (cp.type1 == (int)GeomType::SDF && cp.type2 == (int)GeomType::SDF)
+            max_contacts = std::min(opt.sdf_initpoints, 50); // 初期点ごとに最大1接触(mjMAXCONPAIR)
         else if (cp.type2 == (int)GeomType::MESH || cp.type1 == (int)GeomType::MESH)
             max_contacts = 1; // GJK/EPA returns 1 contact
         else if (cp.type1 == (int)GeomType::HFIELD || cp.type2 == (int)GeomType::HFIELD)

@@ -10,7 +10,8 @@
 
 namespace mjmlx::mkx_kernels {
 
-inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128) {
+inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128,
+                                                int sdf_initpoints = 0, int sdf_iterations = 0) {
   const int contact_stride = 8;
 
   std::string header = R"GLSL(
@@ -72,7 +73,143 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
                 R[3]*lp.x+R[4]*lp.y+R[5]*lp.z+pos.y,
                 R[6]*lp.x+R[7]*lp.y+R[8]*lp.z+pos.z);
 }
-)GLSL";
+)GLSL" + std::string(R"GLSL(
+// ── SDF-SDF (MuJoCo mjc_SDF 移植) ──
+// sdf_info(geomごと20float)=[格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound, 軸ごとのセル数(3), 種別, gear属性(5)]。格子はgeomローカルの一様ボクセルで、格子外はクランプ点までの距離を足して外挿する。
+float mjmlx_sdf_cell(int base, ivec3 n, ivec3 i) {
+    return sdf_grid[base + (i.z * n.y + i.y) * n.x + i.x];
+}
+float mjmlx_sdf_dist_grid(int g, vec3 x);
+
+// MuJoCo gearプラグイン(plugin/sdf/gear.cc)のdistance()の移植。属性=[alpha, diameter, teeth, thickness, innerdiameter]
+float mjmlx_gear_mod(float x, float y) { return x - y * floor(x / y); }
+float mjmlx_gear_smooth_union(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return b * (1.0 - h) + a * h - k * h * (1.0 - h);
+}
+float mjmlx_gear_dist(int o, vec3 p) {
+    float alpha = sdf_info[o+15], D = sdf_info[o+16], N = sdf_info[o+17], thick = sdf_info[o+18], inner = sdf_info[o+19];
+    const float PI = 3.14159265358979;
+    float psi = 3.096e-5 * N * N - 6.557e-3 * N + 0.551;
+    float R = D / 2.0;
+    float rho = length(p.xy);
+    float Pd = N / D;
+    float P = PI / Pd;
+    float a = 1.0 / Pd;
+    float Ro = (D + 2.0 * a) / 2.0;
+    float h = 2.2 / Pd;
+    float innerR = Ro - h - 0.14 * D;
+    if (inner >= 0.0) innerR = inner / 2.0;
+    float d2;
+    if (innerR - rho > 0.0) d2 = innerR - rho;
+    else if (Ro - rho < -0.2) d2 = rho - Ro;
+    else {
+        float Rb = D * cos(psi) / 2.0;
+        float fi = atan(p.y, p.x) + alpha;
+        float alphaStride = P / R;
+        float invAlpha = acos(Rb / R);
+        float invPhi = tan(invAlpha) - invAlpha;
+        float shift = alphaStride / 2.0 - 2.0 * invPhi;
+        float fia = mjmlx_gear_mod(fi + shift / 2.0, alphaStride) - shift / 2.0;
+        float fib = mjmlx_gear_mod(-fi - shift + shift / 2.0, alphaStride) - shift / 2.0;
+        float dista = -1.0e6, distb = -1.0e6;
+        if (Rb < rho) {
+            float acr = acos(Rb / rho);
+            float ta = sqrt(rho * rho - Rb * Rb);
+            dista = ta - Rb * (fia + acr);
+            distb = ta - Rb * (fib + acr);
+        }
+        float gearOuter = rho - Ro;
+        float gearLowBase = rho - (Ro - h);
+        float crownBase = rho - innerR;
+        float cogs = max(dista, distb);
+        float baseWalls = max(fia - (alphaStride - shift), fib - (alphaStride - shift));
+        cogs = max(baseWalls, cogs);
+        // smoothIntersection(gearOuter, cogs, k) = max(max(a,b), -smoothUnion(max(a,-b), max(b,-a), k))
+        float k = 0.0035 * D;
+        cogs = max(max(gearOuter, cogs), -mjmlx_gear_smooth_union(max(gearOuter, -cogs), max(cogs, -gearOuter), k));
+        cogs = mjmlx_gear_smooth_union(gearLowBase, cogs, Rb - Ro + h);
+        d2 = max(cogs, -crownBase);
+    }
+    vec2 w = vec2(d2, abs(p.z) - thick / 2.0);
+    return min(max(w.x, w.y), 0.0) + length(max(w, vec2(0.0)));
+}
+float mjmlx_sdf_dist(int g, vec3 x) {
+    int o = g * 20;
+    if (sdf_info[o+14] > 0.5) return mjmlx_gear_dist(o, x);
+    return mjmlx_sdf_dist_grid(g, x);
+}
+float mjmlx_sdf_dist_grid(int g, vec3 x) {
+    int o = g * 20;
+    int base = int(sdf_info[o]);
+    ivec3 n = ivec3(sdf_info[o+11], sdf_info[o+12], sdf_info[o+13]);
+    vec3 ctr = vec3(sdf_info[o+1], sdf_info[o+2], sdf_info[o+3]);
+    vec3 gh = vec3(sdf_info[o+7], sdf_info[o+8], sdf_info[o+9]);
+    vec3 xc = clamp(x, ctr - gh, ctr + gh);
+    vec3 u = (xc - (ctr - gh)) / (2.0 * gh) * vec3(n - 1);
+    ivec3 i0 = min(ivec3(floor(u)), (n - 2));
+    vec3 f = u - vec3(i0);
+    float c00 = mix(mjmlx_sdf_cell(base, n, i0), mjmlx_sdf_cell(base, n, i0 + ivec3(1,0,0)), f.x);
+    float c10 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,1,0)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,1,0)), f.x);
+    float c01 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,0,1)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,0,1)), f.x);
+    float c11 = mix(mjmlx_sdf_cell(base, n, i0 + ivec3(0,1,1)), mjmlx_sdf_cell(base, n, i0 + ivec3(1,1,1)), f.x);
+    return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z) + length(x - xc);
+}
+// 中心差分の勾配(刻みは1セル)
+vec3 mjmlx_sdf_grad(int g, vec3 x) {
+    int o = g * 20;
+    bool exact = sdf_info[o+14] > 0.5;
+    vec3 h = vec3(sdf_info[o+7], sdf_info[o+8], sdf_info[o+9]) * 2.0 / (vec3(ivec3(sdf_info[o+11], sdf_info[o+12], sdf_info[o+13])) - 1.0);
+    if (exact) h = vec3(2e-4);
+    return vec3(mjmlx_sdf_dist(g, x + vec3(h.x,0,0)) - mjmlx_sdf_dist(g, x - vec3(h.x,0,0)),
+                mjmlx_sdf_dist(g, x + vec3(0,h.y,0)) - mjmlx_sdf_dist(g, x - vec3(0,h.y,0)),
+                mjmlx_sdf_dist(g, x + vec3(0,0,h.z)) - mjmlx_sdf_dist(g, x - vec3(0,0,h.z))) / (2.0 * h);
+}
+float mjmlx_halton(int i, int b) {
+    float f = 1.0, r = 0.0;
+    int n = i;
+    while (n > 0) { f /= float(b); r += f * float(n % b); n /= b; }
+    return r;
+}
+// 評価点xはg2ローカル。g1ローカル座標は R21*x + p21。type 0=衝突(A+B+|max(A,B)|), 1=交差(max), 2=中間面(A-B)
+float mjmlx_sdf_obj(int ga, int gb, mat3 R21, vec3 p21, vec3 x, int type) {
+    float A = mjmlx_sdf_dist(ga, x);
+    float B = mjmlx_sdf_dist(gb, R21 * x + p21);
+    if (type == 0) return A + B + abs(max(A, B));
+    if (type == 1) return max(A, B);
+    return A - B;
+}
+vec3 mjmlx_sdf_obj_grad(int ga, int gb, mat3 R21, vec3 p21, vec3 x, int type) {
+    vec3 y = R21 * x + p21;
+    float A = mjmlx_sdf_dist(ga, x);
+    float B = mjmlx_sdf_dist(gb, y);
+    vec3 g1 = mjmlx_sdf_grad(ga, x);
+    vec3 g2 = transpose(R21) * mjmlx_sdf_grad(gb, y);
+    if (type == 0) return g1 + g2 + (A > B ? g1 : g2) * (max(A, B) > 0.0 ? 1.0 : -1.0);
+    if (type == 1) return A > B ? g1 : g2;
+    return msl_norm(msl_norm(g1) - msl_norm(g2));
+}
+// 勾配降下+バックトラッキング直線探索(stepGradient)。距離を返す
+float mjmlx_sdf_descend(int ga, int gb, mat3 R21, vec3 p21, inout vec3 x, int type, int niter) {
+    float dist = 1e10;
+    for (int step = 0; step < niter; step++) {
+        vec3 grad = mjmlx_sdf_obj_grad(ga, gb, R21, p21, x, type);
+        if (any(isnan(grad)) || any(greaterThan(abs(grad), vec3(1e10)))) return 1e10;
+        vec3 x0 = x;
+        float dist0 = mjmlx_sdf_obj(ga, gb, R21, p21, x0, type);
+        float alpha = 2.0;
+        float wolfe = -0.1 * alpha * dot(grad, grad);
+        do {
+            alpha *= 0.5;
+            wolfe *= 0.5;
+            x = x0 - alpha * grad;
+            dist = mjmlx_sdf_obj(ga, gb, R21, p21, x, type);
+        } while (alpha > 1e-4 && dist - dist0 > wolfe);
+        if (dist0 < dist) return dist;
+    }
+    return dist;
+}
+)GLSL");
 
   std::ostringstream ss;
   ss << "uint bid = gl_GlobalInvocationID.x;\n"
@@ -80,7 +217,9 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
      << "const int NG = " << ng << ";\n"
      << "const int NUM_PAIRS = " << npairs << ";\n"
      << "const int MAX_CON = " << max_contacts_per_env << ";\n"
-     << "const int STRIDE = " << contact_stride << ";\n\n"
+     << "const int STRIDE = " << contact_stride << ";\n"
+     << "const int SDF_INITPOINTS = " << sdf_initpoints << ";\n"
+     << "const int SDF_ITERATIONS = " << sdf_iterations << ";\n\n"
      << "uint gx_off = bid * NG * 3;\n"
      << "uint gm_off = bid * NG * 9;\n"
      << "uint con_off = bid * MAX_CON * STRIDE;\n\n"
@@ -95,6 +234,68 @@ for (int p = 0; p < NUM_PAIRS; p++) {
     int t1 = int(pair_data[pd+2]), t2 = int(pair_data[pd+3]);
     float pair_margin = pair_data[pd+4];
     float rbound_sum = pair_data[pd+5];
+
+
+    // (rbound判定の前に処理)
+    // SDF同士: MuJoCo mjc_SDFと同じく、AABB交差内のHalton点から勾配降下で接触点を探す。接触は複数点を直接書き込む。SDFと他形状の組は未対応(接触なし)。
+    if (t1 == 8 || t2 == 8) {
+        if (t1 == 8 && t2 == 8 && SDF_INITPOINTS > 0) {
+            // g2ローカルでの最適化。R21/p21 = g2座標->g1座標
+            vec3 pos1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
+            vec3 pos2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
+            if (msl_len(pos1 - pos2) >= rbound_sum) continue;
+            mat3 W1, W2;  // 列優先: W[col][row]
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
+                W1[c][r] = geom_xmat[uint(g1*9+r*3+c)*NBATCH+bid];
+                W2[c][r] = geom_xmat[uint(g2*9+r*3+c)*NBATCH+bid];
+            }
+            mat3 R21 = transpose(W1) * W2;
+            vec3 p21 = transpose(W1) * (pos2 - pos1);
+            mat3 R12 = transpose(R21);
+            vec3 p12 = -(R12 * p21);
+
+            // g1フレームでのAABB交差
+            vec3 lo1 = vec3(1e10), hi1 = vec3(-1e10), lo2 = vec3(1e10), hi2 = vec3(-1e10);
+            vec3 c1 = vec3(sdf_info[g1*20+1], sdf_info[g1*20+2], sdf_info[g1*20+3]);
+            vec3 h1 = vec3(sdf_info[g1*20+4], sdf_info[g1*20+5], sdf_info[g1*20+6]);
+            vec3 c2 = vec3(sdf_info[g2*20+1], sdf_info[g2*20+2], sdf_info[g2*20+3]);
+            vec3 h2 = vec3(sdf_info[g2*20+4], sdf_info[g2*20+5], sdf_info[g2*20+6]);
+            for (int k = 0; k < 8; k++) {
+                vec3 v1 = c1 + h1 * vec3((k&1) != 0 ? 1.0 : -1.0, (k&2) != 0 ? 1.0 : -1.0, (k&4) != 0 ? 1.0 : -1.0);
+                vec3 v2 = R21 * (c2 + h2 * vec3((k&1) != 0 ? 1.0 : -1.0, (k&2) != 0 ? 1.0 : -1.0, (k&4) != 0 ? 1.0 : -1.0)) + p21;
+                lo1 = min(lo1, v1); hi1 = max(hi1, v1);
+                lo2 = min(lo2, v2); hi2 = max(hi2, v2);
+            }
+            vec3 lo = max(lo1, lo2), hi = min(hi1, hi2);
+            if (all(lessThanEqual(lo, hi))) {
+                vec3 known[50];
+                int nk = 0;
+                for (int i = 0, j = 0; i < SDF_INITPOINTS; i++, j++) {
+                    vec3 xg1 = lo + (hi - lo) * vec3(mjmlx_halton(j, 2), mjmlx_halton(j, 3), mjmlx_halton(j, 5));
+                    vec3 x = R12 * xg1 + p12;  // g2ローカルへ
+                    mjmlx_sdf_descend(g2, g1, R21, p21, x, 0, SDF_ITERATIONS);
+                    // 不正確なSDFによる偽の衝突を交差距離で除く
+                    float dist = mjmlx_sdf_descend(g2, g1, R21, p21, x, 1, 1);
+                    if (dist > 0.0) continue;
+                    bool dup = false;
+                    for (int q = 0; q < nk; q++) if (distance(x, known[q]) < 1e-9) dup = true;
+                    if (dup || nk >= 50 || ncon >= MAX_CON) continue;
+                    known[nk++] = x;
+                    // 接触点・法線: A=B(中間面)を零等値面とする。法線はg1->g2向き
+                    vec3 nl = -mjmlx_sdf_obj_grad(g2, g1, R21, p21, x, 2);
+                    vec3 nw = W2 * msl_norm(nl);
+                    vec3 cp = W2 * x + pos2 - nw * (dist * 0.5);
+                    int idx = int(con_off) + ncon * STRIDE;
+                    contact_data[idx+0]=cp.x; contact_data[idx+1]=cp.y; contact_data[idx+2]=cp.z;
+                    contact_data[idx+3]=nw.x; contact_data[idx+4]=nw.y; contact_data[idx+5]=nw.z;
+                    contact_data[idx+6]=dist;
+                    contact_data[idx+7]=float(p);
+                    ncon++;
+                }
+            }
+        }
+        continue;
+    }
 
     if (t1 != 0 && t2 != 0) {
         vec3 c1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
@@ -301,7 +502,7 @@ for (int p = 0; p < NUM_PAIRS; p++) {
 contact_count[bid] = float(ncon);
 )GLSLBODY";
 
-  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"}, {"contact_data", "contact_count"}, ss.str(), header);
+  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf", "sdf_info", "sdf_grid"}, {"contact_data", "contact_count"}, ss.str(), header);
 }
 
 } // namespace mjmlx::mkx_kernels

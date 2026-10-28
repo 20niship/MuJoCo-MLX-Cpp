@@ -26,7 +26,7 @@ namespace mjmlx {
 enum class JointType : int { FREE = 0, BALL = 1, SLIDE = 2, HINGE = 3 };
 enum class GeomType : int {
     PLANE = 0, HFIELD = 1, SPHERE = 2, CAPSULE = 3,
-    ELLIPSOID = 4, CYLINDER = 5, BOX = 6, MESH = 7
+    ELLIPSOID = 4, CYLINDER = 5, BOX = 6, MESH = 7, SDF = 8
 };
 enum class IntegratorType : int { EULER = 0, RK4 = 1, IMPLICIT = 2, IMPLICITFAST = 3 };
 enum class SolverType : int { PGS = 0, CG = 1, NEWTON = 2 };
@@ -70,6 +70,8 @@ struct Option {
     mx::array wind = mx::zeros({3});
     float viscosity = 0.0f;
     float density = 0.0f;
+    int sdf_initpoints = 40;  // mjOption.sdf_initpoints
+    int sdf_iterations = 10;  // mjOption.sdf_iterations
 };
 
 // ── Statistic ────────────────────────────────────────────────
@@ -229,6 +231,13 @@ struct Model {
     mx::array mesh_vertadr = mx::array({});    // (nmesh,) int: start index of vertices for each mesh
     mx::array mesh_vertnum = mx::array({});    // (nmesh,) int: number of vertices for each mesh
     mx::array mesh_vert = mx::array({});       // (total_verts, 3) float: all mesh vertices
+
+    // SDF geom: プラグインSDFをgeomローカルのボクセル格子にベイクしたもの(GPU衝突カーネルがtrilinearでサンプルする)
+    // geom_sdf_info: (ngeom, SDF_INFO_STRIDE) = [格子先頭, aabb中心(3), aabb半幅(3), 格子半幅(3), rbound, 軸ごとのセル数(3), 種別(0=格子,1=gearを解析評価), gear属性(5)]。SDFでないgeomは先頭が-1
+    static constexpr int SDF_INFO_STRIDE = 20;
+    bool has_sdf = false;
+    mx::array geom_sdf_info = mx::array({});
+    mx::array sdf_grid = mx::array({});         // (全SDFのセル数合計,) float: 符号付き距離
 
     // Hfield data (for height field collision)
     int nhfield = 0;
