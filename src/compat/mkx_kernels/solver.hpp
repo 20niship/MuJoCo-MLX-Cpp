@@ -29,7 +29,7 @@ inline int solver_max_efc() { static const int v = getenv("MJMLX_MAX_EFC") ? ato
 // 小さいモデル(nv<=32)は拘束行列などをworkgroup共有メモリに置く。globalメモリのレイテンシ(数百cycle)が直列部分を支配するため。
 // 共有メモリに載せるため拘束行数の上限を下げる(超過分の接触は落ちる)。MJMLX_SOLVER_SHARED=0で無効。
 inline bool solver_use_shared(int nv) { static const bool on = !getenv("MJMLX_SOLVER_SHARED") || atoi(getenv("MJMLX_SOLVER_SHARED")) != 0; return on && nv <= 32; }
-inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(solver_max_efc(), 96) : solver_max_efc(); }
+inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(solver_max_efc(), 72) : solver_max_efc(); }
 
 inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
@@ -38,6 +38,7 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float time
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
   const float newton_tol = getenv("MJMLX_NTOL") ? (float)atof(getenv("MJMLX_NTOL")) : 1e-4f;  // Newton減少量(g.s)がtrace(M)のこの倍未満なら収束とみなす(CPUとの差は1e-4でも変わらない)。0で無効
+  const float ls_tol = getenv("MJMLX_LSTOL") ? (float)atof(getenv("MJMLX_LSTOL")) : 1e-3f;  // 直線探索の二分法を、導関数が初期勾配のこの割合未満で打ち切る。0で無効
   const int max_efc              = solver_max_efc_for(nv);
   const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
@@ -91,10 +92,10 @@ shared float tg_pAp;
 
   if(use_shared) {
     std::ostringstream sh;
-    sh << "shared float sh_H[" << nv * nv << "];\n"
+    // sh_Hは構築中(cdof/subtree_com)・直線探索中(sh_red)の作業領域も兼ねる。占有メモリが減るとワークグループの同時実行数が増え、レイテンシ律速のsolverがほぼ比例して速くなる。
+    sh << "shared float sh_H[" << std::max({nv * nv, 6 * nv + 3 * nb, 12 * nv}) << "];\n"
        << "shared float sh_J[" << max_efc * nv << "];\n"
        << "shared float sh_D[" << max_efc << "];\n"
-       << "shared float sh_aref[" << max_efc << "];\n"
        << "shared float sh_force[" << max_efc << "];\n"
        << "shared float sh_Jaref[" << max_efc << "];\n"
        << "shared float sh_act[" << max_efc << "];\n"
@@ -105,12 +106,10 @@ shared float tg_pAp;
        << "shared float sh_qacc[" << nv << "];\n"
        << "shared float sh_Ma[" << nv << "];\n"
        << "shared float sh_Mv[" << nv << "];\n"
-       << "shared float sh_red[" << 12 * nv << "];\n"
+       << "shared float sh_bc[" << 2 * nv << "];\n"
        << "shared float sh_ld[" << nv << "];\n"
        << "shared float sh_qM[" << nv * nv << "];\n"
-       << "shared float sh_qfs[" << nv << "];\n"
-       << "shared float sh_cdof[" << nv * 6 << "];\n"
-       << "shared float sh_scom[" << nb * 3 << "];\n";
+       << "shared float sh_qfs[" << nv << "];\n";
     header += sh.str();
   }
   {
@@ -153,6 +152,7 @@ shared float tg_pAp;
      << "const int MAX_CON = " << max_contacts_per_env << ";\n"
      << "const float TIMESTEP = " << solver_fmt_float(timestep) << "f;\n"
      << "const float GTOL_REL = " << solver_fmt_float(gtol_rel) << "f;\n"
+     << "const float LS_TOL = " << solver_fmt_float(ls_tol) << "f;\n"
      << "const float NEWTON_TOL = " << solver_fmt_float(newton_tol) << "f;\n"
      << "const float MJMINVAL_CV = 1e-12f;\n"
      << "const float MJMINVAL_SV = 1e-14f;\n"
@@ -163,12 +163,13 @@ shared float tg_pAp;
   if(use_shared) {
     ss << "#define QMV(i)       sh_qM[(i)]\n";
     ss << "#define QFS(i)       sh_qfs[(i)]\n";
-    ss << "#define CDOF(i)      sh_cdof[(i)]\n";
-    ss << "#define SCOM(i)      sh_scom[(i)]\n";
+    ss << "#define CDOF(i)      sh_H[(i)]\n";
+    ss << "#define SCOM(i)      sh_H[6*NV+(i)]\n";
+    ss << "#define sh_red       sh_H\n";
     ss << "#define H(i)         sh_H[(i)]\n"
        << "#define J(r,c)       sh_J[(r)*NV+(c)]\n"
        << "#define efc_D(i)     sh_D[(i)]\n"
-       << "#define efc_aref(i)  sh_aref[(i)]\n"
+       << "#define efc_aref(i)  sh_Jv[(i)]\n"
        << "#define efc_force(i) sh_force[(i)]\n"
        << "#define grad(i)      sh_grad[(i)]\n"
        << "#define search_d(i)  sh_search[(i)]\n"
@@ -213,6 +214,10 @@ shared float tg_pAp;
      << "uint con_off = bid * MAX_CON * CON_STRIDE;\n"
      << "uint qfc_off = bid * NV;\n\n";
 
+  // J^T f: 依存したFMAの鎖が行数だけ続くと遅いので、4本の独立した累積に分ける
+  ss << "#define JTF(S) { float a0_ = 0.0f, a1_ = 0.0f, a2_ = 0.0f, a3_ = 0.0f; int q_ = 0; "
+     << "for (; q_ + 3 < nefc; q_ += 4) { a0_ += J(q_,int(tid))*efc_force(q_); a1_ += J(q_+1,int(tid))*efc_force(q_+1); a2_ += J(q_+2,int(tid))*efc_force(q_+2); a3_ += J(q_+3,int(tid))*efc_force(q_+3); } "
+     << "for (; q_ < nefc; q_++) a0_ += J(q_,int(tid))*efc_force(q_); S = (a0_ + a1_) + (a2_ + a3_); }\n";
   ss << "#define EFC_REFRESH(r) { float fl_ = efc_floss(r); float jr_ = Jaref(r); "
      << "if (fl_ > 0.0f) { float fd_ = efc_D(r) * jr_; if (abs(fd_) < fl_) { act(r) = 1.0f; efc_force(r) = -fd_; } else { act(r) = 0.0f; efc_force(r) = (jr_ > 0.0f) ? -fl_ : fl_; } } "
      << "else { act(r) = (jr_ < 0.0f) ? 1.0f : 0.0f; efc_force(r) = efc_D(r) * (-jr_) * act(r); } }\n";
@@ -229,10 +234,14 @@ shared float tg_pAp;
        << "barrier(); memoryBarrierBuffer();\n\n";
   } else {
     // 共有メモリ版は全域のゼロ埋めをしない: 拘束行(J/D/aref/floss)は作る時に全要素を書き、qacc等は読む前に必ず書く。
-    ss << "for (int ii = int(tid); ii < NV*NV; ii += NV) sh_qM[ii] = qM_in[uint(ii)*NBATCH+bid];\n"
-       << "sh_qfs[tid] = qfrc_smooth_in[uint(int(tid))*NBATCH+bid];\n"
-       << "for (int ii = int(tid); ii < NV*6; ii += NV) sh_cdof[ii] = cdof_in[uint(ii)*NBATCH+bid];\n"
-       << "for (int ii = int(tid); ii < NB*3; ii += NV) sh_scom[ii] = subtree_com_in[uint(ii)*NBATCH+bid];\n"
+    // グローバルの読み込みを先にまとめて発行してからsharedへ書く(ループ内で1つずつ待つとレイテンシが直列に積み上がる)
+    ss << "{ float tq[NV*NV/NV]; for (int k = 0; k < NV; k++) tq[k] = qM_in[uint(int(tid) + k*NV)*NBATCH+bid];\n"
+       << "  float tc[6]; for (int k = 0; k < 6; k++) tc[k] = cdof_in[uint(int(tid) + k*NV)*NBATCH+bid];\n"
+       << "  float tf = qfrc_smooth_in[uint(int(tid))*NBATCH+bid];\n"
+       << "  for (int k = 0; k < NV; k++) sh_qM[int(tid) + k*NV] = tq[k];\n"
+       << "  for (int k = 0; k < 6; k++) sh_H[int(tid) + k*NV] = tc[k];\n"
+       << "  sh_qfs[tid] = tf; }\n"
+       << "for (int ii = int(tid); ii < NB*3; ii += NV) sh_H[6*NV+ii] = subtree_com_in[uint(ii)*NBATCH+bid];\n"
        << "sh_qacc[tid] = 0.0f;\nbarrier();\n\n";
   }
 
@@ -497,7 +506,7 @@ Ma(int(tid)) = 0.0f;
 for (int r2 = int(tid); r2 < nefc; r2 += NV) { Jaref(r2) = -efc_aref(r2); EFC_REFRESH(r2); }
 barrier(); memoryBarrierBuffer();
 
-{ float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
+{ float s; JTF(s);
   grad(int(tid)) = Ma(int(tid)) - QFS(int(tid)) - s; }
 barrier(); memoryBarrierBuffer();
 
@@ -608,7 +617,7 @@ LS_END
     Ma(int(tid)) += ba * Mv_arr(int(tid));
     barrier(); memoryBarrierBuffer();
 
-    { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
+    { float s; JTF(s);
       grad(int(tid)) = Ma(int(tid)) - QFS(int(tid)) - s; }
     barrier(); memoryBarrierBuffer();
     // 勾配ノルムが初期値の相対GTOL_REL(2乗比)未満なら収束とみなして打ち切る。静止付近のenvは少ない反復で収束し、残りのNSOLVE回を省ける。
@@ -617,7 +626,7 @@ LS_END
     if (tg_done != 0) break;
 }
 
-{ float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
+{ float s; JTF(s);
   qfrc_constraint_out[qfc_off + int(tid)] = s; }
 barrier(); memoryBarrierBuffer();
 // 接触ごとの法線方向の力(ピラミッド錐は全ファセットの力の和)。cfrc_ext算出用。
@@ -635,15 +644,16 @@ if (tid == 0u) {
   // 1スレッド=1行(dof)。Hの行を作って(非アクティブ行は飛ばす)、列ごとに1回のbarrierで分解し、前進/後退代入も列方向に並列化する。
   const std::string kDirectSolve = R"GLSL(
     {
-        float ar[NV];
-        for (int j = 0; j < NV; j++) ar[j] = QMV(int(tid)*NV + j) + ((j == int(tid)) ? MJMINVAL_SV : 0.0f);
+        // Hは対称なので、レーンtが担当するのは組(t, (t+d)%NV) d=0..NV/2 だけ(NV/2+1個。全NV個を計算する従来の約半分の命令数)
+        const int NH = NV/2 + 1;
+        int cj[NH];
+        float ah[NH];
+        for (int d = 0; d < NH; d++) { cj[d] = (int(tid) + d) % NV; ah[d] = QMV(int(tid)*NV + cj[d]) + ((d == 0) ? MJMINVAL_SV : 0.0f); }
         for (int r2 = 0; r2 < nefc; r2++) {
-            float w = efc_D(r2) * act(r2);
-            if (w == 0.0f) continue;
-            float jt = J(r2, int(tid)) * w;
-            for (int j = 0; j < NV; j++) ar[j] += jt * J(r2, j);
+            float jt = J(r2, int(tid)) * (efc_D(r2) * act(r2));
+            for (int d = 0; d < NH; d++) ah[d] += jt * J(r2, cj[d]);
         }
-        for (int j = 0; j < NV; j++) H(int(tid)*NV + j) = ar[j];
+        for (int d = 0; d < NH; d++) { H(int(tid)*NV + cj[d]) = ah[d]; H(cj[d]*NV + int(tid)) = ah[d]; }
     }
     barrier();
     for (int j = 0; j < NV; j++) {
@@ -661,17 +671,17 @@ if (tid == 0u) {
     {
         float bt = -grad(int(tid));
         for (int i = 0; i < NV; i++) {
-            if (int(tid) == i) sh_red[i] = bt / sh_ld[i];
+            if (int(tid) == i) sh_bc[i] = bt / sh_ld[i];
             barrier();
-            if (int(tid) > i) bt -= H(int(tid)*NV + i) * sh_red[i];
+            if (int(tid) > i) bt -= H(int(tid)*NV + i) * sh_bc[i];
         }
-        float yt = sh_red[int(tid)];
+        float yt = sh_bc[int(tid)];
         for (int i = NV - 1; i >= 0; i--) {
-            if (int(tid) == i) sh_red[NV + i] = yt / sh_ld[i];
+            if (int(tid) == i) sh_bc[NV + i] = yt / sh_ld[i];
             barrier();
-            if (int(tid) < i) yt -= H(i*NV + int(tid)) * sh_red[NV + i];
+            if (int(tid) < i) yt -= H(i*NV + int(tid)) * sh_bc[NV + i];
         }
-        search_d(int(tid)) = sh_red[NV + int(tid)];
+        search_d(int(tid)) = sh_bc[NV + int(tid)];
     }
     barrier();
 )GLSL";
@@ -712,6 +722,7 @@ if (tid == 0u) {
         float dd = lg + mid*2.0f*qg;
         for (int i = 0; i < NV; i++) dd += sh_red[i];
         barrier();
+        if (abs(dd) < LS_TOL*abs(lg+lc)) { lo_a = mid; hi_a = mid; break; }  // 導関数がほぼ0なら打ち切る(厳密なNewton方向ではalpha=1で1回目に終わる)。全スレッドで同じ値なのでbarrierは揃う
         if (dd > 0.0f) hi_a = mid; else lo_a = mid;
     }
     float abis = 0.5f*(lo_a+hi_a);
