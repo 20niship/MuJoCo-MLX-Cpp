@@ -1,6 +1,7 @@
 #pragma once
 // Vendored from 20niship/mlx-cross-platform tests/mujoco/collision.hpp at commit 3202339e12231f3a68f9ee67e0b6085a33c52286.
 
+#include <cstdlib>
 #include <sstream>
 #include <string>
 
@@ -10,7 +11,7 @@
 
 namespace mjmlx::mkx_kernels {
 
-inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128) {
+inline mkx::fast::Kernel<> make_collision_kernel(int ng, int npairs, int max_contacts_per_env = 128, const float* pair_data_host = nullptr) {
   const int contact_stride = 8;
 
   std::string header = R"GLSL(
@@ -86,19 +87,19 @@ vec3 mjmlx_support(int gtype, vec3 pos, float R[9], vec3 size,
      << "uint con_off = bid * MAX_CON * STRIDE;\n\n"
      // contact_dataの全消去はしない(1env 1024float × スレッド単位の散らばった書き込みが支配的だった)。solver/cfrcは contact_count 個しか読まない。
      << "int ncon = 0;\n\n"
-     << "const int PAIR_STRIDE = 6;\n\n";
+     << "const int PAIR_STRIDE = 6;\n\n"
+     // geomの位置は全ペアで繰り返し使うので、最初に1回だけ(独立なloadをまとめて発行して)ローカルへ読む
+     << "vec3 GP[NG];\n"
+     << "for (int g = 0; g < NG; g++) GP[g] = vec3(geom_xpos[uint(g*3)*NBATCH+bid], geom_xpos[uint(g*3+1)*NBATCH+bid], geom_xpos[uint(g*3+2)*NBATCH+bid]);\n\n";
 
   ss << R"GLSLBODY(
 for (int p = 0; p < NUM_PAIRS; p++) {
     int pd = p * PAIR_STRIDE;
-    int g1 = int(pair_data[pd+0]), g2 = int(pair_data[pd+1]);
-    int t1 = int(pair_data[pd+2]), t2 = int(pair_data[pd+3]);
-    float pair_margin = pair_data[pd+4];
-    float rbound_sum = pair_data[pd+5];
+    PAIR_LOAD
 
     if (t1 != 0 && t2 != 0) {
-        vec3 c1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
-        vec3 c2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
+        vec3 c1 = GP[g1];
+        vec3 c2 = GP[g2];
         if (msl_len(c1 - c2) >= rbound_sum) continue;
     }
 
@@ -109,10 +110,10 @@ for (int p = 0; p < NUM_PAIRS; p++) {
         int plane_g = (t1 == 0) ? g1 : g2;
         int xg = (t1 == 0) ? g2 : g1;
         int xt = (t1 == 0) ? t2 : t1;
-        vec3 ppos = vec3(geom_xpos[uint(plane_g*3)*NBATCH+bid], geom_xpos[uint(plane_g*3+1)*NBATCH+bid], geom_xpos[uint(plane_g*3+2)*NBATCH+bid]);
+        vec3 ppos = GP[plane_g];
         float pR[9]; for (int k=0;k<9;k++) pR[k] = geom_xmat[uint(plane_g*9+k)*NBATCH+bid];
         vec3 normal = vec3(pR[2], pR[5], pR[8]);
-        vec3 xpos_ = vec3(geom_xpos[uint(xg*3)*NBATCH+bid], geom_xpos[uint(xg*3+1)*NBATCH+bid], geom_xpos[uint(xg*3+2)*NBATCH+bid]);
+        vec3 xpos_ = GP[xg];
         float xR[9]; for (int k=0;k<9;k++) xR[k] = geom_xmat[uint(xg*9+k)*NBATCH+bid];
         vec3 xsize = vec3(geom_size_buf[xg*3], geom_size_buf[xg*3+1], geom_size_buf[xg*3+2]);
         int mesh_id = (xt == 7) ? int(geom_dataid_buf[xg]) : 0;
@@ -129,8 +130,8 @@ for (int p = 0; p < NUM_PAIRS; p++) {
             has_contact = true;
         }
     } else {
-        vec3 pos1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
-        vec3 pos2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
+        vec3 pos1 = GP[g1];
+        vec3 pos2 = GP[g2];
         float R1[9]; for (int k=0;k<9;k++) R1[k] = geom_xmat[uint(g1*9+k)*NBATCH+bid];
         float R2[9]; for (int k=0;k<9;k++) R2[k] = geom_xmat[uint(g2*9+k)*NBATCH+bid];
         vec3 size1 = vec3(geom_size_buf[g1*3], geom_size_buf[g1*3+1], geom_size_buf[g1*3+2]);
@@ -301,7 +302,20 @@ for (int p = 0; p < NUM_PAIRS; p++) {
 contact_count[bid] = float(ncon);
 )GLSLBODY";
 
-  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"}, {"contact_data", "contact_count"}, ss.str(), header);
+  // ペア表(geom id・型・margin・半径和)はモデル定数なのでシェーダのconst配列に焼き込み、ペアごとのグローバル読み込みをなくす。
+  std::string body = ss.str();
+  std::string pair_load = "int g1 = int(pair_data[pd+0]), g2 = int(pair_data[pd+1]);\n    int t1 = int(pair_data[pd+2]), t2 = int(pair_data[pd+3]);\n    float pair_margin = pair_data[pd+4];\n    float rbound_sum = pair_data[pd+5];";
+  if(pair_data_host && !getenv("MJMLX_COLL_GENERIC")) {
+    std::ostringstream pc;
+    pc.precision(9);
+    auto arr_i = [&](const char* name, int k) { pc << "const int " << name << "[" << npairs << "] = int[]("; for(int p = 0; p < npairs; p++) pc << int(pair_data_host[p * 6 + k]) << (p + 1 < npairs ? "," : ""); pc << ");\n"; };
+    auto arr_f = [&](const char* name, int k) { pc << "const float " << name << "[" << npairs << "] = float[]("; for(int p = 0; p < npairs; p++) { std::ostringstream f; f.precision(9); f << pair_data_host[p * 6 + k]; std::string t = f.str(); if(t.find('.') == std::string::npos && t.find('e') == std::string::npos) t += ".0"; pc << t << "f" << (p + 1 < npairs ? "," : ""); } pc << ");\n"; };
+    arr_i("PD_G1", 0); arr_i("PD_G2", 1); arr_i("PD_T1", 2); arr_i("PD_T2", 3); arr_f("PD_M", 4); arr_f("PD_R", 5);
+    header += pc.str();
+    pair_load = "int g1 = PD_G1[p], g2 = PD_G2[p];\n    int t1 = PD_T1[p], t2 = PD_T2[p];\n    float pair_margin = PD_M[p];\n    float rbound_sum = PD_R[p];";
+  }
+  { size_t q = body.find("PAIR_LOAD"); if(q != std::string::npos) body.replace(q, 9, pair_load); }
+  return mkx::fast::compute_kernel("mjmlx_collision", {"geom_xpos", "geom_xmat", "mesh_verts", "pair_data", "mesh_vertadr_buf", "mesh_vertnum_buf", "geom_dataid_buf", "geom_size_buf"}, {"contact_data", "contact_count"}, body, header);
 }
 
 } // namespace mjmlx::mkx_kernels

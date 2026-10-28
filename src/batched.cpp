@@ -650,7 +650,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
 
         if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
-            m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV);
+            m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV, ctx->coll_pair_data.data<float>());
         ctx->uses_gpu_collision = true;
     }
 
