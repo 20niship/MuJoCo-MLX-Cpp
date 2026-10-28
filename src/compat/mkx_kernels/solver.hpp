@@ -33,7 +33,7 @@ inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(
 
 inline int solver_scratch_floats(int nv, int max_efc) { return nv * nv + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
-inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, bool export_qacc = false) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
@@ -153,6 +153,7 @@ shared float tg_pAp;
      << "const float TIMESTEP = " << solver_fmt_float(timestep) << "f;\n"
      << "const float GTOL_REL = " << solver_fmt_float(gtol_rel) << "f;\n"
      << "const float LS_TOL = " << solver_fmt_float(ls_tol) << "f;\n"
+     << "const bool EXPORT_QACC = " << (export_qacc ? "true" : "false") << ";\n"
      << "const float NEWTON_TOL = " << solver_fmt_float(newton_tol) << "f;\n"
      << "const float MJMINVAL_CV = 1e-12f;\n"
      << "const float MJMINVAL_SV = 1e-14f;\n"
@@ -495,7 +496,7 @@ SABL1
 qacc(int(tid)) = 0.0f;
 barrier(); memoryBarrierBuffer();
 
-if (nefc == 0) {
+if (nefc == 0 && !EXPORT_QACC) {
     qfrc_constraint_out[qfc_off + int(tid)] = 0.0f;
     if (tid == 0u) for (int ci = 0; ci < MAX_CON; ci++) contact_fn_out[bid * uint(MAX_CON) + uint(ci)] = 0.0f;
     return;
@@ -626,6 +627,7 @@ LS_END
     if (tg_done != 0) break;
 }
 
+qacc_out[uint(int(tid))*NBATCH+bid] = qacc(int(tid));
 { float s; JTF(s);
   qfrc_constraint_out[qfc_off + int(tid)] = s; }
 barrier(); memoryBarrierBuffer();
@@ -791,7 +793,7 @@ if (tid == 0u) {
     }
     ss.str(body);
   }
-  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
+  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out", "qacc_out"}, ss.str(), header);
 }
 
 

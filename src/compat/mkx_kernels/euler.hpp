@@ -22,59 +22,10 @@ inline std::string euler_fmt_float(float x) {
   return s;
 }
 
-inline mkx::fast::Kernel<> make_euler_kernel(int nv, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints, const std::vector<float>& dof_damping_vals) {
-  int n              = nv;
+// qacc[]からqvel/qposを積分するコード(qacc, qvel_in, qpos_in, voff, qoffが定義済みの前提)。コレスキー版とqacc直接版で共有する。
+inline void emit_euler_integrate(std::ostringstream& ss, int n, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints) {
   std::string dt_str = euler_fmt_float(dt);
-  std::ostringstream ss;
-
-  ss << "uint batch_idx = gl_GlobalInvocationID.x;\n"
-     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
-     << "const uint n = " << n << "u;\n"
-     << "uint moff = batch_idx * n * n;\n"
-     << "uint voff = batch_idx * n;\n"
-     << "uint qoff = batch_idx * " << nq << "u;\n"
-
-     << "float a[" << n << " * " << n << "];\n"
-     << "for (uint i = 0u; i < n * n; i++) a[i] = qM[uint(i)*NBATCH+batch_idx];\n";
-
-  for(int i = 0; i < nv; i++) {
-    if(dof_damping_vals[static_cast<size_t>(i)] != 0.0f) {
-      ss << "a[" << i * n + i << "] += " << dt_str << "f * " << euler_fmt_float(dof_damping_vals[static_cast<size_t>(i)]) << "f;\n";
-    }
-  }
-  for(int i = 0; i < n; i++) ss << "a[" << i * n + i << "] += 1e-6f;\n";
-
-  ss << "float rhs[" << n << "];\n"
-     << "for (uint i = 0u; i < n; i++) rhs[i] = qfrc_smooth[uint(i)*NBATCH+batch_idx] + qfrc_constraint[voff+i];\n"
-
-     << "float l[" << n << " * " << n << "];\n"
-     << "for (uint i = 0u; i < n * n; i++) l[i] = 0.0f;\n"
-     << "for (uint j = 0u; j < n; j++) {\n"
-     << "  float s = 0.0f;\n"
-     << "  for (uint k = 0u; k < j; k++) s += l[j*n+k]*l[j*n+k];\n"
-     << "  float diagv = a[j*n+j] - s;\n"
-     << "  l[j*n+j] = sqrt(max(diagv, 1e-6f));\n"
-     << "  for (uint i = j+1u; i < n; i++) {\n"
-     << "    float s2 = 0.0f;\n"
-     << "    for (uint k = 0u; k < j; k++) s2 += l[i*n+k]*l[j*n+k];\n"
-     << "    l[i*n+j] = (a[i*n+j] - s2) / l[j*n+j];\n"
-     << "  }\n"
-     << "}\n"
-
-     << "float y[" << n << "];\n"
-     << "for (uint i = 0u; i < n; i++) {\n"
-     << "  float s = 0.0f;\n"
-     << "  for (uint k = 0u; k < i; k++) s += l[i*n+k]*y[k];\n"
-     << "  y[i] = (rhs[i] - s) / l[i*n+i];\n"
-     << "}\n"
-
-     << "float qacc[" << n << "];\n"
-     << "for (int i = " << (n - 1) << "; i >= 0; i--) {\n"
-     << "  float s = 0.0f;\n"
-     << "  for (uint k = uint(i)+1u; k < n; k++) s += l[k*n+uint(i)]*qacc[k];\n"
-     << "  qacc[i] = (y[i] - s) / l[i*n+i];\n"
-     << "}\n"
-
+  ss
      << "float new_qvel[" << n << "];\n"
      << "for (uint i = 0u; i < n; i++) {\n"
      << "  float v = qvel_in[voff+i] + qacc[i] * " << dt_str << "f;\n"
@@ -156,7 +107,78 @@ inline mkx::fast::Kernel<> make_euler_kernel(int nv, int nq, float dt, const std
      << "for (uint i = 0u; i < n; i++) qvel_out[voff+i] = new_qvel[i];\n"
      << "for (uint i = 0u; i < n; i++) qacc_out[voff+i] = qacc[i];\n";
 
+}
+
+inline mkx::fast::Kernel<> make_euler_kernel(int nv, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints, const std::vector<float>& dof_damping_vals) {
+  int n              = nv;
+  std::string dt_str = euler_fmt_float(dt);
+  std::ostringstream ss;
+
+  ss << "uint batch_idx = gl_GlobalInvocationID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
+     << "const uint n = " << n << "u;\n"
+     << "uint moff = batch_idx * n * n;\n"
+     << "uint voff = batch_idx * n;\n"
+     << "uint qoff = batch_idx * " << nq << "u;\n"
+
+     << "float a[" << n << " * " << n << "];\n"
+     << "for (uint i = 0u; i < n * n; i++) a[i] = qM[uint(i)*NBATCH+batch_idx];\n";
+
+  for(int i = 0; i < nv; i++) {
+    if(dof_damping_vals[static_cast<size_t>(i)] != 0.0f) {
+      ss << "a[" << i * n + i << "] += " << dt_str << "f * " << euler_fmt_float(dof_damping_vals[static_cast<size_t>(i)]) << "f;\n";
+    }
+  }
+  for(int i = 0; i < n; i++) ss << "a[" << i * n + i << "] += 1e-6f;\n";
+
+  ss << "float rhs[" << n << "];\n"
+     << "for (uint i = 0u; i < n; i++) rhs[i] = qfrc_smooth[uint(i)*NBATCH+batch_idx] + qfrc_constraint[voff+i];\n"
+
+     << "float l[" << n << " * " << n << "];\n"
+     << "for (uint i = 0u; i < n * n; i++) l[i] = 0.0f;\n"
+     << "for (uint j = 0u; j < n; j++) {\n"
+     << "  float s = 0.0f;\n"
+     << "  for (uint k = 0u; k < j; k++) s += l[j*n+k]*l[j*n+k];\n"
+     << "  float diagv = a[j*n+j] - s;\n"
+     << "  l[j*n+j] = sqrt(max(diagv, 1e-6f));\n"
+     << "  for (uint i = j+1u; i < n; i++) {\n"
+     << "    float s2 = 0.0f;\n"
+     << "    for (uint k = 0u; k < j; k++) s2 += l[i*n+k]*l[j*n+k];\n"
+     << "    l[i*n+j] = (a[i*n+j] - s2) / l[j*n+j];\n"
+     << "  }\n"
+     << "}\n"
+
+     << "float y[" << n << "];\n"
+     << "for (uint i = 0u; i < n; i++) {\n"
+     << "  float s = 0.0f;\n"
+     << "  for (uint k = 0u; k < i; k++) s += l[i*n+k]*y[k];\n"
+     << "  y[i] = (rhs[i] - s) / l[i*n+i];\n"
+     << "}\n"
+
+     << "float qacc[" << n << "];\n"
+     << "for (int i = " << (n - 1) << "; i >= 0; i--) {\n"
+     << "  float s = 0.0f;\n"
+     << "  for (uint k = uint(i)+1u; k < n; k++) s += l[k*n+uint(i)]*qacc[k];\n"
+     << "  qacc[i] = (y[i] - s) / l[i*n+i];\n"
+     << "}\n";
+
+  emit_euler_integrate(ss, n, nq, dt, simple_qa, simple_da, free_joints, ball_joints);
   return mkx::fast::compute_kernel("mjmlx_euler", {"qM", "qfrc_smooth", "qfrc_constraint", "qvel_in", "qpos_in"}, {"qpos_out", "qvel_out", "qacc_out"}, ss.str(), "");
+}
+
+// solverが求めたqacc(SoA、成分*B+env)をそのまま積分する。質量行列のコレスキー分解をやり直さないので、nv=18で約390us -> 数十usになる。
+// solverのqaccはNewtonの収束許容(MJMLX_NTOL)まで精度が出ており、陰的なdamping/actuator速度項が無い(コレスキー版が M だけを使う)場合に限り同じ式になる。
+inline mkx::fast::Kernel<> make_euler_from_qacc_kernel(int nv, int nq, float dt, const std::vector<int>& simple_qa, const std::vector<int>& simple_da, const std::vector<std::pair<int, int>>& free_joints, const std::vector<std::pair<int, int>>& ball_joints) {
+  std::ostringstream ss;
+  ss << "uint batch_idx = gl_GlobalInvocationID.x;\n"
+     << "uint NBATCH = gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
+     << "const uint n = " << nv << "u;\n"
+     << "uint voff = batch_idx * n;\n"
+     << "uint qoff = batch_idx * " << nq << "u;\n"
+     << "float qacc[" << nv << "];\n"
+     << "for (uint i = 0u; i < n; i++) qacc[i] = qacc_in[i*NBATCH+batch_idx];\n";
+  emit_euler_integrate(ss, nv, nq, dt, simple_qa, simple_da, free_joints, ball_joints);
+  return mkx::fast::compute_kernel("mjmlx_euler_acc", {"qacc_in", "qvel_in", "qpos_in"}, {"qpos_out", "qvel_out", "qacc_out"}, ss.str(), "");
 }
 
 } // namespace mjmlx::mkx_kernels
