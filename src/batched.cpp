@@ -1465,8 +1465,11 @@ MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out) {
         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
     MX_MARK_PERSISTENT(raw[0], &s);
     auto packed = mx::fast::kernel_outputs(raw)[0];
-    const float* p = packed.data<float>();
-    std::memcpy(out, p, static_cast<size_t>(B) * spec.stride * sizeof(float));
+    // array::data<float>()はfloat->float変換と余分なコピーを挟むので、読み戻したvectorを直接コピーする
+    auto proxy = mx::to_raw(packed);
+    mkx::eval<mx::Backend>(proxy);
+    auto v = proxy.to_vector();
+    std::memcpy(out, v.data(), static_cast<size_t>(B) * spec.stride * sizeof(float));
     return 0;
 }
 
