@@ -979,7 +979,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qfrc_constraint_flat = mx::zeros({1});
             mx::array solver_qacc = mx::zeros({1});
             bool have_solver_qacc = false;
-            mx::array cfrc_ext_flat = mx::zeros({B * nb * 6});
+            mx::array cfrc_ext_flat = mx::zeros({1});  // 接触が無い経路でだけ下でB*nb*6のゼロ配列にする(毎substep 1.4MBのホストでのゼロ埋めは約250us)
             mx::array subtree_com_out = mx::zeros({1});
             mx::array cinert_out = mx::zeros({1});
             mx::array cvel_out = mx::zeros({1});
@@ -1161,6 +1161,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = kin_view(0, nb * 3, {B, nb, 3}, false);
             auto xquat_out = kin_view(1, nb * 4, {B, nb, 4}, false);
+            if (cfrc_ext_flat.size() != static_cast<int64_t>(B) * nb * 6) cfrc_ext_flat = mx::zeros({B * nb * 6});
             auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out, xquat_out,
