@@ -66,6 +66,16 @@ def _quat_rotate_inverse(quat_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
     return np.stack([rx, ry, rz], axis=1).astype(np.float32)
 
 
+def _projected_gravity(quat_wxyz: np.ndarray) -> np.ndarray:
+    """重力(0,0,-1)をbody座標へ。_quat_rotate_inverse(quat, [0,0,-1])の閉形式(行列の3行目)で、配列確保が少ない。"""
+    w, x, y, z = quat_wxyz[:, 0], quat_wxyz[:, 1], quat_wxyz[:, 2], quat_wxyz[:, 3]
+    return np.stack([2.0 * (w * y - x * z), -2.0 * (y * z + w * x), 2.0 * (x * x + y * y) - 1.0], axis=1).astype(np.float32)
+
+
+def _rowdot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.einsum("ij,ij->i", a, b)
+
+
 def _yaw_to_quat(yaw: np.ndarray) -> np.ndarray:
     half = yaw / 2.0
     return np.stack([np.cos(half), np.zeros_like(yaw), np.zeros_like(yaw), np.sin(half)], axis=1).astype(np.float32)
@@ -254,8 +264,7 @@ class MjmlxGo2Env(VecEnv):
             quat = qpos[:, 3:7]
             base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
             base_ang_vel = qvel[:, 3:6]
-            gravity = np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (qpos.shape[0], 1))
-            projected_gravity = _quat_rotate_inverse(quat, gravity)
+            projected_gravity = _projected_gravity(quat)
         joint_pos_rel = qpos[:, 7:19] - DEFAULT_JOINT_POS
         joint_vel = qvel[:, 6:18]
         return np.concatenate(
@@ -289,7 +298,7 @@ class MjmlxGo2Env(VecEnv):
             nq, nv = self.nq, self.nv
             qpos, qvel = pk[:, :nq], pk[:, nq:nq + nv]
             contact_force = pk[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
-            joint_torque = pk[:, nq + nv + 5:]
+            torque_sq, torque_abs_mean = pk[:, nq + nv + 5], float(pk[:, nq + nv + 6].sum()) / (self.num_envs * 12)
         else:
             qpos, qvel = self._sim.state()
             cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
@@ -298,10 +307,8 @@ class MjmlxGo2Env(VecEnv):
             self._feet_contact_sensor.update(CONTROL_DT)
             self._base_contact_sensor.update(CONTROL_DT)
 
-        not_finite = ~np.isfinite(qpos).all(axis=1) | ~np.isfinite(qvel).all(axis=1)
-        finite_qpos = np.where(np.isfinite(qpos), qpos, 0.0)
-        finite_qvel = np.where(np.isfinite(qvel), qvel, 0.0)
-        blew_up = not_finite | (np.abs(finite_qpos).max(axis=1) > 1000.0) | (np.abs(finite_qvel).max(axis=1) > 1000.0)
+        # NaN/infはmaxがNaN/infになり比較がFalseになるので、isfinite+whereを使わずに1回のabs-maxで判定する
+        blew_up = ~(np.abs(pk[:, :nq + nv]).max(axis=1) <= 1000.0) if self._pack is not None else ~((np.abs(qpos).max(axis=1) <= 1000.0) & (np.abs(qvel).max(axis=1) <= 1000.0))
 
         quat = qpos[:, 3:7]
         base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
@@ -322,17 +329,18 @@ class MjmlxGo2Env(VecEnv):
             foot_contact = foot_force_norm > BASE_CONTACT_FORCE_THRESHOLD
 
         cmd = self._commands
-        lin_err = np.sum((cmd[:, 0:2] - base_lin_vel[:, 0:2]) ** 2, axis=1)
+        d_lin = cmd[:, 0:2] - base_lin_vel[:, 0:2]
+        lin_err = _rowdot(d_lin, d_lin)
         ang_err = (cmd[:, 2] - base_ang_vel[:, 2]) ** 2
         r_track_lin = W_TRACK_LIN * np.exp(-lin_err / TRACK_STD_SQ)
         r_track_ang = W_TRACK_ANG * np.exp(-ang_err / TRACK_STD_SQ)
         # 接触衝撃の瞬間は速度が物理的に大きく跳ねうるので、二乗前にクリップしてreward発散を防ぐ
         r_lin_vel_z = self._w["lin_vel_z"] * np.clip(base_lin_vel[:, 2], -20.0, 20.0) ** 2
-        r_ang_vel_xy = self._w["ang_vel_xy"] * np.sum(np.clip(base_ang_vel[:, 0:2], -50.0, 50.0) ** 2, axis=1)
+        r_ang_vel_xy = self._w["ang_vel_xy"] * _rowdot(*(2 * [np.clip(base_ang_vel[:, 0:2], -50.0, 50.0)]))
         joint_acc = np.clip((joint_vel - self._prev_joint_vel) / CONTROL_DT, -500.0, 500.0)  # 接触衝撃時の差分近似スパイクでreward/value発散するのを防ぐ
-        r_dof_acc = self._w["dof_acc"] * np.sum(joint_acc**2, axis=1)
+        r_dof_acc = self._w["dof_acc"] * _rowdot(joint_acc, joint_acc)
         action_prev = self._last_action.copy()
-        r_action_rate = self._w["action_rate"] * np.sum((action - self._last_action) ** 2, axis=1)
+        r_action_rate = self._w["action_rate"] * _rowdot(*(2 * [action - self._last_action]))
 
         contact_filt = foot_contact | self._last_foot_contact
         first_contact = (self._feet_air_time > 0.0) & contact_filt
@@ -342,15 +350,16 @@ class MjmlxGo2Env(VecEnv):
         self._feet_air_time *= ~contact_filt
         self._last_foot_contact = foot_contact
 
-        projected_gravity = _quat_rotate_inverse(quat, np.tile(np.array([0.0, 0.0, -1.0], np.float32), (self.num_envs, 1)))
-        r_flat_orient = self._w["flat_orientation"] * np.sum(projected_gravity[:, 0:2] ** 2, axis=1)
+        projected_gravity = _projected_gravity(quat)
+        r_flat_orient = self._w["flat_orientation"] * _rowdot(projected_gravity[:, 0:2], projected_gravity[:, 0:2])
 
         if self._pack is None:
             try:
                 joint_torque = self._sim.qfrc_actuator()[:, 6:18]
             except AttributeError:
                 joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
-        r_torque = self._w["torque"] * np.sum(joint_torque**2, axis=1)
+            torque_sq, torque_abs_mean = np.sum(joint_torque**2, axis=1), float(np.abs(joint_torque).mean())
+        r_torque = self._w["torque"] * torque_sq
 
         self.last_reward_terms = {
             "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
@@ -402,9 +411,9 @@ class MjmlxGo2Env(VecEnv):
             "Metrics/ctrl_saturated_frac": float((ctrl_target != ctrl).mean()),
             "Metrics/joint_vel_abs": float(np.abs(joint_vel).mean()),
             "Metrics/joint_pos_dev": float(np.abs(qpos[:, 7:19] - DEFAULT_JOINT_POS).mean()),
-            "Metrics/base_tilt": float(np.linalg.norm(_quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))[:, :2], axis=1).mean()),
+            "Metrics/base_tilt": float(np.sqrt(_rowdot(projected_gravity[:, :2], projected_gravity[:, :2])).mean()),
             "Metrics/feet_air_time": float(self._feet_air_time.mean()),
-            "Metrics/joint_torque_abs": float(np.abs(joint_torque).mean()),
+            "Metrics/joint_torque_abs": torque_abs_mean,
             "Metrics/foot_contact_frac": float(foot_contact.mean()),
             "Termination/base_contact": float(base_contact.mean()),
             "Termination/blew_up": float(blew_up.mean()),

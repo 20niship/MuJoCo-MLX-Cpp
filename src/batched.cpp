@@ -530,6 +530,7 @@ struct BatchedStepContext {
     std::optional<KernelFn> kin_kernel;
     std::optional<KernelFn> euler_kernel;
     std::optional<KernelFn> euler_devmem_kernel;
+    std::optional<KernelFn> euler_acc_kernel;  // solverのqaccをそのまま積分する軽量版(コレスキーをやり直さない)
     std::optional<KernelFn> forward_kernel;
     bool uses_devmem_euler = false;
     bool uses_gpu_forward = false;
@@ -698,6 +699,10 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
     int euler_stack = 2 * m.nv * m.nv + 4 * m.nv + m.nq;
     if (euler_stack * 4 <= 24000 && m.nv <= 80) {
         ctx->euler_kernel = mkx_kernels::make_euler_kernel(m.nv, m.nq, m.opt.timestep, s_qa, s_da, fj, bj, damp_vals);
+        // 陰的なdamping/actuator速度項が無ければEulerの加速度は M^-1(qfrc_smooth+qfrc_constraint) でsolverのqaccと同じ。solverは収束許容まで解いているので再計算を省く
+        bool no_implicit = std::all_of(damp_vals.begin(), damp_vals.end(), [](float v) { return v == 0.0f; });
+        if (no_implicit && mkx_kernels::solver_use_shared(m.nv) && !getenv("MJMLX_EULER_EXACT"))
+            ctx->euler_acc_kernel = mkx_kernels::make_euler_from_qacc_kernel(m.nv, m.nq, m.opt.timestep, s_qa, s_da, fj, bj);
     } else if (m.nv <= EULER_DEVMEM_MAX_NV) {
         ctx->euler_devmem_kernel = mkx_kernels::make_euler_devmem_kernel(m.nv, m.nq, m.opt.timestep, s_qa, s_da, fj, bj, damp_vals);
         ctx->uses_devmem_euler = true;
@@ -750,7 +755,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         if (getenv("MJMLX_PROF")) fprintf(stderr, "[prof] collision: ngeom=%d pairs=%d\n", m.ngeom, (int)m.cache.collision_pairs.size());
         ctx->collision_kernel = mkx_kernels::make_collision_kernel(
             m.ngeom, (int)m.cache.collision_pairs.size(), MAX_CONTACTS_PER_ENV,
-            m.has_sdf ? m.opt.sdf_initpoints : 0, m.opt.sdf_iterations);
+            m.has_sdf ? m.opt.sdf_initpoints : 0, m.opt.sdf_iterations, ctx->coll_pair_data.data<float>());
         ctx->uses_gpu_collision = true;
     }
 
@@ -789,7 +794,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl);  // ABL_*: 計測用(物理が変わる)
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl, ctx->euler_acc_kernel.has_value());  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
@@ -972,6 +977,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qM_flat = mx::zeros({1});
             mx::array qfrc_smooth_flat = mx::zeros({1});
             mx::array qfrc_constraint_flat = mx::zeros({1});
+            mx::array solver_qacc = mx::zeros({1});
+            bool have_solver_qacc = false;
             mx::array cfrc_ext_flat = mx::zeros({B * nb * 6});
             mx::array subtree_com_out = mx::zeros({1});
             mx::array cinert_out = mx::zeros({1});
@@ -1067,14 +1074,17 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                             if (ctx->solver_ntlim + ctx->solver_ntfl > 0) { solver_in.push_back(fwd[8]); solver_in.push_back(ctx->ten_lim_tab); solver_in.push_back(ctx->ten_fric_tab); }
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs(solver_in),
-                                mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}, {B * MAX_CONTACTS_PER_ENV}}),
+                                mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}, {B * MAX_CONTACTS_PER_ENV}, {B * nv}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
                             // shapeは毎step固定のため永続化(issue #14)。
                             MX_MARK_PERSISTENT(solver_raw[0], owner);
                             MX_MARK_PERSISTENT(solver_raw[1], owner);
                             MX_MARK_PERSISTENT(solver_raw[2], owner);
+                            MX_MARK_PERSISTENT(solver_raw[3], owner);
                             solver = mx::fast::kernel_outputs(solver_raw);
+                            solver_qacc = solver[3];
+                            have_solver_qacc = true;
                         }
                         qfrc_constraint_flat = solver[0];
                         prof_stage("solver", solver);
@@ -1125,7 +1135,13 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto grid = std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1};
             auto tgroup = std::array<uint32_t, 3>{env_threadgroup(B), 1, 1};
             // shapeは毎step固定のため全出力永続化(issue #14)。
-            if (ctx->euler_kernel.has_value()) {
+            if (ctx->euler_acc_kernel.has_value() && have_solver_qacc) {
+                auto raw = (*ctx->euler_acc_kernel)(mx::fast::kernel_inputs({solver_qacc, mx::astype(mx::flatten(qvel_batch), mx::float32), mx::astype(mx::flatten(qpos_batch), mx::float32)}), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
+                MX_MARK_PERSISTENT(raw[0], owner);
+                MX_MARK_PERSISTENT(raw[1], owner);
+                MX_MARK_PERSISTENT(raw[2], owner);
+                euler = mx::fast::kernel_outputs(raw);
+            } else if (ctx->euler_kernel.has_value()) {
                 auto raw = (*ctx->euler_kernel)(mx::fast::kernel_inputs(euler_inputs), mx::fast::kernel_shapes({{B * nq}, {B * nv}, {B * nv}}), grid, tgroup);
                 MX_MARK_PERSISTENT(raw[0], owner);
                 MX_MARK_PERSISTENT(raw[1], owner);
@@ -1541,7 +1557,7 @@ MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_
     for (int i = 0; i < nbody_sel; i++) if (body_ids[i] < 0 || body_ids[i] >= m.nbody) return -1;
     if (dof_lo < 0 || dof_lo + ndof > m.nv) return -1;
     int nq = m.nq, nv = m.nv, nb = m.nbody;
-    int stride = nq + nv + nbody_sel + ndof;
+    int stride = nq + nv + nbody_sel + 2;  // 最後の2つは範囲内のqfrc_actuatorの二乗和と絶対値和(個別の値は転送しない)
     std::ostringstream ss;
     ss << "uint e = gl_GlobalInvocationID.x;\n"
        << "if (e >= uint(" << sim->sim.num_envs << ")) return;\n"
@@ -1552,7 +1568,9 @@ MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_
         uint32_t c = static_cast<uint32_t>(body_ids[k]) * 6u + 3u;
         ss << "{ uint c = e * " << nb * 6 << "u + " << c << "u; vec3 f = vec3(cfrc_in[c], cfrc_in[c+1u], cfrc_in[c+2u]); pack_out[o + " << (nq + nv + k) << "u] = length(f); }\n";
     }
-    for (int k = 0; k < ndof; k++) ss << "pack_out[o + " << (nq + nv + nbody_sel + k) << "u] = qfa_in[e * " << nv << "u + " << (dof_lo + k) << "u];\n";
+    ss << "{ float sq = 0.0, ab = 0.0;\n";
+    for (int k = 0; k < ndof; k++) ss << "{ float t = qfa_in[e * " << nv << "u + " << (dof_lo + k) << "u]; sq += t*t; ab += abs(t); }\n";
+    ss << "pack_out[o + " << (nq + nv + nbody_sel) << "u] = sq; pack_out[o + " << (nq + nv + nbody_sel + 1) << "u] = ab; }\n";
     auto spec = std::make_shared<PackSpec>();
     spec->kernel = mkx::fast::compute_kernel("mjmlx_pack", {"qpos_in", "qvel_in", "cfrc_in", "qfa_in"}, {"pack_out"}, ss.str(), "");
     spec->stride = stride;
@@ -1571,8 +1589,11 @@ MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out) {
         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
     MX_MARK_PERSISTENT(raw[0], &s);
     auto packed = mx::fast::kernel_outputs(raw)[0];
-    const float* p = packed.data<float>();
-    std::memcpy(out, p, static_cast<size_t>(B) * spec.stride * sizeof(float));
+    // array::data<float>()はfloat->float変換と余分なコピーを挟むので、読み戻したvectorを直接コピーする
+    auto proxy = mx::to_raw(packed);
+    mkx::eval<mx::Backend>(proxy);
+    auto v = proxy.to_vector();
+    std::memcpy(out, v.data(), static_cast<size_t>(B) * spec.stride * sizeof(float));
     return 0;
 }
 
