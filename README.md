@@ -270,6 +270,20 @@ Go2 4096 env の `env.step`(ランダムaction、dt 0.005 x 4)を、PR #42 時�
 `gpu_vs_cpu_contact_stress` が外部のGPU高負荷時に1回だけ失敗(224秒)したが、再実行7回はすべて通過。
 残り: solverがGPU時間の約6割、forward/kinematicsが各1割。ホスト側(グラフ構築・numpy・readback)が小〜中env数では支配的で、mlx_vulkanのHOST_CACHEDステージング(mlx_vulkan PR #12)とグラフキャッシュが次の手。
 
+
+### 7. ホスト側の追加高速化とGenesisとの差(暫定値)
+
+mlx_vulkan PR #12(HOST_CACHEDステージング、未マージ)の参照への更新と、`env.step` のnumpy整理(行ごとの内積をeinsumに、重力投影を閉形式に、発散判定を1回に)。#44 に対して、同一セッション・交互3回(GPU使用率8〜31%のデスクトップ描画下、ランダムaction):
+
+| env数 | Before(#44)平均 | After平均(最小〜最大) | 倍率 | Genesis(同env数) |
+|---|---|---|---|---|
+| 4096 | 155,993 | 192,412(177,453〜202,668) | 1.23倍 | 約252k |
+| 16384 | 175,549 | 209,792(200,653〜215,589) | 1.19〜1.24倍 | 約313k |
+
+Genesisの8192/16384 envは各1回の測定(8192: 約288k、16384: 約313k)で、4096以下は前節の過去値。**Genesisには未達**(4096で約0.76倍、16384で約0.67倍)。Isaac Lab(4096で約120k)は上回る。
+Vulkanタイムスタンプによる16384 envの内訳: GPU 約36ms/step(solver 約72%、forward 約14%、kinematics 約6%、collision 約5%)、残りはホスト(readback・numpy)。大env数ではGPU時間そのもの(solverの共有メモリ命令数、forwardのローカルメモリ)が律速で、次の手はsolverのJから単位行(frictionloss/limit)を外す疎化、forward/kinematics/collisionの融合、env.stepの観測・報酬のGPU(torch)化。
+**この参照更新はmlx_vulkan #12 のマージ後に、mainのマージコミットへ更新するまでmainにマージしない。**
+
 ## Architecture
 
 ```
