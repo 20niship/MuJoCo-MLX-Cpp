@@ -257,6 +257,12 @@ MJMLX_API int mjmlx_camera_draw_call_count(const MjmlxCameraRenderer* r);
 MJMLX_API int mjmlx_camera_get_rgb(MjmlxCameraRenderer* r, uint8_t* out);
 MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer* r, float* out);
 
+// CUDA interop(Linux、VK_KHR_external_memory_fd): CPUを経由せず、描画結果をexport可能なデバイスメモリへコピーしてfdで渡す。非対応環境では supported=0 で、上のCPU読み出しを使う。
+MJMLX_API int mjmlx_camera_gpu_supported(const MjmlxCameraRenderer* r);
+MJMLX_API int mjmlx_camera_gpu_copy(MjmlxCameraRenderer* r); // render後に呼ぶ。完了待ちして0
+// which=0: color(RGBA8, (env,cam,H,W,4)), 1: depth(float32, (env,cam,H,W))。新しいfd(所有権は呼び出し側)を返す。失敗は-1
+MJMLX_API int mjmlx_camera_gpu_export_fd(MjmlxCameraRenderer* r, int which, uint64_t* alloc_size);
+
 #ifdef __cplusplus
 }
 #endif

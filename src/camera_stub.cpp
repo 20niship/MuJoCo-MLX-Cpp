@@ -21,5 +21,8 @@ MJMLX_API int mjmlx_camera_draw_call_count(const MjmlxCameraRenderer*) { return 
 MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer*) { return -1; }
 MJMLX_API int mjmlx_camera_get_rgb(MjmlxCameraRenderer*, uint8_t*) { return -1; }
 MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer*, float*) { return -1; }
+MJMLX_API int mjmlx_camera_gpu_supported(const MjmlxCameraRenderer*) { return 0; }
+MJMLX_API int mjmlx_camera_gpu_copy(MjmlxCameraRenderer*) { return -1; }
+MJMLX_API int mjmlx_camera_gpu_export_fd(MjmlxCameraRenderer*, int, uint64_t*) { return -1; }
 
 } // extern "C"
