@@ -21,6 +21,9 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--dt", type=float, default=None, help="物理dtの上書き(decimationは制御周期0.02sになるよう自動)")
     ap.add_argument("--solver-iters", type=int, default=None, help="Newton反復数の上書き(既定はenvの値)")
+    ap.add_argument("--device", default="cpu", help="観測・報酬を計算するtorch device。cudaだとGPUクロックが上がり学習時に近い速度になる(cpuは低クロックで約1.5倍遅い)")
+    ap.add_argument("--no-self-collision", action="store_true", help="脚/胴体同士の衝突を切る(Isaac Lab/Genesisと同じ設定)")
+    ap.add_argument("--foot-condim", type=int, default=6, help="足の摩擦円錐の次元(3で並進摩擦のみ。速いが、ねじり・転がり摩擦が無くなる)")
     args = ap.parse_args()
 
     sys.path.insert(0, args.build_dir)
@@ -36,7 +39,8 @@ def main() -> None:
     if args.solver_iters is not None:
         import mjmlx_go2_env
         mjmlx_go2_env.SOLVER_ITERATIONS = args.solver_iters
-    env = MjmlxGo2Env(native, args.envs, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+    env = MjmlxGo2Env(native, args.envs, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True,
+                      device=args.device, self_collision=not args.no_self_collision, foot_condim=args.foot_condim)
     env.reset()
     rng = np.random.default_rng(0)
     act = lambda: torch.from_numpy(rng.normal(0, 0.5, (args.envs, 12)).astype(np.float32))

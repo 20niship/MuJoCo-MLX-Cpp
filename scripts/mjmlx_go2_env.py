@@ -106,7 +106,7 @@ def _go2_xml_path() -> str:
     )
 
 
-def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collision: bool = True) -> None:
+def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collision: bool = True, foot_condim: int = 6) -> None:
     src_path = os.path.abspath(_go2_xml_path())
     assets_dir = os.path.join(os.path.dirname(src_path), "assets")
     with open(src_path) as f:
@@ -119,6 +119,8 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str, self_collisio
         xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
     if not self_collision:  # 脚・胴体同士の衝突を切って地形との接触だけにする(Isaac LabのUNITREE_GO2_CFGはenabled_self_collisions=False)。衝突ペアが約7分の1になる
         xml = xml.replace('<default class="collision">\n        <geom group="3"/>', '<default class="collision">\n        <geom group="3" conaffinity="0"/>', 1)
+    if foot_condim != 6:  # 足の摩擦円錐の次元(6=並進+ねじり+転がり、3=並進のみ)。3だとピラミッドの拘束行が足1接触あたり10行->4行になりsolverが約1.2倍速い(Isaac Lab/Genesisは並進摩擦のみ)
+        xml = xml.replace('condim="6"', f'condim="{foot_condim}"')
     for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
         old, new = kv.split("->", 1)
         xml = xml.replace(old, new)
@@ -220,11 +222,12 @@ class MjmlxGo2Env(VecEnv):
         generated_xml_path: str = "/tmp/go2_stairs_generated.xml",
         use_sensors: bool = False,
         self_collision: bool = True,
+        foot_condim: int = 6,
     ):
         self._native = native_module
         self._w = PRESETS[reward_preset]
         self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
-        build_terrain_model_xml(self.terrain, generated_xml_path, self_collision=self_collision)
+        build_terrain_model_xml(self.terrain, generated_xml_path, self_collision=self_collision, foot_condim=foot_condim)
 
         self._model = native_module.load_model(generated_xml_path)
         self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
@@ -246,6 +249,9 @@ class MjmlxGo2Env(VecEnv):
                 self._pack = self._sim.set_pack_spec(np.array([BASE_BODY_IDX, *FOOT_BODY_IDX], dtype=np.int32), 6, 12)
             except RuntimeError:
                 pass
+        if self._pack is not None:
+            self._pk_pin = torch.empty((num_envs, self._pack), dtype=torch.float32, pin_memory=torch.cuda.is_available())
+            self._pk_np = self._pk_pin.numpy()
         self.num_actions = self.nu
         self.max_episode_length = MAX_EPISODE_STEPS
         self.device = device  # 方策ネットワーク/PPOバッファの置き場。物理はmjmlx側で別途GPU実行
@@ -382,8 +388,9 @@ class MjmlxGo2Env(VecEnv):
         self._sim.step(np.ascontiguousarray(ctrl.cpu().numpy()), DECIMATION)
         ov_base = ov_foot = ov_lin = ov_ang = ov_grav = None
         if self._pack is not None:
-            pk = self._sim.read_pack()
-            pk_t = self._to_dev(pk)
+            self._sim.read_pack_into(self._pk_np)  # ピン留めバッファへ直接読む
+            pk = self._pk_np
+            pk_t = self._pk_pin.to(self.device, non_blocking=True)
             qpos_h, qvel_h = pk[:, :nq], pk[:, nq:nq + nv]
             qpos, qvel = pk_t[:, :nq], pk_t[:, nq:nq + nv]
             contact_force = pk_t[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム

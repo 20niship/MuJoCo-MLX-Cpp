@@ -110,6 +110,12 @@ struct RlBatchedSim {
         if (pack_stride < 0) throw std::runtime_error("mjmlx_rl: set_pack_spec failed (GPU sim and valid body/dof ids required)");
         return pack_stride;
     }
+    // 呼び出し側が確保した(ピン留め等の)バッファへ直接読む。毎stepの確保とページフォルトを避ける
+    void read_pack_into(FloatArray out) {
+        if (pack_stride <= 0) throw std::runtime_error("mjmlx_rl: call set_pack_spec first");
+        if (out.ndim() != 2 || static_cast<int>(out.shape(0)) != num_envs || static_cast<int>(out.shape(1)) != pack_stride) throw std::runtime_error("mjmlx_rl: out must have shape (num_envs, stride)");
+        if (mjmlx_batched_get_pack(handle, out.data()) != 0) throw std::runtime_error("mjmlx_rl: read_pack failed");
+    }
     FloatArray read_pack() {
         if (pack_stride <= 0) throw std::runtime_error("mjmlx_rl: call set_pack_spec first");
         size_t n = static_cast<size_t>(num_envs) * pack_stride;
@@ -189,7 +195,8 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("sensordata", &RlBatchedSim::sensordata)
         .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator)
         .def("set_pack_spec", &RlBatchedSim::set_pack_spec, nb::arg("body_ids"), nb::arg("dof_lo"), nb::arg("ndof"))
-        .def("read_pack", &RlBatchedSim::read_pack);
+        .def("read_pack", &RlBatchedSim::read_pack)
+        .def("read_pack_into", &RlBatchedSim::read_pack_into, nb::arg("out").noconvert());
 
     nb::class_<RlCamera>(m, "Camera")
         .def_prop_ro("num_cameras", &RlCamera::ncam)
