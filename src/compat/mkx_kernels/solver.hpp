@@ -5,6 +5,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <mkx/ops/fast_kernel.hpp>
 
@@ -35,7 +36,7 @@ inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(
 inline int solver_h_floats(int nv) { return std::max(nv * nv, 3 * nv); }
 inline int solver_scratch_floats(int nv, int max_efc) { return solver_h_floats(nv) + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
-inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, int ntlim = 0, int ntfl = 0) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
@@ -160,6 +161,9 @@ shared float tg_pAp;
      << "const float MJMINVAL_SV = 1e-14f;\n"
      << "const float MJMINIMP = 0.0001f;\n"
      << "const float MJMAXIMP = 0.9999f;\n\n";
+  // tendonのlimit/frictionの行はforwardが出力したtendon値(ten_in: SoA、1tendonあたり[length, velocity, J(NV)])から作る。
+  if(ntlim + ntfl > 0) ss << "const int TEN_ROW = " << nv + 2 << ";\nconst int NTLIM = " << ntlim << ";\nconst int NTFL = " << ntfl << ";\n"
+                          << "#define TEN(i) ten_in[uint(i)*NBATCH+bid]\n\n";
 
   ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n";
   if(use_shared) {
@@ -260,9 +264,30 @@ for (int fi = int(tid); fi < NFL_EFF; fi += NV) {
 barrier();
 )GLSL";
   }
+  const int ntfl_eff = std::max(0, std::min(ntfl, max_efc - 4 - nfl_eff));
+  if(ntfl_eff > 0) {
+    // tendonのfrictionloss行はDOF摩擦行の後ろに並べる。
+    ss << "const int NTFL_EFF = " << ntfl_eff << ";\nconst int FRIC_ROW0 = " << nfl_eff << ";\n";
+    ss << R"GLSL(
+for (int fi = int(tid); fi < NTFL_EFF; fi += NV) {
+    int fp = fi * 10;
+    int tn = int(tfric_tab[fp+0]);
+    float fl = tfric_tab[fp+1];
+    float k_f, b_f, imp_f;
+    efc_kbi(tfric_tab[fp+2], tfric_tab[fp+3], tfric_tab[fp+4], tfric_tab[fp+5], tfric_tab[fp+6], tfric_tab[fp+7], tfric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
+    float r_f = max(tfric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
+    int row = FRIC_ROW0 + fi;
+    for (int di = 0; di < NV; di++) J(row, di) = TEN(tn*TEN_ROW + 2 + di);
+    efc_D(row) = 1.0f / r_f;
+    efc_aref(row) = -b_f * TEN(tn*TEN_ROW + 1);
+    efc_floss(row) = fl;
+}
+barrier();
+)GLSL";
+  }
   ss << "if (tid == 0u) {\n"
      << "int ncon = int(contact_count_in[bid]);\n"
-     << "int nefc = " << nfl_eff << ";\n\n";
+     << "int nefc = " << nfl_eff + ntfl_eff << ";\n\n";
 
   if(nlim > 0) {
     ss << R"GLSL(
@@ -285,6 +310,31 @@ for (int li = 0; li < NLIM; li++) {
         J(nefc, dof) = sgn;
         efc_D(nefc) = 1.0f / r_l;
         efc_aref(nefc) = -b_l * (sgn * qvel_in[qv_off + dof]) - k_l * imp_l * pos;
+        nefc++;
+    }
+}
+)GLSL";
+  }
+
+  if(ntlim > 0) {
+    ss << R"GLSL(
+for (int li = 0; li < NTLIM; li++) {
+    if (nefc >= MAX_EFC_N - 4) break;
+    int lp = li * 13;
+    int tn = int(tlim_tab[lp+0]);
+    float len = TEN(tn*TEN_ROW);
+    float dist_lo = len - tlim_tab[lp+2];
+    float dist_hi = tlim_tab[lp+3] - len;
+    float pos = min(dist_lo, dist_hi) - tlim_tab[lp+4];
+    if (pos < 0.0f) {
+        float sgn = (dist_lo < dist_hi) ? 1.0f : -1.0f;
+        float k_l, b_l, imp_l;
+        efc_kbi(tlim_tab[lp+5], tlim_tab[lp+6], tlim_tab[lp+7], tlim_tab[lp+8], tlim_tab[lp+9], tlim_tab[lp+10], tlim_tab[lp+11], pos, k_l, b_l, imp_l);
+        float r_l = max(tlim_tab[lp+12] * (1.0f - imp_l) / imp_l, MJMINVAL_CV);
+        for (int di = 0; di < NV; di++) J(nefc, di) = sgn * TEN(tn*TEN_ROW + 2 + di);
+        efc_floss(nefc) = 0.0f;
+        efc_D(nefc) = 1.0f / r_l;
+        efc_aref(nefc) = -b_l * (sgn * TEN(tn*TEN_ROW + 1)) - k_l * imp_l * pos;
         nefc++;
     }
 }
@@ -782,7 +832,9 @@ if (tid == 0u) {
     }
     ss.str(body);
   }
-  return mkx::fast::compute_kernel("mjmlx_solver", {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"}, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
+  std::vector<std::string> in_names = {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"};
+  if(ntlim + ntfl > 0) { in_names.push_back("ten_in"); in_names.push_back("tlim_tab"); in_names.push_back("tfric_tab"); }
+  return mkx::fast::compute_kernel("mjmlx_solver", in_names, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out"}, ss.str(), header);
 }
 
 

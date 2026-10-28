@@ -416,7 +416,7 @@ All features validated against MuJoCo C reference implementation. **237 tests ac
 - **SITE transmission** -- actuators at sites, full 6-DOF Jacobian projection
 - **Tendon limits** -- constraint rows for tendon length bounds, qacc diff ~1e-3
 - **Tendon friction loss** -- friction constraints through tendons, exact match
-- **Spatial tendons (wrapping geometry)** -- DEFERRED: MJX supports it but requires ~400 lines of geodesic path computation around spheres/cylinders; most RL models use fixed tendons only
+- **Spatial tendons (wrapping geometry)** -- batched GPU path only (site/pulley/sphere・cylinder wrap/sidesite, matches MuJoCo C); the scalar/vmap paths still support fixed tendons only
 - Fixed tendons + passive forces + limits + friction: both scalar and vmap. Transmission: scalar path
 
 ### Phase 6: Actuator Dynamics (scalar + vmap)

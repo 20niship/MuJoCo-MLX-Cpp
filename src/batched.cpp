@@ -97,6 +97,44 @@ struct ForwardHostConsts {
     int jnt_dofadr0 = 0;
 };
 
+// tendon(固定/空間)のGPU計算に要るモデル定数。tendonが無ければnten=0。
+static mkx_kernels::TendonHost build_tendon_host(const Model& m) {
+    mkx_kernels::TendonHost th;
+    if (m.ntendon == 0) return th;
+    auto to_i = [](const mx::array& a) { mx::eval(a); auto p = a.data<int>(); return std::vector<int>(p, p + a.size()); };
+    auto to_f = [](const mx::array& a) { mx::eval(a); auto p = a.data<float>(); return std::vector<float>(p, p + a.size()); };
+    th.nten = m.ntendon;
+    th.adr = to_i(m.tendon_adr);
+    th.num = to_i(m.tendon_num);
+    th.wtype = to_i(m.wrap_type);
+    th.wobj = to_i(m.wrap_objid);
+    th.wprm = to_f(m.wrap_prm);
+    th.stiffness = to_f(m.tendon_stiffness);
+    th.damping = to_f(m.tendon_damping);
+    th.lengthspring = to_f(mx::flatten(m.tendon_lengthspring));
+    th.jnt_qposadr = to_i(m.jnt_qposadr);
+    th.jnt_dofadr = to_i(m.jnt_dofadr);
+    for (int w : th.wtype) if (w != mkx_kernels::TW_JOINT) th.has_spatial = true;
+    if (th.has_spatial) {
+        if (m.nsite > 0) {
+            th.site_body = to_i(m.site_bodyid);
+            th.site_pos = to_f(mx::flatten(m.site_pos));
+        }
+        th.geom_body = to_i(m.geom_bodyid);
+        auto gs = to_f(mx::flatten(m.geom_size));
+        th.geom_radius.resize(m.ngeom);
+        for (int g = 0; g < m.ngeom; g++) th.geom_radius[g] = gs[g * 3];
+    }
+    th.act_tendon.assign(std::max(m.nu, 1), -1);
+    if (m.nu > 0 && m.actuator_trntype.size() > 0) {
+        auto trnt = to_i(m.actuator_trntype);
+        auto trnid = to_i(m.actuator_trnid);
+        for (int a = 0; a < m.nu; a++)
+            if (trnt[a] == 3) { th.act_tendon[a] = trnid[a * 2]; th.has_tendon_actuator = true; }  // TRN_TENDON
+    }
+    return th;
+}
+
 static ForwardHostConsts extract_forward_host_consts(const Model& m) {
     m.init_cache();
     int nb = m.nbody, nv = m.nv, nq = m.nq, nu = m.nu, njnt = m.njnt;
@@ -187,6 +225,7 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
         int gear_ncol = (int)m.actuator_gear.shape(1);
         for (int ai = 0; ai < nu; ai++) {
             int trnt = trnt_ptr[ai];
+            if (trnt == 3) k.act_gear[ai] = gear_ptr[ai * gear_ncol];  // TENDON: 長さ/momentはカーネル側でtendonから取る
             if (trnt == 0 || trnt == 1) {  // JOINT (0) or JOINTINPARENT (1)
                 int ji = trnid_ptr[ai * 2];
                 if (ji >= 0 && ji < njnt) {
@@ -242,7 +281,7 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
 }
 static int forward_scratch_per_env(const Model& m) {
     int nb = m.nbody, nv = m.nv;
-    return nb*10 + nv*6 + nv*6 + nb*6 + nb*6 + nb*3 + nb + nv + nv;
+    return nb*10 + nv*6 + nv*6 + nb*6 + nb*6 + nb*3 + nb + nv + nv + (m.ntendon > 0 ? mkx_kernels::tendon_scratch_floats(m.ntendon, nv) : 0);
 }
 
 // ── Backend-agnostic host data builders for GLSL (mkx_kernels) collision/solver dispatch ──
@@ -391,6 +430,55 @@ static std::vector<float> build_solver_friction_table(const Model& m, int& n_out
     return tab;
 }
 
+// tendonのlimit拘束テーブル(1tendon 13float): tendon, 0, lo, hi, margin, solref(2), solimp(5), invweight。
+static std::vector<float> build_tendon_limit_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::LIMIT) || m.ntendon == 0) return tab;
+    mx::eval(m.tendon_limited, m.tendon_range, m.tendon_margin, m.tendon_solref_lim, m.tendon_solimp_lim, m.tendon_invweight0);
+    auto limited = m.tendon_limited.data<uint8_t>();
+    auto range = m.tendon_range.data<float>();
+    auto margin = m.tendon_margin.data<float>();
+    auto sref = m.tendon_solref_lim.data<float>();
+    auto simp = m.tendon_solimp_lim.data<float>();
+    auto iw = m.tendon_invweight0.data<float>();
+    for (int t = 0; t < m.ntendon; t++) {
+        if (!limited[t]) continue;
+        tab.push_back((float)t);
+        tab.push_back(0.0f);
+        tab.push_back(range[t*2]);
+        tab.push_back(range[t*2+1]);
+        tab.push_back(margin[t]);
+        for (int k = 0; k < 2; k++) tab.push_back(sref[t*2+k]);
+        for (int k = 0; k < 5; k++) tab.push_back(simp[t*5+k]);
+        tab.push_back(iw[t]);
+        n_out++;
+    }
+    return tab;
+}
+
+// tendonのfrictionloss拘束テーブル(1tendon 10float): tendon, frictionloss, solref(2), solimp(5), invweight。
+static std::vector<float> build_tendon_friction_table(const Model& m, int& n_out) {
+    std::vector<float> tab;
+    n_out = 0;
+    if ((m.opt.disableflags & DisableBit::FRICTIONLOSS) || m.ntendon == 0) return tab;
+    mx::eval(m.tendon_frictionloss, m.tendon_solref_fri, m.tendon_solimp_fri, m.tendon_invweight0);
+    auto fl = m.tendon_frictionloss.data<float>();
+    auto sref = m.tendon_solref_fri.data<float>();
+    auto simp = m.tendon_solimp_fri.data<float>();
+    auto iw = m.tendon_invweight0.data<float>();
+    for (int t = 0; t < m.ntendon; t++) {
+        if (fl[t] <= 0.0f) continue;
+        tab.push_back((float)t);
+        tab.push_back(fl[t]);
+        for (int k = 0; k < 2; k++) tab.push_back(sref[t*2+k]);
+        for (int k = 0; k < 5; k++) tab.push_back(simp[t*5+k]);
+        tab.push_back(iw[t]);
+        n_out++;
+    }
+    return tab;
+}
+
 MJMLX_NO_VECTORIZE static mx::array build_solver_pair_props(const Model& m) {
     m.init_cache();
     const auto& c = m.cache;
@@ -466,6 +554,10 @@ struct BatchedStepContext {
     mx::array make_m_mask = mx::zeros({1});
     mx::array act_moment = mx::zeros({1});
     int fwd_scratch_per_env = 0;
+    mkx_kernels::TendonHost ten;  // tendonが無ければnten=0(GLSLは従来と同一)
+    mx::array ten_lim_tab = mx::zeros({1});
+    mx::array ten_fric_tab = mx::zeros({1});
+    int solver_ntlim = 0, solver_ntfl = 0;
 
     // Collision kernel
     std::optional<KernelFn> collision_kernel;
@@ -622,6 +714,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         mx::eval(ctx->act_moment);
 
         ForwardHostConsts fc = extract_forward_host_consts(m);
+        ctx->ten = build_tendon_host(m);
         ctx->forward_kernel = mkx_kernels::make_forward_kernel(
             m.nbody, m.nv, m.nq, m.nu, m.njnt, m.opt.timestep, fc.gravity,
             fc.body_parentid, fc.body_rootid, fc.body_mass, fc.body_inertia,
@@ -629,7 +722,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
             fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0,
             fc.act_gain1, fc.act_gain2, fc.act_bias1, fc.act_bias2,
-            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp);
+            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp, ctx->ten.nten > 0 ? &ctx->ten : nullptr);
         ctx->uses_gpu_forward = true;
     }
 
@@ -671,6 +764,13 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             ctx->solver_limit_tab = mx::array(lt.data(), {(int)lt.size()}, mx::float32);
             ctx->solver_fric_tab = mx::array(ft.data(), {(int)ft.size()}, mx::float32);
             mx::eval(ctx->solver_limit_tab, ctx->solver_fric_tab);
+            auto tl = build_tendon_limit_table(m, ctx->solver_ntlim);
+            auto tf = build_tendon_friction_table(m, ctx->solver_ntfl);
+            if (tl.empty()) tl.push_back(0.0f);
+            if (tf.empty()) tf.push_back(0.0f);
+            ctx->ten_lim_tab = mx::array(tl.data(), {(int)tl.size()}, mx::float32);
+            ctx->ten_fric_tab = mx::array(tf.data(), {(int)tf.size()}, mx::float32);
+            mx::eval(ctx->ten_lim_tab, ctx->ten_fric_tab);
         }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
@@ -678,7 +778,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         int si = (solver_iters_override > 0) ? solver_iters_override : std::min(raw_si, m.has_sdf ? 10 : 3);
         int cgi = getenv("MJMLX_CGITERS") ? atoi(getenv("MJMLX_CGITERS")) : 30;  // CPUとの差を小さくするため十分に回す(CG_TOLで早期終了する)
         // frictionloss拘束(区分二次で飽和する)は有効/無効の切り替わりを反復で辿るため、3回では静止付近で1e-2級のずれが残る(8回で1e-4)。速度優先ならconfigのsolver_iterationsで下げられる。
-        if (ctx->solver_nfl > 0) si = std::max(si, std::min(raw_si, 8));
+        if (ctx->solver_nfl > 0 || ctx->solver_ntfl > 0) si = std::max(si, std::min(raw_si, 8));
         ctx->solver_scratch_size = solver_scratch_per_env(m);
         if (ctx->solver_scratch_size != mkx_kernels::solver_scratch_floats(m.nv, mkx_kernels::solver_max_efc_for(m.nv))) throw std::logic_error("mjmlx: solver scratch確保量がカーネルの必要量と不一致");
         ctx->solver_pair_props = build_solver_pair_props(m);
@@ -689,7 +789,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl);  // ABL_*: 計測用(物理が変わる)
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl);  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
@@ -884,15 +984,22 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                 int scratchSz = ctx->fwd_scratch_per_env;
 
                 std::vector<mx::array> fwd;
+                const bool has_ten = ctx->ten.nten > 0;
                 {
-                    auto fwd_raw = (*ctx->forward_kernel)(
-                        mx::fast::kernel_inputs({mx::flatten(xipos), mx::flatten(ximat),
+                    std::vector<mx::array> fwd_in = {mx::flatten(xipos), mx::flatten(ximat),
                          mx::flatten(xanchor), mx::flatten(xaxis), mx::flatten(xmat),
                          mx::flatten(qpos_batch), mx::flatten(qvel_batch), mx::flatten(ctrl_batch),
-                         ctx->act_moment}),
-                        mx::fast::kernel_shapes({{B * nv * nv}, {B * nv}, {B * nb * 3},
+                         ctx->act_moment};
+                    std::vector<mx::Shape> fwd_shapes = {{B * nv * nv}, {B * nv}, {B * nb * 3},
                          {B * nb * 10}, {B * nb * 6}, {B * nv},
-                         {B * scratchSz}, {B * nv * 6}}),
+                         {B * scratchSz}, {B * nv * 6}};
+                    if (has_ten) {
+                        fwd_shapes.push_back({B * mkx_kernels::tendon_scratch_floats(ctx->ten.nten, nv)});
+                        if (ctx->ten.has_spatial) { fwd_in.push_back(mx::flatten(xpos)); fwd_in.push_back(mx::flatten(kin[7])); fwd_in.push_back(mx::flatten(kin[8])); }
+                    }
+                    auto fwd_raw = (*ctx->forward_kernel)(
+                        mx::fast::kernel_inputs(fwd_in),
+                        mx::fast::kernel_shapes(fwd_shapes),
                         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B, "FWD", 64u), 1, 1}
                     );
                     // shapeは毎step固定のため全出力永続化(issue #14: alloc/free churn削減)。
@@ -904,6 +1011,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                     MX_MARK_PERSISTENT(fwd_raw[5], owner);
                     MX_MARK_PERSISTENT(fwd_raw[6], owner);
                     MX_MARK_PERSISTENT(fwd_raw[7], owner);
+                    if (has_ten) MX_MARK_PERSISTENT(fwd_raw[8], owner);
                     fwd = mx::fast::kernel_outputs(fwd_raw);
                     prof_stage("forward", fwd);
                 }
@@ -948,15 +1056,17 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         int scratch_sz = ctx->solver_scratch_size;
                         std::vector<mx::array> solver;
                         {
-                            auto solver_raw = (*ctx->solver_kernel)(
-                                mx::fast::kernel_inputs({qM_flat, qfrc_smooth_flat, cdof_flat,
+                            std::vector<mx::array> solver_in = {qM_flat, qfrc_smooth_flat, cdof_flat,
                                  mx::flatten(fwd[2]),
                                  mx::astype(mx::flatten(qvel_batch), mx::float32),
                                  coll[0], coll[1],
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
                                  ctx->solver_body_rootid,
                                  mx::astype(mx::flatten(qpos_batch), mx::float32),
-                                 ctx->solver_limit_tab, ctx->solver_fric_tab}),
+                                 ctx->solver_limit_tab, ctx->solver_fric_tab};
+                            if (ctx->solver_ntlim + ctx->solver_ntfl > 0) { solver_in.push_back(fwd[8]); solver_in.push_back(ctx->ten_lim_tab); solver_in.push_back(ctx->ten_fric_tab); }
+                            auto solver_raw = (*ctx->solver_kernel)(
+                                mx::fast::kernel_inputs(solver_in),
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}, {B * MAX_CONTACTS_PER_ENV}}),
                                 std::array<uint32_t, 3>{static_cast<uint32_t>(B * nv), 1, 1}, std::array<uint32_t, 3>{static_cast<uint32_t>(nv), 1, 1}
                             );
