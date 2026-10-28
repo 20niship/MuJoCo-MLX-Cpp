@@ -376,6 +376,12 @@ cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-
 
 # Conformance tests only
 cd build && ctest -L correctness --output-on-failure
+
+# GPUバッチの健全性テスト(tests/test_robustness.cpp): nvと拘束(limit/contact/tendon/frictionloss)の構成ごとに、
+# 発散・env間不一致・Bや位置への依存・反復不一致・MuJoCo C比を見る。CIは代表のみ(-L robust)、総当たりは -L robust_full、
+# 既知の失敗は -L known_issue(直ったらCI側へ移す)。solver実装やlavapipeのスレッド数は環境変数
+# (MJMLX_SOLVER_SHARED=0, MJMLX_SOLVER_CG=1, LP_NUM_THREADS=1)で振れる。ROBUST_VERBOSE=1で各ケースの誤差を表示。
+cd build && ctest -L robust_full --output-on-failure
 ```
 
 ## Unified C API (mjb.h)
