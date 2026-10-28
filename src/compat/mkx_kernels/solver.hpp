@@ -666,7 +666,7 @@ LS_END
     // 勾配ノルムが初期値の相対GTOL_REL(2乗比)未満なら収束とみなして打ち切る。静止付近のenvは少ない反復で収束し、残りのNSOLVE回を省ける。
     if (tid == 0u) { float gn = 0.0f; for (int i = 0; i < NV; i++) gn += grad(i)*grad(i); if (gn < GTOL_REL*tg_g0) tg_done = 1; }
     barrier(); memoryBarrierBuffer(); memoryBarrierShared();
-    if (tg_done != 0) break;
+    TG_BREAK
 }
 
 { float s = 0.0f; for (int r2 = 0; r2 < nefc; r2++) s += J(r2,int(tid))*efc_force(r2);
@@ -798,6 +798,12 @@ if (tid == 0u) {
   {
     static const int sabl = getenv("MJMLX_SABL") ? atoi(getenv("MJMLX_SABL")) : 0;  // 計測用: 1=拘束構築直後、2=初期勾配直後でqfrc_constraint=0を書いて終了
     std::string body = ss.str();
+    // tendonの拘束行があるモデルは早期打ち切り(break)を出さない。早期打ち切りがワークグループの一部のスレッドだけ抜けるとlavapipeで発散する(原因未特定、全反復を回せば厳密解と一致する)。tendonが無いモデルのGLSLは従来どおり。
+    {
+      const std::string tgb = "TG_BREAK";
+      const std::string rep_with = (ntlim + ntfl > 0) ? std::string() : "if (tg_done != 0) break;";
+      for(size_t q = body.find(tgb); q != std::string::npos; q = body.find(tgb, q)) body.replace(q, tgb.size(), rep_with);
+    }
     // 早期returnで依存が切れると前段がコンパイラに消されるので、各点の状態を出力に書いてから終了する。
     auto rep = [&](const std::string& key, bool on, const std::string& chk) {
         size_t p = body.find(key);

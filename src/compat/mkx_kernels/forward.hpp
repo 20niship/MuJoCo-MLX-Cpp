@@ -130,23 +130,6 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     if(has_ten && th->has_tendon_actuator) ss << "const int act_ten[" << nu << "] = " << int_array_literal(th->act_tendon) << ";\n";
   }
 
-  // freeジョイントが複数あるとき、並進dofのcdof添字(joint内の位置)をジョイントごとに求める(従来は先頭ジョイントのdofadr基準で2つ目以降が範囲外になっていた)。
-  bool multi_free = false;
-  {
-    int nfree = 0;
-    for(int i = 0; i < nv; i++) nfree += (dof_jtype[static_cast<size_t>(i)] == 0 && dof_rotaxis[static_cast<size_t>(i)] < 0 && (i == 0 || dof_jid[static_cast<size_t>(i - 1)] != dof_jid[static_cast<size_t>(i)] || dof_rotaxis[static_cast<size_t>(i - 1)] >= 0));
-    multi_free = nfree > 1;
-  }
-  if(multi_free) {
-    std::vector<int> dof_sub(static_cast<size_t>(nv), 0);
-    for(int i = 0; i < nv; i++) {
-      int first = i;
-      while(first > 0 && dof_jid[static_cast<size_t>(first - 1)] == dof_jid[static_cast<size_t>(i)]) first--;
-      dof_sub[static_cast<size_t>(i)] = i - first;
-    }
-    ss << "const int dof_sub[" << nv << "] = " << int_array_literal(dof_sub) << ";\n";
-  }
-
   ss << "const int dof_jtype[" << nv << "] = " << int_array_literal(dof_jtype) << ";\n";
   ss << "const int dof_rotaxis[" << nv << "] = " << int_array_literal(dof_rotaxis) << ";\n";
   ss << "const int dof_jid[" << nv << "] = " << int_array_literal(dof_jid) << ";\n\n";
@@ -220,7 +203,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "    c6[0]=ax[0]; c6[1]=ax[1]; c6[2]=ax[2];\n"
      << "    c6[3]=ax[1]*d[2]-ax[2]*d[1]; c6[4]=ax[2]*d[0]-ax[0]*d[2]; c6[5]=ax[0]*d[1]-ax[1]*d[0];\n"
      << "  } else if (jt == 0 && ra < 0) {\n"
-     << (multi_free ? "    int sub = dof_sub[di];\n" : "    int sub = di - " + std::to_string(njnt > 0 ? jnt_dofadr0 : 0) + ";\n")
+     << "    int sub = di - " << (njnt > 0 ? jnt_dofadr0 : 0) << ";\n"
      << "    c6[3+sub] = 1.0f;\n"
      << "  } else if (jt == 0 && ra >= 0) {\n"
      << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[uint(bdi*9+k)*NBATCH+bid];\n"

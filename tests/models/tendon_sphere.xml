@@ -1,4 +1,4 @@
-<!-- 球wrap + sidesite、site間tendon(range/spring)の小モデル(MuJoCo model/replicate/tendon.xmlを縮小) -->
+<!-- 球wrap(a→bulb→b、bulbのsidesite付き) + site間tendon(range/spring)の小モデル(MuJoCo model/replicate/tendon.xmlを縮小)。free jointは1つだけ(複数freeのGPU重力は別件) -->
 <mujoco model="tendon sphere">
   <option solver="Newton" timestep="0.002" iterations="50"/>
   <default>
@@ -11,16 +11,16 @@
     <body pos="0 0 1.5">
       <freejoint/>
       <site name="hook" pos="0 0 .3"/>
-      <site name="bulb"/>
+      <site name="bulb" pos="0 0 .4"/>
       <geom name="bulb" size=".3" rgba="0 0 .8 1" density="100" contype="0" conaffinity="0"/>
     </body>
-    <body pos=".2 0 1.5">
-      <freejoint/>
+    <body pos="-.5 0 1.7">
+      <joint type="slide" axis="1 0 0"/><joint type="slide" axis="0 1 0"/><joint type="slide" axis="0 0 1"/>
       <site name="a"/>
       <geom rgba=".8 0 .4 1" size=".03"/>
     </body>
-    <body pos="1.2 0 1.5">
-      <freejoint/>
+    <body pos=".5 0 1.7">
+      <joint type="slide" axis="1 0 0"/><joint type="slide" axis="0 1 0"/><joint type="slide" axis="0 0 1"/>
       <site name="b"/>
       <geom rgba=".8 .4 0 1" size=".1"/>
     </body>
@@ -30,7 +30,7 @@
       <site site="ceiling"/>
       <site site="hook"/>
     </spatial>
-    <spatial range="0 0.5" limited="true">
+    <spatial range="0 1.0" limited="true">
       <site site="a"/>
       <geom geom="bulb" sidesite="bulb"/>
       <site site="b"/>
