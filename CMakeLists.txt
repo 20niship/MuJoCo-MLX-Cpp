@@ -246,6 +246,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_sdf_mesh tests/test_sdf_mesh.cpp)
+    target_link_libraries(test_sdf_mesh PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_sdf_mesh PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     add_executable(bench_tendon tests/bench_tendon.cpp)
     target_link_libraries(bench_tendon PRIVATE mjmlx)
     target_include_directories(bench_tendon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -281,6 +288,18 @@ if(MJMLX_BUILD_TESTS)
     )
 
     if(MJMLX_BUILD_CAMERA)
+    add_executable(bench_camera tests/bench_camera.cpp)
+    target_link_libraries(bench_camera PRIVATE mjmlx)
+    target_include_directories(bench_camera PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    add_executable(camera_dump tests/camera_dump.cpp)
+    target_link_libraries(camera_dump PRIVATE mjmlx)
+    target_include_directories(camera_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    add_executable(test_camera_tendon tests/test_camera_tendon.cpp)
+    target_link_libraries(test_camera_tendon PRIVATE mjmlx)
+    target_include_directories(test_camera_tendon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
     add_executable(test_camera tests/test_camera.cpp)
     target_link_libraries(test_camera PRIVATE mjmlx ${CMAKE_DL_LIBS})
     set_target_properties(test_camera PROPERTIES ENABLE_EXPORTS ON)
@@ -321,6 +340,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
     if(MJMLX_BUILD_CAMERA)
         add_test(NAME camera COMMAND test_camera)
+        add_test(NAME camera_tendon COMMAND test_camera_tendon)
+        set_tests_properties(camera_tendon PROPERTIES SKIP_RETURN_CODE 77 LABELS "correctness")
         set_tests_properties(camera PROPERTIES SKIP_RETURN_CODE 77 LABELS "correctness")
     endif()
     set_tests_properties(math_full linalg_full batched_collision_primitives PROPERTIES LABELS "correctness")
@@ -346,6 +367,10 @@ if(MJMLX_BUILD_TESTS)
     if(MJMLX_SDF_PLUGIN)
         add_test(NAME gpu_vs_cpu_sdf_gear COMMAND test_sdf_gear "${MJMLX_SDF_PLUGIN}" ${_M}/sdf_gear.xml)
         set_tests_properties(gpu_vs_cpu_sdf_gear PROPERTIES LABELS "correctness")
+        # mesh由来SDF(プラグイン無し)はMuJoCo Cのoctree距離と、mesh geomはMuJoCo Cのレイ近似が粗いので解析値(上面0.30+管半径0.05)と比べる。
+        add_test(NAME gpu_vs_cpu_sdf_meshsdf COMMAND test_sdf_mesh "${MJMLX_SDF_PLUGIN}" ${_M}/sdf_meshsdf.xml 0.002)
+        add_test(NAME gpu_vs_cpu_sdf_mesh COMMAND test_sdf_mesh "${MJMLX_SDF_PLUGIN}" ${_M}/sdf_mesh.xml 0.003 0.35)
+        set_tests_properties(gpu_vs_cpu_sdf_meshsdf gpu_vs_cpu_sdf_mesh PROPERTIES LABELS "correctness")
     endif()
 
 

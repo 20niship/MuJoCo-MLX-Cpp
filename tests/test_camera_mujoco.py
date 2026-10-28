@@ -99,5 +99,31 @@ for name, (tex, matattr, gtype, size) in cases.items():
     check(name, diff < 12, f"{diff:.2f}")
     save(name, rgb, rgb_m)
 
+# --- tendon: site間 + 球wrap(sidesite) + 円柱wrap。tendon色(緑)のマスクをMuJoCoと比べる ---
+xml = f'''<mujoco><option gravity="0 0 0"/>{UNLIT}
+<worldbody>
+  <geom name="ball" type="sphere" size="0.3" pos="0 0 1" rgba="1 0 0 1" contype="0" conaffinity="0"/>
+  <geom name="cyl" type="cylinder" size="0.15 0.3" pos="0 0 2.2" euler="90 0 0" rgba="0 0 1 1" contype="0" conaffinity="0"/>
+  <site name="top" pos="0 0 1.6"/>
+  <site name="ctop" pos="0 0 2.6"/>
+  <body name="a" pos="-0.8 0 1.1"><joint type="slide" axis="0 0 1"/><inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/><site name="sa"/></body>
+  <body name="b" pos="0.8 0 1.1"><joint type="slide" axis="0 0 1"/><inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/><site name="sb"/></body>
+  <body name="c" pos="-0.8 0 2.3"><joint type="slide" axis="0 0 1"/><inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/><site name="sc"/></body>
+  <body name="d" pos="0.8 0.1 2.3"><joint type="slide" axis="0 0 1"/><inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/><site name="sd"/></body>
+  <camera name="c" pos="0 -4 1.7" xyaxes="1 0 0 0 0 1" fovy="60"/>
+</worldbody>
+<tendon>
+  <spatial width="0.05" rgba="0 1 0 1"><site site="sa"/><geom geom="ball" sidesite="top"/><site site="sb"/></spatial>
+  <spatial width="0.05" rgba="0 1 0 1"><site site="sc"/><geom geom="cyl" sidesite="ctop"/><site site="sd"/></spatial>
+  <spatial width="0.03" rgba="0 1 0 1"><site site="sa"/><site site="sc"/></spatial>
+</tendon></mujoco>'''
+rgb, depth, rgb_m, depth_m, _ = render_both(xml)
+green = lambda x: (x[..., 1] > 80) & (x[..., 1] > 3 * x[..., 0].astype(int)) & (x[..., 1] > 3 * x[..., 2].astype(int))
+go, gm = green(rgb), green(rgb_m)
+iou = (go & gm).sum() / max((go | gm).sum(), 1)
+print(f"tendon: green px mine={go.sum()} mujoco={gm.sum()} IoU={iou:.4f}")
+check("tendon_mask_iou", iou > 0.75 and go.sum() > 100, f"{iou:.4f}")
+save("tendon", rgb, rgb_m)
+
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

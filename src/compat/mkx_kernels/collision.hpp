@@ -237,9 +237,9 @@ for (int p = 0; p < NUM_PAIRS; p++) {
 
 
     // (rbound判定の前に処理)
-    // SDF同士: MuJoCo mjc_SDFと同じく、AABB交差内のHalton点から勾配降下で接触点を探す。接触は複数点を直接書き込む。SDFと他形状の組は未対応(接触なし)。
+    // SDF同士: MuJoCo mjc_SDFと同じく、AABB交差内のHalton点から勾配降下で接触点を探す。接触は複数点を直接書き込む。相手はSDFか、格子に焼いたmesh(MuJoCoのmjc_MeshSDF)。それ以外の組は未対応(接触なし)。
     if (t1 == 8 || t2 == 8) {
-        if (t1 == 8 && t2 == 8 && SDF_INITPOINTS > 0) {
+        if (SDF_INITPOINTS > 0 && sdf_info[g1*20] >= 0.0 && sdf_info[g2*20] >= 0.0) {
             // g2ローカルでの最適化。R21/p21 = g2座標->g1座標
             vec3 pos1 = vec3(geom_xpos[uint(g1*3)*NBATCH+bid], geom_xpos[uint(g1*3+1)*NBATCH+bid], geom_xpos[uint(g1*3+2)*NBATCH+bid]);
             vec3 pos2 = vec3(geom_xpos[uint(g2*3)*NBATCH+bid], geom_xpos[uint(g2*3+1)*NBATCH+bid], geom_xpos[uint(g2*3+2)*NBATCH+bid]);
