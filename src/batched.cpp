@@ -1417,7 +1417,7 @@ MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_
     for (int i = 0; i < nbody_sel; i++) if (body_ids[i] < 0 || body_ids[i] >= m.nbody) return -1;
     if (dof_lo < 0 || dof_lo + ndof > m.nv) return -1;
     int nq = m.nq, nv = m.nv, nb = m.nbody;
-    int stride = nq + nv + nbody_sel + ndof;
+    int stride = nq + nv + nbody_sel + 2;  // 最後の2つは範囲内のqfrc_actuatorの二乗和と絶対値和(個別の値は転送しない)
     std::ostringstream ss;
     ss << "uint e = gl_GlobalInvocationID.x;\n"
        << "if (e >= uint(" << sim->sim.num_envs << ")) return;\n"
@@ -1428,7 +1428,9 @@ MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_
         uint32_t c = static_cast<uint32_t>(body_ids[k]) * 6u + 3u;
         ss << "{ uint c = e * " << nb * 6 << "u + " << c << "u; vec3 f = vec3(cfrc_in[c], cfrc_in[c+1u], cfrc_in[c+2u]); pack_out[o + " << (nq + nv + k) << "u] = length(f); }\n";
     }
-    for (int k = 0; k < ndof; k++) ss << "pack_out[o + " << (nq + nv + nbody_sel + k) << "u] = qfa_in[e * " << nv << "u + " << (dof_lo + k) << "u];\n";
+    ss << "{ float sq = 0.0, ab = 0.0;\n";
+    for (int k = 0; k < ndof; k++) ss << "{ float t = qfa_in[e * " << nv << "u + " << (dof_lo + k) << "u]; sq += t*t; ab += abs(t); }\n";
+    ss << "pack_out[o + " << (nq + nv + nbody_sel) << "u] = sq; pack_out[o + " << (nq + nv + nbody_sel + 1) << "u] = ab; }\n";
     auto spec = std::make_shared<PackSpec>();
     spec->kernel = mkx::fast::compute_kernel("mjmlx_pack", {"qpos_in", "qvel_in", "cfrc_in", "qfa_in"}, {"pack_out"}, ss.str(), "");
     spec->stride = stride;

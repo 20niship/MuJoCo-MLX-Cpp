@@ -289,7 +289,7 @@ class MjmlxGo2Env(VecEnv):
             nq, nv = self.nq, self.nv
             qpos, qvel = pk[:, :nq], pk[:, nq:nq + nv]
             contact_force = pk[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
-            joint_torque = pk[:, nq + nv + 5:]
+            torque_sq, torque_abs_mean = pk[:, nq + nv + 5], float(pk[:, nq + nv + 6].sum()) / (self.num_envs * 12)
         else:
             qpos, qvel = self._sim.state()
             cfrc_ext = self._sim.cfrc_ext()  # (N, nbody*6): [torque(3),force(3)]/body
@@ -298,10 +298,8 @@ class MjmlxGo2Env(VecEnv):
             self._feet_contact_sensor.update(CONTROL_DT)
             self._base_contact_sensor.update(CONTROL_DT)
 
-        not_finite = ~np.isfinite(qpos).all(axis=1) | ~np.isfinite(qvel).all(axis=1)
-        finite_qpos = np.where(np.isfinite(qpos), qpos, 0.0)
-        finite_qvel = np.where(np.isfinite(qvel), qvel, 0.0)
-        blew_up = not_finite | (np.abs(finite_qpos).max(axis=1) > 1000.0) | (np.abs(finite_qvel).max(axis=1) > 1000.0)
+        # NaN/infはmaxがNaN/infになり比較がFalseになるので、isfinite+whereを使わずに1回のabs-maxで判定する
+        blew_up = ~((np.abs(qpos).max(axis=1) <= 1000.0) & (np.abs(qvel).max(axis=1) <= 1000.0))
 
         quat = qpos[:, 3:7]
         base_lin_vel = _quat_rotate_inverse(quat, qvel[:, 0:3])
@@ -350,7 +348,8 @@ class MjmlxGo2Env(VecEnv):
                 joint_torque = self._sim.qfrc_actuator()[:, 6:18]
             except AttributeError:
                 joint_torque = np.zeros((self.num_envs, 12), dtype=np.float32)  # ponytail: qfrc_actuatorバインディング未ビルド時のフォールバック
-        r_torque = self._w["torque"] * np.sum(joint_torque**2, axis=1)
+            torque_sq, torque_abs_mean = np.sum(joint_torque**2, axis=1), float(np.abs(joint_torque).mean())
+        r_torque = self._w["torque"] * torque_sq
 
         self.last_reward_terms = {
             "track_lin": r_track_lin, "track_ang": r_track_ang, "lin_vel_z": r_lin_vel_z, "ang_vel_xy": r_ang_vel_xy,
@@ -404,7 +403,7 @@ class MjmlxGo2Env(VecEnv):
             "Metrics/joint_pos_dev": float(np.abs(qpos[:, 7:19] - DEFAULT_JOINT_POS).mean()),
             "Metrics/base_tilt": float(np.linalg.norm(_quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0], dtype=np.float32))[:, :2], axis=1).mean()),
             "Metrics/feet_air_time": float(self._feet_air_time.mean()),
-            "Metrics/joint_torque_abs": float(np.abs(joint_torque).mean()),
+            "Metrics/joint_torque_abs": torque_abs_mean,
             "Metrics/foot_contact_frac": float(foot_contact.mean()),
             "Termination/base_contact": float(base_contact.mean()),
             "Termination/blew_up": float(blew_up.mean()),
