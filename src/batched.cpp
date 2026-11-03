@@ -979,7 +979,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qfrc_constraint_flat = mx::zeros({1});
             mx::array solver_qacc = mx::zeros({1});
             bool have_solver_qacc = false;
-            mx::array cfrc_ext_flat = mx::zeros({B * nb * 6});
+            mx::array cfrc_ext_flat = mx::zeros({1});  // 接触が無い経路でだけ下でB*nb*6のゼロ配列にする(毎substep 1.4MBのホストでのゼロ埋めは約250us)
             mx::array subtree_com_out = mx::zeros({1});
             mx::array cinert_out = mx::zeros({1});
             mx::array cvel_out = mx::zeros({1});
@@ -1161,6 +1161,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             auto new_qvel = mx::reshape(euler[1], {B, nv});
             auto xpos_out = kin_view(0, nb * 3, {B, nb, 3}, false);
             auto xquat_out = kin_view(1, nb * 4, {B, nb, 4}, false);
+            if (cfrc_ext_flat.size() != static_cast<int64_t>(B) * nb * 6) cfrc_ext_flat = mx::zeros({B * nb * 6});
             auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
             return {new_qpos, new_qvel, xpos_out, xquat_out,
@@ -1589,11 +1590,11 @@ MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out) {
         std::array<uint32_t, 3>{static_cast<uint32_t>(B), 1, 1}, std::array<uint32_t, 3>{env_threadgroup(B), 1, 1});
     MX_MARK_PERSISTENT(raw[0], &s);
     auto packed = mx::fast::kernel_outputs(raw)[0];
-    // array::data<float>()はfloat->float変換と余分なコピーを挟むので、読み戻したvectorを直接コピーする
+    // data<float>()/to_vector()は変換や余分なコピーを挟むので、評価後の永続バッファからステージング経由で直接outへ読む
     auto proxy = mx::to_raw(packed);
     mkx::eval<mx::Backend>(proxy);
-    auto v = proxy.to_vector();
-    std::memcpy(out, v.data(), static_cast<size_t>(B) * spec.stride * sizeof(float));
+    const size_t nbytes = static_cast<size_t>(B) * spec.stride * sizeof(float);
+    mx::Backend::download(mx::Backend::get_or_allocate(packed.node().get(), nbytes), out, nbytes);
     return 0;
 }
 

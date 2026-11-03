@@ -609,8 +609,9 @@ void camera_prepare_device();
 // io.cpp
 Model load_model(const char* xml_path);
 Model load_model_from_string(const char* xml_string);
-std::pair<Model, mjModel*> load_model_pair(const char* xml_path);
-std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string);
+struct ModelLoadOptions { bool self_collision = true; int max_condim = 0; };
+std::pair<Model, mjModel*> load_model_pair(const char* xml_path, const ModelLoadOptions& opts = {});
+std::pair<Model, mjModel*> load_model_from_string_pair(const char* xml_string, const ModelLoadOptions& opts = {});
 Data make_data(const Model& model);
 
 // math.cpp

@@ -46,6 +46,18 @@ MJMLX_API MjmlxModel* mjmlx_load_model(const char* xml_path);
 // Load model from MJCF XML string. Returns NULL on error.
 MJMLX_API MjmlxModel* mjmlx_load_model_from_string(const char* xml_string);
 
+// 読み込み時に適用するオプション(元のMJCFファイルは変更せず、コンパイル前にメモリ上のモデルを上書きする)。mjmlx_default_model_options()で初期化して使う。
+//  self_collision: 0にするとロボット(関節を持つbodyとその子孫)のgeom同士の衝突を切る(各geomのconaffinityを0にする)。関節を持たない静的bodyやworld(地形)のgeomは書き換えず、それらとは衝突する。ロボットのgeomはcontype!=0の前提(MuJoCo既定は1)
+//  max_condim: 0以外なら、ロボット(関節を持つbodyとその子孫)のgeomのcondimをこの値以下にする。3にすると足のねじり・転がり摩擦(condim 4/6)が無くなり並進摩擦のみになる(拘束行が減り速い)
+// 既定(self_collision=1, max_condim=0)はmjmlx_load_modelと完全に同じ挙動。
+typedef struct MjmlxModelOptions {
+    int self_collision;
+    int max_condim;
+} MjmlxModelOptions;
+MJMLX_API MjmlxModelOptions mjmlx_default_model_options(void);
+MJMLX_API MjmlxModel* mjmlx_load_model_ex(const char* xml_path, const MjmlxModelOptions* options);
+MJMLX_API MjmlxModel* mjmlx_load_model_from_string_ex(const char* xml_string, const MjmlxModelOptions* options);
+
 // Free model and all associated memory.
 MJMLX_API void mjmlx_free_model(MjmlxModel* model);
 
