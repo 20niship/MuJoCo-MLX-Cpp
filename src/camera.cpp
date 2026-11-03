@@ -38,6 +38,8 @@ struct CamDevice {
     uint32_t queue_family = 0;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     bool multi_draw_indirect = true, shader_clip_distance = true;
+    // VK_KHR_external_memory_fd(Linux): 読み出し用バッファをCUDAへfdで渡す(ゼロコピーのGPUテンソル)。無ければCPU読み出しのみ。
+    PFN_vkGetMemoryFdKHR get_memory_fd = nullptr;
     bool valid = false;
     std::string reason = "camera device not prepared (mjmlx_load_model was not called before any Vulkan use)";
 };
@@ -101,6 +103,10 @@ void prepare_device() {
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, dex.data());
         std::vector<const char*> de;
         for (auto& e : dex) if (std::string(e.extensionName) == "VK_KHR_portability_subset") de.push_back("VK_KHR_portability_subset");
+        bool has_ext = false, has_fd = false;
+        for (auto& e : dex) { std::string n = e.extensionName; has_ext |= n == "VK_KHR_external_memory"; has_fd |= n == "VK_KHR_external_memory_fd"; }
+        const bool want_fd = has_ext && has_fd && !(std::getenv("MJMLX_CAMERA_INTEROP") && std::atoi(std::getenv("MJMLX_CAMERA_INTEROP")) == 0);
+        if (want_fd) { de.push_back("VK_KHR_external_memory"); de.push_back("VK_KHR_external_memory_fd"); }
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qi.queueFamilyIndex = (uint32_t)qf; qi.queueCount = 1; qi.pQueuePriorities = &prio;
@@ -111,6 +117,7 @@ void prepare_device() {
         if (vkCreateDevice(phys, &di, nullptr, &dev) != VK_SUCCESS) { g_dev.reason = "vkCreateDevice failed"; vkDestroyInstance(inst, nullptr); return; }
         VkQueue q;
         vkGetDeviceQueue(dev, (uint32_t)qf, 0, &q);
+        if (want_fd) g_dev.get_memory_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
         mkx::VulkanBackend::ExternalDevice ext{inst, phys, dev, q, (uint32_t)qf};
         if (!mkx::VulkanBackend::use_external_device(ext)) {
             g_dev.reason = "mkx was already initialised before mjmlx_load_model";
@@ -737,6 +744,18 @@ struct MjmlxCameraRenderer {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorSet dset = VK_NULL_HANDLE;
     GpuBuf rb_color, rb_depth;
+    // CUDA interop用: デバイスローカルでfdをexportできる読み出し先(CPUへは出さない)。
+    GpuBuf xb_color, xb_depth;
+    VkDeviceSize xb_color_alloc = 0, xb_depth_alloc = 0;
+    // GPU上でタイル画像を(env,cam,H,W)の連続バッファへ並べ替えるcompute pass。vkCmdCopyImageToBufferをタイル数(最大数千)の領域で呼ぶより速く、render()と同じcommand bufferに入る。
+    bool pack_ok = false, gpu_mode = false;
+    VkImageLayout copy_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkDescriptorSetLayout pk_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pk_layout = VK_NULL_HANDLE;
+    VkPipeline pk_pipe = VK_NULL_HANDLE;
+    VkShaderModule pk_mod = VK_NULL_HANDLE;
+    VkDescriptorPool pk_pool = VK_NULL_HANDLE;
+    VkDescriptorSet pk_set = VK_NULL_HANDLE;
     void *rb_color_ptr = nullptr, *rb_depth_ptr = nullptr;
     VkQueryPool qpool = VK_NULL_HANDLE;
     bool rendered = false, read_back = false;
@@ -763,6 +782,26 @@ struct MjmlxCameraRenderer {
         try { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props | VK_MEMORY_PROPERTY_HOST_CACHED_BIT); } catch (...) { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props); }
         vk_check(vkAllocateMemory(h.device, &ai, nullptr, &b.mem), "vkAllocateMemory(buffer)");
         vkBindBufferMemory(h.device, b.buf, b.mem, 0);
+        return b;
+    }
+
+    GpuBuf make_export_buf(size_t size, VkDeviceSize& alloc) {
+        GpuBuf b;
+        b.size = std::max<size_t>(size, 4);
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.pNext = &eb; bi.size = b.size; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vk_check(vkCreateBuffer(h.device, &bi, nullptr, &b.buf), "vkCreateBuffer(export)");
+        VkMemoryRequirements rq;
+        vkGetBufferMemoryRequirements(h.device, b.buf, &rq);
+        VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+        ex.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.pNext = &ex; ai.allocationSize = rq.size; ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vk_check(vkAllocateMemory(h.device, &ai, nullptr, &b.mem), "vkAllocateMemory(export)");
+        vkBindBufferMemory(h.device, b.buf, b.mem, 0);
+        alloc = rq.size;
         return b;
     }
 
@@ -828,14 +867,21 @@ struct MjmlxCameraRenderer {
     }
 
     void build(const mjModel* m);
+    void enable_gpu_mode();
+    void record_pack(VkCommandBuffer c);
 
     ~MjmlxCameraRenderer() {
         if (!h.device) return;
         vkDeviceWaitIdle(h.device);
         if (qpool) vkDestroyQueryPool(h.device, qpool, nullptr);
         if (h.command_pool) vkDestroyCommandPool(h.device, h.command_pool, nullptr);
-        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &lodbuf, &tpos, &tmat, &wtab, &ttab, &rb_color, &rb_depth}) destroy(*b);
+        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &lodbuf, &tpos, &tmat, &wtab, &ttab, &rb_color, &rb_depth, &xb_color, &xb_depth}) destroy(*b);
         if (dpool) vkDestroyDescriptorPool(h.device, dpool, nullptr);
+        if (pk_pool) vkDestroyDescriptorPool(h.device, pk_pool, nullptr);
+        if (pk_pipe) vkDestroyPipeline(h.device, pk_pipe, nullptr);
+        if (pk_layout) vkDestroyPipelineLayout(h.device, pk_layout, nullptr);
+        if (pk_set_layout) vkDestroyDescriptorSetLayout(h.device, pk_set_layout, nullptr);
+        if (pk_mod) vkDestroyShaderModule(h.device, pk_mod, nullptr);
         if (gfx) vkDestroyPipeline(h.device, gfx, nullptr);
         if (comp) vkDestroyPipeline(h.device, comp, nullptr);
         if (cull) vkDestroyPipeline(h.device, cull, nullptr);
@@ -1109,8 +1155,16 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     tmat = make_buf((size_t)std::max<uint32_t>(nslot, 1) * 9 * B * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     // 画像: RGBA8 + 線形depth(R32F、ピクセル単位の正確な値) + z-test用D32。
-    make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, img_color, mem_color, view_color);
-    make_image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, img_depth, mem_depth, view_depth);
+    {
+        VkFormatProperties fc, fd;
+        vkGetPhysicalDeviceFormatProperties(h.physical, VK_FORMAT_R8G8B8A8_UNORM, &fc);
+        vkGetPhysicalDeviceFormatProperties(h.physical, VK_FORMAT_R32_SFLOAT, &fd);
+        pack_ok = h.get_memory_fd && (fc.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (fd.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        if (!pack_ok) h.get_memory_fd = nullptr; // interop不可(CPU読み出しのみ)
+    }
+    const VkImageUsageFlags stor = pack_ok ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
+    make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | stor, VK_IMAGE_ASPECT_COLOR_BIT, img_color, mem_color, view_color);
+    make_image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | stor, VK_IMAGE_ASPECT_COLOR_BIT, img_depth, mem_depth, view_depth);
     make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, img_zbuf, mem_zbuf, view_zbuf);
 
     VkAttachmentDescription att[3]{};
@@ -1257,6 +1311,8 @@ MJMLX_API MjmlxCameraRenderer* mjmlx_camera_create(MjmlxBatchedSim* sim, int wid
         mjmlx::camera_prepare_device();
         if (!g_dev.valid) throw std::runtime_error("camera unsupported on this Vulkan setup: " + g_dev.reason);
         r->h = g_dev;
+        // 解像度が高いほど同じLODでもシルエット誤差は小さい。128px以上はK=4でも64pxのK=16と同等のMuJoCo Rendererとの一致度(ロボットIoU 0.96)になり、描画が約3倍速い。
+        r->lodk = height >= 128 ? 4.0f : 16.0f;
         if (const char* e = std::getenv("MJMLX_CAM_LOD_K")) r->lodk = (float)std::atof(e);
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = g_dev.queue_family;
@@ -1343,6 +1399,7 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             r->draw_calls++;
             vkCmdEndRenderPass(c);
             if (prof) vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r->qpool, 2);
+            if (r->gpu_mode) r->record_pack(c);
         });
         if (std::getenv("MJMLX_CAM_PROF")) {
             auto t_c = std::chrono::steady_clock::now();
@@ -1362,7 +1419,100 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
     }
 }
 
-// 画像をタイル単位で (env,cam,H,W) の連続バッファへコピーして読み出す(並べ替えはGPUのvkCmdCopyImageToBuffer領域で行う)。
+static const char* kPack = R"(
+#version 450
+layout(local_size_x = 256) in;
+layout(rgba8, binding = 0) uniform readonly image2D img_c;
+layout(r32f, binding = 1) uniform readonly image2D img_d;
+layout(std430, binding = 2) writeonly buffer OC { uint oc[]; };
+layout(std430, binding = 3) writeonly buffer OD { float od[]; };
+layout(push_constant) uniform PK { uint W; uint H; uint tiles_x; uint n; } pk;
+void main() {
+  uint wh = pk.W * pk.H, stride = gl_NumWorkGroups.x * 256u;
+  for (uint i = gl_GlobalInvocationID.x; i < pk.n; i += stride) {
+    uint t = i / wh, p = i - t * wh;
+    ivec2 xy = ivec2(int((t % pk.tiles_x) * pk.W + p % pk.W), int((t / pk.tiles_x) * pk.H + p / pk.W));
+    oc[i] = packUnorm4x8(imageLoad(img_c, xy));
+    od[i] = imageLoad(img_d, xy).r;
+  }
+}
+)";
+
+void MjmlxCameraRenderer::enable_gpu_mode() {
+    size_t npx = (size_t)ntiles * W * H;
+    xb_color = make_export_buf(npx * 4, xb_color_alloc);
+    xb_depth = make_export_buf(npx * 4, xb_depth_alloc);
+    VkDescriptorSetLayoutBinding lb[4];
+    for (uint32_t i = 0; i < 4; i++) lb[i] = {i, i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 4; sli.pBindings = lb;
+    vk_check(vkCreateDescriptorSetLayout(h.device, &sli, nullptr, &pk_set_layout), "vkCreateDescriptorSetLayout(pack)");
+    VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1; pli.pSetLayouts = &pk_set_layout; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+    vk_check(vkCreatePipelineLayout(h.device, &pli, nullptr, &pk_layout), "vkCreatePipelineLayout(pack)");
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+    vk_check(vkCreateDescriptorPool(h.device, &dpi, nullptr, &pk_pool), "vkCreateDescriptorPool(pack)");
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pk_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &pk_set_layout;
+    vk_check(vkAllocateDescriptorSets(h.device, &dai, &pk_set), "vkAllocateDescriptorSets(pack)");
+    VkDescriptorImageInfo ii[2] = {{VK_NULL_HANDLE, view_color, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, view_depth, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorBufferInfo bb[2] = {{xb_color.buf, 0, VK_WHOLE_SIZE}, {xb_depth.buf, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[4]{};
+    for (uint32_t i = 0; i < 4; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = pk_set; w[i].dstBinding = i; w[i].descriptorCount = 1;
+        w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        if (i < 2) w[i].pImageInfo = &ii[i]; else w[i].pBufferInfo = &bb[i - 2];
+    }
+    vkUpdateDescriptorSets(h.device, 4, w, 0, nullptr);
+    pk_mod = make_module(compile_glsl(kPack, "comp"));
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, pk_mod, "main", nullptr};
+    ci.layout = pk_layout;
+    vk_check(vkCreateComputePipelines(h.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pk_pipe), "vkCreateComputePipelines(pack)");
+    copy_layout = VK_IMAGE_LAYOUT_GENERAL; // 以降のCPU読み出しcopyもGENERALから行う(pack passがGENERALへ遷移させる)
+    gpu_mode = true;
+}
+
+// render pass直後(画像はTRANSFER_SRC_OPTIMAL)に呼ぶ。GENERALへ遷移してタイル画像を連続バッファへ並べ替える。
+void MjmlxCameraRenderer::record_pack(VkCommandBuffer c) {
+    VkImageMemoryBarrier ib[2]{};
+    VkImage imgs[2] = {img_color, img_depth};
+    for (int i = 0; i < 2; i++) {
+        ib[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        ib[i].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        ib[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        ib[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib[i].srcQueueFamilyIndex = ib[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib[i].image = imgs[i]; ib[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
+    uint32_t pk[4] = {(uint32_t)W, (uint32_t)H, tiles_x, ntiles * (uint32_t)W * (uint32_t)H};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pk_pipe);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, pk_layout, 0, 1, &pk_set, 0, nullptr);
+    vkCmdPushConstants(c, pk_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), pk);
+    vkCmdDispatch(c, std::min<uint32_t>((pk[3] + 255) / 256, 65535), 1, 1);
+}
+
+// 画像をタイル単位で (env,cam,H,W) の連続バッファへコピーする(並べ替えはGPUのvkCmdCopyImageToBuffer領域で行う)。
+static void copy_tiles(MjmlxCameraRenderer* r, VkBuffer color, VkBuffer depth) {
+    std::vector<VkBufferImageCopy> regs(r->ntiles);
+    for (uint32_t t = 0; t < r->ntiles; t++) {
+        regs[t] = {(VkDeviceSize)t * r->W * r->H * 4, (uint32_t)r->W, (uint32_t)r->H, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                   {(int32_t)((t % r->tiles_x) * r->W), (int32_t)((t / r->tiles_x) * r->H), 0}, {(uint32_t)r->W, (uint32_t)r->H, 1}};
+    }
+    auto tr0 = std::chrono::steady_clock::now();
+    r->one_shot([&](VkCommandBuffer c) {
+        vkCmdCopyImageToBuffer(c, r->img_color, r->copy_layout, color, r->ntiles, regs.data());
+        vkCmdCopyImageToBuffer(c, r->img_depth, r->copy_layout, depth, r->ntiles, regs.data());
+    });
+    auto tr1 = std::chrono::steady_clock::now();
+    if (std::getenv("MJMLX_CAM_PROF")) fprintf(stderr, "[cam] readback: gpu_copy(submit+wait)=%.2fms\n", std::chrono::duration<double, std::milli>(tr1 - tr0).count());
+}
+
 static void camera_readback(MjmlxCameraRenderer* r) {
     if (r->read_back) return;
     size_t npx = (size_t)r->ntiles * r->W * r->H;
@@ -1373,18 +1523,7 @@ static void camera_readback(MjmlxCameraRenderer* r) {
         vk_check(vkMapMemory(r->h.device, r->rb_color.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_color_ptr), "vkMapMemory");
         vk_check(vkMapMemory(r->h.device, r->rb_depth.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_depth_ptr), "vkMapMemory");
     }
-    std::vector<VkBufferImageCopy> regs(r->ntiles);
-    for (uint32_t t = 0; t < r->ntiles; t++) {
-        regs[t] = {(VkDeviceSize)t * r->W * r->H * 4, (uint32_t)r->W, (uint32_t)r->H, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                   {(int32_t)((t % r->tiles_x) * r->W), (int32_t)((t / r->tiles_x) * r->H), 0}, {(uint32_t)r->W, (uint32_t)r->H, 1}};
-    }
-    auto tr0 = std::chrono::steady_clock::now();
-    r->one_shot([&](VkCommandBuffer c) {
-        vkCmdCopyImageToBuffer(c, r->img_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_color.buf, r->ntiles, regs.data());
-        vkCmdCopyImageToBuffer(c, r->img_depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_depth.buf, r->ntiles, regs.data());
-    });
-    auto tr1 = std::chrono::steady_clock::now();
-    if (std::getenv("MJMLX_CAM_PROF")) fprintf(stderr, "[cam] readback: gpu_copy(submit+wait)=%.2fms\n", std::chrono::duration<double, std::milli>(tr1 - tr0).count());
+    copy_tiles(r, r->rb_color.buf, r->rb_depth.buf);
     r->read_back = true;
 }
 
@@ -1403,6 +1542,33 @@ MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer* r, float* out) {
     const char* dsrc = static_cast<const char*>(r->rb_depth_ptr);
     parallel_chunks((size_t)r->ntiles * r->W * r->H * sizeof(float), [=](size_t a, size_t b) { std::memcpy(reinterpret_cast<char*>(out) + a, dsrc + a, b - a); });
     return 0;
+}
+
+// ── CUDA interop(Linux, VK_KHR_external_memory_fd) ─────────────────────────────
+
+MJMLX_API int mjmlx_camera_gpu_supported(const MjmlxCameraRenderer* r) { return r && r->h.get_memory_fd ? 1 : 0; }
+
+// 描画結果をCPUを経由せずデバイスローカルのexport可能バッファ(RGBA8とfloat depth、(env,cam,H,W)順)へ並べる。初回は有効化して今のフレームを変換し、以降はrender()が同じsubmit内で変換済み。
+MJMLX_API int mjmlx_camera_gpu_copy(MjmlxCameraRenderer* r) {
+    if (!r || !r->rendered || !r->h.get_memory_fd) return -1;
+    try {
+        if (!r->gpu_mode) {
+            r->enable_gpu_mode();
+            r->one_shot([&](VkCommandBuffer c) { r->record_pack(c); });
+        }
+        return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "mjmlx_camera_gpu_copy error: %s\n", e.what()); return -1; }
+}
+
+// which=0: color(RGBA8), 1: depth(float32)。呼ぶたびに新しいfdを返し(所有権は呼び出し側、cudaImportExternalMemoryが引き取る)、*alloc_sizeにメモリ確保サイズを入れる。失敗は-1。
+MJMLX_API int mjmlx_camera_gpu_export_fd(MjmlxCameraRenderer* r, int which, uint64_t* alloc_size) {
+    if (!r || !r->h.get_memory_fd || !r->xb_color.buf) return -1;
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    gi.memory = which == 0 ? r->xb_color.mem : r->xb_depth.mem; gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    int fd = -1;
+    if (r->h.get_memory_fd(r->h.device, &gi, &fd) != VK_SUCCESS) return -1;
+    if (alloc_size) *alloc_size = which == 0 ? r->xb_color_alloc : r->xb_depth_alloc;
+    return fd;
 }
 
 } // extern "C"

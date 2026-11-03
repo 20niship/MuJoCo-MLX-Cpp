@@ -185,7 +185,88 @@ Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセ�
 | 4096 | 64 | 3,882 → **55,908** | 1,949 → **29,512** | skip | 1,797 → **19,608** | skip |
 | 4096 | 128 | 3,867 → **22,578** | 1,397 → **8,631** | skip | 1,319 → **7,423** | skip |
 
-注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定16、0でLOD無効)で変えられる。
+注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定は高さ128px未満で16、128px以上で4、0でLOD無効)で変えられる。
+
+
+#### カメラあり強化学習の1 step(物理4substep + 描画 + RGB/depthがGPU上のtorchテンソルとして使える状態まで)
+
+```bash
+PYTHONPATH=/path/to/torch-cu126 uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128   # 前方視点(ロボットはほぼ写らない)
+PYTHONPATH=/path/to/torch-cu126 uv run python scripts/bench_camera_rl.py --camera orbit ...                                       # 三人称視点(ロボット全体が写る、約40万三角形/env)
+```
+
+RTX 3060、Go2平地、**全envで丁度1カメラ**(モデル同梱の`track`を置換。上の`bench_camera_vs_isaac.py`の置換は`track`を残すので、現在のmenagerieのモデルでは mjmlx だけ2カメラ/envを描いており、上の表のmjmlx列は同条件ではない)、RGB+depth、torchは`device=cuda`、SMクロックは全計測で1837MHz、計測前に他のGPUジョブが無いことを確認(util 0%)。cpu/gpu経路を別プロセスで**交互に3回**走らせて中央値(プロセス内でも2ラウンドの中央値)。env-steps/s。mjmlxのみ計測(Genesisは過去値)。
+
+- 旧: 描画後にRGB/depthをCPUへ読み出し(numpy)、`torch.from_numpy(...).to('cuda')`でアップロード。
+- 新: Vulkan->CUDA external memory interop(`scripts/mjmlx_camera_cuda.py`)で、描画結果をGPU上のまま`cuda`テンソルとして使う。
+
+前方視点(`--camera front`):
+
+| envs | px | 物理のみ | 描画のみ(env-frames/s) | 旧: 物理+描画+CPU読出+upload | **新: interop** | 新/旧 | Genesis(過去値) | 新/Genesis |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 29,993 | 296,503 | 21,091 | **24,273** | 1.15x | 10,400 | 2.3x |
+| 256 | 64 | 102,601 | 849,761 | 55,566 | **76,307** | 1.37x | 32,100 | 2.4x |
+| 1024 | 64 | 269,492 | 1,698,282 | 91,594 | **199,027** | 2.17x | 64,400 | 3.1x |
+| 4096 | 64 | 456,442 | 2,112,591 | 76,654 | **337,618** | 4.40x | 82,900 | 4.1x |
+| 64 | 128 | 30,658 | 257,009 | 16,241 | **23,082** | 1.42x | 10,300 | 2.2x |
+| 256 | 128 | 95,593 | 654,376 | 27,764 | **69,929** | 2.52x | 29,100 | 2.4x |
+| 1024 | 128 | 258,027 | 1,145,990 | 22,431 | **174,913** | 7.80x | 52,400 | 3.3x |
+| 4096 | 128 | 473,909 | 1,285,141 | 21,983 | **273,812** | 12.5x | 66,100 | 4.1x |
+
+三人称視点(`--camera orbit`、ロボット全体が写る重い場合)。128pxの「旧」はLOD係数も旧既定(K=16)、「新」は解像度別の既定(後述):
+
+| envs | px | 物理のみ | 描画のみ(env-frames/s) | 旧: CPU読出+upload | **新: interop(+128pxはLOD K=4)** | 新/旧 | Genesis(過去値) | 新/Genesis |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 29,719 | 110,413 | 17,715 | **21,250** | 1.20x | 10,400 | 2.0x |
+| 256 | 64 | 99,535 | 157,113 | 43,489 | **53,839** | 1.24x | 32,100 | 1.7x |
+| 1024 | 64 | 269,572 | 175,600 | 61,517 | **98,292** | 1.60x | 64,400 | 1.5x |
+| 4096 | 64 | 468,667 | 179,121 | 55,447 | **124,415** | 2.24x | 82,900 | 1.5x |
+| 64 | 128 | 30,264 | 108,247 | 12,169 | **20,873** | 1.71x | 10,300 | 2.0x |
+| 256 | 128 | 99,612 | 149,680 | 19,085 | **51,695** | 2.71x | 29,100 | 1.8x |
+| 1024 | 128 | 267,239 | 166,360 | 16,132 | **91,333** | 5.66x | 52,400 | 1.7x |
+| 4096 | 128 | 463,801 | 169,719 | 16,239 | **113,679** | 7.00x | 66,100 | 1.7x |
+
+施策ごとの寄与(三人称128px、4096env、env-steps/s):
+
+| 構成 | env-steps/s |
+|---|---|
+| 旧(CPU読出+upload、LOD K=16) | 16,239 |
+| + LOD既定をK=4に(CPU読出のまま) | 20,093 |
+| + CUDA interop(LOD K=16のまま) | 50,218 |
+| + interop + LOD K=4(新) | **113,679** |
+
+Genesisの値は過去の計測(BatchRenderer(Madrona)、GPUテンソル出力)で、今回は再計測していない。GPU・カメラ位置・シーンの複雑さ・シェーディング・`env.step`に含まれる処理(mjmlxは`MjmlxGo2Env.step`の報酬込み)が揃っている保証はない。
+
+ボトルネック(4096env、1 step、ms):
+
+| | 前方64px | 三人称64px | 三人称128px |
+|---|---|---|---|
+| 物理step | 9.0 | 8.7 | 9.0 |
+| 描画(GPU) | 2.0 | 23.0 | 24.8 |
+| (うち頂点処理のみ。`MJMLX_CAM_EXP=discard`) | - | 12.7 | 14.0 |
+| 旧: RGB読出(numpy) | 13.9 | 13.8 | 51.5 |
+| 旧: depth読出(numpy) | 8.0 | 7.8 | 46.1 |
+| 旧: torchへアップロード(rgb+depth) | 12.1 | 12.7 | 50.8 |
+| 新: pack passの追加(render+pack - render) | 0.5 | 0.6 | 1.8 |
+| 新: テンソル取得 | 0.01 | 0.01 | 0.01 |
+
+- 旧経路は読み出し+アップロード(34〜148ms)が物理+描画(11〜35ms)を大きく上回り、そこが支配的だった。interopで消える。
+- 描画前の運動学の再実行(`s.kinematics(qpos)`)は4096envでも0.2〜0.3ms(初回のみ約94ms)。**施策(1)(物理出力の再利用)は効果が無いため実装しない**(物理stepの最終substepの運動学は1 substep前の姿勢なので、再利用すると姿勢も1 substepずれる)。
+- 物理と描画は同じ`VkQueue`で直列に走り、どちらもGPU律速(描画のGPU時間 + 物理のGPU時間 = 計測した1 step時間と一致)。**施策(3)(非同期パイプライン)** は同一キューでは重ならず、別キューにしても同じSMを取り合うので、重なっても短縮は描画分(前方64pxで1 step 11msのうち2.0ms)が上限で、観測遅延を生む割に見合わないため実装しない。
+- **施策(4)(ホスト側コスト)**: 描画は1 submit。ホスト側の固定費は小さく(上の運動学0.2〜0.3ms + submit)、64envは物理側が1 step 2.1ms(30k steps/s)で頭打ち。GPU計算量でなく固定オーバーヘッドと思われるが、原因は未調査。
+- 並べ替え(タイル画像->`(env,cam,H,W)`)は、初版の`vkCmdCopyImageToBuffer`(タイル数個の領域)が4096envで約4ms(描画より遅い)だったので、compute shader(`record_pack`)に置換して`render()`と同じsubmitに入れた。前方64px・4096envで 275,787 -> 337,618(本ブランチ内の単発計測と上の交互3回の中央値で、同一手順の比較ではない)。
+- **施策(5)(LOD)**: 解像度が高いほど同じLODでもシルエット誤差が小さいので、`height >= 128`の既定を`MJMLX_CAM_LOD_K=4`にした(64pxは従来の16)。MuJoCo標準レンダラ(`scripts/compare_camera_mujoco.py`、三人称、16env)との比較:
+
+| px | K | ロボットシルエットIoU | depth誤差 平均 / p95 | 描画のみ(4096env) |
+|---|---|---|---|---|
+| 64 | 16(既定) | 0.960 | 28.2 / 75.2 mm | 181k |
+| 64 | 4 | 0.899 | 30.2 / 77.4 mm | 424k |
+| 128 | 16(旧既定) | 0.989 | 13.9 / 37.2 mm | 60k |
+| 128 | 4(新既定) | 0.965 | 14.9 / 37.9 mm | 178k |
+
+128pxのK=4は64pxのK=16と同等のIoU(0.965 vs 0.960)なので採用し、64pxのK=4はIoUが落ちる(0.899)ので採用しなかった。品質を優先するなら`MJMLX_CAM_LOD_K=16`で従来に戻せる。
+
+未達・残り: Genesisの過去値は全構成で上回ったが、三人称視点では描画(約23ms/4096env)が1 stepの約7割を占める。頂点処理が約半分で、次の手はメッシュレットによる細かい単位のカリング・LODの更新、背面カリング、Hi-Zによるオクルージョンカリング。interopはLinux+VK_KHR_external_memory_fd+CUDAのみ(同期は`vkQueueWaitIdle`で、GPU間セマフォではない)。Vulkanのデバイスは`MKX_VULKAN_DEVICE_INDEX`、CUDAは既定のデバイス0を使うので、複数GPUでは揃える必要がある。mac(MoltenVK)では`VK_KHR_external_memory_fd`が無いため従来のCPU読み出しになる(実機未検証)。
 
 
 ### 5. Go2物理stepの速度: 履歴の再検証・退行の原因・最適化(RTX 3060、Go2平地、dt 0.005 x decimation 4、ランダムaction、env-steps/s)
@@ -359,6 +440,15 @@ MJCFの`<camera>`/`<light>`/geomのrgbaを使い、全env x 全カメラを`vkCm
 cam = native.create_camera(sim, 128, 128)  # sim: create_batched(use_gpu=True)の戻り値
 cam.render()
 rgb, depth = cam.rgb(), cam.depth()        # (num_envs, ncam, H, W, 3) uint8 / (num_envs, ncam, H, W) float32(m)
+```
+
+学習側がtorchのGPUテンソルを使う場合は、CPUを経由せずVulkanのメモリをそのままCUDAテンソルにできる(Linux、`VK_KHR_external_memory_fd` + torchのCUDAランタイム。`scripts/mjmlx_camera_cuda.py`):
+
+```python
+from mjmlx_camera_cuda import CudaCamera
+gcam = CudaCamera.try_create(cam)          # 非対応環境(mac・feature無し・MJMLX_BUILD_CAMERA=OFF・CUDA無し)はNone -> 上のCPU読み出しを使う
+cam.render()
+rgba, depth = gcam.read()                  # cudaのuint8 (num_envs, ncam, H, W, 4) / float32 (num_envs, ncam, H, W)。同じメモリを指し、次のread()で上書き
 ```
 
 例: `scripts/example_go2_camera.py`、MuJoCo比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera.py`。カメラはCMakeオプション `MJMLX_BUILD_CAMERA`(既定ON)で分離されている。OFFにすると `mjmlx_camera_*` はスタブ(`create_camera` が明確なエラー)になり、カメラ無しの学習・ビルドには影響しない。ONでも、graphics+compute queue family・multiDrawIndirect・drawIndirectFirstInstance・shaderClipDistanceのいずれかを持たない/mkxが先に初期化された場合は `create_camera` だけが失敗する(理由をstderrに出す)。MoltenVK(mac)でのこれらのfeatureの有無は未検証(実機が無い)。カメラ用デバイスは `mjmlx_load_model` 時にmkxへ注入される(`VulkanBackend::use_external_device`)。環境変数 `MJMLX_CAMERA_DEVICE=0` で注入を無効化できる。

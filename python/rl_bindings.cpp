@@ -193,10 +193,22 @@ NB_MODULE(_mjmlx_rl_native, m) {
 
     nb::class_<RlCamera>(m, "Camera")
         .def_prop_ro("num_cameras", &RlCamera::ncam)
+        .def_prop_ro("width", [](const RlCamera& c) { return c.width; })
+        .def_prop_ro("height", [](const RlCamera& c) { return c.height; })
+        .def_prop_ro("num_envs", [](const RlCamera& c) { return c.sim->num_envs; })
         .def_prop_ro("draw_calls", [](const RlCamera& c) { return mjmlx_camera_draw_call_count(c.handle); })
         .def("render", &RlCamera::render)
         .def("rgb", &RlCamera::rgb)
-        .def("depth", &RlCamera::depth);
+        .def("depth", &RlCamera::depth)
+        // CUDA interop(Linux): scripts/mjmlx_camera_cuda.py がfdをcudaImportExternalMemoryに渡してGPUテンソルにする
+        .def_prop_ro("gpu_supported", [](const RlCamera& c) { return mjmlx_camera_gpu_supported(c.handle) != 0; })
+        .def("gpu_copy", [](RlCamera& c) { if (mjmlx_camera_gpu_copy(c.handle) != 0) throw std::runtime_error("mjmlx_rl: gpu_copy failed (render() first; CUDA interop unsupported?)"); })
+        .def("gpu_export_fd", [](RlCamera& c, int which) {
+            uint64_t sz = 0;
+            int fd = mjmlx_camera_gpu_export_fd(c.handle, which, &sz);
+            if (fd < 0) throw std::runtime_error("mjmlx_rl: gpu_export_fd failed (call gpu_copy() once first)");
+            return std::make_pair(fd, sz);
+        }, nb::arg("which"));
 
     m.def("create_camera", [](std::shared_ptr<RlBatchedSim> sim, int width, int height) -> std::shared_ptr<RlCamera> {
         auto cam = std::make_shared<RlCamera>();
