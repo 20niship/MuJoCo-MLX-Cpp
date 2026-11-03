@@ -155,7 +155,7 @@ across 6 files to a 9x9 geom-type dispatch table with analytic, convex
 | CYLINDER | Yes | Partial (SDF) | Yes (Phase 3.2) |
 | BOX | Yes | Yes (as mesh) | Yes (Phase 3.1) |
 | MESH | Yes | Yes (vertex limit) | Yes (GJK/EPA, Phase 3.3) |
-| SDF | Yes | Yes | **Partial** (SDF-SDFのみ、GPUバッチ経路。SDFギアはMuJoCo Cと一致) |
+| SDF | Yes | Yes | **Partial** (SDF-SDFとSDF-meshのみ、GPUバッチ経路。SDFギアはMuJoCo Cと一致) |
 
 ### Collision Pairs Implemented
 
@@ -185,6 +185,7 @@ MuJoCo C has 36+ pair functions. MuJoCo-MLX-Cpp has 20+ (including GJK/EPA gener
 | hfield-* | `mjc_ConvexHField` | Yes | Yes (grid-cell triangle tests) |
 | cylinder-cylinder | `mjc_CylinderCylinder` | Yes | **No** (uncommon in RL) |
 | sdf-sdf | `mjc_SDF` | Yes | **Partial** (プラグインSDFを格子へベイク(gearプラグインはGPUで解析式を直接評価)し、GPUカーネルでMuJoCoと同じHalton初期点+勾配降下。SDFと他形状の組、CPU/vmap経路は未対応) |
+| sdf-mesh | `mjc_MeshSDF` | Yes | **Partial** (meshを符号付き距離の格子に焼き、sdf-sdfと同じカーネルで衝突。プラグイン無しのmesh由来SDF geom(`<geom type="sdf" mesh=...>`)もMuJoCoのoctree距離と一致。mesh geomに対するMuJoCo Cのmjc_MeshSDFはワールド原点方向のレイによる粗い距離近似のため、GPUの方が正確で数mm差が出る。sdfとprimitive/hfieldの組、CPU/vmap経路は未対応) |
 
 ### Collision Code Volume
 

@@ -41,7 +41,8 @@ inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float time
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
   const float newton_tol = getenv("MJMLX_NTOL") ? (float)atof(getenv("MJMLX_NTOL")) : 1e-4f;  // Newton減少量(g.s)がtrace(M)のこの倍未満なら収束とみなす(CPUとの差は1e-4でも変わらない)。0で無効
-  const float ls_tol = getenv("MJMLX_LSTOL") ? (float)atof(getenv("MJMLX_LSTOL")) : 1e-3f;  // 直線探索の二分法を、導関数が初期勾配のこの割合未満で打ち切る。0で無効
+  // tendonの拘束行があるモデルは、スレッドごとに判定する早期打ち切り(Newtonのbreakと同じ理由)を出さない。CIのlavapipeで一部のスレッドだけ抜けてbarrierがずれ、qvelが発散した。
+  const float ls_tol = (ntlim + ntfl > 0) ? 0.0f : (getenv("MJMLX_LSTOL") ? (float)atof(getenv("MJMLX_LSTOL")) : 1e-3f);  // 直線探索の二分法を、導関数が初期勾配のこの割合未満で打ち切る。0で無効
   const int max_efc              = solver_max_efc_for(nv);
   const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;

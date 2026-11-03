@@ -15,7 +15,7 @@ check: build
 # Build then run only the tests that don't depend on the removed single-env pipeline (for CI; requires a working Vulkan device)
 # contact_stress(nv=300)はlavapipeで約23分かかりstep1でGPU状態が発散するため、実GPUでは `ctest` 全体を回して確認する。
 check-ci: build
-    cd {{build_dir}} && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && (! [ -x ./test_camera ] || ./test_camera || [ $? -eq 77 ]) && ctest -R gpu_vs_cpu -E "contact_stress|model_" --output-on-failure
+    cd {{build_dir}} && ./test_math_full && ./test_linalg_full && ./test_batched_collision_primitives && (! [ -x ./test_camera ] || ./test_camera || [ $? -eq 77 ]) && (! [ -x ./test_camera_tendon ] || ./test_camera_tendon || [ $? -eq 77 ]) && ctest -R gpu_vs_cpu -E "contact_stress|model_" --output-on-failure
 
 # CIと同じDockerイメージ(lavapipe)でcheck-ciを実行する。GPUで回す場合は `just docker-test --gpus all -e NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility`
 docker-test *ARGS:

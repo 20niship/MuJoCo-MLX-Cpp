@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "compat/mkx_kernels/tendon.hpp"
 #include "internal.h"
 #include "mjmlx/mjmlx.h"
 
@@ -37,6 +38,8 @@ struct CamDevice {
     uint32_t queue_family = 0;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     bool multi_draw_indirect = true, shader_clip_distance = true;
+    // VK_KHR_external_memory_fd(Linux): 読み出し用バッファをCUDAへfdで渡す(ゼロコピーのGPUテンソル)。無ければCPU読み出しのみ。
+    PFN_vkGetMemoryFdKHR get_memory_fd = nullptr;
     bool valid = false;
     std::string reason = "camera device not prepared (mjmlx_load_model was not called before any Vulkan use)";
 };
@@ -100,6 +103,10 @@ void prepare_device() {
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, dex.data());
         std::vector<const char*> de;
         for (auto& e : dex) if (std::string(e.extensionName) == "VK_KHR_portability_subset") de.push_back("VK_KHR_portability_subset");
+        bool has_ext = false, has_fd = false;
+        for (auto& e : dex) { std::string n = e.extensionName; has_ext |= n == "VK_KHR_external_memory"; has_fd |= n == "VK_KHR_external_memory_fd"; }
+        const bool want_fd = has_ext && has_fd && !(std::getenv("MJMLX_CAMERA_INTEROP") && std::atoi(std::getenv("MJMLX_CAMERA_INTEROP")) == 0);
+        if (want_fd) { de.push_back("VK_KHR_external_memory"); de.push_back("VK_KHR_external_memory_fd"); }
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qi.queueFamilyIndex = (uint32_t)qf; qi.queueCount = 1; qi.pQueuePriorities = &prio;
@@ -110,6 +117,7 @@ void prepare_device() {
         if (vkCreateDevice(phys, &di, nullptr, &dev) != VK_SUCCESS) { g_dev.reason = "vkCreateDevice failed"; vkDestroyInstance(inst, nullptr); return; }
         VkQueue q;
         vkGetDeviceQueue(dev, (uint32_t)qf, 0, &q);
+        if (want_fd) g_dev.get_memory_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
         mkx::VulkanBackend::ExternalDevice ext{inst, phys, dev, q, (uint32_t)qf};
         if (!mkx::VulkanBackend::use_external_device(ext)) {
             g_dev.reason = "mkx was already initialised before mjmlx_load_model";
@@ -320,10 +328,139 @@ void main() {
 }
 )";
 
-std::string with_common(const char* src) {
+const char* kCommonT = R"(
+layout(push_constant) uniform PC {
+  uint B; uint ncam; uint nvis; uint tiles_x; uint tiles_y; uint nlights; uint nbody; uint H;
+  float aspect; float znear; float zfar; float lodk;
+  uint ngeom; uint ntend; uint nslot;
+} pc;
+)";
+
+std::string with_common(const std::string& src, bool tendon = false) {
     std::string s = src;
     size_t p;
-    while ((p = s.find("$COMMON")) != std::string::npos) s.replace(p, 7, kCommon);
+    while ((p = s.find("$COMMON")) != std::string::npos) s.replace(p, 7, tendon ? kCommonT : kCommon);
+    return s;
+}
+
+// ── tendon描画(空間tendonのみ有効)─────────────────────────────────────────────
+// tendonの経路(site間・球/円柱wrapの接点)を、(env,tendon)ごとにGPUで求めて線分ごとの円柱の姿勢(仮想geom)としてtpos/tmatへ書く。
+// 仮想geomはgeom表の後ろ(ids.x >= ngeom)に並べ、頂点/cullシェーダだけがそこから姿勢を読む。tendonが無いモデルは元のシェーダのまま(下の置換をしない)。
+
+std::string tendon_variant(std::string s, bool is_cull) {
+    auto rep = [&](const std::string& from, const std::string& to) {
+        size_t p = s.find(from);
+        if (p == std::string::npos) throw std::runtime_error("mjmlx_camera: tendon shader patch target missing");
+        s.replace(p, from.size(), to);
+    };
+    rep("layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };",
+        "layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };\n"
+        "layout(std430, binding = 11) readonly buffer TP { float tpos[]; };\n"
+        "layout(std430, binding = 12) readonly buffer TM { float tmat[]; };");
+    rep("  vec3 gp = vec3(geom_xpos[(g * 3u + 0u) * pc.B + e], geom_xpos[(g * 3u + 1u) * pc.B + e], geom_xpos[(g * 3u + 2u) * pc.B + e]);\n"
+        "  mat3 R;\n"
+        "  for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = geom_xmat[(g * 9u + 3u * i + j) * pc.B + e];\n",
+        "  vec3 gp; mat3 R;\n"
+        "  if (g >= pc.ngeom) {\n"
+        "    uint ts = g - pc.ngeom;\n"
+        "    gp = vec3(tpos[(ts * 3u + 0u) * pc.B + e], tpos[(ts * 3u + 1u) * pc.B + e], tpos[(ts * 3u + 2u) * pc.B + e]);\n"
+        "    for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = tmat[(ts * 9u + 3u * i + j) * pc.B + e];\n"
+        "  } else {\n"
+        "    gp = vec3(geom_xpos[(g * 3u + 0u) * pc.B + e], geom_xpos[(g * 3u + 1u) * pc.B + e], geom_xpos[(g * 3u + 2u) * pc.B + e]);\n"
+        "    for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) R[j][i] = geom_xmat[(g * 9u + 3u * i + j) * pc.B + e];\n"
+        "  }\n");
+    if (is_cull)  // tendonの仮想geomはカリングせずLOD0固定(線分の長さが時変で球境界が使えない)
+        rep("  uint g = gt[vis].ids.x;\n",
+            "  uint g = gt[vis].ids.x;\n"
+            "  if (g >= pc.ngeom) { Lod L0 = lods[vis]; uint b0 = k * 5u; cmds[b0] = L0.lod[0].y; cmds[b0 + 1u] = 1u; cmds[b0 + 2u] = L0.lod[0].x; cmds[b0 + 3u] = L0.lod[0].z; cmds[b0 + 4u] = k; return; }\n");
+    return s;
+}
+
+
+// MuJoCoと同様、wrapはsite→接点→(接点間の弦、半分の太さ)→接点→siteの線分で描く。(env,tendon)ごとに経路をたどり、線分ごとに円柱(スロットs)の姿勢を書く。円柱メッシュは半径1・半長1なので、列に半径/半長を掛けた行列にする。
+const char* kTendComp = R"(
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer GX { float geom_xpos[]; };
+layout(std430, binding = 1) readonly buffer GM { float geom_xmat[]; };
+layout(std430, binding = 5) readonly buffer BP { float body_xpos[]; };
+layout(std430, binding = 6) readonly buffer BM { float body_xmat[]; };
+layout(std430, binding = 11) writeonly buffer TP { float tpos[]; };
+layout(std430, binding = 12) writeonly buffer TM { float tmat[]; };
+struct W { ivec4 a; vec4 b; ivec4 c; vec4 d; };   // a={type,objid,hasside,body}, b={site pos | radius}, c={sidebody}, d={sidepos}
+layout(std430, binding = 13) readonly buffer WT { W wt[]; };
+struct T { ivec4 a; vec4 col; };                    // a={adr,num,slot0,nslots}, col.x=半径
+layout(std430, binding = 14) readonly buffer TT { T tt[]; };
+)" "$COMMON" R"(
+$WRAPFN
+mat3 bmat(uint b, uint e) {
+  mat3 M;
+  for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) M[j][i] = body_xmat[(b * 9u + 3u * i + j) * pc.B + e];
+  return M;
+}
+vec3 bpos(uint b, uint e) { return vec3(body_xpos[(b * 3u + 0u) * pc.B + e], body_xpos[(b * 3u + 1u) * pc.B + e], body_xpos[(b * 3u + 2u) * pc.B + e]); }
+vec3 site_w(uint body, vec3 lp, uint e) { return bpos(body, e) + bmat(body, e) * lp; }
+void put(uint e, uint slot, vec3 c, mat3 R) {
+  for (uint k = 0u; k < 3u; k++) tpos[(slot * 3u + k) * pc.B + e] = c[k];
+  for (uint i = 0u; i < 3u; i++) for (uint j = 0u; j < 3u; j++) tmat[(slot * 9u + 3u * i + j) * pc.B + e] = R[j][i];
+}
+void off(uint e, uint slot) { put(e, slot, vec3(0.0), mat3(0.0)); }
+void seg(uint e, uint slot, vec3 a, vec3 b, float r) {
+  vec3 d = b - a; float L = length(d);
+  if (L < 1e-9) { off(e, slot); return; }
+  vec3 z = d / L;
+  vec3 t = abs(z.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 x = normalize(cross(t, z)); vec3 y = cross(z, x);
+  put(e, slot, 0.5 * (a + b), mat3(x * r, y * r, z * (0.5 * L + 0.5 * r)));  // 端を半径の半分だけ延ばし、折れ曲がりの隙間を埋める(MuJoCoはカプセル)
+}
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.B * pc.ntend) return;
+  uint e = i / pc.ntend, t = i % pc.ntend;
+  T tn = tt[t];
+  int adr = tn.a.x, num = tn.a.y; uint slot = uint(tn.a.z);
+  float r = tn.col.x;
+  int j = 0;
+  while (j < num - 1) {
+    W w0 = wt[adr + j], w1 = wt[adr + j + 1];
+    if (w0.a.x == 2 || w1.a.x == 2) { j++; continue; }
+    vec3 s0 = site_w(uint(w0.a.w), w0.b.xyz, e);
+    if (w1.a.x == 4 || w1.a.x == 5) {
+      W w2 = wt[adr + j + 2];
+      vec3 s1 = site_w(uint(w2.a.w), w2.b.xyz, e);
+      uint g = uint(w1.a.y);
+      vec3 gx = vec3(geom_xpos[(g * 3u + 0u) * pc.B + e], geom_xpos[(g * 3u + 1u) * pc.B + e], geom_xpos[(g * 3u + 2u) * pc.B + e]);
+      mat3 gR = mat3(geom_xmat[(g * 9u + 0u) * pc.B + e], geom_xmat[(g * 9u + 3u) * pc.B + e], geom_xmat[(g * 9u + 6u) * pc.B + e],
+                     geom_xmat[(g * 9u + 1u) * pc.B + e], geom_xmat[(g * 9u + 4u) * pc.B + e], geom_xmat[(g * 9u + 7u) * pc.B + e],
+                     geom_xmat[(g * 9u + 2u) * pc.B + e], geom_xmat[(g * 9u + 5u) * pc.B + e], geom_xmat[(g * 9u + 8u) * pc.B + e]);
+      bool has = w1.a.z != 0;
+      vec3 side = has ? site_w(uint(w1.c.x), w1.d.xyz, e) : vec3(0.0);
+      bool sph = w1.a.x == 4;
+      vec3 p0, p1;
+      float wl = tw_wrap(p0, p1, s0, s1, gx, gR, w1.b.x, sph, has, side);
+      if (wl < 0.0) {
+        seg(e, slot, s0, s1, r);
+        off(e, slot + 1u); off(e, slot + 2u);
+      } else {
+        seg(e, slot, s0, p0, r);
+        seg(e, slot + 1u, p0, p1, 0.5 * r);
+        seg(e, slot + 2u, p1, s1, r);
+      }
+      slot += 3u; j += 2;
+    } else {
+      vec3 s1 = site_w(uint(w1.a.w), w1.b.xyz, e);
+      seg(e, slot, s0, s1, r);
+      slot += 1u; j += 1;
+    }
+  }
+}
+)";
+
+std::string tendon_comp_source() {
+    std::string s = kTendComp;
+    size_t p;
+    while ((p = s.find("$WRAPFN")) != std::string::npos) s.replace(p, 7, mjmlx::mkx_kernels::detail_tendon::wrap_header());
+    while ((p = s.find("$COMMON")) != std::string::npos) s.replace(p, 7, kCommonT);
     return s;
 }
 
@@ -571,7 +708,9 @@ struct GpuBuf { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HAND
 struct GeomRec { float rgba[4]; float ms[4]; uint32_t ids[4]; float tx[4]; };
 struct LightRec { float pos[4], dir[4], diffuse[4], ambient[4], specular[4]; };
 struct CamConst { float a[4], b[4], rl[3][4], rw[3][4]; int32_t ids[4]; };
-struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, H; float aspect, znear, zfar, lodk; };
+struct PushC { uint32_t B, ncam, nvis, tiles_x, tiles_y, nlights, nbody, H; float aspect, znear, zfar, lodk; uint32_t ngeom, ntend, nslot; };
+struct WrapRec { int32_t a[4]; float b[4]; int32_t c[4]; float d[4]; };
+struct TendRec { int32_t a[4]; float col[4]; };
 struct LodRec { float sphere[4]; uint32_t lod[4][4]; };
 
 } // namespace
@@ -588,6 +727,11 @@ struct MjmlxCameraRenderer {
     std::vector<float> clear_rgb = {0.2f, 0.3f, 0.4f};
 
     GpuBuf vbo, ibo, indirect, gtab, lights, camc, campose, texbuf, lodbuf;
+    // tendon描画(空間tendonがあるモデルのみ): 線分ごとの円柱の姿勢(仮想geom)と、経路の表。
+    GpuBuf tpos, tmat, wtab, ttab;
+    uint32_t ntend = 0, nslot = 0;
+    VkPipeline tend = VK_NULL_HANDLE;
+    VkShaderModule m_tend = VK_NULL_HANDLE;
     VkImage img_color = VK_NULL_HANDLE, img_depth = VK_NULL_HANDLE, img_zbuf = VK_NULL_HANDLE;
     VkDeviceMemory mem_color = VK_NULL_HANDLE, mem_depth = VK_NULL_HANDLE, mem_zbuf = VK_NULL_HANDLE;
     VkImageView view_color = VK_NULL_HANDLE, view_depth = VK_NULL_HANDLE, view_zbuf = VK_NULL_HANDLE;
@@ -600,6 +744,18 @@ struct MjmlxCameraRenderer {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorSet dset = VK_NULL_HANDLE;
     GpuBuf rb_color, rb_depth;
+    // CUDA interop用: デバイスローカルでfdをexportできる読み出し先(CPUへは出さない)。
+    GpuBuf xb_color, xb_depth;
+    VkDeviceSize xb_color_alloc = 0, xb_depth_alloc = 0;
+    // GPU上でタイル画像を(env,cam,H,W)の連続バッファへ並べ替えるcompute pass。vkCmdCopyImageToBufferをタイル数(最大数千)の領域で呼ぶより速く、render()と同じcommand bufferに入る。
+    bool pack_ok = false, gpu_mode = false;
+    VkImageLayout copy_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkDescriptorSetLayout pk_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pk_layout = VK_NULL_HANDLE;
+    VkPipeline pk_pipe = VK_NULL_HANDLE;
+    VkShaderModule pk_mod = VK_NULL_HANDLE;
+    VkDescriptorPool pk_pool = VK_NULL_HANDLE;
+    VkDescriptorSet pk_set = VK_NULL_HANDLE;
     void *rb_color_ptr = nullptr, *rb_depth_ptr = nullptr;
     VkQueryPool qpool = VK_NULL_HANDLE;
     bool rendered = false, read_back = false;
@@ -626,6 +782,26 @@ struct MjmlxCameraRenderer {
         try { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props | VK_MEMORY_PROPERTY_HOST_CACHED_BIT); } catch (...) { ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, props); }
         vk_check(vkAllocateMemory(h.device, &ai, nullptr, &b.mem), "vkAllocateMemory(buffer)");
         vkBindBufferMemory(h.device, b.buf, b.mem, 0);
+        return b;
+    }
+
+    GpuBuf make_export_buf(size_t size, VkDeviceSize& alloc) {
+        GpuBuf b;
+        b.size = std::max<size_t>(size, 4);
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.pNext = &eb; bi.size = b.size; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vk_check(vkCreateBuffer(h.device, &bi, nullptr, &b.buf), "vkCreateBuffer(export)");
+        VkMemoryRequirements rq;
+        vkGetBufferMemoryRequirements(h.device, b.buf, &rq);
+        VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+        ex.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.pNext = &ex; ai.allocationSize = rq.size; ai.memoryTypeIndex = find_mem(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vk_check(vkAllocateMemory(h.device, &ai, nullptr, &b.mem), "vkAllocateMemory(export)");
+        vkBindBufferMemory(h.device, b.buf, b.mem, 0);
+        alloc = rq.size;
         return b;
     }
 
@@ -691,20 +867,28 @@ struct MjmlxCameraRenderer {
     }
 
     void build(const mjModel* m);
+    void enable_gpu_mode();
+    void record_pack(VkCommandBuffer c);
 
     ~MjmlxCameraRenderer() {
         if (!h.device) return;
         vkDeviceWaitIdle(h.device);
         if (qpool) vkDestroyQueryPool(h.device, qpool, nullptr);
         if (h.command_pool) vkDestroyCommandPool(h.device, h.command_pool, nullptr);
-        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &lodbuf, &rb_color, &rb_depth}) destroy(*b);
+        for (auto* b : {&vbo, &ibo, &indirect, &gtab, &lights, &camc, &campose, &texbuf, &lodbuf, &tpos, &tmat, &wtab, &ttab, &rb_color, &rb_depth, &xb_color, &xb_depth}) destroy(*b);
         if (dpool) vkDestroyDescriptorPool(h.device, dpool, nullptr);
+        if (pk_pool) vkDestroyDescriptorPool(h.device, pk_pool, nullptr);
+        if (pk_pipe) vkDestroyPipeline(h.device, pk_pipe, nullptr);
+        if (pk_layout) vkDestroyPipelineLayout(h.device, pk_layout, nullptr);
+        if (pk_set_layout) vkDestroyDescriptorSetLayout(h.device, pk_set_layout, nullptr);
+        if (pk_mod) vkDestroyShaderModule(h.device, pk_mod, nullptr);
         if (gfx) vkDestroyPipeline(h.device, gfx, nullptr);
         if (comp) vkDestroyPipeline(h.device, comp, nullptr);
         if (cull) vkDestroyPipeline(h.device, cull, nullptr);
+        if (tend) vkDestroyPipeline(h.device, tend, nullptr);
         if (pipe_layout) vkDestroyPipelineLayout(h.device, pipe_layout, nullptr);
         if (set_layout) vkDestroyDescriptorSetLayout(h.device, set_layout, nullptr);
-        for (auto sm : {m_vert, m_frag, m_comp, m_cull}) if (sm) vkDestroyShaderModule(h.device, sm, nullptr);
+        for (auto sm : {m_vert, m_frag, m_comp, m_cull, m_tend}) if (sm) vkDestroyShaderModule(h.device, sm, nullptr);
         if (fb) vkDestroyFramebuffer(h.device, fb, nullptr);
         if (render_pass) vkDestroyRenderPass(h.device, render_pass, nullptr);
         for (auto v : {view_color, view_depth, view_zbuf}) if (v) vkDestroyImageView(h.device, v, nullptr);
@@ -799,7 +983,83 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
         }
         grecs.push_back(gr);
     }
+    const uint32_t nvis_geom = (uint32_t)ranges.size();
+    // 空間tendon(site/geom wrapを含む)を描画対象にする。固定tendonは形が無いので描かない(MuJoCoと同じ)。
+    std::vector<WrapRec> wrecs;
+    std::vector<TendRec> trecs;
+    std::vector<int> slot_tendon;  // スロット -> tendon
+    std::vector<int> tendon_ids;   // 描画するtendonの通し番号 -> モデルのtendon id
+    for (int t = 0; t < m->ntendon; t++) {
+        if (m->tendon_group[t] > 2) continue;
+        const int adr = m->tendon_adr[t], num = m->tendon_num[t];
+        if (m->wrap_type[adr] == mjWRAP_JOINT) continue;
+        TendRec tr{};
+        tr.a[0] = (int)wrecs.size(); tr.a[1] = num; tr.a[2] = (int)slot_tendon.size();
+        for (int k = 0; k < num; k++) {
+            const int type = m->wrap_type[adr + k], obj = m->wrap_objid[adr + k];
+            WrapRec w{};
+            w.a[0] = type; w.a[1] = obj;
+            if (type == mjWRAP_SITE) {
+                w.a[3] = m->site_bodyid[obj];
+                for (int q = 0; q < 3; q++) w.b[q] = (float)m->site_pos[3 * obj + q];
+            } else if (type == mjWRAP_SPHERE || type == mjWRAP_CYLINDER) {
+                const int side = (int)std::lround(m->wrap_prm[adr + k]);
+                w.b[0] = (float)m->geom_size[3 * obj];
+                w.a[2] = side >= 0;
+                if (side >= 0) {
+                    w.c[0] = m->site_bodyid[side];
+                    for (int q = 0; q < 3; q++) w.d[q] = (float)m->site_pos[3 * side + q];
+                }
+            }
+            wrecs.push_back(w);
+        }
+        int slots = 0;
+        for (int j = 0; j < num - 1;) {
+            const int t0 = m->wrap_type[adr + j], t1 = m->wrap_type[adr + j + 1];
+            if (t0 == mjWRAP_PULLEY || t1 == mjWRAP_PULLEY) { j++; continue; }
+            if (t1 == mjWRAP_SPHERE || t1 == mjWRAP_CYLINDER) { slots += 3; j += 2; }
+            else { slots += 1; j += 1; }
+        }
+        tr.a[3] = slots;
+        tr.col[0] = (float)m->tendon_width[t];
+        for (int q = 0; q < slots; q++) slot_tendon.push_back((int)trecs.size());
+        trecs.push_back(tr);
+        tendon_ids.push_back(t);
+    }
+    ntend = (uint32_t)trecs.size();
+    nslot = (uint32_t)slot_tendon.size();
+    if (nslot > 0) {
+        // 単位円柱(半径1・半長1)。姿勢行列の列に寸法を掛けて使う。
+        const float one[3] = {1.0f, 1.0f, 0.0f};
+        Mesh cyl = make_primitive(mjGEOM_CYLINDER, one);
+        orient_outward(cyl);
+        auto add_unit = [&](const Mesh& mm) {
+            LodSet r{};
+            Range rg{(uint32_t)idx.size(), (uint32_t)mm.i.size(), (int32_t)vtx.size()};
+            vtx.insert(vtx.end(), mm.v.begin(), mm.v.end());
+            idx.insert(idx.end(), mm.i.begin(), mm.i.end());
+            for (int l = 0; l < 4; l++) r.lod[l] = rg;
+            r.sphere[3] = 1e6f;
+            return r;
+        };
+        const LodSet rc = add_unit(cyl);
+        auto tend_rec = [&](int slot, int tendon) {
+            GeomRec gr{};
+            const int t = tendon_ids[tendon];
+            const int mid = m->tendon_matid[t];
+            const float* rgba = &m->tendon_rgba[4 * t];
+            const bool def = rgba[0] == 0.5f && rgba[1] == 0.5f && rgba[2] == 0.5f && rgba[3] == 1.0f;
+            const float* use = (mid >= 0 && def) ? &m->mat_rgba[4 * mid] : rgba;
+            for (int k = 0; k < 4; k++) gr.rgba[k] = use[k];
+            gr.ms[0] = mid >= 0 ? m->mat_specular[mid] : 0.5f;
+            gr.ms[1] = mid >= 0 ? m->mat_shininess[mid] : 0.5f;
+            gr.ids[0] = (uint32_t)m->ngeom + (uint32_t)slot;
+            return gr;
+        };
+        for (uint32_t q = 0; q < nslot; q++) { ranges.push_back(rc); grecs.push_back(tend_rec((int)q, slot_tendon[q])); }
+    }
     nvis = (uint32_t)ranges.size();
+    (void)nvis_geom;
     if (std::getenv("MJMLX_CAM_PROF")) {
         uint64_t tri = 0;
         for (auto& rg : ranges) tri += rg.lod[0].count / 3;
@@ -886,10 +1146,25 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     lights = make_device_buf(lrecs.data(), lrecs.size() * sizeof(LightRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     camc = make_device_buf(ccs.data(), ccs.size() * sizeof(CamConst), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     campose = make_buf((size_t)ntiles * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // tendon用(無いモデルでも束縛は必要なのでダミーを置く)。
+    if (wrecs.empty()) wrecs.push_back({});
+    if (trecs.empty()) trecs.push_back({});
+    wtab = make_device_buf(wrecs.data(), wrecs.size() * sizeof(WrapRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    ttab = make_device_buf(trecs.data(), trecs.size() * sizeof(TendRec), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    tpos = make_buf((size_t)std::max<uint32_t>(nslot, 1) * 3 * B * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    tmat = make_buf((size_t)std::max<uint32_t>(nslot, 1) * 9 * B * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     // 画像: RGBA8 + 線形depth(R32F、ピクセル単位の正確な値) + z-test用D32。
-    make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, img_color, mem_color, view_color);
-    make_image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, img_depth, mem_depth, view_depth);
+    {
+        VkFormatProperties fc, fd;
+        vkGetPhysicalDeviceFormatProperties(h.physical, VK_FORMAT_R8G8B8A8_UNORM, &fc);
+        vkGetPhysicalDeviceFormatProperties(h.physical, VK_FORMAT_R32_SFLOAT, &fd);
+        pack_ok = h.get_memory_fd && (fc.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (fd.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        if (!pack_ok) h.get_memory_fd = nullptr; // interop不可(CPU読み出しのみ)
+    }
+    const VkImageUsageFlags stor = pack_ok ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
+    make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | stor, VK_IMAGE_ASPECT_COLOR_BIT, img_color, mem_color, view_color);
+    make_image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | stor, VK_IMAGE_ASPECT_COLOR_BIT, img_depth, mem_depth, view_depth);
     make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, img_zbuf, mem_zbuf, view_zbuf);
 
     VkAttachmentDescription att[3]{};
@@ -927,16 +1202,16 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     vk_check(vkCreateFramebuffer(h.device, &fbi, nullptr, &fb), "vkCreateFramebuffer");
 
     // ディスクリプタ: 0 geom_xpos, 1 geom_xmat, 2 campose, 3 geom表, 4 光源, 5 body_xpos, 6 body_xmat, 7 カメラ定数。
-    VkDescriptorSetLayoutBinding lb[11];
-    for (uint32_t i = 0; i < 11; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutBinding lb[15];
+    for (uint32_t i = 0; i < 15; i++) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 11; sli.pBindings = lb;
+    sli.bindingCount = 15; sli.pBindings = lb;
     vk_check(vkCreateDescriptorSetLayout(h.device, &sli, nullptr, &set_layout), "vkCreateDescriptorSetLayout");
     VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushC)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &set_layout; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
     vk_check(vkCreatePipelineLayout(h.device, &pli, nullptr, &pipe_layout), "vkCreatePipelineLayout");
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
     vk_check(vkCreateDescriptorPool(h.device, &dpi, nullptr, &dpool), "vkCreateDescriptorPool");
@@ -947,23 +1222,32 @@ void MjmlxCameraRenderer::build(const mjModel* m) {
     VkDescriptorBufferInfo bc{camc.buf, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bt{texbuf.buf, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bl{lodbuf.buf, 0, VK_WHOLE_SIZE}, bic{indirect.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[7]{};
-    uint32_t bind[7] = {2, 3, 4, 7, 8, 9, 10};
-    const VkDescriptorBufferInfo* infos[7] = {&bi[0], &bi[1], &bi[2], &bc, &bt, &bl, &bic};
-    for (int i = 0; i < 7; i++) {
+    VkDescriptorBufferInfo btp{tpos.buf, 0, VK_WHOLE_SIZE}, btm{tmat.buf, 0, VK_WHOLE_SIZE}, bwt{wtab.buf, 0, VK_WHOLE_SIZE}, btt{ttab.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[11]{};
+    uint32_t bind[11] = {2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14};
+    const VkDescriptorBufferInfo* infos[11] = {&bi[0], &bi[1], &bi[2], &bc, &bt, &bl, &bic, &btp, &btm, &bwt, &btt};
+    for (int i = 0; i < 11; i++) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = dset; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = infos[i];
     }
-    vkUpdateDescriptorSets(h.device, 7, w, 0, nullptr);
+    vkUpdateDescriptorSets(h.device, 11, w, 0, nullptr);
 
     // パイプライン。
+    const bool has_tend = nslot > 0;
     m_comp = make_module(compile_glsl(with_common(kCamComp), "comp"));
-    m_cull = make_module(compile_glsl(with_common(kCull), "comp"));
+    if (has_tend) m_tend = make_module(compile_glsl(tendon_comp_source(), "comp"));
+    m_cull = make_module(compile_glsl(with_common(has_tend ? tendon_variant(kCull, true) : std::string(kCull), has_tend), "comp"));
     VkComputePipelineCreateInfo cpi2{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi2.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_cull, "main", nullptr};
     cpi2.layout = pipe_layout;
     vk_check(vkCreateComputePipelines(h.device, VK_NULL_HANDLE, 1, &cpi2, nullptr, &cull), "vkCreateComputePipelines(cull)");
-    m_vert = make_module(compile_glsl(with_common(kVert), "vert"));
+    if (has_tend) {
+        VkComputePipelineCreateInfo cpt{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpt.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_tend, "main", nullptr};
+        cpt.layout = pipe_layout;
+        vk_check(vkCreateComputePipelines(h.device, VK_NULL_HANDLE, 1, &cpt, nullptr, &tend), "vkCreateComputePipelines(tendon)");
+    }
+    m_vert = make_module(compile_glsl(with_common(has_tend ? tendon_variant(kVert, false) : std::string(kVert), has_tend), "vert"));
     m_frag = make_module(compile_glsl(with_common(kFrag), "frag"));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_comp, "main", nullptr};
@@ -1027,6 +1311,8 @@ MJMLX_API MjmlxCameraRenderer* mjmlx_camera_create(MjmlxBatchedSim* sim, int wid
         mjmlx::camera_prepare_device();
         if (!g_dev.valid) throw std::runtime_error("camera unsupported on this Vulkan setup: " + g_dev.reason);
         r->h = g_dev;
+        // 解像度が高いほど同じLODでもシルエット誤差は小さい。128px以上はK=4でも64pxのK=16と同等のMuJoCo Rendererとの一致度(ロボットIoU 0.96)になり、描画が約3倍速い。
+        r->lodk = height >= 128 ? 4.0f : 16.0f;
         if (const char* e = std::getenv("MJMLX_CAM_LOD_K")) r->lodk = (float)std::atof(e);
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = g_dev.queue_family;
@@ -1067,7 +1353,7 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
         }
         vkUpdateDescriptorSets(r->h.device, 4, w, 0, nullptr);
 
-        PushC pc{(uint32_t)r->B, (uint32_t)r->ncam, r->nvis, r->tiles_x, r->tiles_y, r->nlights, (uint32_t)r->nbody, (uint32_t)r->H, (float)r->W / (float)r->H, r->znear, r->zfar, r->lodk};
+        PushC pc{(uint32_t)r->B, (uint32_t)r->ncam, r->nvis, r->tiles_x, r->tiles_y, r->nlights, (uint32_t)r->nbody, (uint32_t)r->H, (float)r->W / (float)r->H, r->znear, r->zfar, r->lodk, (uint32_t)r->ngeom, r->ntend, r->nslot};
         r->draw_calls = 0;
         const bool prof = std::getenv("MJMLX_CAM_PROF") != nullptr;
         if (prof && !r->qpool) {
@@ -1082,6 +1368,10 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0, nullptr);
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->comp);
             vkCmdDispatch(c, (r->ntiles + 63) / 64, 1, 1);
+            if (r->nslot > 0) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, r->tend);
+                vkCmdDispatch(c, ((uint32_t)r->B * r->ntend + 63) / 64, 1, 1);
+            }
             VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -1109,6 +1399,7 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
             r->draw_calls++;
             vkCmdEndRenderPass(c);
             if (prof) vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r->qpool, 2);
+            if (r->gpu_mode) r->record_pack(c);
         });
         if (std::getenv("MJMLX_CAM_PROF")) {
             auto t_c = std::chrono::steady_clock::now();
@@ -1128,7 +1419,100 @@ MJMLX_API int mjmlx_camera_render(MjmlxCameraRenderer* r) {
     }
 }
 
-// 画像をタイル単位で (env,cam,H,W) の連続バッファへコピーして読み出す(並べ替えはGPUのvkCmdCopyImageToBuffer領域で行う)。
+static const char* kPack = R"(
+#version 450
+layout(local_size_x = 256) in;
+layout(rgba8, binding = 0) uniform readonly image2D img_c;
+layout(r32f, binding = 1) uniform readonly image2D img_d;
+layout(std430, binding = 2) writeonly buffer OC { uint oc[]; };
+layout(std430, binding = 3) writeonly buffer OD { float od[]; };
+layout(push_constant) uniform PK { uint W; uint H; uint tiles_x; uint n; } pk;
+void main() {
+  uint wh = pk.W * pk.H, stride = gl_NumWorkGroups.x * 256u;
+  for (uint i = gl_GlobalInvocationID.x; i < pk.n; i += stride) {
+    uint t = i / wh, p = i - t * wh;
+    ivec2 xy = ivec2(int((t % pk.tiles_x) * pk.W + p % pk.W), int((t / pk.tiles_x) * pk.H + p / pk.W));
+    oc[i] = packUnorm4x8(imageLoad(img_c, xy));
+    od[i] = imageLoad(img_d, xy).r;
+  }
+}
+)";
+
+void MjmlxCameraRenderer::enable_gpu_mode() {
+    size_t npx = (size_t)ntiles * W * H;
+    xb_color = make_export_buf(npx * 4, xb_color_alloc);
+    xb_depth = make_export_buf(npx * 4, xb_depth_alloc);
+    VkDescriptorSetLayoutBinding lb[4];
+    for (uint32_t i = 0; i < 4; i++) lb[i] = {i, i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 4; sli.pBindings = lb;
+    vk_check(vkCreateDescriptorSetLayout(h.device, &sli, nullptr, &pk_set_layout), "vkCreateDescriptorSetLayout(pack)");
+    VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1; pli.pSetLayouts = &pk_set_layout; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+    vk_check(vkCreatePipelineLayout(h.device, &pli, nullptr, &pk_layout), "vkCreatePipelineLayout(pack)");
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+    vk_check(vkCreateDescriptorPool(h.device, &dpi, nullptr, &pk_pool), "vkCreateDescriptorPool(pack)");
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pk_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &pk_set_layout;
+    vk_check(vkAllocateDescriptorSets(h.device, &dai, &pk_set), "vkAllocateDescriptorSets(pack)");
+    VkDescriptorImageInfo ii[2] = {{VK_NULL_HANDLE, view_color, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, view_depth, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorBufferInfo bb[2] = {{xb_color.buf, 0, VK_WHOLE_SIZE}, {xb_depth.buf, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[4]{};
+    for (uint32_t i = 0; i < 4; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = pk_set; w[i].dstBinding = i; w[i].descriptorCount = 1;
+        w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        if (i < 2) w[i].pImageInfo = &ii[i]; else w[i].pBufferInfo = &bb[i - 2];
+    }
+    vkUpdateDescriptorSets(h.device, 4, w, 0, nullptr);
+    pk_mod = make_module(compile_glsl(kPack, "comp"));
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, pk_mod, "main", nullptr};
+    ci.layout = pk_layout;
+    vk_check(vkCreateComputePipelines(h.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pk_pipe), "vkCreateComputePipelines(pack)");
+    copy_layout = VK_IMAGE_LAYOUT_GENERAL; // 以降のCPU読み出しcopyもGENERALから行う(pack passがGENERALへ遷移させる)
+    gpu_mode = true;
+}
+
+// render pass直後(画像はTRANSFER_SRC_OPTIMAL)に呼ぶ。GENERALへ遷移してタイル画像を連続バッファへ並べ替える。
+void MjmlxCameraRenderer::record_pack(VkCommandBuffer c) {
+    VkImageMemoryBarrier ib[2]{};
+    VkImage imgs[2] = {img_color, img_depth};
+    for (int i = 0; i < 2; i++) {
+        ib[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        ib[i].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        ib[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        ib[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib[i].srcQueueFamilyIndex = ib[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib[i].image = imgs[i]; ib[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
+    uint32_t pk[4] = {(uint32_t)W, (uint32_t)H, tiles_x, ntiles * (uint32_t)W * (uint32_t)H};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pk_pipe);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, pk_layout, 0, 1, &pk_set, 0, nullptr);
+    vkCmdPushConstants(c, pk_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), pk);
+    vkCmdDispatch(c, std::min<uint32_t>((pk[3] + 255) / 256, 65535), 1, 1);
+}
+
+// 画像をタイル単位で (env,cam,H,W) の連続バッファへコピーする(並べ替えはGPUのvkCmdCopyImageToBuffer領域で行う)。
+static void copy_tiles(MjmlxCameraRenderer* r, VkBuffer color, VkBuffer depth) {
+    std::vector<VkBufferImageCopy> regs(r->ntiles);
+    for (uint32_t t = 0; t < r->ntiles; t++) {
+        regs[t] = {(VkDeviceSize)t * r->W * r->H * 4, (uint32_t)r->W, (uint32_t)r->H, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                   {(int32_t)((t % r->tiles_x) * r->W), (int32_t)((t / r->tiles_x) * r->H), 0}, {(uint32_t)r->W, (uint32_t)r->H, 1}};
+    }
+    auto tr0 = std::chrono::steady_clock::now();
+    r->one_shot([&](VkCommandBuffer c) {
+        vkCmdCopyImageToBuffer(c, r->img_color, r->copy_layout, color, r->ntiles, regs.data());
+        vkCmdCopyImageToBuffer(c, r->img_depth, r->copy_layout, depth, r->ntiles, regs.data());
+    });
+    auto tr1 = std::chrono::steady_clock::now();
+    if (std::getenv("MJMLX_CAM_PROF")) fprintf(stderr, "[cam] readback: gpu_copy(submit+wait)=%.2fms\n", std::chrono::duration<double, std::milli>(tr1 - tr0).count());
+}
+
 static void camera_readback(MjmlxCameraRenderer* r) {
     if (r->read_back) return;
     size_t npx = (size_t)r->ntiles * r->W * r->H;
@@ -1139,18 +1523,7 @@ static void camera_readback(MjmlxCameraRenderer* r) {
         vk_check(vkMapMemory(r->h.device, r->rb_color.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_color_ptr), "vkMapMemory");
         vk_check(vkMapMemory(r->h.device, r->rb_depth.mem, 0, VK_WHOLE_SIZE, 0, &r->rb_depth_ptr), "vkMapMemory");
     }
-    std::vector<VkBufferImageCopy> regs(r->ntiles);
-    for (uint32_t t = 0; t < r->ntiles; t++) {
-        regs[t] = {(VkDeviceSize)t * r->W * r->H * 4, (uint32_t)r->W, (uint32_t)r->H, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                   {(int32_t)((t % r->tiles_x) * r->W), (int32_t)((t / r->tiles_x) * r->H), 0}, {(uint32_t)r->W, (uint32_t)r->H, 1}};
-    }
-    auto tr0 = std::chrono::steady_clock::now();
-    r->one_shot([&](VkCommandBuffer c) {
-        vkCmdCopyImageToBuffer(c, r->img_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_color.buf, r->ntiles, regs.data());
-        vkCmdCopyImageToBuffer(c, r->img_depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->rb_depth.buf, r->ntiles, regs.data());
-    });
-    auto tr1 = std::chrono::steady_clock::now();
-    if (std::getenv("MJMLX_CAM_PROF")) fprintf(stderr, "[cam] readback: gpu_copy(submit+wait)=%.2fms\n", std::chrono::duration<double, std::milli>(tr1 - tr0).count());
+    copy_tiles(r, r->rb_color.buf, r->rb_depth.buf);
     r->read_back = true;
 }
 
@@ -1169,6 +1542,33 @@ MJMLX_API int mjmlx_camera_get_depth(MjmlxCameraRenderer* r, float* out) {
     const char* dsrc = static_cast<const char*>(r->rb_depth_ptr);
     parallel_chunks((size_t)r->ntiles * r->W * r->H * sizeof(float), [=](size_t a, size_t b) { std::memcpy(reinterpret_cast<char*>(out) + a, dsrc + a, b - a); });
     return 0;
+}
+
+// ── CUDA interop(Linux, VK_KHR_external_memory_fd) ─────────────────────────────
+
+MJMLX_API int mjmlx_camera_gpu_supported(const MjmlxCameraRenderer* r) { return r && r->h.get_memory_fd ? 1 : 0; }
+
+// 描画結果をCPUを経由せずデバイスローカルのexport可能バッファ(RGBA8とfloat depth、(env,cam,H,W)順)へ並べる。初回は有効化して今のフレームを変換し、以降はrender()が同じsubmit内で変換済み。
+MJMLX_API int mjmlx_camera_gpu_copy(MjmlxCameraRenderer* r) {
+    if (!r || !r->rendered || !r->h.get_memory_fd) return -1;
+    try {
+        if (!r->gpu_mode) {
+            r->enable_gpu_mode();
+            r->one_shot([&](VkCommandBuffer c) { r->record_pack(c); });
+        }
+        return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "mjmlx_camera_gpu_copy error: %s\n", e.what()); return -1; }
+}
+
+// which=0: color(RGBA8), 1: depth(float32)。呼ぶたびに新しいfdを返し(所有権は呼び出し側、cudaImportExternalMemoryが引き取る)、*alloc_sizeにメモリ確保サイズを入れる。失敗は-1。
+MJMLX_API int mjmlx_camera_gpu_export_fd(MjmlxCameraRenderer* r, int which, uint64_t* alloc_size) {
+    if (!r || !r->h.get_memory_fd || !r->xb_color.buf) return -1;
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    gi.memory = which == 0 ? r->xb_color.mem : r->xb_depth.mem; gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    int fd = -1;
+    if (r->h.get_memory_fd(r->h.device, &gi, &fd) != VK_SUCCESS) return -1;
+    if (alloc_size) *alloc_size = which == 0 ? r->xb_color_alloc : r->xb_depth_alloc;
+    return fd;
 }
 
 } // extern "C"
