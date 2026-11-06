@@ -13,6 +13,15 @@ GPU-batched MuJoCo physics and camera rendering on Vulkan, for reinforcement lea
 
 The tensor backend is [`extern/mlx_vulkan`](https://github.com/20niship/mlx_vulkan) (MKX, an MLX-style array library on Vulkan compute), vendored as a git submodule. The Metal backend was removed; Vulkan is the only GPU backend. (The `MJB_BACKEND_MLX` enum and `mlx` names in the API are historical and mean "the GPU engine".)
 
+## Why this library
+
+- **Same models as MuJoCo.** It loads the same MJCF XML files as MuJoCo (menagerie Go2/G1/Piper, Gymnasium Humanoid/HalfCheetah, ...) through MuJoCo's own parser, and every feature is checked against MuJoCo C in CI. Switching an existing MuJoCo model to the GPU engine is a `load_model(path)` call; no model conversion, no new asset format. `libmjb` additionally lets the same C code run on MuJoCo C (CPU) or the GPU engine by changing one enum.
+- **Vendor-neutral: no NVIDIA GPU required.** Compute and rendering use only Vulkan (compute shaders written in GLSL). Any Vulkan 1.2+ device works: NVIDIA, AMD, Intel, or even a CPU through Mesa lavapipe (this is what CI uses). Only the zero-copy camera -> PyTorch path (Vulkan -> CUDA interop) needs an NVIDIA GPU + CUDA; without it you get the same images through a CPU read-back.
+- **Cross-platform by construction.** Linux is tested on NVIDIA and lavapipe. The Vulkan layer ([`mlx_vulkan`](https://github.com/20niship/mlx_vulkan)) also targets macOS through MoltenVK, but **macOS has not been verified for this repository yet** (camera features there are also unverified).
+- **Almost no dependencies.** The C++ core needs only the Vulkan loader/headers, `glslangValidator` (shaders are compiled at first use), and MuJoCo (for MJCF parsing and the CPU reference). No CUDA toolkit, no Python required for the C/C++ libraries, no ML framework. Python bindings add nanobind; training adds PyTorch + rsl_rl. Everything else (VMA, doctest) is fetched by CMake.
+- **Faster than Isaac Lab and Genesis.** Go2 `env.step` on an RTX 3060: 3.4x Isaac Lab and 1.6x Genesis at 4096 envs (409K vs 120K / 252K env-steps/s), 1.7x Genesis at 16384 envs, ahead of Isaac Lab at every measured size; with a camera on every env 4.1x Genesis and up to 2.7x Isaac Lab TiledCamera (see Highlights for conditions). Caveats: Isaac Lab / Genesis are earlier single measurements (not re-run in the same session); Genesis measures a bare `scene.step()`; at 256 envs we are only on par with Genesis (63K vs 60K).
+- **Built for RL throughput.** Hundreds of thousands of env-steps/s on a mid-range GPU, batched cameras, observations/rewards computed on the training device, one device-to-host transfer per step.
+
 ## Highlights (RTX 3060 12 GB unless noted)
 
 Unitree Go2, flat ground, dt 0.005 x 4 substeps, `env.step` with observations and rewards, `device=cuda`:
@@ -44,7 +53,7 @@ https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
 
 ## Build
 
-Requirements: Linux with a Vulkan 1.3 GPU driver (NVIDIA tested; lavapipe is used in CI), CMake >= 3.25, a C++20 compiler, [just](https://github.com/casey/just), [uv](https://github.com/astral-sh/uv), and MuJoCo (`pip install mujoco`, found automatically, or `-DMUJOCO_ROOT=...`). macOS via MoltenVK is untested.
+Requirements: a Vulkan driver (NVIDIA tested; lavapipe `mesa-vulkan-drivers` is used in CI and needs no GPU), the Vulkan headers/loader and `glslangValidator` (`libvulkan-dev glslang-tools` on Debian/Ubuntu), CMake >= 3.25, a C++20 compiler, and MuJoCo (`pip install mujoco`, found automatically, or `-DMUJOCO_ROOT=...`). [just](https://github.com/casey/just) and [uv](https://github.com/astral-sh/uv) are optional conveniences used by the recipes below. Runtime link dependencies of `libmjmlx`: `libvulkan` and `libmujoco` only. macOS via MoltenVK is untested.
 
 ```bash
 git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp

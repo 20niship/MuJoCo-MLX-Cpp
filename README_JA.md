@@ -13,6 +13,15 @@ Vulkan上でMuJoCoの物理とカメラ描画をGPUバッチ実行する、数�
 
 テンソルバックエンドは[`extern/mlx_vulkan`](https://github.com/20niship/mlx_vulkan)(MKX。Vulkan compute上のMLX風配列ライブラリ)をgit submoduleで取り込んでいる。Metalバックエンドは削除済みで、GPUバックエンドはVulkanのみ。(API中の`MJB_BACKEND_MLX`や`mlx`という名前は歴史的なもので「GPUエンジン」を指す。)
 
+## 特長
+
+- **MuJoCoと同じモデルをそのまま使える。** MuJoCoのパーサでMJCF(XML)を読むので、menagerieのGo2/G1/Piper、GymnasiumのHumanoid/HalfCheetahなどがそのまま動く。全機能をCIでMuJoCo Cと突き合わせている。既存のMuJoCoモデルをGPUエンジンに切り替えるのは`load_model(path)`だけで、モデル変換も新しいアセット形式も不要。`libmjb`ならenumを1つ変えるだけで同じCコードをMuJoCo C(CPU)とGPUエンジンのどちらでも動かせる。
+- **NVIDIA GPU不要(ベンダー非依存)。** 計算も描画もVulkan(GLSLのcompute shader)だけを使う。Vulkan 1.2以上のデバイスならNVIDIA/AMD/Intelのどれでも、Mesa lavapipe経由でCPUのみでも動く(CIはこれ)。NVIDIA + CUDAが必要なのは、カメラ画像をコピーなしでPyTorchに渡す経路(Vulkan→CUDA interop)だけで、無い環境ではCPU読み出しで同じ画像が得られる。
+- **クロスプラットフォーム設計。** Linux(NVIDIAとlavapipe)で検証済み。Vulkan層([`mlx_vulkan`](https://github.com/20niship/mlx_vulkan))はMoltenVK経由でmacOSも対象にしているが、**このリポジトリでのmacOS動作は未検証**(カメラ機能も未検証)。
+- **依存がほとんど無い。** C++コアが必要とするのはVulkan(ローダーとヘッダ)、`glslangValidator`(シェーダを初回使用時にコンパイル)、MuJoCo(MJCFのパースとCPU参照)だけ。CUDA Toolkit、PyTorch等のMLフレームワーク、C/C++ライブラリ利用時のPythonは不要。Pythonバインディングはnanobind、学習にはPyTorch + rsl_rlを追加で使う。その他(VMA、doctest)はCMakeが取得する。
+- **Isaac LabやGenesisより速い。** RTX 3060のGo2 `env.step`で、4096 envならIsaac Labの3.4倍・Genesisの1.6倍(409K vs 120K / 252K env-steps/s)、16384 envsでGenesisの1.7倍、計測した全サイズでIsaac Labより速い。全envにカメラを付けた場合はGenesisの4.1倍、Isaac Lab TiledCameraの最大2.7倍(条件はハイライト参照)。注意: Isaac Lab/Genesisは過去の単発計測(同一セッションでの再計測ではない)、Genesisは素の`scene.step()`、256 envsではGenesisとほぼ同等(63K vs 60K)。
+- **RLのスループット重視。** 中級GPUで数十万env-steps/s、バッチカメラ、観測・報酬は学習デバイス上で計算、1 stepあたりデバイス→ホスト転送は1回。
+
 ## ハイライト(特記なき限りRTX 3060 12 GB)
 
 Unitree Go2、平地、dt 0.005 x 4 substep、観測・報酬込みの`env.step`、`device=cuda`:
@@ -44,7 +53,7 @@ https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
 
 ## ビルド
 
-必要なもの: Vulkan 1.3対応GPUドライバのLinux(NVIDIAで確認、CIはlavapipe)、CMake >= 3.25、C++20コンパイラ、[just](https://github.com/casey/just)、[uv](https://github.com/astral-sh/uv)、MuJoCo(`pip install mujoco`で自動検出、または`-DMUJOCO_ROOT=...`)。macOS(MoltenVK)は未検証。
+必要なもの: Vulkanドライバ(NVIDIAで確認。CIはGPU不要のlavapipe=`mesa-vulkan-drivers`)、Vulkanのヘッダ/ローダーと`glslangValidator`(Debian/Ubuntuなら`libvulkan-dev glslang-tools`)、CMake >= 3.25、C++20コンパイラ、MuJoCo(`pip install mujoco`で自動検出、または`-DMUJOCO_ROOT=...`)。[just](https://github.com/casey/just)と[uv](https://github.com/astral-sh/uv)は下のレシピ用の任意ツール。`libmjmlx`の実行時リンク依存は`libvulkan`と`libmujoco`のみ。macOS(MoltenVK)は未検証。
 
 ```bash
 git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp

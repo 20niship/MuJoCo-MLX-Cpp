@@ -58,11 +58,11 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
 </style>
 </head>
 <body>
-<nav><b>MuJoCo-MLX-Cpp</b><a href="#perf">Performance</a><a href="#camera">Camera</a><a href="#cpu">vs MuJoCo CPU</a><a href="#robots">Robots</a><a href="#how">How it works</a><a href="#start">Start</a><a class="keep" href="https://github.com/20niship/MuJoCo-MLX-Cpp">GitHub ↗</a></nav>
+<nav><b>MuJoCo-MLX-Cpp</b><a href="#perf">Performance</a><a href="#camera">Camera</a><a href="#cpu">vs MuJoCo CPU</a><a href="#robots">Robots</a><a href="#why">Why</a><a href="#how">How it works</a><a href="#usage">Usage</a><a href="#platforms">Platforms</a><a href="#start">Start</a><a class="keep" href="https://github.com/20niship/MuJoCo-MLX-Cpp">GitHub ↗</a></nav>
 
 <header class="hero">
   <h1>Train robots<br>at GPU speed.</h1>
-  <p>MuJoCo physics <em>and</em> tiled camera rendering, batched across thousands of environments on a single GPU — Vulkan compute on Linux (NVIDIA tested). C++ core, Python bindings, C API.</p>
+  <p>MuJoCo physics <em>and</em> tiled camera rendering, batched across thousands of environments on a single GPU — Loads your existing MJCF models. Runs on any Vulkan GPU — no NVIDIA required. C++ core with almost no dependencies, Python bindings, C API.</p>
   <div class="big">
     <div><strong>480K</strong><span>env-steps/s · Unitree Go2 · 4096 envs</span></div>
     <div><strong>650K</strong><span>env-steps/s · 16384 envs</span></div>
@@ -71,6 +71,20 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   <div><a class="btn" href="#perf">See the numbers</a><a class="btn o" href="https://github.com/20niship/MuJoCo-MLX-Cpp">Source on GitHub</a></div>
   <div class="scroll">scroll ↓</div>
 </header>
+
+<section id="why">
+  <h2>Why this library</h2>
+  <p class="lead">Keep your MuJoCo models and workflow. Get GPU throughput without a vendor lock-in.</p>
+  <div class="grid">
+    <div class="card"><h3>Faster than Isaac Lab and Genesis</h3><p>Go2 <code>env.step</code> on an RTX 3060: <b>3.4×</b> Isaac Lab and <b>1.6×</b> Genesis at 4096 envs (409K vs 120K / 252K env-steps/s), <b>1.7×</b> Genesis at 16384 envs, 1.3× at 1024 — and ahead of Isaac Lab at every measured size. With a camera on every env: <b>4.1×</b> Genesis, up to <b>2.7×</b> Isaac Lab TiledCamera. Caveats are listed under the charts.</p></div>
+    <div class="card"><h3>Same models as MuJoCo</h3><p>Reads the same MJCF XML through MuJoCo's own parser — menagerie Go2 / G1 / Piper, Gymnasium Humanoid / HalfCheetah, your own. No conversion, no new asset format. CI checks the GPU engine against MuJoCo C trajectory by trajectory.</p></div>
+    <div class="card"><h3>No NVIDIA GPU required</h3><p>Physics and rendering are Vulkan compute / graphics only. NVIDIA, AMD, Intel, or plain CPU through Mesa lavapipe (what CI uses). Only the zero-copy camera→PyTorch path needs NVIDIA + CUDA; otherwise you read images back through the CPU.</p></div>
+    <div class="card"><h3>Cross-platform by design</h3><p>Linux is tested (NVIDIA + lavapipe). The Vulkan layer also targets macOS via MoltenVK, but macOS is <b>not yet verified</b> for this repo — we say so rather than guess.</p></div>
+    <div class="card"><h3>Almost no dependencies</h3><p><code>libmjmlx</code> links only <code>libvulkan</code> and <code>libmujoco</code>. Build needs the Vulkan headers, <code>glslangValidator</code> (shaders are compiled on first use), CMake and a C++20 compiler. No CUDA toolkit, no ML framework, no Python for the C/C++ libraries.</p></div>
+    <div class="card"><h3>One API, CPU or GPU</h3><p><code>libmjb</code> exposes a single C API with a backend enum: MuJoCo C (float64, thread pool) or the GPU engine. Same code, easy A/B against the reference.</p></div>
+    <div class="card"><h3>Built for RL</h3><p>Observation / reward on the training device, packed single-transfer read-back, batched cameras, load-time contact simplification for speed. Isaac Lab–style Go2 environment included.</p></div>
+  </div>
+</section>
 
 <section id="what">
   <h2>What it is</h2>
@@ -85,7 +99,7 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
 
 <section id="perf">
   <h2>Physics throughput</h2>
-  <p class="lead">Unitree Go2, flat ground, dt 0.005 × 4 substeps, random actions. Same hardware class, observations and rewards included.</p>
+  <p class="lead"><b>Faster than both Isaac Lab and Genesis</b> at 1024 envs and above (about on par with Genesis at 256). Unitree Go2, flat ground, dt 0.005 × 4 substeps, random actions. Same hardware class, observations and rewards included.</p>
 
   <div class="bars" style="--m:660000">
     <h4>Go2 env.step — 16,384 envs</h4><small>RTX 3060 12 GB · env-steps/s · higher is better</small>
@@ -181,12 +195,94 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   </div>
 </section>
 
+<section id="usage">
+  <h2>Usage</h2>
+  <p class="lead">From a model file to training, cameras, and the C API.</p>
+
+  <h3>1 · Load an MJCF and step thousands of envs</h3>
+<pre><code>import sys; sys.path.insert(0, "build")
+import _mjmlx_rl_native as native
+
+model = native.load_model("unitree_go2/scene.xml")         # same MJCF MuJoCo reads
+sim = native.create_batched(model, 4096, frame_skip=1)      # 4096 envs on the GPU (use_gpu=True is the default)
+sim.step(ctrl, 4)                                           # ctrl: (4096, nu) float32; 4 substeps per call
+qpos, qvel = sim.state()                                    # numpy (4096, nq) / (4096, nv)</code></pre>
+
+  <h3>2 · Speed knobs at load time (default is exact MuJoCo behaviour)</h3>
+<pre><code>model = native.load_model(path, self_collision=False, max_condim=3)   # +15-23% env-steps/s</code></pre>
+  <p class="note"><code>self_collision=False</code> drops robot-vs-robot contacts; <code>max_condim=3</code> removes torsional/rolling foot friction. The MJCF file is never modified; terrain is untouched. Pass the same options to the CPU reference when comparing.</p>
+
+  <h3>3 · Train Go2 with rsl_rl PPO</h3>
+<pre><code>uv sync --group build --group go2
+uv run python scripts/train_go2_ppo.py --build-dir build --flat --reward-preset isaac_flat \
+    --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
+uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build \
+    --reward-preset isaac_flat --speed 0.5            # tiled video + tracking error
+tensorboard --logdir runs/</code></pre>
+  <p class="note">Flags: <code>--reward-preset {relaxed,isaac_flat}</code>, stairs terrain by default (drop <code>--flat</code>), <code>--use-sensors</code>, <code>--no-self-collision --max-condim 3</code>, <code>--cpu</code> for MuJoCo C. Simplifications vs Isaac Lab: blind policy (no height scan), one physical model for all envs, no terrain curriculum.</p>
+
+  <h3>4 · Cameras for every env</h3>
+<pre><code>cam = native.create_camera(sim, 128, 128)
+cam.render()
+rgb, depth = cam.rgb(), cam.depth()                   # (envs, cams, H, W, 3) uint8 / (envs, cams, H, W) float32 [m]
+
+from mjmlx_camera_cuda import CudaCamera              # Linux + NVIDIA + CUDA torch: zero-copy
+g = CudaCamera.try_create(cam)                         # None elsewhere -> keep the readback above
+cam.render(); rgba, depth = g.read()                   # CUDA tensors</code></pre>
+
+  <h3>5 · C / C++ (or anything with FFI)</h3>
+<pre><code>#include &lt;mjmlx/mjb.h&gt;
+MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);   // GPU engine; MJB_BACKEND_CPU = MuJoCo C
+MjbModel* m = mjb_load_model(gpu, "humanoid.xml");
+MjbBatchedConfig cfg = { .num_envs = 8192 };
+MjbBatchedSim* sim = mjb_batched_create(m, &amp;cfg);
+mjb_batched_step(sim, controls);</code></pre>
+
+  <h3>6 · Verify and benchmark</h3>
+<pre><code>just check-ci                     # CPU-vs-GPU trajectory tests (runs on lavapipe, no GPU needed)
+cd build &amp;&amp; ctest -L robust       # batch sanity sweep over nv x constraint types
+uv run python scripts/bench_go2_step.py --build-dir build --envs 4096
+uv run python scripts/compare_cpu_gpu_go2.py --build-dir build   # 1-step error vs MuJoCo C
+just check-video-export           # CPU | GPU side-by-side video</code></pre>
+</section>
+
+<section id="platforms">
+  <h2>Platforms &amp; dependencies</h2>
+  <table>
+    <tr><th>Item</th><th>Status</th></tr>
+    <tr><td>Linux + NVIDIA (Vulkan)</td><td class="w">Tested — all benchmarks on this page</td></tr>
+    <tr><td>Linux + lavapipe (CPU Vulkan)</td><td class="w">Tested — CI runs on it, no GPU required</td></tr>
+    <tr><td>AMD / Intel GPU (Vulkan)</td><td>Expected to work (standard Vulkan compute), not tested here</td></tr>
+    <tr><td>macOS (MoltenVK)</td><td>Not verified for this repo</td></tr>
+    <tr><td>Zero-copy camera → CUDA tensor</td><td>Linux + NVIDIA + CUDA PyTorch only</td></tr>
+  </table>
+  <table>
+    <tr><th>Dependency</th><th>Needed for</th></tr>
+    <tr><td>Vulkan loader + headers</td><td>build and run</td></tr>
+    <tr><td><code>glslangValidator</code></td><td>shader compilation at first use</td></tr>
+    <tr><td>MuJoCo (<code>pip install mujoco</code> or a release)</td><td>MJCF parsing and the CPU reference backend</td></tr>
+    <tr><td>CMake ≥ 3.25, C++20 compiler</td><td>build</td></tr>
+    <tr><td>nanobind · PyTorch + rsl_rl</td><td>only for Python bindings · only for training</td></tr>
+    <tr><td>VMA, doctest</td><td>fetched by CMake</td></tr>
+  </table>
+</section>
+
+<section id="limits">
+  <h2>What is and isn't supported</h2>
+  <div class="grid">
+    <div class="card"><h3>Supported (checked against MuJoCo C)</h3><p>free / ball / hinge / slide joints; Euler integration; pyramidal friction (condim 3/4/6); plane / sphere / capsule / box / cylinder / ellipsoid / mesh (GJK/EPA) and SDF contacts; joint limits; friction loss; fixed and spatial tendons; gravity compensation; TENDON / SITE transmission; 19 sensor types; RGB + depth cameras.</p></div>
+    <div class="card"><h3>Not supported (yet)</h3><p>Equality constraints, actuator activation dynamics (FILTER / INTEGRATOR / MUSCLE), RK4, heightfield contacts (cameras do render hfields), islands / noslip / sleep, per-env physical models, differentiable physics.</p></div>
+    <div class="card"><h3>Good to know</h3><p>Constraint rows are capped at 72 per env on the shared-memory solver path (contacts beyond that are dropped; Go2 is fine). Long contact-rich rollouts diverge from MuJoCo chaotically, so accuracy is judged per control step (Go2: 3.6e-5 rad mean).</p></div>
+  </div>
+  <p class="note">Full matrix: <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/CONFORMANCE.md">CONFORMANCE.md</a>. Design notes: <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>.</p>
+</section>
+
 <section id="start">
   <h2>Get started</h2>
   <pre><code>git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp
 cd MuJoCo-MLX-Cpp
 uv sync --group build --group go2
-just build-python               # Vulkan
+just build-python               # any Vulkan device (needs libvulkan-dev + glslang-tools)
 
 uv run python scripts/train_go2_ppo.py --build-dir build \
   --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500</code></pre>
