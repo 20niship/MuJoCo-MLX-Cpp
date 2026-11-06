@@ -104,7 +104,7 @@ tensorboard --logdir runs/
 
 Useful flags: `--reward-preset {relaxed,isaac_flat}`, `--device cuda`, `--no-self-collision --max-condim 3` (fast mode), `--use-sensors` (observations via the batched IMU / contact sensors), `--cpu` (MuJoCo C instead of the GPU engine). `MJMLX_GO2_INTEGRATOR=implicitfast` integrates PD actuators implicitly.
 
-Simplifications versus Isaac Lab: no height scanner (blind policy), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
+Simplifications versus Isaac Lab: the Go2 environment does not use a height scanner yet (blind policy; the [raycast API](#raycast-height-scanner--lidar-batched-gpu-sim-only) exists but is not wired into the observations), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
 
 Trained policy rollout (Go2, flat ground, `isaac_flat` preset, 500 iterations, commands forward/back/left/right at 0.5 m/s; the policy tracks back/left/right but stays still for forward, so this is a work in progress):
 
@@ -148,6 +148,23 @@ cam.render(); rgba, depth = gcam.read()         # CUDA tensors, no CPU copy
 ```
 
 Not supported: shadows, translucency, lights attached to moving bodies, trackcom (approximated by the body origin). Interop needs Linux + `VK_KHR_external_memory_fd` + CUDA torch; set `MKX_VULKAN_DEVICE_INDEX` to match the CUDA device on multi-GPU hosts. Camera needs a graphics+compute queue, `multiDrawIndirect`, `drawIndirectFirstInstance`, `shaderClipDistance` (only `create_camera` fails otherwise). Examples: `scripts/example_go2_camera.py`, comparison with MuJoCo's renderer: `scripts/compare_camera_mujoco.py`, speed: `scripts/bench_camera*.py`.
+
+## Raycast (height scanner / LiDAR, batched GPU sim only)
+
+`mj_ray` for every env in one GPU dispatch (one thread per ray): plane, sphere, capsule, ellipsoid, cylinder, box and mesh geoms, with `bodyexclude`, `flg_static`, `geomgroup` and `max_dist` like MuJoCo. Results match MuJoCo C `mj_ray` (`ctest -R raycast`, max distance error ~1e-5 over 2400 random rays per case, no hit/miss or geom-id mismatches). Not hit: heightfield and SDF geoms. Meshes are tested face by face (AABB prefilter only), so exclude large visual meshes with the geom-group mask.
+
+```python
+rc = native.create_raycaster(sim)
+dist, geomid = rc.cast(origins, dirs, max_dist=0.0, bodyexclude=-1, flg_static=True, geomgroup_mask=-1)
+# origins, dirs: float32 (num_envs, nray, 3) world frame; dist: float32 (num_envs, nray), -1 = miss (like mj_ray); geomid: int32, -1 = miss
+
+from mjmlx_sensors import RayCaster, grid_pattern          # Isaac Lab RayCaster / height scanner style
+scanner = RayCaster(native, sim, base_body_id, grid_pattern((1.6, 1.0), 0.1), offset_z=0.2, alignment="yaw", geomgroup_mask=1 << 0)
+scanner.update()
+obs = scanner.height_scan(offset=0.5).clamp(-1.0, 1.0)     # (num_envs, num_rays)
+```
+
+C API: `mjmlx_raycaster_create/cast/free` in `mjmlx.h`. Example on the Go2 stairs terrain (compares hit heights with the terrain, mean error 1.5 mm): `scripts/example_raycast_height_scan.py`. Speed (RTX 3060, Go2 scene, 187 rays/env, terrain group only): the cast itself runs at about 60 M rays/s (4096 envs: 12 ms); the Python `RayCaster.update()` currently adds numpy/torch host copies (about 38 ms at 4096 envs), because rays and results go through host memory.
 
 ## Benchmarks and comparisons
 
@@ -283,6 +300,7 @@ Batched GPU path, checked against MuJoCo C. Full matrix and known gaps: [CONFORM
 - Contacts: pyramidal friction, condim 3/4/6, margin/gap; plane/sphere/capsule/box/cylinder/ellipsoid/mesh (GJK/EPA), analytic sphere/capsule-box, SDF-SDF and SDF-mesh.
 - Constraints: joint limits, DOF friction loss, fixed and spatial tendons (limits, friction loss, wrap).
 - Gravity compensation, TENDON/SITE transmission, contact forces (`cfrc_ext`), 19 sensor types (IMU, frame, joint, actuator, subtreecom).
+- Raycasting (`mj_ray` equivalent, height scanner / LiDAR basis) for plane/sphere/capsule/ellipsoid/cylinder/box/mesh geoms.
 - Not supported in the batched path: equality constraints, actuator activation dynamics (FILTER/INTEGRATOR/MUSCLE), heightfield contacts (cameras do render hfields), RK4, inverse dynamics, islands/noslip/sleep, differentiable physics.
 
 ## Layout

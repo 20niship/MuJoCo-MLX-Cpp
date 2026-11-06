@@ -88,6 +88,7 @@ struct RlBatchedSim {
     FloatArray qpos() { int n; auto* p = mjmlx_batched_get_qpos(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray qvel() { int n; auto* p = mjmlx_batched_get_qvel(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray xpos() { int n; auto* p = mjmlx_batched_get_xpos(handle, &n); return copy_out(p, n, num_envs); }
+    FloatArray xquat() { int n; auto* p = mjmlx_batched_get_xquat(handle, &n); return copy_out(p, n, num_envs); }
     FloatArray cfrc_ext() { int n; auto* p = mjmlx_batched_get_cfrc_ext(handle, &n); return copy_out(p, n, num_envs); }
     // (num_envs, nsensordata)。MJCFの<sensor>をMuJoCoのsensor_adr順に並べたもの。sensorが無ければ(num_envs, 0)。
     FloatArray sensordata() {
@@ -156,6 +157,29 @@ struct RlCamera {
     }
 };
 
+struct RlRaycaster {
+    std::shared_ptr<RlBatchedSim> sim;
+    MjmlxRaycaster* handle = nullptr;
+    ~RlRaycaster() { if (handle) mjmlx_raycaster_free(handle); }
+
+    std::pair<FloatArray, IntArray> cast(FloatArray origins, FloatArray dirs, float max_dist, int bodyexclude, bool flg_static, int geomgroup_mask) {
+        const size_t B = static_cast<size_t>(sim->num_envs);
+        if (origins.ndim() != 3 || origins.shape(0) != B || origins.shape(2) != 3 || dirs.ndim() != 3 || dirs.shape(0) != B || dirs.shape(1) != origins.shape(1) || dirs.shape(2) != 3)
+            throw std::runtime_error("mjmlx_rl: origins/dirs must have shape (num_envs, nray, 3)");
+        const size_t nray = origins.shape(1);
+        if (nray == 0) throw std::runtime_error("mjmlx_rl: nray must be > 0");
+        const size_t n = B * nray;
+        float* dist = new float[n];
+        nb::capsule od(dist, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        int32_t* gid = new int32_t[n];
+        nb::capsule og(gid, [](void* p) noexcept { delete[] static_cast<int32_t*>(p); });
+        if (mjmlx_raycaster_cast(handle, origins.data(), dirs.data(), static_cast<int>(nray), max_dist, bodyexclude, flg_static ? 1 : 0, geomgroup_mask, dist, gid) != 0)
+            throw std::runtime_error("mjmlx_rl: raycast failed");
+        size_t shape[2] = {B, nray};
+        return {FloatArray(dist, 2, shape, od), IntArray(gid, 2, shape, og)};
+    }
+};
+
 NB_MODULE(_mjmlx_rl_native, m) {
     m.doc() = "Minimal numpy-facing mjmlx bindings for RL training (no mlx.core dependency at the Python boundary)";
 
@@ -191,6 +215,7 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)
         .def("xpos", &RlBatchedSim::xpos)
+        .def("xquat", &RlBatchedSim::xquat)
         .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
         .def("sensordata", &RlBatchedSim::sensordata)
         .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator)
@@ -217,7 +242,18 @@ NB_MODULE(_mjmlx_rl_native, m) {
             return std::make_pair(fd, sz);
         }, nb::arg("which"));
 
-    m.def("create_camera", [](std::shared_ptr<RlBatchedSim> sim, int width, int height) -> std::shared_ptr<RlCamera> {
+    nb::class_<RlRaycaster>(m, "Raycaster")
+        .def("cast", &RlRaycaster::cast, nb::arg("origins"), nb::arg("dirs"), nb::arg("max_dist") = 0.0f, nb::arg("bodyexclude") = -1, nb::arg("flg_static") = true, nb::arg("geomgroup_mask") = -1);
+
+    m.def("create_raycaster", [](std::shared_ptr<RlBatchedSim> sim) -> std::shared_ptr<RlRaycaster> {
+        auto rc = std::make_shared<RlRaycaster>();
+        rc->handle = mjmlx_raycaster_create(sim->handle);
+        if (!rc->handle) throw std::runtime_error("mjmlx_rl: failed to create raycaster (GPU sim required)");
+        rc->sim = sim;
+        return rc;
+    }, nb::arg("sim"));
+
+    m.def("create_camera",[](std::shared_ptr<RlBatchedSim> sim, int width, int height) -> std::shared_ptr<RlCamera> {
         auto cam = std::make_shared<RlCamera>();
         cam->handle = mjmlx_camera_create(sim->handle, width, height);
         if (!cam->handle) throw std::runtime_error("mjmlx_rl: failed to create camera renderer (need GPU sim and <camera> in the model)");

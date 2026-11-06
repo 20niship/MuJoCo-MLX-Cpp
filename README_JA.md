@@ -104,7 +104,7 @@ tensorboard --logdir runs/
 
 主なオプション: `--reward-preset {relaxed,isaac_flat}`、`--device cuda`、`--no-self-collision --max-condim 3`(高速モード)、`--use-sensors`(batchedのIMU/接触センサ経由の観測)、`--cpu`(GPUエンジンの代わりにMuJoCo C)。`MJMLX_GO2_INTEGRATOR=implicitfast`でPDアクチュエータを陰的に積分する。
 
-Isaac Lab版からの簡略化: height_scannerなし(盲目方策)、env別の物理ドメインランダマイズなし(全envで単一モデル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
+Isaac Lab版からの簡略化: Go2環境はまだheight_scannerを使わない(盲目方策。[レイキャストAPI](#レイキャストheight-scanner--lidarbatched-gpu-sim専用)はあるが観測には未接続)、env別の物理ドメインランダマイズなし(全envで単一モデル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
 
 学習済み方策の再生(Go2、平地、`isaac_flat`、500 iteration、前後左右に0.5 m/sで指令。後退・左・右は追従するが前進だけ静止するので途中経過):
 
@@ -148,6 +148,23 @@ cam.render(); rgba, depth = gcam.read()         # CUDAテンソル、CPUコピ�
 ```
 
 未対応: 影、半透明、可動bodyに付いたlight、trackcom(body原点で近似)。interopはLinux + `VK_KHR_external_memory_fd` + CUDA版torchが必要で、複数GPUでは`MKX_VULKAN_DEVICE_INDEX`をCUDAのデバイスと揃える。カメラにはgraphics+compute queue、`multiDrawIndirect`、`drawIndirectFirstInstance`、`shaderClipDistance`が必要(満たさない時は`create_camera`だけが失敗)。例: `scripts/example_go2_camera.py`、MuJoCo描画との比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera*.py`。
+
+## レイキャスト(height scanner / LiDAR、GPUバッチsim専用)
+
+全envのレイを1回のGPU dispatch(1スレッド=1レイ)で撃つ`mj_ray`相当。plane / sphere / capsule / ellipsoid / cylinder / box / meshに対応し、`bodyexclude`・`flg_static`・`geomgroup`・`max_dist`もMuJoCoと同様に使える。結果はMuJoCo Cの`mj_ray`と一致(`ctest -R raycast`、各ケース2400本のランダムなレイで距離誤差は最大約1e-5、当たり/外れ・geom idの不一致なし)。hfieldとSDFは当たらない。メッシュは面を総当たり(AABBで枝刈りのみ)なので、大きなvisual meshはgeom groupのマスクで除外する。
+
+```python
+rc = native.create_raycaster(sim)
+dist, geomid = rc.cast(origins, dirs, max_dist=0.0, bodyexclude=-1, flg_static=True, geomgroup_mask=-1)
+# origins, dirs: float32 (num_envs, nray, 3) 世界座標。dist: float32 (num_envs, nray)、-1が外れ(mj_rayと同じ)。geomid: int32、-1が外れ
+
+from mjmlx_sensors import RayCaster, grid_pattern          # Isaac LabのRayCaster / height scanner相当
+scanner = RayCaster(native, sim, base_body_id, grid_pattern((1.6, 1.0), 0.1), offset_z=0.2, alignment="yaw", geomgroup_mask=1 << 0)
+scanner.update()
+obs = scanner.height_scan(offset=0.5).clamp(-1.0, 1.0)     # (num_envs, num_rays)
+```
+
+C APIは`mjmlx.h`の`mjmlx_raycaster_create/cast/free`。Go2の階段地形での例(ヒット点の高さを地形と比較、平均誤差1.5 mm): `scripts/example_raycast_height_scan.py`。速度(RTX 3060、Go2、1 envあたり187本、地形のgroupのみ): キャスト自体は約60 M rays/s(4096 envsで12 ms)。Pythonの`RayCaster.update()`はレイと結果がホストメモリを経由するためnumpy/torchのコピーが乗り、4096 envsで約38 ms。
 
 ## ベンチマークと比較
 
