@@ -26,9 +26,19 @@ env-steps/s. Fast mode is `self_collision=False, max_condim=3` (what Isaac Lab/G
 
 Camera RL step (physics x4 substeps + render + RGB/depth as CUDA tensors, 1 camera/env, 64 px, 4096 envs, front view): **337,618 env-steps/s** (Genesis past value: 82,900). Third-person orbit view (whole robot visible): 124,415.
 
+**Performance charts**
+
+![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
+
+![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
+
+![camera vs Isaac](https://github.com/user-attachments/assets/cac72f15-a227-49ae-a040-4c669b0d8ed4)
+
+![history](https://github.com/user-attachments/assets/e5522b76-834a-4d85-85ac-344f9079f0be)
+
 Media for this README and the project page (training videos, CPU vs GPU comparison, camera views) is **not stored in the repository**; it is attached on GitHub and referenced by URL.
 
-https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
+https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
 
 *CPU (MuJoCo C, left) vs GPU (right) for piper / openarm / go2 / g1, produced by `just check-video-export`. Arms agree; legged robots diverge after landing because contact solutions are chaotic, so we compare single-step error instead (below).*
 

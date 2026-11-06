@@ -102,6 +102,7 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   </div>
   <p class="note">Fast mode = <code>self_collision=False, max_condim=3</code> (the setting Isaac Lab / Genesis use). Default stays exact. Isaac Lab / Genesis figures are earlier measurements, not re-run on the same session; Genesis measures bare <code>scene.step()</code>, ours include observation and reward. See the <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#detailed-performance-log">full log</a> for conditions.</p>
 
+  <figure><img src="https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8" alt="Go2 env.step throughput vs Isaac Lab / Genesis" loading="lazy"><figcaption>Go2 env.step throughput vs Isaac Lab / Genesis</figcaption></figure>
   <h3>How we got here</h3>
   <div class="bars" style="--m:420000">
     <h4>Go2 4096 envs, env-steps/s by milestone</h4><small>Each step measured by building that commit</small>
@@ -112,6 +113,7 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
     <div class="row"><span>Host overhead cut</span><div><i style="--v:192000"><b>192K</b></i></div></div>
     <div class="row us"><span>Torch obs/reward + compile</span><div><i style="--v:409000"><b>409K</b></i></div></div>
   </div>
+  <figure><img src="https://github.com/user-attachments/assets/e5522b76-834a-4d85-85ac-344f9079f0be" alt="Go2 4096 envs optimization history" loading="lazy"><figcaption>Go2 4096 envs optimization history</figcaption></figure>
   <p class="note">Milestones are from different sessions and GPU clock states, so adjacent bars are indicative, not a strict series.</p>
 </section>
 
@@ -119,10 +121,8 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   <h2>Trained policies</h2>
   <p class="lead">Go2 locomotion trained end to end on this simulator with rsl_rl PPO, Isaac Lab–compatible observations and rewards.</p>
   <div class="grid">
-    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · flat ground · cmd_vel tracking</b>Attach video to a PR, paste the user-attachments URL into <code>data-url</code></div></div><figcaption>Unitree Go2 following forward/back/left/right velocity commands.</figcaption></figure>
-    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · stairs terrain</b>Attach video, paste URL into <code>data-url</code></div></div><figcaption>Blind (proprioception-only) policy on stair terrain.</figcaption></figure>
-    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · camera-in-the-loop (optional)</b>Attach video, paste URL into <code>data-url</code></div></div><figcaption>Policy rollout with onboard cameras.</figcaption></figure>
-    <figure><div class="slot" data-type="image" data-url=""><div><b>Training curves</b>Attach image, paste URL into <code>data-url</code></div></div><figcaption>Reward / episode length over iterations.</figcaption></figure>
+    <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/aecb396c-8e09-42ec-ae4e-2f2847251d0f"><div><b>Go2 · flat ground · cmd_vel tracking</b>Attach video to a PR, paste the user-attachments URL into <code>data-url</code></div></div><figcaption>Unitree Go2 following forward/back/left/right velocity commands.</figcaption></figure>
+    <figure><div class="slot" data-type="image" data-url="https://github.com/user-attachments/assets/0364072b-e79a-4201-b6e9-0bc79388c605"><div><b>Training curves</b>Attach image, paste URL into <code>data-url</code></div></div><figcaption>Reward / episode length over iterations.</figcaption></figure>
   </div>
 </section>
 
@@ -143,8 +143,9 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
     <div class="row us"><span>Ours · 1024 envs</span><div><i style="--v:17604"><b>17.6K</b></i></div></div>
     <div class="row us"><span>Ours · 4096 envs</span><div><i style="--v:19608"><b>19.6K</b></i></div></div>
   </div>
+  <figure><img src="https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e" alt="Camera-in-the-loop RL step vs Genesis" loading="lazy"><figcaption>Camera-in-the-loop RL step vs Genesis</figcaption></figure><figure><img src="https://github.com/user-attachments/assets/cac72f15-a227-49ae-a040-4c669b0d8ed4" alt="Physics + render step vs Isaac Lab TiledCamera" loading="lazy"><figcaption>Physics + render step vs Isaac Lab TiledCamera</figcaption></figure>
   <p class="note">Camera placement and FOV match, but shading and clip planes differ (Phong vs minimal RTX). Third-person orbit camera (whole robot visible, ~400K triangles/env) still reaches 124K env-steps/s at 4096 envs, 64 px.</p>
-  <figure><div class="slot" data-type="video" data-url=""><div><b>Camera views during training</b>Tiled RGB from thousands of envs at once — attach video, paste URL into <code>data-url</code></div></div><figcaption>What the policy sees: one camera per env, all rendered in a single pass.</figcaption></figure>
+  <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/775677ca-8b5d-42bf-a5ce-9b20bbdc91aa"><div><b>Camera views during training</b>Tiled RGB from 64 envs at once (third-person camera, random actions) — attach video, paste URL into <code>data-url</code></div></div><figcaption>What the policy sees: one camera per env, all rendered in a single pass.</figcaption></figure>
 </section>
 
 <section id="cpu">
@@ -156,7 +157,7 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
     <tr><td>Default model</td><td class="w">3.6e-5 rad</td><td>8e-7 rad</td></tr>
     <tr><td><code>max_condim=3</code> (both sides)</td><td class="w">1.4e-5 rad</td><td>5e-7 rad</td></tr>
   </table>
-  <figure><div class="slot" data-type="video" data-url=""><div><b>Divergence overlay (optional)</b>Attach a CPU-vs-GPU difference video, paste URL into <code>data-url</code></div></div></figure>
+  <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/5e2f02d7-8480-4254-ac73-137b26d0d437"><div><b>Divergence overlay (optional)</b>Attach a CPU-vs-GPU difference video, paste URL into <code>data-url</code></div></div></figure>
 </section>
 
 <section id="robots">

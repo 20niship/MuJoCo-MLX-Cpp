@@ -26,9 +26,19 @@ Unitree Go2、平地、dt 0.005 x 4 substep、観測・報酬込みの`env.step`
 
 カメラ付きRLの1 step(物理4 substep + 描画 + RGB/depthがCUDAテンソルになるまで、1カメラ/env、64px、4096 env、前方視点): **337,618 env-steps/s**(Genesis過去値 82,900)。三人称視点(ロボット全体が写る): 124,415。
 
+**性能グラフ**
+
+![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
+
+![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
+
+![camera vs Isaac](https://github.com/user-attachments/assets/cac72f15-a227-49ae-a040-4c669b0d8ed4)
+
+![history](https://github.com/user-attachments/assets/e5522b76-834a-4d85-85ac-344f9079f0be)
+
 READMEとプロジェクトページで使う動画・画像(学習動画、CPU比較、カメラ映像)は**リポジトリに含めない**。GitHub上で添付し、URLで参照する。
 
-https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
+https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
 
 *左がCPU(MuJoCo C)、右がGPU。piper / openarm / go2 / g1。`just check-video-export`で生成。アームは一致し、脚ロボットは着地後の接触解の差で軌道が分かれる(接触はカオス的に増幅されるので、1 stepの差で評価する。下記)。*
 
