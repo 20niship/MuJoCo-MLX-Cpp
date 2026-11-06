@@ -592,6 +592,11 @@ struct BatchedSim {
 
     // sensor (MJCF <sensor>)。nsensor==0なら空で、stepに追加コストはない
     std::shared_ptr<SensorCtx> sensor;
+
+    // 直近substepの接触(touchセンサがあるときだけstepが出力する): contact_data(B*MAX_CON*8: pos3,normal3,dist,pair)、接触数(B)、接触ごとの法線力(B*MAX_CON)
+    mx::array con_data = mx::array({});
+    mx::array con_cnt = mx::array({});
+    mx::array con_fn = mx::array({});
 };
 
 // sensor.cpp
@@ -600,6 +605,7 @@ void sensor_before_step(SensorCtx& ctx, const BatchedSim& sim);  // step前の�
 void sensor_mark_reset(SensorCtx& ctx, const int* reset_mask, int num_envs);
 void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& out);  // (B, nsensordata)をhostで計算
 int sensor_nsensordata(const SensorCtx& ctx);
+bool sensor_needs_contacts(const SensorCtx& ctx);  // touchセンサがあるとき、stepが接触配列(con_*)を出力する
 
 // ── Module functions (internal C++ API) ──────────────────────
 

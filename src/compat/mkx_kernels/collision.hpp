@@ -324,7 +324,7 @@ for (int p = 0; p < NUM_PAIRS; p++) {
         vec3 best_w = mjmlx_support(xt, xpos_, xR, xsize, adr, nverts, -normal);
         float best_d = msl_dot(best_w - ppos, normal);
         if (best_d < pair_margin) {
-            vec3 cp = best_w - normal * best_d;
+            vec3 cp = best_w - normal * (best_d * 0.5f);  // MuJoCoと同じく2つの面の中点(plane面上の点にすると摩擦行のモーメントアームがずれ、接触力の配分がCPUとずれる)
             c_pos[0]=cp.x; c_pos[1]=cp.y; c_pos[2]=cp.z;
             c_norm[0]=normal.x; c_norm[1]=normal.y; c_norm[2]=normal.z;
             c_dist = best_d;

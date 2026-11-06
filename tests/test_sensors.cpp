@@ -1,5 +1,5 @@
 // batched GPUのsensordata vs MuJoCo C。各step前のGPUの状態をmjDataに入れてmj_forwardした値を参照にするので、物理のCPU/GPU差とは切り分けてセンサ式だけを検証する。
-// Usage: test_sensors <model.xml> <steps> <tol> [tol_acc] [qnoise=0.05] [vnoise=0.5] [lift_z=0] [ctrl_amp=0.3] [solver_iters=0]   tol_acc=0ならaccelerometerを比較しない。実ロボットは小さいnoiseにしてfree jointをlift_zだけ持ち上げる   tol_acc省略時はaccelerometerを比較しない(接触ありは速度差分が衝撃で乖離するため)
+// Usage: test_sensors <model.xml> <steps> <tol> [tol_acc] [qnoise=0.05] [vnoise=0.5] [lift_z=0] [ctrl_amp=0.3] [solver_iters=0] [tol_touch=tol]   tol_acc=0ならaccelerometerを比較しない。実ロボットは小さいnoiseにしてfree jointをlift_zだけ持ち上げる   tol_acc省略時はaccelerometerを比較しない(接触ありは速度差分が衝撃で乖離するため)
 // accelerometerは速度の1step差分(Isaac Lab IMUと同じ)なのでMuJoCoの厳密値とは1step分遅れた近似になる。
 // sensorごと(名前単位)に全env・全stepでのmax|diff|を出力し、型ごとの許容を超えたらFAIL。
 
@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
     const bool check_acc = tol_acc > 0;
     const float qnoise = argc > 5 ? (float)atof(argv[5]) : 0.05f, vnoise = argc > 6 ? (float)atof(argv[6]) : 0.5f, lift_z = argc > 7 ? (float)atof(argv[7]) : 0.f, ctrl_amp = argc > 8 ? (float)atof(argv[8]) : 0.3f;
     const int solver_iters = argc > 9 ? atoi(argv[9]) : 0;
+    const double tol_touch = argc > 10 ? atof(argv[10]) : tol;  // touch(接触力[N])は桁が大きく、solverの収束(solver_iters)に依存するので別の許容
     const int B = 6;
 
     auto* model = mjmlx_load_model(argv[1]);
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
     for (int s = 0; s < mj->nsensor; s++) {
         bool acc = mj->sensor_type[s] == mjSENS_ACCELEROMETER;
         if (acc && !check_acc) { printf("  %-14s SKIP (accelerometer)\n", mj_id2name(mj, mjOBJ_SENSOR, s)); continue; }
-        double lim = acc ? tol_acc : tol;
+        double lim = acc ? tol_acc : (mj->sensor_type[s] == mjSENS_TOUCH ? tol_touch : tol);
         if (acc && !acc_errs[s].empty()) {
             auto& v = acc_errs[s];
             std::sort(v.begin(), v.end());

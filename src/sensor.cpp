@@ -27,6 +27,19 @@ struct SensorDesc {
     ObjFrame frame;            // objtypeがsite/geom/body/xbodyのとき
     int qposadr = 0, dofadr = 0;  // joint系
     float gear = 1.0f;         // actuatorpos/vel
+    // touch: siteの形状(site座標系の内外判定用)
+    int site_type = 0;
+    std::array<float, 3> site_size{0, 0, 0};
+    // camprojection: カメラのフレームと内部パラメータ(画素単位)。対象siteはframe
+    ObjFrame cam;
+    float fx = 1, fy = 1, cx = 0, cy = 0;
+};
+
+// rangefinderが当てるgeom(typeが負なら不可視で当たらない)
+struct RayGeom {
+    int type = 0, bodyid = 0;
+    std::array<float, 3> size{0, 0, 0};
+    ObjFrame frame;
 };
 
 std::array<float, 9> quat_to_mat9(const std::array<float, 4>& q) {
@@ -70,6 +83,92 @@ struct WorldFrame {
     Q4 quat;
 };
 
+
+// ── rangefinder / touch用の幾何(geomローカル座標、長軸はz) ──
+// a t^2 + 2 b t + c = 0 の最小の非負根(無ければ-1)
+double ray_quadratic(double a, double b, double c) {
+    double det = b * b - a * c;
+    if (det < 0 || a == 0) return -1;
+    double sq = std::sqrt(det), t0 = (-b - sq) / a, t1 = (-b + sq) / a;
+    return t0 >= 0 ? t0 : (t1 >= 0 ? t1 : -1);
+}
+double min_hit(double a, double b) { return a < 0 ? b : (b < 0 ? a : std::min(a, b)); }
+// レイ p + t*d (t>=0)とgeomの交点のt。当たらなければ-1。
+double ray_local(int type, const std::array<float, 3>& sz, const V3& p, const V3& d) {
+    switch (type) {
+        case mjGEOM_PLANE: {
+            if (d[2] == 0) return -1;
+            double t = -p[2] / d[2];
+            if (t < 0) return -1;
+            double x = p[0] + t * d[0], y = p[1] + t * d[1];
+            if ((sz[0] > 0 && std::fabs(x) > sz[0]) || (sz[1] > 0 && std::fabs(y) > sz[1])) return -1;
+            return t;
+        }
+        case mjGEOM_SPHERE:
+            return ray_quadratic(d[0] * d[0] + d[1] * d[1] + d[2] * d[2], p[0] * d[0] + p[1] * d[1] + p[2] * d[2], p[0] * p[0] + p[1] * p[1] + p[2] * p[2] - (double)sz[0] * sz[0]);
+        case mjGEOM_ELLIPSOID: {
+            V3 ps{p[0] / sz[0], p[1] / sz[1], p[2] / sz[2]}, ds{d[0] / sz[0], d[1] / sz[1], d[2] / sz[2]};
+            return ray_quadratic(ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2], ps[0] * ds[0] + ps[1] * ds[1] + ps[2] * ds[2], ps[0] * ps[0] + ps[1] * ps[1] + ps[2] * ps[2] - 1.0);
+        }
+        case mjGEOM_BOX: {
+            double tin = -1e30, tout = 1e30;
+            for (int i = 0; i < 3; i++) {
+                if (std::fabs(d[i]) < 1e-12) { if (std::fabs(p[i]) > sz[i]) return -1; continue; }
+                double t0 = (-sz[i] - p[i]) / d[i], t1 = (sz[i] - p[i]) / d[i];
+                if (t0 > t1) std::swap(t0, t1);
+                tin = std::max(tin, t0); tout = std::min(tout, t1);
+            }
+            if (tin > tout || tout < 0) return -1;
+            return tin >= 0 ? tin : tout;
+        }
+        case mjGEOM_CYLINDER: case mjGEOM_CAPSULE: {
+            const double r = sz[0], h = sz[1];
+            double best = -1;
+            double a = d[0] * d[0] + d[1] * d[1];  // 側面(無限円筒)のうち|z|<=hの部分
+            if (a > 1e-14) {
+                double b = p[0] * d[0] + p[1] * d[1], c = p[0] * p[0] + p[1] * p[1] - r * r, det = b * b - a * c;
+                if (det >= 0) {
+                    double sq = std::sqrt(det);
+                    for (double t : {(-b - sq) / a, (-b + sq) / a})
+                        if (t >= 0 && std::fabs(p[2] + t * d[2]) <= h) { best = min_hit(best, t); break; }
+                }
+            }
+            if (type == mjGEOM_CYLINDER) {
+                if (std::fabs(d[2]) > 1e-12)
+                    for (double zc : {-h, h}) {
+                        double t = (zc - p[2]) / d[2];
+                        if (t >= 0 && std::pow(p[0] + t * d[0], 2) + std::pow(p[1] + t * d[1], 2) <= r * r) best = min_hit(best, t);
+                    }
+            } else {
+                for (double zc : {-h, h}) {  // 両端の半球
+                    double q2 = p[2] - zc;
+                    double aa = d[0] * d[0] + d[1] * d[1] + d[2] * d[2], bb = p[0] * d[0] + p[1] * d[1] + q2 * d[2], cc = p[0] * p[0] + p[1] * p[1] + q2 * q2 - r * r, det = bb * bb - aa * cc;
+                    if (det < 0) continue;
+                    double sq = std::sqrt(det);
+                    for (double t : {(-bb - sq) / aa, (-bb + sq) / aa})
+                        if (t >= 0 && (zc > 0 ? p[2] + t * d[2] >= h : p[2] + t * d[2] <= -h)) { best = min_hit(best, t); break; }
+                }
+            }
+            return best;
+        }
+        default: return -1;
+    }
+}
+// siteローカル座標の点が形状の内側か(mju_insideGeomと同じ)
+bool inside_geom(int type, const std::array<float, 3>& s, const V3& p) {
+    switch (type) {
+        case mjGEOM_SPHERE: return p[0] * p[0] + p[1] * p[1] + p[2] * p[2] <= (double)s[0] * s[0];
+        case mjGEOM_ELLIPSOID: return std::pow(p[0] / s[0], 2) + std::pow(p[1] / s[1], 2) + std::pow(p[2] / s[2], 2) <= 1.0;
+        case mjGEOM_BOX: return std::fabs(p[0]) <= s[0] && std::fabs(p[1]) <= s[1] && std::fabs(p[2]) <= s[2];
+        case mjGEOM_CYLINDER: return p[0] * p[0] + p[1] * p[1] <= (double)s[0] * s[0] && std::fabs(p[2]) <= s[1];
+        case mjGEOM_CAPSULE: {
+            double z = std::max(-(double)s[1], std::min((double)s[1], p[2]));
+            return p[0] * p[0] + p[1] * p[1] + (p[2] - z) * (p[2] - z) <= (double)s[0] * s[0];
+        }
+        default: return false;
+    }
+}
+
 }  // namespace
 
 struct SensorCtx {
@@ -86,6 +185,9 @@ struct SensorCtx {
     std::vector<int> bmap, cmap;               // body id -> 上の配列内の位置(無ければ-1)
     std::optional<mx::array> used_idx, com_idx;
     bool needs_prev = false;  // accelerometerがあるときだけstep前の出力を保持する
+    bool needs_contacts = false;  // touchがあるときstepが接触配列を出す
+    std::vector<RayGeom> ray_geoms;  // rangefinderがあるときだけ
+    std::vector<std::array<int, 2>> pair_bodies;  // 衝突ペア番号 -> (body1, body2)。touchの絞り込み用(初回に作る)
 
     // 直近stepへの入力のqpos/qvel(xpos等の出力はこの状態に対応する)
     std::optional<mx::array> in_qpos, in_qvel;
@@ -118,6 +220,7 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
             case mjOBJ_GEOM:  f.body = m->geom_bodyid[id]; copy3(m->geom_pos + 3 * id); copy4(m->geom_quat + 4 * id); break;
             case mjOBJ_BODY:  f.body = id; copy3(m->body_ipos + 3 * id); copy4(m->body_iquat + 4 * id); break;  // MuJoCoのbodyは慣性系
             case mjOBJ_XBODY: f.body = id; break;
+            case mjOBJ_CAMERA: f.body = m->cam_bodyid[id]; copy3(m->cam_pos + 3 * id); copy4(m->cam_quat + 4 * id); break;
             default: return false;
         }
         f.mat = quat_to_mat9(f.quat);
@@ -132,6 +235,7 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
         d.objtype = m->sensor_objtype[i];
         d.objid = m->sensor_objid[i];
         const char* nm = mj_id2name(m, mjOBJ_SENSOR, i);
+        const char* why = "";
 
         auto joint_ok = [&]() {
             int jt = m->jnt_type[d.objid];
@@ -176,12 +280,74 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
             case mjSENS_SUBTREECOM:
                 d.supported = true;
                 break;
+            case mjSENS_TOUCH: {
+                d.supported = frame_of(mjOBJ_SITE, d.objid, d);
+                d.objtype = mjOBJ_SITE;
+                d.site_type = m->site_type[d.objid];
+                for (int k = 0; k < 3; k++) d.site_size[k] = (float)m->site_size[3 * d.objid + k];
+                d.supported = d.supported && (d.site_type == mjGEOM_SPHERE || d.site_type == mjGEOM_CAPSULE || d.site_type == mjGEOM_ELLIPSOID ||
+                                              d.site_type == mjGEOM_CYLINDER || d.site_type == mjGEOM_BOX);
+                if (d.supported) ctx->needs_contacts = true;
+                break;
+            }
+            case mjSENS_RANGEFINDER: {
+                d.supported = frame_of(mjOBJ_SITE, d.objid, d);
+                d.objtype = mjOBJ_SITE;
+                for (int g = 0; g < m->ngeom && d.supported; g++) {
+                    int gt = m->geom_type[g];
+                    if (m->geom_bodyid[g] == m->site_bodyid[d.objid] || m->geom_rgba[4 * g + 3] == 0) continue;
+                    if (gt == mjGEOM_MESH || gt == mjGEOM_HFIELD || gt == mjGEOM_SDF) { d.supported = false; why = "model has mesh/hfield/SDF geoms (ray intersection not implemented for them)"; }
+                }
+                if (d.supported && ctx->ray_geoms.empty()) {
+                    for (int g = 0; g < m->ngeom; g++) {
+                        RayGeom rg;
+                        rg.type = m->geom_rgba[4 * g + 3] == 0 ? -1 : m->geom_type[g];  // 不可視(alpha 0)のgeomは当たらない
+                        rg.bodyid = m->geom_bodyid[g];
+                        for (int k = 0; k < 3; k++) rg.size[k] = (float)m->geom_size[3 * g + k];
+                        SensorDesc tmp;
+                        frame_of(mjOBJ_GEOM, g, tmp);
+                        rg.frame = tmp.frame;
+                        ctx->ray_geoms.push_back(rg);
+                    }
+                }
+                break;
+            }
+            case mjSENS_CAMPROJECTION: {
+                int cam = m->sensor_refid[i];
+                d.supported = frame_of(mjOBJ_SITE, d.objid, d) && m->sensor_reftype[i] == mjOBJ_CAMERA && cam >= 0;
+                d.objtype = mjOBJ_SITE;
+                if (d.supported && m->cam_mode[cam] != mjCAMLIGHT_FIXED) { d.supported = false; why = "only fixed cameras are supported (not track/trackcom/targetbody)"; }
+                if (d.supported) {
+                    SensorDesc tmp;
+                    frame_of(mjOBJ_CAMERA, cam, tmp);
+                    d.cam = tmp.frame;
+                    const double rx = m->cam_resolution[2 * cam], ry = m->cam_resolution[2 * cam + 1];
+                    const double sx = m->cam_sensorsize[2 * cam], sy = m->cam_sensorsize[2 * cam + 1];
+                    // MuJoCoのcamprojectionは主点(principal)を使わず、画像中心を原点にする(sensorsize指定時の焦点距離だけ使う)
+                    if (sx > 0 && sy > 0) {  // sensorsize + focal指定
+                        d.fx = (float)(m->cam_intrinsic[4 * cam] / sx * rx);
+                        d.fy = (float)(m->cam_intrinsic[4 * cam + 1] / sy * ry);
+                        d.cx = (float)(rx / 2);
+                        d.cy = (float)(ry / 2);
+                    } else {  // fovy指定(正方画素)
+                        d.fy = d.fx = (float)(0.5 * ry / std::tan(0.5 * m->cam_fovy[cam] * M_PI / 180.0));
+                        d.cx = (float)(rx / 2);
+                        d.cy = (float)(ry / 2);
+                    }
+                }
+                break;
+            }
+            case mjSENS_FORCE: case mjSENS_TORQUE:
+                d.supported = false;
+                why = "needs the full contact wrench (friction/torsion, not exported by the GPU solver) and cfrc_int (RNE backward pass); not implemented";
+                break;
+
             default:
                 d.supported = false;
         }
         if (!d.supported)
-            fprintf(stderr, "[mjmlx WARNING] sensor '%s' (type %d) is not supported on the GPU path; its sensordata stays 0.\n",
-                    nm ? nm : "", d.type);
+            fprintf(stderr, "[mjmlx WARNING] sensor '%s' (type %d) is not supported on the GPU path; its sensordata stays 0.%s%s\n",
+                    nm ? nm : "", d.type, *why ? " Reason: " : "", why);
         ctx->sensors.push_back(d);
     }
 
@@ -190,7 +356,11 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
         if (!d.supported) continue;
         bool framed = d.type == mjSENS_GYRO || d.type == mjSENS_VELOCIMETER || d.type == mjSENS_ACCELEROMETER || d.type == mjSENS_MAGNETOMETER ||
                       (d.type >= mjSENS_FRAMEPOS && d.type <= mjSENS_FRAMEANGVEL);
+        framed = framed || d.type == mjSENS_TOUCH || d.type == mjSENS_RANGEFINDER || d.type == mjSENS_CAMPROJECTION;
         if (framed) { used.insert(d.frame.body); coms.insert(ctx->body_rootid[d.frame.body]); }
+        if (d.type == mjSENS_CAMPROJECTION) { used.insert(d.cam.body); coms.insert(ctx->body_rootid[d.cam.body]); }
+        if (d.type == mjSENS_RANGEFINDER)
+            for (const auto& rg : ctx->ray_geoms) { used.insert(rg.bodyid); coms.insert(ctx->body_rootid[rg.bodyid]); }
         if (d.type == mjSENS_SUBTREECOM) coms.insert(d.objid);
     }
     if (used.empty()) used.insert(0);
@@ -207,6 +377,7 @@ std::shared_ptr<SensorCtx> make_sensor_ctx(const mjModel* m, int num_envs) {
 }
 
 int sensor_nsensordata(const SensorCtx& ctx) { return ctx.nsensordata; }
+bool sensor_needs_contacts(const SensorCtx& ctx) { return ctx.needs_contacts; }
 
 void sensor_before_step(SensorCtx& ctx, const BatchedSim& sim) {
     ctx.in_qpos = sim.qpos;
@@ -295,6 +466,17 @@ void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& o
     const float* pcom = use_prev ? p_com->data<float>() : nullptr;
     const float* pcvel = use_prev ? p_cvel->data<float>() : nullptr;
 
+    // touch: 直近substepの接触(位置・法線力・ペア)。法線力は全ファセットの和でmj_contactForceのforce[0]に対応する。
+    const float *con_data = nullptr, *con_cnt = nullptr, *con_fn = nullptr;
+    int max_con = 0;
+    if (ctx.needs_contacts && sim.con_fn.size() > 0) {
+        mx::eval({sim.con_data, sim.con_cnt, sim.con_fn});
+        con_data = sim.con_data.data<float>(); con_cnt = sim.con_cnt.data<float>(); con_fn = sim.con_fn.data<float>();
+        max_con = (int)(sim.con_fn.size() / B);
+        if (ctx.pair_bodies.empty())
+            for (const auto& cp : sim.model->cache.collision_pairs) ctx.pair_bodies.push_back({cp.body1, cp.body2});
+    }
+
     out.assign((size_t)B * nsd, 0.0f);
     for (int b = 0; b < B; b++) {
         EnvKin now{xpos + (size_t)b * nu_ * 3, xquat + (size_t)b * nu_ * 4, com + (size_t)b * nc_ * 3, cvel + (size_t)b * nu_ * 6, ctx};
@@ -350,6 +532,44 @@ void sensor_compute(SensorCtx& ctx, const BatchedSim& sim, std::vector<float>& o
                         for (int i = 0; i < 3; i++) a[i] = (w.lin_vel[i] - wp.lin_vel[i]) / ctx.dt;
                     }
                     put3(mat_t_vec(w.mat, a - V3{ctx.gravity[0], ctx.gravity[1], ctx.gravity[2]}));
+                    break;
+                }
+                case mjSENS_TOUCH: {
+                    if (!con_fn) break;
+                    auto w = now.frame(d.frame);
+                    const int sbody = d.frame.body, nc = std::min(max_con, (int)con_cnt[b]);
+                    double sum = 0;
+                    for (int ci = 0; ci < nc; ci++) {
+                        const float fn = con_fn[(size_t)b * max_con + ci];
+                        if (fn <= 0) continue;
+                        const float* cd = con_data + ((size_t)b * max_con + ci) * 8;
+                        const auto& pb = ctx.pair_bodies[(size_t)cd[7]];
+                        if (pb[0] != sbody && pb[1] != sbody) continue;
+                        V3 pl = mat_t_vec(w.mat, V3{cd[0], cd[1], cd[2]} - w.pos);
+                        if (inside_geom(d.site_type, d.site_size, pl)) sum += fn;
+                    }
+                    y[0] = (float)sum;
+                    break;
+                }
+                case mjSENS_RANGEFINDER: {
+                    auto w = now.frame(d.frame);
+                    V3 dir{w.mat[2], w.mat[5], w.mat[8]};  // siteのz軸
+                    double best = -1;
+                    for (const auto& rg : ctx.ray_geoms) {
+                        if (rg.type < 0 || rg.bodyid == d.frame.body) continue;
+                        auto g = now.frame(rg.frame);
+                        double t = ray_local(rg.type, rg.size, mat_t_vec(g.mat, w.pos - g.pos), mat_t_vec(g.mat, dir));
+                        if (t >= 0 && (best < 0 || t < best)) best = t;
+                    }
+                    y[0] = (float)best;
+                    break;
+                }
+                case mjSENS_CAMPROJECTION: {
+                    auto c = now.frame(d.cam);
+                    auto t = now.frame(d.frame);
+                    V3 pc = mat_t_vec(c.mat, t.pos - c.pos);  // カメラは-zを向き、xが右、yが上
+                    y[0] = (float)(d.cx + d.fx * pc[0] / -pc[2]);
+                    y[1] = (float)(d.cy - d.fy * pc[1] / -pc[2]);
                     break;
                 }
                 default: break;

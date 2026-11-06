@@ -417,7 +417,10 @@ if(MJMLX_BUILD_TESTS)
     # MJCF <sensor>のGPU値 vs MuJoCo C(同一状態でmj_forward)。accelerometerは1step差分なので空中のp95のみ緩い閾値で比較する。
     add_test(NAME sensors_air COMMAND test_sensors ${_M}/sensors.xml 60 1e-4 2.0)
     add_test(NAME sensors_contact COMMAND test_sensors ${_M}/sensors_contact.xml 300 1e-4)
-    set_tests_properties(sensors_air sensors_contact PROPERTIES LABELS "correctness")
+    # touch/rangefinder/camprojection。接触力(touch)はsolverの収束に依存するのでsolver_iters=50で比べる(既定はNewton 3回で数%ずれる)
+    add_test(NAME sensors_extra_air COMMAND test_sensors ${_M}/sensors_extra.xml 40 1e-3 0 0.02 0.3 0 0.2 50 0.05)
+    add_test(NAME sensors_extra_contact COMMAND test_sensors ${_M}/sensors_extra.xml 40 1e-3 0 0.02 0.3 -0.195 0.2 50 0.05)
+    set_tests_properties(sensors_air sensors_contact sensors_extra_air sensors_extra_contact PROPERTIES LABELS "correctness")
 
     # mesh付き実ロボットMJCFの軌道比較(関節角・body位置/姿勢のCPU-GPU差)。モデルは `just fetch-models` で benchmarks/models/external/ に取得(git管理外)。
     # 未取得なら登録しない。LABELS=modelsなのでCIの `just check-ci` には含まれず、`just check-models` で実行する。

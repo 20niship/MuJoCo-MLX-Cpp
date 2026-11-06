@@ -979,6 +979,10 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             mx::array qfrc_constraint_flat = mx::zeros({1});
             mx::array solver_qacc = mx::zeros({1});
             bool have_solver_qacc = false;
+            // touchセンサがあるときだけ接触配列(collision/solverの出力)をstepの出力に足す(無ければ追加コストなし)
+            const BatchedSim* bsim = static_cast<const BatchedSim*>(owner);
+            const bool want_con = bsim && bsim->sensor && sensor_needs_contacts(*bsim->sensor);
+            std::optional<mx::array> con_data_o, con_cnt_o, con_fn_o;
             mx::array cfrc_ext_flat = mx::zeros({1});  // 接触が無い経路でだけ下でB*nb*6のゼロ配列にする(毎substep 1.4MBのホストでのゼロ埋めは約250us)
             mx::array subtree_com_out = mx::zeros({1});
             mx::array cinert_out = mx::zeros({1});
@@ -1088,6 +1092,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         }
                         qfrc_constraint_flat = solver[0];
                         prof_stage("solver", solver);
+                        if (want_con) { con_data_o = coll[0]; con_cnt_o = coll[1]; con_fn_o = solver[2]; }
                         auto cfrc_raw = (*ctx->cfrc_ext_kernel)(
                             mx::fast::kernel_inputs({coll[0], coll[1], solver[2], ctx->solver_pair_props}),
                             mx::fast::kernel_shapes({{B * nb * 6}}),
@@ -1164,9 +1169,15 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
             if (cfrc_ext_flat.size() != static_cast<int64_t>(B) * nb * 6) cfrc_ext_flat = mx::zeros({B * nb * 6});
             auto cfrc_ext_out = mx::reshape(cfrc_ext_flat, {B, nb, 6});
 
-            return {new_qpos, new_qvel, xpos_out, xquat_out,
+            std::vector<mx::array> outs = {new_qpos, new_qvel, xpos_out, xquat_out,
                     subtree_com_out, cinert_out, cvel_out,
                     qfrc_actuator_out, cfrc_ext_out};
+            if (want_con) {  // 接触が無いモデルは空配列(size 0)を返す
+                outs.push_back(con_data_o ? *con_data_o : mx::zeros({0}));
+                outs.push_back(con_cnt_o ? *con_cnt_o : mx::zeros({0}));
+                outs.push_back(con_fn_o ? *con_fn_o : mx::zeros({0}));
+            }
+            return outs;
         };
 
         // mx::compile fuses ops (reshape, astype, etc.) in the computation graph.
@@ -1408,6 +1419,7 @@ MJMLX_API void mjmlx_batched_step_n(MjmlxBatchedSim* sim, const float* ctrl_flat
         if (results.size() > 6) s.cvel = results[6];
         if (results.size() > 7) s.qfrc_actuator = results[7];
         if (results.size() > 8) s.cfrc_ext = results[8];
+        if (results.size() > 11) { s.con_data = results[9]; s.con_cnt = results[10]; s.con_fn = results[11]; }
     }
 }
 

@@ -358,7 +358,7 @@ MuJoCo-MLX-Cpp's solver supports:
 
 | Subsystem | MuJoCo C | MJX | MuJoCo-MLX-Cpp |
 |-----------|----------|-----|----------------|
-| **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 19 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37) |
+| **Sensors** (49 types, 1,542 lines) | Full | `src/sensor.cpp`, 22 types (batched GPU path) | **Partial**: IMU/frame/joint/actuator-pos-vel/subtreecom (issue #37), touch, rangefinder, camprojection (fixed cameras). Not supported: force/torque, user/clock/geomdist/contact/tactile etc. |
 | **Fixed tendons** (length, velocity, J, passive) | Full | Yes | Yes (Phase 5.1) |
 | **Spatial tendons** (site / pulley / sphere・cylinder wrap / sidesite) | Full | Yes | **Partial** (batched GPU path only; scalar/vmap DEFERRED) |
 | **Tendon limits + friction** | Full | Yes | Yes (Phase 5.4-5.5) |
@@ -597,7 +597,7 @@ remaining conformance gap:
 | RK4 | `mj_RungeKutta` | `integrate_rk4()` | Full parity (scalar path) |
 | Implicit/Fast | `mj_implicit` | `integrate_implicit()` | Full parity (scalar path) |
 | Flex | `mj_flex` | -- | DEFERRED |
-| Sensor | `mj_sensorPos/Vel/Acc` | `mjmlx_batched_get_sensordata` | Partial (accelerometer is a 1-step velocity difference, like Isaac Lab IMU) |
+| Sensor | `mj_sensorPos/Vel/Acc` | `mjmlx_batched_get_sensordata` | Partial (accelerometer is a 1-step velocity difference, like Isaac Lab IMU; touch force accuracy depends on `solver_iterations`: ~0.1% at 50, up to several % at the default 3 Newton iterations) |
 | Inverse | `mj_inverse` | -- | DEFERRED |
 
 ### Summary Statistics
@@ -610,7 +610,7 @@ remaining conformance gap:
 | Transmission types | 6 | 4 | 3 (JOINT, TENDON, SITE) |
 | Gain types | 4 | 3 | 2 (FIXED, AFFINE) |
 | Dynamics types | 6 | 5 | 4 (NONE, INTEGRATOR, FILTER, FILTEREXACT) |
-| Sensor types | 49 | ~30 | 19 (batched GPU) |
+| Sensor types | 49 | ~30 | 22 (batched GPU) |
 | Solvers | 3 (+noslip) | 2 | 2 (CG, Newton) |
 | Joint types | 4 | 4 | 4 |
 | Batched GPU sim | No | Yes (CUDA/TPU) | Yes (GPU, 73K SPS training) |
