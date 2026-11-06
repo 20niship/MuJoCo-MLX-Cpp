@@ -2,6 +2,18 @@
 
 [English](README.md) | **日本語**
 
+[![CI](https://github.com/20niship/MuJoCo-MLX-Cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/20niship/MuJoCo-MLX-Cpp/actions/workflows/ci.yml)
+[![Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=github)](https://20niship.github.io/MuJoCo-MLX-Cpp/)
+[![License](https://img.shields.io/github/license/20niship/MuJoCo-MLX-Cpp)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/20niship/MuJoCo-MLX-Cpp)](https://github.com/20niship/MuJoCo-MLX-Cpp/commits/main)
+[![Stars](https://img.shields.io/github/stars/20niship/MuJoCo-MLX-Cpp?style=flat)](https://github.com/20niship/MuJoCo-MLX-Cpp/stargazers)
+![Vulkan](https://img.shields.io/badge/Vulkan-compute-AC162C?logo=vulkan&logoColor=white)
+![No NVIDIA required](https://img.shields.io/badge/NVIDIA%20GPU-not%20required-76B900?logo=nvidia&logoColor=white)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![MuJoCo](https://img.shields.io/badge/MuJoCo-3.5-orange)
+![Python](https://img.shields.io/badge/Python-nanobind-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Linux%20(tested)-lightgrey)
+
 **プロジェクトページ: https://20niship.github.io/MuJoCo-MLX-Cpp/**
 
 Vulkan上でMuJoCoの物理とカメラ描画をGPUバッチ実行する、数千env並列の強化学習向けライブラリ。
