@@ -1,697 +1,305 @@
 # MuJoCo-MLX-Cpp
 
-GPU-accelerated MuJoCo physics on Apple Silicon via [MLX](https://github.com/ml-explore/mlx).
+**English** | [日本語](README_JA.md)
 
-Two C++ shared libraries:
+[![CI](https://github.com/20niship/MuJoCo-MLX-Cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/20niship/MuJoCo-MLX-Cpp/actions/workflows/ci.yml)
+[![Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=github)](https://20niship.github.io/MuJoCo-MLX-Cpp/)
+[![License](https://img.shields.io/github/license/20niship/MuJoCo-MLX-Cpp)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/20niship/MuJoCo-MLX-Cpp)](https://github.com/20niship/MuJoCo-MLX-Cpp/commits/main)
+[![Stars](https://img.shields.io/github/stars/20niship/MuJoCo-MLX-Cpp?style=flat)](https://github.com/20niship/MuJoCo-MLX-Cpp/stargazers)
+![Vulkan](https://img.shields.io/badge/Vulkan-compute-AC162C?logo=vulkan&logoColor=white)
+![No NVIDIA required](https://img.shields.io/badge/NVIDIA%20GPU-not%20required-76B900?logo=nvidia&logoColor=white)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![MuJoCo](https://img.shields.io/badge/MuJoCo-3.5-orange)
+![Python](https://img.shields.io/badge/Python-nanobind-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Linux%20(tested)-lightgrey)
 
-- **`libmjmlx.dylib`** -- MuJoCo physics pipeline reimplemented on GPU using MLX C++
-- **`libmjb.dylib`** -- Unified dual-backend C API that dispatches to either MuJoCo C (CPU) or MuJoCo-MLX (GPU)
+**Project page: https://20niship.github.io/MuJoCo-MLX-Cpp/**
 
-Designed for consumption from Python (via nanobind), Unity/C# (via P/Invoke), or any language with C FFI.
+GPU-batched MuJoCo physics and camera rendering on Vulkan, for reinforcement learning with thousands of parallel environments.
 
-## Performance
+- **Physics**: MuJoCo-compatible pipeline (kinematics, collision, constraint solver, integration) as GPU compute kernels, validated against MuJoCo C.
+- **Camera**: every env x every camera rendered in one indirect draw; RGB+depth handed to PyTorch as CUDA tensors without a CPU copy (Linux).
+- **RL**: Unitree Go2 environment with Isaac Lab-style observations/rewards, trained with [rsl_rl](https://github.com/leggedrobotics/rsl_rl) PPO.
+- **Libraries**: `libmjmlx` (GPU physics, C API `mjmlx.h`) and `libmjb` (dual-backend C API `mjb.h`: MuJoCo C on CPU or the GPU engine). Python via nanobind.
 
-Humanoid stepping throughput on Apple M4 Max (40-core GPU, 64 GB unified memory):
+The tensor backend is [`extern/mlx_vulkan`](https://github.com/20niship/mlx_vulkan) (MKX, an MLX-style array library on Vulkan compute), vendored as a git submodule. The Metal backend was removed; Vulkan is the only GPU backend. (The `MJB_BACKEND_MLX` enum and `mlx` names in the API are historical and mean "the GPU engine".)
 
-| Envs | Steps/sec | Notes |
-|------|-----------|-------|
-| 256 | 15,027 | |
-| 1,024 | 68,753 | |
-| 4,096 | 255,362 | |
-| 8,192 | **331,207** | Peak throughput (pure stepping) |
+## Why this library
 
-Architecture: `GPU kinematics -> compile(vmap(forward)) -> GPU integration` (Euler in batched, Euler/RK4/ImplicitFast in scalar)
+- **Same models as MuJoCo.** It loads the same MJCF XML files as MuJoCo (menagerie Go2/G1/Piper, Gymnasium Humanoid/HalfCheetah, ...) through MuJoCo's own parser, and every feature is checked against MuJoCo C in CI. Switching an existing MuJoCo model to the GPU engine is a `load_model(path)` call; no model conversion, no new asset format. `libmjb` additionally lets the same C code run on MuJoCo C (CPU) or the GPU engine by changing one enum.
+- **Vendor-neutral: no NVIDIA GPU required.** Compute and rendering use only Vulkan (compute shaders written in GLSL). Any Vulkan 1.2+ device works: NVIDIA, AMD, Intel, or even a CPU through Mesa lavapipe (this is what CI uses). Only the zero-copy camera -> PyTorch path (Vulkan -> CUDA interop) needs an NVIDIA GPU + CUDA; without it you get the same images through a CPU read-back.
+- **Cross-platform by construction.** Linux is tested on NVIDIA and lavapipe. The Vulkan layer ([`mlx_vulkan`](https://github.com/20niship/mlx_vulkan)) also targets macOS through MoltenVK, but **macOS has not been verified for this repository yet** (camera features there are also unverified).
+- **Almost no dependencies.** The C++ core needs only the Vulkan loader/headers, `glslangValidator` (shaders are compiled at first use), and MuJoCo (for MJCF parsing and the CPU reference). No CUDA toolkit, no Python required for the C/C++ libraries, no ML framework. Python bindings add nanobind; training adds PyTorch + rsl_rl. Everything else (VMA, doctest) is fetched by CMake.
+- **Faster than Isaac Lab and Genesis.** Go2 `env.step` on an RTX 3060: 3.4x Isaac Lab and 1.6x Genesis at 4096 envs (409K vs 120K / 252K env-steps/s), 1.7x Genesis at 16384 envs, ahead of Isaac Lab at every measured size; with a camera on every env 4.1x Genesis and up to 2.7x Isaac Lab TiledCamera (see Highlights for conditions). Caveats: Isaac Lab / Genesis are earlier single measurements (not re-run in the same session); Genesis measures a bare `scene.step()`; at 256 envs we are only on par with Genesis (63K vs 60K).
+- **Built for RL throughput.** Hundreds of thousands of env-steps/s on a mid-range GPU, batched cameras, observations/rewards computed on the training device, one device-to-host transfer per step.
 
-### Training benchmarks (Gymnasium Humanoid-v5, 8192 envs, 32M steps)
+## Highlights (RTX 3060 12 GB unless noted)
 
-| Backend state | Best AvgR | Avg SPS | Wall time | Notes |
-|---------------|-----------|---------|-----------|-------|
-| Phase 1e (pre-conformance) | 5,678 | 70K | 454s | Tendons silently ignored; unrealistic leg dynamics |
-| **Full conformance** | **1,102** | **73K** | **439s** | Hip-knee tendon coupling active; physically correct |
+Unitree Go2, flat ground, dt 0.005 x 4 substeps, `env.step` with observations and rewards, `device=cuda`:
 
-The Phase 1e result was inflated by missing tendon constraints -- the gymnasium humanoid XML has 2 fixed tendons coupling hip and knee joints, which were not implemented in the vmap path at Phase 1e. With tendons active, the humanoid must learn a more realistic gait. The conformance result (1,102) is still 2.4x the MuJoCo C baseline (451 @ 8M steps). Reward was still climbing at 32M steps.
+| Envs | This repo (default) | This repo (fast mode) | Isaac Lab | Genesis |
+|---|---|---|---|---|
+| 4,096 | 409K | **480K** | ~120K | ~252K |
+| 16,384 | 526K | **649K** | - | ~313K |
 
-Reproduce benchmarks (requires [MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX) Python package):
+env-steps/s. Fast mode is `self_collision=False, max_condim=3` (what Isaac Lab/Genesis use); the default keeps the exact model. Isaac Lab / Genesis values are earlier single measurements and not re-run in the same session; Genesis measures a bare `scene.step()` while ours includes observation and reward. Details and caveats: [Detailed performance log](#detailed-performance-log).
+
+Camera RL step (physics x4 substeps + render + RGB/depth as CUDA tensors, 1 camera/env, 64 px, 4096 envs, front view): **337,618 env-steps/s** (Genesis past value: 82,900). Third-person orbit view (whole robot visible): 124,415.
+
+**Performance charts**
+
+![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
+
+![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
+
+![camera vs Isaac](https://github.com/user-attachments/assets/cac72f15-a227-49ae-a040-4c669b0d8ed4)
+
+![history](https://github.com/user-attachments/assets/e5522b76-834a-4d85-85ac-344f9079f0be)
+
+Media for this README and the project page (training videos, CPU vs GPU comparison, camera views) is **not stored in the repository**; it is attached on GitHub and referenced by URL.
+
+https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
+
+*CPU (MuJoCo C, left) vs GPU (right) for piper / openarm / go2 / g1, produced by `just check-video-export`. Arms agree; legged robots diverge after landing because contact solutions are chaotic, so we compare single-step error instead (below).*
+
+## Build
+
+Requirements: a Vulkan driver (NVIDIA tested; lavapipe `mesa-vulkan-drivers` is used in CI and needs no GPU), the Vulkan headers/loader and `glslangValidator` (`libvulkan-dev glslang-tools` on Debian/Ubuntu), CMake >= 3.25, a C++20 compiler, and MuJoCo (`pip install mujoco`, found automatically, or `-DMUJOCO_ROOT=...`). [just](https://github.com/casey/just) and [uv](https://github.com/astral-sh/uv) are optional conveniences used by the recipes below. Runtime link dependencies of `libmjmlx`: `libvulkan` and `libmujoco` only. macOS via MoltenVK is untested.
 
 ```bash
-python examples/train_humanoid.py --gpu-ceiling   # ~73K SPS (GPU+vmap, 8192 envs)
-python examples/train_humanoid.py --cpu-ceiling   # ~29K SPS (dispatch_apply thread pool, 252 envs)
+git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp
+cd MuJoCo-MLX-Cpp
+just build                      # libmjmlx + libmjb + tests/benchmarks (Release) into build/
+just build-python               # also builds the nanobind extension (_mjmlx_rl_native)
 ```
 
-The CPU ceiling uses `dispatch_apply` over N `mjData*` instances (the same C MuJoCo physics as float64). This is ~2x faster than Python multiprocessing (`AsyncVectorEnv`) by eliminating IPC overhead.
+Equivalent raw CMake: `cmake -B build -DCMAKE_BUILD_TYPE=Release -DMJMLX_BUILD_PYTHON=ON && cmake --build build -j`.
 
-SPS parity maintained via comprehensive zero-eval caching across two optimization passes:
-1. **Tendon cache** -- constant Jacobian, scatter matrix, actuator masks precomputed at load time
-2. **Full vmap cache** -- tree scatter matrices (smooth_vmap), DOF friction/joint limit/tendon constraint/contact invweight/equality constraint data (constraint_vmap) all precomputed in `ModelCache`
+CMake options: `MJMLX_BUILD_TESTS`, `MJMLX_BUILD_BENCHMARKS`, `MJMLX_BUILD_EXAMPLES`, `MJMLX_BUILD_PYTHON` (default OFF), `MJMLX_BUILD_CAMERA` (default ON; OFF turns `mjmlx_camera_*` into stubs).
 
-The entire vmap pipeline (smooth, constraint, solver, forward) is zero `mx::eval()`, zero `.data<>()`, zero CPU-GPU sync.
-
-### Self-contained PPO example (HalfCheetah-v4, this repo only)
-
-`scripts/train_ppo.py` trains PPO (stable-baselines3) on Gymnasium's `HalfCheetah-v4` MJCF (`half_cheetah.xml`) using this repo's own batched physics as the vector env (`scripts/mjmlx_halfcheetah_vec_env.py` replicates HalfCheetah-v4's reward/observation/reset-noise/episode-length exactly, for comparability with published baselines), via a small numpy-facing nanobind module (`python/rl_bindings.cpp`) rather than the `mlx.core`-sharing bindings in `python/bindings.cpp` (see that file's header comment for why).
-
-Measured on Apple M-series (2048 envs, PPO throughput including gradient updates):
-
-| Backend | env-steps/sec |
-|---|---|
-| MKX (Vulkan) | 55,000 - 150,000 |
-| MKX (Vulkan) | 18,000 - 26,000 |
+Fetch robot models (mesh MJCFs for piper/openarm/go2/g1/h1, git-ignored):
 
 ```bash
-just build-python && just train-ppo --envs 2048 --timesteps 2000000                          # MLX
-just build-python-mkx && just train-ppo --envs 2048 --timesteps 2000000 --build-dir build-mkx  # MKX
+just fetch-models
 ```
 
-TensorBoard: `uv run tensorboard --logdir runs/`
-
-### Go2階段地形cmd_vel追従学習(`scripts/train_go2_ppo.py`)
-
-Unitree Go2を階段状のBox地形(高さ3〜5cm、奥行き20〜50cmの段)の上でcmd_vel(vx, vy, vyaw)追従させるPPO学習。観測・報酬・PPOハイパーパラメータ・ネットワーク構成・ドメインランダマイズは[IsaacLabのUnitreeGo2RoughEnvCfg / UnitreeGo2RoughPPORunnerCfg](https://github.com/isaac-sim/IsaacLab)を踏襲し、学習ライブラリもIsaacLabと同じ[rsl_rl](https://github.com/leggedrobotics/rsl_rl)を使う(SB3は使わない)。
-
-依存パッケージ(`go2`/`build` dependency groupに定義済み):
+## Train Go2 (PPO, rsl_rl)
 
 ```bash
 uv sync --group build --group go2
-```
 
-ビルド(Python拡張、Go2モデルのメッシュ取得込み):
+# flat ground, Isaac Lab (UnitreeGo2FlatEnvCfg)-style rewards, PPO update on CUDA
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/train_go2_ppo.py --build-dir build \
+  --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
 
-```bash
-# macOS (MLX/Metal backend)
-cmake -B build -DMJMLX_BUILD_PYTHON=ON
-cmake --build build --target _mjmlx_rl_native -j
+# stairs terrain (default), checkpoints every 50 iterations under --logdir
+uv run python scripts/train_go2_ppo.py --build-dir build --envs 2048 --logdir runs/go2_stairs
 
-# Linux (MKX/Vulkan backend, 例: NVIDIA GPU機)
-cmake -B build-mkx -DMJMLX_TENSOR_BACKEND=MKX -DCMAKE_BUILD_TYPE=Release -DMJMLX_BUILD_PYTHON=ON
-cmake --build build-mkx --target _mjmlx_rl_native -j
-
-# unitree_go2のメッシュ/XML(gitignore対象、初回のみ)を取得
-uv run python3 -c "from pathlib import Path; import sys; sys.path.insert(0,'scripts'); from bench_check import fetch_models; fetch_models(Path('benchmarks/models/external'))"
-```
-
-学習実行:
-
-```bash
-uv run python scripts/train_go2_ppo.py --build-dir build-mkx --envs 2048 --max-iterations 1500 --logdir runs/go2_stairs
-# macOSでMLX backendを使う場合は --build-dir build (デフォルト)
-# GPU無し/デバッグ用途なら --cpu を付ける
-```
-
-チェックポイントは`--logdir`配下に`save_interval`(既定50)イテレーションごとに`model_{iteration}.pt`として自動保存される(rsl_rlの`OnPolicyRunner`が管理、学習終了時にも最終モデルを保存)。
-
-学習ログはTensorBoardで確認する:
-
-```bash
-tensorboard --logdir runs/go2_stairs --host 0.0.0.0 --port 6006
-```
-
-#### 平地での学習・推論・Isaac Lab準拠の報酬(Linux / MKX Vulkan)
-
-```bash
-# 階段なしの平地 + Isaac Lab(UnitreeGo2FlatEnvCfg)準拠の報酬、PPO更新もGPU(CUDA)で回す
-PYTHONPATH=<cu126等のtorch> uv run python scripts/train_go2_ppo.py --build-dir build --flat \
-  --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
-
-# 学習済みモデルで前後左右のcmd_velを与え、2x2タイル動画(runs/video/*.mp4)と追従誤差を出す
+# roll out the trained policy with forward/back/left/right commands -> tiled mp4 in runs/video/
 uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
+
+tensorboard --logdir runs/
 ```
 
-- `--reward-preset`: `relaxed`(罰則を弱めた従来設定)/ `isaac_flat`(Isaac Lab準拠: `flat_orientation_l2`・`feet_air_time`など)
-- `--device cuda`: ドライバに合うCUDA版torchが要る(例: ドライバ12.7なら `torch+cu126`)。CPUのままでも動くがPPO更新が約17秒/iter遅い
-- `MJMLX_GO2_INTEGRATOR=implicitfast`: PDアクチュエータを陰的に扱う(既定はXMLのまま=陽的)
+Useful flags: `--reward-preset {relaxed,isaac_flat}`, `--device cuda`, `--no-self-collision --max-condim 3` (fast mode), `--use-sensors` (observations via the batched IMU / contact sensors), `--cpu` (MuJoCo C instead of the GPU engine). `MJMLX_GO2_INTEGRATOR=implicitfast` integrates PD actuators implicitly.
 
-エンジンの制約により、IsaacLab版から以下を省略・簡略化している:
-- **height_scanner観測**: 本エンジンにレイキャストAPIが無いため、盲目(proprioception only)方策になる
-- **per-envの物理DR(質量/摩擦/COM)**: batched simが全envで単一モデルを共有するため、env別に質量・摩擦を変えるAPIが無い
-- **地形カリキュラム**: 実装対象外(固定難度の階段地形のみ)
-- **heading_command方式のcmd_vel生成**: `||cmd_vel|| ∈ [--cmd-vel-min, --cmd-vel-max]`の直接サンプリングに簡略化
+Simplifications versus Isaac Lab: no height scanner (blind policy), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
 
-## Performance measurement(学習速度・CPU/GPU差・Isaac Labとの比較)
+Trained policy rollout (Go2, flat ground, `isaac_flat` preset, 500 iterations, commands forward/back/left/right at 0.5 m/s; the policy tracks back/left/right but stays still for forward, so this is a work in progress):
 
-事前に別プロセス(ollama等)がGPU/CPUを使っていないか確認する(各段の時間が2〜3倍ぶれる)。以降のスクリプトは `--build-dir`(既定 `build`)でPython拡張のビルド先を指す。
+https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
 
-### 1. Go2のenv.step速度(4096 env)
-```bash
-uv run python scripts/bench_go2_step.py --build-dir build --envs 4096     # 平均/最小[ms]とenv-steps/s
-MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build --steps 40   # 段(kin/forward/collision/solver/cfrc/euler)ごとの.build/.eval[ms/substep]
-scripts/prof_min.sh build 5                                              # 上を複数回回し、段ごとの最小値を出す(ぶれ対策)
+A self-contained HalfCheetah-v4 PPO example (stable-baselines3) is in `scripts/train_ppo.py` (`just train-ppo`).
+
+## Simulation simplification options (load time)
+
+The MJCF is not modified; the in-memory model is overridden before compilation, only for articulated bodies (terrain is untouched). Defaults are exact MuJoCo behaviour.
+
+| Option | Effect | Cost |
+|---|---|---|
+| `self_collision=False` | robot geoms do not collide with each other (`conaffinity=0`); Go2 pairs 233 -> 23 | self-contact disappears |
+| `max_condim=3` | drops torsional/rolling friction of the feet (10 -> 4 constraint rows per contact) | slight change in foot slipping/spinning |
+
+```c
+MjmlxModelOptions opt = mjmlx_default_model_options();   // {self_collision=1, max_condim=0}
+opt.self_collision = 0; opt.max_condim = 3;
+MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);
 ```
-`--build-dir` を別コミットのビルドにすれば前後比較できる。`MJMLX_TG_<KERNEL>`(KIN/FWD/COLL)でスレッド数、`MJMLX_SOLVER_SHARED=0`・`MKX_DEVICE_LOCAL=0`で最適化を無効にして効果を切り分けられる。
+```python
+model = native.load_model(path, self_collision=False, max_condim=3)
+env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)
+```
 
-### 2. 学習1 iterationの時間(Isaac Labと比較)
-`train_go2_ppo.py` のログの `Iteration time` / `Collection time` が1 iteration(4096 env × 24 step)の時間。Isaac Labは別環境(Python 3.11)に入れて同じ条件で測る:
+Go2 4096 / 16384 envs, env-steps/s: default 409K / 528K; `max_condim=3` 468K / 639K; both options 481K / 648K.
+
+## Camera sensor (Vulkan, batched GPU sim only)
+
+`<camera>` / `<light>` / geom rgba from the MJCF; Phong shading, RGB + depth, hfield and 2D textures (plane/box/hfield), spatial tendons drawn as cylinders. GPU-side frustum culling and LOD (mesh vertex clustering, `MJMLX_CAM_LOD_K`), one `vkCmdDrawIndexedIndirect` for all envs and cameras.
+
+```python
+cam = native.create_camera(sim, 128, 128)       # sim from create_batched(use_gpu=True)
+cam.render()
+rgb, depth = cam.rgb(), cam.depth()             # (num_envs, ncam, H, W, 3) uint8 / (..., H, W) float32 [m]
+
+from mjmlx_camera_cuda import CudaCamera        # Vulkan -> CUDA external-memory interop (Linux)
+gcam = CudaCamera.try_create(cam)               # None if unsupported -> fall back to the CPU readback above
+cam.render(); rgba, depth = gcam.read()         # CUDA tensors, no CPU copy
+```
+
+Not supported: shadows, translucency, lights attached to moving bodies, trackcom (approximated by the body origin). Interop needs Linux + `VK_KHR_external_memory_fd` + CUDA torch; set `MKX_VULKAN_DEVICE_INDEX` to match the CUDA device on multi-GPU hosts. Camera needs a graphics+compute queue, `multiDrawIndirect`, `drawIndirectFirstInstance`, `shaderClipDistance` (only `create_camera` fails otherwise). Examples: `scripts/example_go2_camera.py`, comparison with MuJoCo's renderer: `scripts/compare_camera_mujoco.py`, speed: `scripts/bench_camera*.py`.
+
+## Benchmarks and comparisons
+
+Check that nothing else (ollama, desktop compositing, other GPU jobs) is using the GPU; it changes timings by 2x. Compare commits/settings **alternately within one session**, not across days.
+
 ```bash
-uv venv --python 3.11 ~/isaac/.venv && source ~/isaac/.venv/bin/activate   # python は別名の場合があるので .venv/bin/python を直接使う
+uv run python scripts/bench_go2_step.py --build-dir build --envs 4096        # env.step speed
+MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build       # per-stage GPU/host time
+uv run python scripts/bench_physics_vs_others.py ...                         # this repo / Isaac Lab / Genesis
+uv run python scripts/bench_camera_vs_isaac.py --build-dir build             # camera vs Isaac Lab TiledCamera
+PYTHONPATH=<torch-cu126> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
+uv run python scripts/compare_cpu_gpu_go2.py --build-dir build               # 1-step difference vs MuJoCo C
+just check-video-export                                                      # CPU|GPU tiled comparison video
+just bench                                                                   # regression check against benchmarks/baseline.csv
+```
+
+Go2 1-control-step difference from MuJoCo C (joint angles): mean 3.6e-5 rad, p95 8e-7 rad (default); mean 1.4e-5 rad with `--max-condim 3` applied to both sides. Isaac Lab setup and the full measurement log (what each optimization bought, regressions, GPU clock effects): [Detailed performance log](#detailed-performance-log).
+
+## Detailed performance log
+
+Provisional values, RTX 3060 12 GB unless noted. The original Japanese log with every table is in [README_JA.md](README_JA.md#性能測定ログ詳細). Compare **within one session, alternating** runs; the GPU clock state changes results by up to 2x.
+
+### Isaac Lab setup (for the comparison)
+
+```bash
+uv venv --python 3.11 ~/isaac/.venv && source ~/isaac/.venv/bin/activate
 uv pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
 git clone --depth 1 --branch v2.3.2 https://github.com/isaac-sim/IsaacLab.git ~/isaac/IsaacLab && cd ~/isaac/IsaacLab
-uv pip install "setuptools<81" wheel && uv pip install --no-build-isolation flatdict==4.0.1   # isaaclab.sh --install がflatdictのビルドで失敗するため先に入れる
+uv pip install "setuptools<81" wheel && uv pip install --no-build-isolation flatdict==4.0.1   # install first: isaaclab.sh --install fails building flatdict
 ./isaaclab.sh --install rsl_rl
 OMNI_KIT_ACCEPT_EULA=YES ~/isaac/.venv/bin/python scripts/reinforcement_learning/rsl_rl/train.py \
-  --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless --max_iterations 20   # ログの Computation / collection / learning を見る
-```
-RTX 3060(12 GB)での実測は `docs/wip_isaac_comparison.md`(本リポジトリ約1.3 s/iter、Isaac Lab約2.2 s/iter)。
-
-### 3. CPU(MuJoCo C)とGPUの物理の差
-```bash
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
-just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
+  --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless --max_iterations 20
 ```
 
-#### CPU(MuJoCo C)とGPU(MKX/Vulkan)の比較動画
+On the RTX 3060: this repo ~1.3 s/iteration vs Isaac Lab ~2.2 s/iteration (4096 envs x 24 steps, measured earlier).
 
-`just check-video-export` が生成する、piper / openarm / go2 / g1 の4ロボットを左CPU・右GPUで並べたタイル動画(3秒)。
+### Go2 physics step history (4096 envs, dt 0.005 x 4, env-steps/s, each commit built and measured)
 
-https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
+| Commit | Change | env-steps/s |
+|---|---|---|
+| b0a2367 | start of PR #33 | 7,200 |
+| 087ef1c | dt aligned to Isaac (4 substeps) | 22,500 |
+| a829b7c | solver in shared memory | 32,000 |
+| 15faba3 | contact Jacobian in local arrays (solver ~2x) | 51,000 |
+| 4d35636 | buffers in VRAM | 93,000-107,000 |
+| 87bfbf9 | stricter solver convergence (SI=16, GTOL=1e-10, CG=30) | 77,000-83,000 |
+| 8da6ee2 | main after PR #40 | 86,000-89,000 |
 
-動画はリポジトリには含めない(サイズが大きいため)。上のコマンドで `runs/video/compare.mp4` に生成される。arm2種はCPUとGPUが一致し、go2/g1は着地後に接触解の差で軌道が分かれる。
-長い軌道の比較は接触でカオス的に増幅されるので、1 stepの差で評価する。
+The regression after VRAM residency was the stricter solver settings (10-15%); sensor and camera PRs were within noise (+-10%). Much of the earlier "57k -> 53k" jitter was GPU contention and clock state.
 
-### 4. カメラ描画速度(Isaac Lab TiledCameraと比較)
-```bash
-uv run python scripts/bench_camera_vs_isaac.py --build-dir build            # 両方測ってJSON(runs/camera_vs_isaac.json)と表を出す
-uv run python scripts/bench_camera_vs_isaac.py --only mjmlx --envs 256 --sizes 64   # こちらだけ
-```
-Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセス、RTX機能を全て切り、Go2平地env、TiledCamera 1台/env、rgb+distance_to_camera)を子プロセスで呼ぶ。RTX 3060 12GB、Go2、1カメラ/env、env-frames/s(描画のみ)と env-steps/s(物理4substep+描画1回):
+### Bottlenecks (4096 envs)
 
-| envs | px | mjmlx 描画のみ(GPU) 旧→新 | mjmlx 描画+CPU読出 旧→新 | Isaac 描画のみ | mjmlx 物理+描画 旧→新 | Isaac 物理+描画 |
-|---|---|---|---|---|---|---|
-| 64 | 64 | 1,718 → **40,630** | 1,531 → **27,520** | 3,298 | 1,161 → **4,180** | 2,238 |
-| 64 | 128 | 1,708 → **17,206** | 1,190 → **10,595** | 1,557 | 960 → **3,563** | 1,179 |
-| 256 | 64 | 1,960 → **50,956** | 1,762 → **34,094** | 5,490 | 1,390 → **10,972** | 4,133 |
-| 256 | 128 | 1,898 → **18,567** | 1,090 → **9,367** | 2,427 | 1,010 → **6,196** | 2,240 |
-| 1024 | 64 | 2,763 → **53,466** | 1,737 → **31,618** | 7,924 | 1,499 → **17,604** | 7,278 |
-| 1024 | 128 | 2,794 → **18,832** | 1,214 → **8,816** | skip | 1,138 → **7,363** | skip |
-| 4096 | 64 | 3,882 → **55,908** | 1,949 → **29,512** | skip | 1,797 → **19,608** | skip |
-| 4096 | 128 | 3,867 → **22,578** | 1,397 → **8,631** | skip | 1,319 → **7,423** | skip |
+- ~78% of GPU time was the solver; kinematics/forward/collision/Euler together ~0.9 ms per substep.
+- Read-back: the staging memory was uncached host memory (~200 MB/s); reading `cfrc_ext` (1.4 MB) took ~8 ms. `HOST_CACHED` staging brought it to 0.85 ms (`env.step` 48 -> 34 ms).
+- Host: graph build ~0.6 ms/substep, numpy ~3.5 ms/step. Newton iterations ~3 on average; CG often hit its 30-iteration cap.
 
-注記(条件差): Isaacの出力はGPUテンソルのまま(CPU読出なし)、こちらの「描画のみ」もGPU上まで、「描画+読出」はrgb+depthをnumpyへ。Isaacの物理+描画は`env.step`全体(観測・報酬・イベントを含む)、こちらは`MjmlxGo2Env.step`(報酬含む)。Isaacは物理dt 0.005 x4、こちらも同じ。カメラ位置/画角(水平47.5度)は揃えたが、近遠面・照明・シェーディングは異なる(こちらはPhongのみ、Isaacは最小設定のRTX)。Isaacの1024x128と4096は1800sのタイムアウトで未完(原因は未調査。VRAM不足と断定はできない)。旧はGPU上のフラスタム/LODカリング導入前(Go2のvisual meshが約40万三角形/envありジオメトリ律速で、64pxでIsaacの0.35〜0.52倍)、新は導入後(1ドローのまま、GPU上のcompute passで(env,cam,geom)毎にフラスタム球カリングとLOD選択、メッシュは頂点クラスタリングで1/4,1/16,1/64に簡略化)。この比較のカメラはIsaacと同じ前方視点でロボット自身はほぼ写らない。ロボット全体が写る三人称カメラ(`--camera orbit`)では 1024env 64px で 描画のみ 30,072、物理+描画 14,421 env-frames(steps)/s。LODの強さは環境変数 `MJMLX_CAM_LOD_K`(既定は高さ128px未満で16、128px以上で4、0でLOD無効)で変えられる。
+### What each optimization bought
 
+| Change | Effect |
+|---|---|
+| gather the read-back into one buffer / one transfer (`set_pack_spec/read_pack`) | ~82k -> 112k |
+| Newton direction by shared-memory Cholesky instead of CG (`MJMLX_SOLVER_CG=1` for the old behaviour) | 112k -> 150k (solver 6.9 -> 3.4 ms) |
+| merge equal-height terrain segments into one box (flat: 23 -> 1 box, pairs 739 -> 233) | collision ~4x |
+| `step(ctrl, n)`: one ctrl transfer per step | 6 fewer waits/step |
+| forward scratch in local arrays | forward 527 -> 300 us |
+| early exit on Newton decrease (`MJMLX_NTOL`, 1e-4) | solver 3.47 -> 2.25 ms |
+| line-search cut-off, symmetric H assembly, independent J^T f accumulators, shared-memory shrink (rows 96 -> 72) | solver 2300 -> 1620 us |
+| Euler straight from solver `qacc` (`MJMLX_EULER_EXACT=1` for the old path) | euler 390 -> 49 us |
+| collision pair table baked into the shader | collision 111 -> 70 us |
+| observation/reward in torch on the training device (+`torch.compile`) | 1.0-1.23x, more at large env counts |
+| no per-substep `cfrc_ext` zero allocation, `read_pack_into` into pinned memory | 12.2 -> 9.3 ms (4096 envs) |
+| fast mode `self_collision=False, max_condim=3` | +15-23% |
 
-#### カメラあり強化学習の1 step(物理4substep + 描画 + RGB/depthがGPU上のtorchテンソルとして使える状態まで)
+Same-session alternating comparisons (env-steps/s): PR #42 -> solver PR: 112.6k -> 149.3k (1.33x); -> host-side cleanups: 156k -> 192k at 4096 envs, 176k -> 210k at 16384; torch obs/reward at `device=cuda`: 308k -> 312k (4096), 348k -> 427k (16384); host overhead PR: 319k -> 410k (4096, 1.28x) and 433k -> 526k (16384), 480k / 649k in fast mode.
 
-```bash
-PYTHONPATH=/path/to/torch-cu126 uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128   # 前方視点(ロボットはほぼ写らない)
-PYTHONPATH=/path/to/torch-cu126 uv run python scripts/bench_camera_rl.py --camera orbit ...                                       # 三人称視点(ロボット全体が写る、約40万三角形/env)
-```
+**GPU clock matters.** Without a CUDA context the SM clock stays near 550 MHz under pure Vulkan compute; with `device=cuda` (as in training) torch activity raises it to ~1140-1840 MHz, so the same code is 1.5-1.6x faster (4096 envs: 195k on cpu device vs 308k on cuda). Compare against Genesis (which runs on CUDA) only with `device=cuda`.
 
-RTX 3060、Go2平地、**全envで丁度1カメラ**(モデル同梱の`track`を置換。上の`bench_camera_vs_isaac.py`の置換は`track`を残すので、現在のmenagerieのモデルでは mjmlx だけ2カメラ/envを描いており、上の表のmjmlx列は同条件ではない)、RGB+depth、torchは`device=cuda`、SMクロックは全計測で1837MHz、計測前に他のGPUジョブが無いことを確認(util 0%)。cpu/gpu経路を別プロセスで**交互に3回**走らせて中央値(プロセス内でも2ラウンドの中央値)。env-steps/s。mjmlxのみ計測(Genesisは過去値)。
+Remaining gap/ideas: the solver is ~60-75% of GPU time and is bound by shared-memory instruction count (18 threads/env; 32 threads/env or sparse unit rows for friction loss/limits are worth ~10% each); small env counts are dominated by host graph build and ~22 serial dispatches per substep.
 
-- 旧: 描画後にRGB/depthをCPUへ読み出し(numpy)、`torch.from_numpy(...).to('cuda')`でアップロード。
-- 新: Vulkan->CUDA external memory interop(`scripts/mjmlx_camera_cuda.py`)で、描画結果をGPU上のまま`cuda`テンソルとして使う。
+### Camera-in-the-loop RL (Go2 flat, exactly 1 camera/env, RGB+depth, `device=cuda`, SM clock 1837 MHz, median of 3 alternating runs)
 
-前方視点(`--camera front`):
+Front view, env-steps/s: old path = render, read RGB/depth to CPU, upload to CUDA; new = Vulkan->CUDA interop.
 
-| envs | px | 物理のみ | 描画のみ(env-frames/s) | 旧: 物理+描画+CPU読出+upload | **新: interop** | 新/旧 | Genesis(過去値) | 新/Genesis |
+| envs | px | physics only | render only (env-frames/s) | old | **new (interop)** | new/old | Genesis (past) | new/Genesis |
 |---|---|---|---|---|---|---|---|---|
 | 64 | 64 | 29,993 | 296,503 | 21,091 | **24,273** | 1.15x | 10,400 | 2.3x |
 | 256 | 64 | 102,601 | 849,761 | 55,566 | **76,307** | 1.37x | 32,100 | 2.4x |
 | 1024 | 64 | 269,492 | 1,698,282 | 91,594 | **199,027** | 2.17x | 64,400 | 3.1x |
 | 4096 | 64 | 456,442 | 2,112,591 | 76,654 | **337,618** | 4.40x | 82,900 | 4.1x |
-| 64 | 128 | 30,658 | 257,009 | 16,241 | **23,082** | 1.42x | 10,300 | 2.2x |
-| 256 | 128 | 95,593 | 654,376 | 27,764 | **69,929** | 2.52x | 29,100 | 2.4x |
-| 1024 | 128 | 258,027 | 1,145,990 | 22,431 | **174,913** | 7.80x | 52,400 | 3.3x |
 | 4096 | 128 | 473,909 | 1,285,141 | 21,983 | **273,812** | 12.5x | 66,100 | 4.1x |
 
-三人称視点(`--camera orbit`、ロボット全体が写る重い場合)。128pxの「旧」はLOD係数も旧既定(K=16)、「新」は解像度別の既定(後述):
+Third-person orbit view (whole robot visible, ~400K triangles/env): 64 px / 4096 envs 124,415 (Genesis 82,900, 1.5x); 128 px / 4096 envs 113,679 (7.0x vs old, 1.7x vs Genesis). Contributions at orbit 128 px / 4096 envs: old 16,239; + LOD K=4 20,093; + interop 50,218; both 113,679.
 
-| envs | px | 物理のみ | 描画のみ(env-frames/s) | 旧: CPU読出+upload | **新: interop(+128pxはLOD K=4)** | 新/旧 | Genesis(過去値) | 新/Genesis |
-|---|---|---|---|---|---|---|---|---|
-| 64 | 64 | 29,719 | 110,413 | 17,715 | **21,250** | 1.20x | 10,400 | 2.0x |
-| 256 | 64 | 99,535 | 157,113 | 43,489 | **53,839** | 1.24x | 32,100 | 1.7x |
-| 1024 | 64 | 269,572 | 175,600 | 61,517 | **98,292** | 1.60x | 64,400 | 1.5x |
-| 4096 | 64 | 468,667 | 179,121 | 55,447 | **124,415** | 2.24x | 82,900 | 1.5x |
-| 64 | 128 | 30,264 | 108,247 | 12,169 | **20,873** | 1.71x | 10,300 | 2.0x |
-| 256 | 128 | 99,612 | 149,680 | 19,085 | **51,695** | 2.71x | 29,100 | 1.8x |
-| 1024 | 128 | 267,239 | 166,360 | 16,132 | **91,333** | 5.66x | 52,400 | 1.7x |
-| 4096 | 128 | 463,801 | 169,719 | 16,239 | **113,679** | 7.00x | 66,100 | 1.7x |
+Against Isaac Lab TiledCamera (physics x4 + render, 64 px): 64 envs 4,180 vs 2,238; 256 envs 10,972 vs 4,133; 1024 envs 17,604 vs 7,278; 4096 envs 19,608 (Isaac timed out for 1024x128 and 4096). Camera placement and FOV match; shading and clip planes differ (Phong vs minimal RTX). The old numbers (before GPU frustum/LOD culling) were 0.35-0.52x of Isaac at 64 px.
 
-施策ごとの寄与(三人称128px、4096env、env-steps/s):
+Bottleneck at 4096 envs, per step (ms): physics 9.0; render 2.0 (front 64 px) / 23-25 (orbit), about half of that vertex processing; old CPU read-back of RGB+depth + upload 34-148 ms (dominant, removed by interop); pack pass 0.5-1.8; tensor handoff 0.01.
 
-| 構成 | env-steps/s |
-|---|---|
-| 旧(CPU読出+upload、LOD K=16) | 16,239 |
-| + LOD既定をK=4に(CPU読出のまま) | 20,093 |
-| + CUDA interop(LOD K=16のまま) | 50,218 |
-| + interop + LOD K=4(新) | **113,679** |
+LOD default: `MJMLX_CAM_LOD_K` = 16 below 128 px height, 4 at >= 128 px. Versus MuJoCo's renderer (third person, 16 envs): 64 px K=16 IoU 0.960, depth error 28.2/75.2 mm (mean/p95); 128 px K=4 IoU 0.965, 14.9/37.9 mm (similar to 64 px K=16, 3x faster); 64 px K=4 drops to IoU 0.899, so it is not the default.
 
-Genesisの値は過去の計測(BatchRenderer(Madrona)、GPUテンソル出力)で、今回は再計測していない。GPU・カメラ位置・シーンの複雑さ・シェーディング・`env.step`に含まれる処理(mjmlxは`MjmlxGo2Env.step`の報酬込み)が揃っている保証はない。
+Not done (measured to be pointless or unjustified): reusing physics kinematics for rendering (0.2-0.3 ms saved), async physics/render pipeline (one queue, both GPU-bound; at most the 2 ms render share). Next: meshlet culling, back-face culling, Hi-Z occlusion. Interop is Linux + `VK_KHR_external_memory_fd` + CUDA only (sync via `vkQueueWaitIdle`).
 
-ボトルネック(4096env、1 step、ms):
-
-| | 前方64px | 三人称64px | 三人称128px |
-|---|---|---|---|
-| 物理step | 9.0 | 8.7 | 9.0 |
-| 描画(GPU) | 2.0 | 23.0 | 24.8 |
-| (うち頂点処理のみ。`MJMLX_CAM_EXP=discard`) | - | 12.7 | 14.0 |
-| 旧: RGB読出(numpy) | 13.9 | 13.8 | 51.5 |
-| 旧: depth読出(numpy) | 8.0 | 7.8 | 46.1 |
-| 旧: torchへアップロード(rgb+depth) | 12.1 | 12.7 | 50.8 |
-| 新: pack passの追加(render+pack - render) | 0.5 | 0.6 | 1.8 |
-| 新: テンソル取得 | 0.01 | 0.01 | 0.01 |
-
-- 旧経路は読み出し+アップロード(34〜148ms)が物理+描画(11〜35ms)を大きく上回り、そこが支配的だった。interopで消える。
-- 描画前の運動学の再実行(`s.kinematics(qpos)`)は4096envでも0.2〜0.3ms(初回のみ約94ms)。**施策(1)(物理出力の再利用)は効果が無いため実装しない**(物理stepの最終substepの運動学は1 substep前の姿勢なので、再利用すると姿勢も1 substepずれる)。
-- 物理と描画は同じ`VkQueue`で直列に走り、どちらもGPU律速(描画のGPU時間 + 物理のGPU時間 = 計測した1 step時間と一致)。**施策(3)(非同期パイプライン)** は同一キューでは重ならず、別キューにしても同じSMを取り合うので、重なっても短縮は描画分(前方64pxで1 step 11msのうち2.0ms)が上限で、観測遅延を生む割に見合わないため実装しない。
-- **施策(4)(ホスト側コスト)**: 描画は1 submit。ホスト側の固定費は小さく(上の運動学0.2〜0.3ms + submit)、64envは物理側が1 step 2.1ms(30k steps/s)で頭打ち。GPU計算量でなく固定オーバーヘッドと思われるが、原因は未調査。
-- 並べ替え(タイル画像->`(env,cam,H,W)`)は、初版の`vkCmdCopyImageToBuffer`(タイル数個の領域)が4096envで約4ms(描画より遅い)だったので、compute shader(`record_pack`)に置換して`render()`と同じsubmitに入れた。前方64px・4096envで 275,787 -> 337,618(本ブランチ内の単発計測と上の交互3回の中央値で、同一手順の比較ではない)。
-- **施策(5)(LOD)**: 解像度が高いほど同じLODでもシルエット誤差が小さいので、`height >= 128`の既定を`MJMLX_CAM_LOD_K=4`にした(64pxは従来の16)。MuJoCo標準レンダラ(`scripts/compare_camera_mujoco.py`、三人称、16env)との比較:
-
-| px | K | ロボットシルエットIoU | depth誤差 平均 / p95 | 描画のみ(4096env) |
-|---|---|---|---|---|
-| 64 | 16(既定) | 0.960 | 28.2 / 75.2 mm | 181k |
-| 64 | 4 | 0.899 | 30.2 / 77.4 mm | 424k |
-| 128 | 16(旧既定) | 0.989 | 13.9 / 37.2 mm | 60k |
-| 128 | 4(新既定) | 0.965 | 14.9 / 37.9 mm | 178k |
-
-128pxのK=4は64pxのK=16と同等のIoU(0.965 vs 0.960)なので採用し、64pxのK=4はIoUが落ちる(0.899)ので採用しなかった。品質を優先するなら`MJMLX_CAM_LOD_K=16`で従来に戻せる。
-
-未達・残り: Genesisの過去値は全構成で上回ったが、三人称視点では描画(約23ms/4096env)が1 stepの約7割を占める。頂点処理が約半分で、次の手はメッシュレットによる細かい単位のカリング・LODの更新、背面カリング、Hi-Zによるオクルージョンカリング。interopはLinux+VK_KHR_external_memory_fd+CUDAのみ(同期は`vkQueueWaitIdle`で、GPU間セマフォではない)。Vulkanのデバイスは`MKX_VULKAN_DEVICE_INDEX`、CUDAは既定のデバイス0を使うので、複数GPUでは揃える必要がある。mac(MoltenVK)では`VK_KHR_external_memory_fd`が無いため従来のCPU読み出しになる(実機未検証)。
-
-
-### 5. Go2物理stepの速度: 履歴の再検証・退行の原因・最適化(RTX 3060、Go2平地、dt 0.005 x decimation 4、ランダムaction、env-steps/s)
-
-測り方: `scripts/bench_physics_vs_others.py`(mjmlx/Isaac Lab/Genesis)、コミット間・設定間の比較は同一条件で**交互に複数回**走らせて平均/最小/最大を見る。GPUを他プロセス(デスクトップ描画など)が使うと全段が約2倍に遅くなり、実行ごとに50k〜110kとばらつく(旧記録の「約53k」はこの状態)ので、**絶対値ではなく同一セッション内の比**で比べる。
-
-**コミット別(4096 env、3〜6回の平均。各コミットを実際にビルドして `dt=0.005 x 4` に揃えて計測)**
-
-| コミット | 内容 | env-steps/s |
-|---|---|---|
-| b0a2367 | PR #33 開始 | 7,200 |
-| 087ef1c | dtをIsaacに合わせ4 substep | 22,500 |
-| a829b7c | solverの共有メモリ化 | 32,000 |
-| 15faba3 | 接触ヤコビをlocal配列(solver約2倍) | 51,000 |
-| 4d35636 | VRAM化(「Isaacの約1.7倍速い」の時点) | 93,000〜107,000 |
-| bb3b606 | 87bfbf9の直前 | 89,000〜97,000 |
-| 87bfbf9 | solver収束を厳しく(SI=16, GTOL=1e-10, CG=30) | 77,000〜83,000 |
-| 91965d9 / af6bd6c | sensor PR #38 | 87,000〜99,000 |
-| 8da6ee2 | 現main(PR #40) | 86,000〜89,000 |
-
-- 当時の高速化の記述は再現できた(4d35636は当時のIsaac Labより速い水準)。
-- 退行の主因は **87bfbf9 のsolver設定**(精度のための収束厳格化)。同一バイナリでSI/GTOL/CGだけ戻すと現main 68k → 80k(SI=8のみ)、GTOLのみ戻すと89k。約10〜15%。
-- sensor PR・camera PRの影響は計測のばらつき(±10%)内で、有意な退行は検出できなかった。
-- 以前の「57k→53k」のばらつきの多くはGPU競合・クロック状態による。
-
-**ボトルネック分析(4096 env、1制御step=4 substep)**
-
-- Vulkanのタイムスタンプで1 dispatchごとのGPU時間を測った(`extern/mlx_vulkan` に一時パッチ。案はPR本文)。GPU時間の約78%が solver 1本、残り(kin/forward/collision/euler)は合計でsubstepあたり約0.9ms。
-- 読み戻し: mlx_vulkanのステージングが非キャッシュのホストメモリで、readbackが約200MB/sしか出ない。`cfrc_ext`(1.4MB)の取得だけで約8ms、1 stepで読む3配列の合計は約11ms。`HOST_CACHED` を選ぶと cfrc 8.5→0.85ms、env.step 48→34ms(実測。サブモジュール側の修正案)。
-- ホスト側: グラフ構築は約0.6ms/substep、Pythonのnumpyは約3.5ms/step。
-- solverのCGは多くの状態で上限(30反復)まで回っていた。Newton反復は平均約3回。
-
-**最適化と効果(4096 env、交互5回平均。baseは現main)**
-
-| 変更 | 効果 |
-|---|---|
-| 読み戻しをGPUで1バッファに詰めて1回転送(`set_pack_spec/read_pack`)、リセット経路の読み戻し/書き込みを集約(出力はビット一致) | 約82k → 112k |
-| solverのNewton方向をCGから共有メモリ上のコレスキーへ(`MJMLX_SOLVER_CG=1`で従来) | 112k → 150k(solver 1回 6.9→3.4ms) |
-| 地形の同じ高さの区間を1 boxに統合(平地は23→1個、衝突ペア739→233) | collision約4分の1 |
-| `step(ctrl, n)`でctrl転送をstepあたり1回に | 転送待ち6回/step削減 |
-| forwardの作業領域をローカル配列に | forward 527→300us |
-| Newton減少量による早期終了(`MJMLX_NTOL`、既定1e-4) | solver 3.47→2.25ms。CPUとの1step差は不変(関節角 平均3.7e-5→4.3e-5 rad、p95 4.9e-6) |
-| (任意)`self_collision=False`(Isaac Lab/Genesisと同じ設定) | さらに約4% |
-
-**Before/After(同一セッション、GPU競合下の値)**
-
-| env数 | 変更前 | 変更後 | 変更後(self衝突なし) | Isaac Lab | Genesis |
-|---|---|---|---|---|---|
-| 256 | 16,455 | 35,712 | 38,382 | 16,615 | 59,705 |
-| 1024 | 38,141 | 78,914 | 80,956 | 57,738 | 154,430 |
-| 4096 | 53,413 | 112,293 | 117,336 | 120,091 | 252,518 |
-
-条件差: Genesisは観測・報酬なしの `scene.step()` x4、mjmlx/Isaacは観測・報酬込みの `env.step`。mjmlxはMuJoCo系の接触モデル(摩擦ピラミッドcondim 6)でGenesisより重い。
-**Genesisには未達**(256/1024/4096でそれぞれ約0.6/0.5/0.45倍)。残り: solverが依然GPU時間の大半(共有メモリ命令数が律速)、小envではホストのグラフ構築とsubstep内の約22 dispatchの直列レイテンシが支配的。次の手はsolverの行列組み立て(H=M+J^T D J)の対称利用とvec4共有メモリ読み、frictionloss/limit行を密Jから外す、kin/forward/collisionの融合、mlx_vulkanのHOST_CACHEDステージング。
-
-
-### 6. solver高速化(PR #42 の続き。値はすべて暫定値)
-
-Go2 4096 env の `env.step`(ランダムaction、dt 0.005 x 4)を、PR #42 時点(Before)と本ブランチ(After)で**同一セッションで交互に3回**測定(GPU使用率は計測前後で約10%、デスクトップ描画あり。実行間のばらつきは約±3%):
-
-| | 平均 | 最小 | 最大 |
-|---|---|---|---|
-| Before(#42) | 112,559 env-steps/s | 111,300 | 114,633 |
-| After(本ブランチ) | 149,338 env-steps/s | 143,902 | 152,159 |
-
-**平均 112.6k → 149.3k env-steps/s(1.33倍)**。同条件の追加7回交互計測(別セッション、GPU使用率8〜14%)でも After/Before = 1.30倍(256 env 1.22倍、1024 env 1.26倍)。Isaac Lab/Genesisは再計測しておらず、前節の過去値(Genesis 4096 env 約252k、Isaac Lab 約120k)のまま。Genesisには未達。
-
-最適化ごとの効果(Vulkanタイムスタンプで測った4096 envの1 dispatch時間。GPU競合下の値で、同一セッション内の比較):
-
-| 変更 | 効果 |
-|---|---|
-| 直線探索の二分法を導関数が十分小さければ打ち切る(`MJMLX_LSTOL`) | solver 2300 → 2060 us |
-| Hの対称組み立て・非アクティブ行の分岐除去 | → 1961 us |
-| J^T fを4本の独立累積に、グローバル読み込みをまとめて発行 | → 1866 us |
-| 共有メモリ削減(拘束行96→72、作業領域の重ね合わせ)で同時実行数を増やす | → 1620 us |
-| Eulerをsolverのqaccから直接積分(`MJMLX_EULER_EXACT=1`で従来) | euler 390 → 49 us |
-| collisionのペア表をシェーダ定数に焼き込み | collision 111 → 70 us |
-| packのトルクを二乗和/絶対値和に縮約、発散判定を簡略化 | 約+4% |
-
-分析: solverカーネルは18スレッド(1ワープ)/envのレイテンシ律速で、共有メモリを増やして同時実行数を下げると実行時間がほぼ比例して悪化した(12KB増で1.9倍)。そのため共有メモリの削減が効く。
-正しさ: `ctest -L correctness`(10件)・`-L models`(8件)全pass。`compare_cpu_gpu_go2.py` のCPUとの1step差は 平均3.6e-5 rad・p95 8e-7 rad(PR #42: 平均3.8e-5・p95 5e-6)で悪化なし。精度に影響する変更は、拘束行上限72(超過分の接触は落ちる。Go2は問題なし)、Euler直接積分(solverの収束許容 `MJMLX_NTOL` に依存)、直線探索の打ち切り(1e-3)。
-`gpu_vs_cpu_contact_stress` が外部のGPU高負荷時に1回だけ失敗(224秒)したが、再実行7回はすべて通過。
-残り: solverがGPU時間の約6割、forward/kinematicsが各1割。ホスト側(グラフ構築・numpy・readback)が小〜中env数では支配的で、mlx_vulkanのHOST_CACHEDステージング(mlx_vulkan PR #12)とグラフキャッシュが次の手。
-
-
-### 7. ホスト側の追加高速化とGenesisとの差(暫定値)
-
-mlx_vulkan PR #12(HOST_CACHEDステージング、未マージ)の参照への更新と、`env.step` のnumpy整理(行ごとの内積をeinsumに、重力投影を閉形式に、発散判定を1回に)。#44 に対して、同一セッション・交互3回(GPU使用率8〜31%のデスクトップ描画下、ランダムaction):
-
-| env数 | Before(#44)平均 | After平均(最小〜最大) | 倍率 | Genesis(同env数) |
-|---|---|---|---|---|
-| 4096 | 155,993 | 192,412(177,453〜202,668) | 1.23倍 | 約252k |
-| 16384 | 175,549 | 209,792(200,653〜215,589) | 1.19〜1.24倍 | 約313k |
-
-Genesisの8192/16384 envは各1回の測定(8192: 約288k、16384: 約313k)で、4096以下は前節の過去値。**Genesisには未達**(4096で約0.76倍、16384で約0.67倍)。Isaac Lab(4096で約120k)は上回る。
-Vulkanタイムスタンプによる16384 envの内訳: GPU 約36ms/step(solver 約72%、forward 約14%、kinematics 約6%、collision 約5%)、残りはホスト(readback・numpy)。大env数ではGPU時間そのもの(solverの共有メモリ命令数、forwardのローカルメモリ)が律速で、次の手はsolverのJから単位行(frictionloss/limit)を外す疎化、forward/kinematics/collisionの融合、env.stepの観測・報酬のGPU(torch)化。
-**この参照更新はmlx_vulkan #12 のマージ後に、mainのマージコミットへ更新するまでmainにマージしない。**
-
-
-### 8. 観測・報酬のtorch(GPU)化とGPUクロックの影響(暫定値)
-
-`env.step` の観測・報酬・終了判定を `device` 上のtorchで計算するようにした(ホストに残るのは物理への入出力とリセット/押しの乱数処理のみ。cpu deviceでは従来とobs 1.5e-7、reward 5e-7まで一致)。ランダムaction、同一セッション・交互3回、`device=cuda`(`PYTHONPATH=~/torch-cu126`、学習時と同じ条件)での平均 env-steps/s:
-
-| env数 | Before(main) | After | 倍率 | Genesis(過去値) |
-|---|---|---|---|---|
-| 256 | 67,515 | 63,297 | 0.94倍 | 約60k |
-| 1,024 | 173,874 | 192,823 | 1.11倍 | 約154k |
-| 4,096 | 307,812 | 311,661 | 1.01倍 | 約252k |
-| 16,384 | 348,304 | 426,645 | 1.23倍 | 約313k |
-
-小env数ではtorchの細かいカーネル起動が増えて僅かに遅く(256 envで0.94倍)、大env数ほど効く。Isaac Lab/Genesisは再計測しておらず過去値。
-
-**重要: 計測条件でGPUクロックが約2倍変わる。** CUDAコンテキストを持たないcpu deviceのベンチでは、Vulkan計算だけのGPU使用率が低くSMクロックが上がらない(計測中の平均SMクロック 約550MHz)。`device=cuda`(学習と同じ)ではtorchの活動でクロックが上がり(約1140MHz)、同じコードが約1.5〜1.6倍速い(4096 envで cpu device 195k → cuda device 308k)。GenesisはCUDA上で動くため、学習時の条件(cuda device)で比べるのが公平で、その条件ではGenesisの過去値を全env数で上回った(256 envはほぼ同等)。cpu deviceのベンチ値(前節まで)は低クロック状態の値。
-未実施: solverの単位行の疎化、カーネル融合(ts計測ではdispatch間の隙間はほぼ無く効果は小さい見込み)、mlx_vulkanのグラフキャッシュ(PR #6。入力・ctrlを永続バッファに置く設計変更が必要で、削れるのはホストのグラフ構築 約1ms/stepのみ)。
-
-
-### 9. ホスト側のオーバーヘッド削減と高速モード(暫定値、すべて `device=cuda`・SMクロック約1840MHz)
-
-#47 に対する同一セッション・交互3回(平均 env-steps/s):
-
-| env数 | Before(#47) | After(既定設定) | 倍率 | 高速モード | 倍率 |
-|---|---|---|---|---|---|
-| 4096 | 318,967 | 409,549 | 1.28倍 | 480,278 | 1.50倍 |
-| 16384 | 432,840 | 526,102 | 1.22倍 | 649,196 | 1.50倍 |
-
-高速モード = 読み込み時オプション `self_collision=False, max_condim=3`(下記「シミュレーション簡略化オプション」。既定は従来どおり正確なモデル)。
-
-最適化ごとの効果(`env.step` の内訳、4096 env / 16384 env の ms):
-
-| 変更 | 4096 env | 16384 env |
-|---|---|---|
-| (起点 #47) | 12.16 | 37.92 |
-| `env.step` の観測・報酬を `torch.compile` で融合(「その他」3.48→1.65ms) | 10.28 | 36.25 |
-| 接触無し経路用の `cfrc_ext` ゼロ配列(毎substep 1.4MB)の確保をやめる(グラフ構築 1.34→0.40ms) | 9.38 | 31.33 |
-| `read_pack_into`(ピン留めバッファへ直接読む、H2Dを非同期に) | 9.26 | 30.65 |
-
-分析: ブースト状態ではGPU時間は4096 envで約6.1ms/step(solver 約75%)、ホスト側が約3.2msだった。`mx::zeros` による毎substepのホストでのゼロ埋めがグラフ構築の大半(約250us/substep)で、これを除くとmlx_vulkanのグラフキャッシュ(replay)で削れるものは残らない。dispatch間の隙間はほぼ無く、カーネル融合の見込み効果も小さい。ブロック幅・スレッドグループ・NTOL/共有メモリ上限の再調整は効果なし。
-既定設定で目標(4096 env 470k)に届かなかった理由はsolverの共有メモリ命令数が律速のためで、残る手は18スレッド/envから32スレッド/envへの変更や単位行の疎化(いずれも10%前後の見込み)。
-
-
-### 10. シミュレーション簡略化オプション(読み込み時、既定は正確なモデルのまま)
-
-速度のために接触モデルを簡略化するオプション。**MJCFファイルは変更せず**、読み込み時にメモリ上のモデルを上書きしてからコンパイルする(関節を持つbodyとその子孫=ロボットのgeomだけが対象で、地形などの静的bodyのgeomは触らない)。既定(`self_collision=True, max_condim=0`)は従来と完全に同じ挙動。
-
-| オプション | 内容 | 精度への影響 |
-|---|---|---|
-| `self_collision=False` | ロボットのgeom同士の衝突を切る(geomの `conaffinity` を0に)。Isaac Labの `enabled_self_collisions=False` と同じ。ロボットのgeomは `contype!=0`(MuJoCo既定は1)が前提 | 脚と胴体などの自己接触が起きなくなる(通常の歩行では稀)。衝突ペアが約1/10(Go2: 233→23) |
-| `max_condim=3` | ロボットのgeomの `condim` を3以下にする。足(condim 6)の**ねじり摩擦・転がり摩擦が無くなり**並進摩擦のみになる(Isaac Lab/Genesisと同じ) | 足の接触の拘束行が10→4行でsolverが速い。足先で滑る・回る挙動がわずかに変わる。CPU(MuJoCo C)との比較は同じオプションを両方に渡して行う |
-
-使い方:
-```c
-MjmlxModelOptions opt = mjmlx_default_model_options();   // {self_collision=1, max_condim=0}
-opt.self_collision = 0; opt.max_condim = 3;
-MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);      // mjmlx_load_model_from_string_ex もある。既存のmjmlx_load_modelは従来どおり
-```
-```python
-model = native.load_model(path, self_collision=False, max_condim=3)           # 低レベル
-env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)       # Go2環境
-```
-CLI: `bench_go2_step.py --no-self-collision --max-condim 3`、`train_go2_ppo.py --no-self-collision --max-condim 3`、`compare_cpu_gpu_go2.py --max-condim 3`。
-
-速度(4096 env / 16384 env、device=cuda、SMクロック1837MHz、同一セッション交互3回の平均 env-steps/s):
-
-| | 4096 env | 16384 env |
-|---|---|---|
-| 既定(正確) | 409,103 | 527,604 |
-| `max_condim=3` | 467,660(1.15倍) | 638,882(1.21倍) |
-| `self_collision=False, max_condim=3` | 481,351(1.17倍) | 648,499(1.23倍) |
-
-CPUとの1step差(関節角、`compare_cpu_gpu_go2.py`): 既定は 平均3.6e-5 rad・p95 8e-7 rad、`--max-condim 3`(CPU・GPUの両方に同じオプション)は 平均1.4e-5 rad・p95 5e-7 rad。GPUとCPUが同じ簡略モデルを解いているかの確認であり、簡略化自体による本来の物理との差(足のねじり・転がり摩擦の欠落)は含まない。
-
-## Architecture
-
-```
-libmjb.dylib (unified dual-backend API)
-    |
-    +-- mjb_* C API (47 functions)
-    |     Backend selection: MJB_BACKEND_CPU or MJB_BACKEND_MLX
-    |     float* interface everywhere (CPU does double->float conversion)
-    |
-    +-- CPU backend: wraps MuJoCo C (mj_step, mj_forward, ...)
-    |     Batched: GCD thread pool over N independent mjData*
-    |
-    +-- MLX backend: wraps libmjmlx (mjmlx_step, mjmlx_forward, ...)
-          Batched: compiled vmap GPU pipeline
-
-libmjmlx.dylib (GPU physics core)
-    |
-    +-- Physics pipeline (C++ / MLX)
-    |     io, math, smooth, collision, constraint, solver, forward,
-    |     passive, support, scan
-    |
-    +-- Tendon system
-    |     Fixed (joint-based) tendons: ten_length, ten_velocity, ten_J
-    |     Tendon passive forces, limits, friction
-    |     TENDON + SITE actuator transmission (scalar + vmap)
-    |
-    +-- GPU kernels
-    |     Kinematics FK, fused Euler (GLSL (mkx_kernels))
-    |
-    +-- Batched simulation (331K SPS)
-    |     GPU kin -> compile(vmap(forward)) -> GPU euler
-    |
-    +-- Differentiable step (planned)
-    |     grad(step) for empowerment / model-based RL
-    |
-    +-- C API (mjmlx.h, 48 functions)
-          Opaque handles, float* data exchange (unified memory)
-```
-
-## Building
-
-Requirements: macOS 14+, Apple Silicon, CMake >= 3.25, MLX and MuJoCo (via pip).
+## Tests
 
 ```bash
-pip install mlx mujoco
-
-cmake -B build
-cmake --build build -j$(sysctl -n hw.logicalcpu)
+just check-ci          # what CI runs (lavapipe-compatible subset)
+just check-models      # real-robot MJCFs (piper/openarm/go2/g1/h1), local only, needs a real GPU
+cd build && ctest -L correctness   # sensors, SDF, ...
+cd build && ctest -L robust        # GPU batch sanity sweep (representative); robust_full = full nv x constraint grid; known_issue = tracked failures
 ```
 
-This builds both `libmjmlx.dylib` and `libmjb.dylib`. The build auto-detects MLX and MuJoCo from pip.
+Tests run the GPU engine and MuJoCo C side by side and compare trajectories: `test_gpu_vs_cpu` (humanoid, high-DOF tree, contact stress, tendons, real robots), `test_batched_collision_primitives`, `test_robustness` (nv x {limit, contact, tendon, frictionloss}: divergence, env-to-env mismatch, dependence on batch size/position, repeatability), `test_sensors`, `test_sdf_*`, `test_camera*`, `test_math_full`, `test_linalg_full`. CI runs everything in `scripts/Dockerfile` (Debian + lavapipe), identical to `just docker-test`. Environment variables for the robustness sweep: `MJMLX_SOLVER_SHARED=0`, `MJMLX_SOLVER_CG=1`, `LP_NUM_THREADS=1`, `ROBUST_VERBOSE=1`.
 
-To override paths:
-
-```bash
-cmake -B build -DMUJOCO_ROOT=/path/to/mujoco
-```
-
-### Python bindings (nanobind)
-
-```bash
-cmake -B build -DMJMLX_BUILD_PYTHON=ON
-cmake --build build -j$(sysctl -n hw.logicalcpu)
-```
-
-### カメラセンサ(Vulkan, GPUバッチsim専用)
-
-MJCFの`<camera>`/`<light>`/geomのrgbaを使い、全env x 全カメラを`vkCmdDrawIndexedIndirect` 1回でレンダリングする(Phong、RGB+depth)。物理stepとは別パスで、`create_camera`した時のみパイプラインを構築する。
-
-空間tendon(site間・球/円柱wrap)は、`tendon_width`/`tendon_rgba`の円柱として(env,tendon)ごとにGPUで経路を求めて描く(MuJoCo標準レンダラと同じく、wrapは接点間を弦で結び半分の太さで描く)。tendonが無いモデルは従来と同じシェーダ・同じ描画コストで、MuJoCoのカテナリ表示や筋の活性色は未対応。
-
-```python
-cam = native.create_camera(sim, 128, 128)  # sim: create_batched(use_gpu=True)の戻り値
-cam.render()
-rgb, depth = cam.rgb(), cam.depth()        # (num_envs, ncam, H, W, 3) uint8 / (num_envs, ncam, H, W) float32(m)
-```
-
-学習側がtorchのGPUテンソルを使う場合は、CPUを経由せずVulkanのメモリをそのままCUDAテンソルにできる(Linux、`VK_KHR_external_memory_fd` + torchのCUDAランタイム。`scripts/mjmlx_camera_cuda.py`):
-
-```python
-from mjmlx_camera_cuda import CudaCamera
-gcam = CudaCamera.try_create(cam)          # 非対応環境(mac・feature無し・MJMLX_BUILD_CAMERA=OFF・CUDA無し)はNone -> 上のCPU読み出しを使う
-cam.render()
-rgba, depth = gcam.read()                  # cudaのuint8 (num_envs, ncam, H, W, 4) / float32 (num_envs, ncam, H, W)。同じメモリを指し、次のread()で上書き
-```
-
-例: `scripts/example_go2_camera.py`、MuJoCo比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera.py`。カメラはCMakeオプション `MJMLX_BUILD_CAMERA`(既定ON)で分離されている。OFFにすると `mjmlx_camera_*` はスタブ(`create_camera` が明確なエラー)になり、カメラ無しの学習・ビルドには影響しない。ONでも、graphics+compute queue family・multiDrawIndirect・drawIndirectFirstInstance・shaderClipDistanceのいずれかを持たない/mkxが先に初期化された場合は `create_camera` だけが失敗する(理由をstderrに出す)。MoltenVK(mac)でのこれらのfeatureの有無は未検証(実機が無い)。カメラ用デバイスは `mjmlx_load_model` 時にmkxへ注入される(`VulkanBackend::use_external_device`)。環境変数 `MJMLX_CAMERA_DEVICE=0` で注入を無効化できる。
-
-未対応: 影・テクスチャ・hfield・半透明・可動bodyに付いたlight・trackcom(body原点で近似)。
-
-### Running tests
-
-```bash
-# Full suite (237 tests across 28 suites)
-./scripts/run_tests.sh /path/to/humanoid.xml
-
-# Or via CTest
-cd build && cmake .. -DMJMLX_TEST_MODEL=/path/to/humanoid.xml && ctest --output-on-failure
-
-# Conformance tests only
-cd build && ctest -L correctness --output-on-failure
-
-# GPUバッチの健全性テスト(tests/test_robustness.cpp): nvと拘束(limit/contact/tendon/frictionloss)の構成ごとに、
-# 発散・env間不一致・Bや位置への依存・反復不一致・MuJoCo C比を見る。CIは代表のみ(-L robust)、総当たりは -L robust_full、
-# 既知の失敗は -L known_issue(直ったらCI側へ移す)。solver実装やlavapipeのスレッド数は環境変数
-# (MJMLX_SOLVER_SHARED=0, MJMLX_SOLVER_CG=1, LP_NUM_THREADS=1)で振れる。ROBUST_VERBOSE=1で各ケースの誤差を表示。
-cd build && ctest -L robust_full --output-on-failure
-```
-
-## Unified C API (mjb.h)
-
-The `mjb_*` API lets you pick a backend at creation time:
+## C API
 
 ```c
 #include <mjmlx/mjb.h>
 
-// GPU physics (GPU, float32, 73K+ SPS training)
-MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);
+MjbBackend* gpu = mjb_create_backend(MJB_BACKEND_MLX);   // the GPU engine; MJB_BACKEND_CPU = MuJoCo C (double, threads)
 MjbModel* model = mjb_load_model(gpu, "humanoid.xml");
-MjbData* data = mjb_make_data(model);
-mjb_step(model, data);
-
-// CPU physics (MuJoCo C, double, thread-safe)
-MjbBackend* cpu = mjb_create_backend(MJB_BACKEND_CPU);
-MjbModel* cpu_model = mjb_load_model(cpu, "humanoid.xml");
-
-// Batched simulation (both backends)
-MjbBatchedConfig config = { .num_envs = 8192 };
-MjbBatchedSim* sim = mjb_batched_create(model, &config);
+MjbBatchedConfig cfg = { .num_envs = 8192 };
+MjbBatchedSim* sim = mjb_batched_create(model, &cfg);
 mjb_batched_step(sim, controls);
 const float* qpos = mjb_batched_get_qpos(sim, &n);
 ```
 
-See [`include/mjmlx/mjb.h`](include/mjmlx/mjb.h) for the full API.
+`mjb.h` works with either backend; `mjmlx.h` is the lower-level GPU-only API (`mjmlx_batched_*`, sensors, camera, packed read-back `mjmlx_batched_set_pack_spec/get_pack`). **The single-env pipeline (`mjmlx_step`, `mjmlx_forward`, ...) was removed and throws; use the batched API** (a batch of 1 is fine). `mjmlx_grad_step` is a stub; differentiable physics is not implemented. See the headers in [`include/mjmlx/`](include/mjmlx/).
 
-## MLX Physics API (mjmlx.h)
+## What is supported
 
-Lower-level API for direct GPU physics access:
+Batched GPU path, checked against MuJoCo C. Full matrix and known gaps: [CONFORMANCE.md](CONFORMANCE.md). Design: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-```c
-#include <mjmlx/mjmlx.h>
+- Joints: free, ball, hinge, slide. Integrators: Euler; implicit/implicitfast damping handled through the damping term (no RK4).
+- Contacts: pyramidal friction, condim 3/4/6, margin/gap; plane/sphere/capsule/box/cylinder/ellipsoid/mesh (GJK/EPA), analytic sphere/capsule-box, SDF-SDF and SDF-mesh.
+- Constraints: joint limits, DOF friction loss, fixed and spatial tendons (limits, friction loss, wrap).
+- Gravity compensation, TENDON/SITE transmission, contact forces (`cfrc_ext`), 19 sensor types (IMU, frame, joint, actuator, subtreecom).
+- Not supported in the batched path: equality constraints, actuator activation dynamics (FILTER/INTEGRATOR/MUSCLE), heightfield contacts (cameras do render hfields), RK4, inverse dynamics, islands/noslip/sleep, differentiable physics.
 
-MjmlxModel* model = mjmlx_load_model("humanoid.xml");
-MjmlxData* data = mjmlx_make_data(model);
-mjmlx_step(model, data);
-const float* qpos = mjmlx_get_qpos(data, &n);  // zero-copy unified memory
+## Layout
+
+```
+include/mjmlx/     public C headers (mjmlx.h, mjb.h)
+src/               batched.cpp (pipeline), *_vmap.cpp (smooth/constraint/solver graph), compat/mkx_kernels (GLSL kernels), camera.cpp, sensor.cpp, io.cpp, mjb.cpp
+python/            nanobind bindings
+scripts/           Go2 env/training, benchmarks, comparisons
+tests/             C++ tests, fixture MJCFs
+docs/              index.html (GitHub Pages)
+extern/mlx_vulkan  Vulkan tensor backend (submodule)
 ```
 
-See [`include/mjmlx/mjmlx.h`](include/mjmlx/mjmlx.h) for the full API.
+## Contributing rules
 
-## Conformance
-
-All features validated against MuJoCo C reference implementation. **237 tests across 28 test suites, all passing.**
-
-### Phase 1: Synth Physics Foundation
-- **Gravity compensation** (`body_gravcomp` / `qfrc_gravcomp`) -- validated against MuJoCo C
-- **Per-body contact forces** (`cfrc_ext` via `rne_post_constraint`) -- integrated into forward pipeline
-- **Exclude signature** collision filtering (`nexclude`, `exclude_signature`) -- matches MuJoCo C encoding
-- **Model validation warnings** at load time for unsupported features
-- **High-DOF verification** (nv=67) -- perfect match with MuJoCo C, stable through 100+ steps
-
-### Phase 2: Contact Friction
-- **Pyramidal friction (condim=3)** -- 4 pyramid edge rows per contact, D/aref match MuJoCo C within 0.001%
-- **Pyramidal friction (condim=4,6)** -- torsion + rolling friction, 6/10 rows per contact, D values identical
-
-### Phase 3: Collision Geometry
-- **plane-box** -- multi-contact (up to 4 face vertices), ncon/nefc match MuJoCo C exactly
-- **sphere-box** -- closest-point on OBB, with interior fallback
-- **capsule-box** -- segment-to-OBB closest approach with iterative refinement
-- **box-box** -- SAT (15 axes) with support point contact generation
-- **plane-cylinder** -- multi-contact (face center + rim points)
-- **sphere-cylinder** -- cylinder-local closest-point with barrel/cap/rim handling
-- **capsule-cylinder** -- segment-to-cylinder iterative projection refinement
-- **GJK/EPA** -- full convex collision via Gilbert-Johnson-Keerthi + Expanding Polytope Algorithm (scalar: 64-iter GJK + 64-iter EPA; vmap: 32-iter GJK + support-based depth estimation). Both use proper mesh support functions (vertex argmax), not sphere approximation
-- **plane-mesh** -- multi-contact (all penetrating vertices), near-exact MuJoCo C match
-- **mesh-mesh** -- GJK/EPA with proper mesh support functions
-- **plane-hfield** -- heightfield terrain collision against all geom types, grid-cell triangle tests
-- **plane-ellipsoid, sphere-ellipsoid, capsule-ellipsoid** -- analytic collision via ellipsoid-to-sphere transform
-- All collision pair types work in both scalar and vmap (batched) pipelines
-
-### Phase 4: Equality Constraints + DOF Friction
-- **Equality constraints (CONNECT/WELD/JOINT)** -- 12 tests, qacc diff ~0 vs MuJoCo C
-- **DOF friction loss** -- solver friction clamping with linear zone cost, qacc diff ~1e-6
-- Correct constraint ordering: equality -> friction -> limits -> contacts
-
-### Phase 5: Tendon System + Transmission
-- **Fixed (joint-based) tendons** -- `ten_length`, `ten_velocity`, `ten_J` match MuJoCo C within 1e-5
-- **Tendon passive forces** -- spring + damping via `ten_J^T` projection
-- **TENDON transmission** -- actuators through tendons, moment = gear * ten_J
-- **SITE transmission** -- actuators at sites, full 6-DOF Jacobian projection
-- **Tendon limits** -- constraint rows for tendon length bounds, qacc diff ~1e-3
-- **Tendon friction loss** -- friction constraints through tendons, exact match
-- **Spatial tendons (wrapping geometry)** -- batched GPU path only (site/pulley/sphere・cylinder wrap/sidesite, matches MuJoCo C); the scalar/vmap paths still support fixed tendons only
-- Fixed tendons + passive forces + limits + friction: both scalar and vmap. Transmission: scalar path
-
-### Phase 6: Actuator Dynamics (scalar + vmap)
-- **FILTER dynamics** -- first-order low-pass `da/dt = (ctrl - act) / tau`, Euler integration
-- **FILTEREXACT dynamics** -- exact exponential integration of the same ODE
-- **INTEGRATOR dynamics** -- pure integration `da/dt = ctrl`
-- **Activation clamping** -- `actuator_actlimited` / `actuator_actrange`
-- Mixed stateless (NONE) + stateful actuators in the same model
-- **MUSCLE dynamics** -- DEFERRED (biomechanical models only)
-
-### Phase 7: Advanced Integrators (scalar path)
-- **RK4 (4th-order Runge-Kutta)** -- 4 forward evaluations per step, weighted average; qpos diff ~3e-8 vs MuJoCo C
-- **ImplicitFast** -- implicit velocity integration via velocity derivative (`deriv_smooth_vel`): modified mass matrix M' = M - dt * dqfrc/dqvel, Cholesky solve; qvel diff ~1e-6 vs MuJoCo C
-- Euler, RK4, Implicit, ImplicitFast all supported in scalar path
-- Batched (GPU) pipeline uses Euler only; vmap RK4/Implicit DEFERRED (needs GPU kernel rewrite)
-
-### Deferred Phases
-- **Sensors** (Phase 8) -- ~50 sensor types, large surface area; RL training reads joint/body state directly, not XML sensors
-- **Differentiable physics** (Phase 9) -- `grad(step)` via `mx::grad`; requires making full pipeline autodiff-compatible, separate project-scale effort
-- **Inverse dynamics / constraint islands / noslip / sleep** (Phase 10) -- niche features, not needed for common RL workflows
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
-
-## Test Suite Summary
-
-| Suite | Tests | What it validates |
-|-------|-------|-------------------|
-| test_io_full | 9 | Model loading, array shapes, initial state |
-| test_forward_full | 7 | Forward dynamics pipeline, step correctness |
-| test_physics_full | 20 | Physics accuracy vs MuJoCo C |
-| test_solver_full | 11 | Constraint solver (Newton + CG) |
-| test_collision_full | 7 | Core collision detection |
-| test_math_full | 17 | Math utilities (quaternion, rotation, etc.) |
-| test_linalg_full | 11 | Linear algebra (Cholesky, solve, etc.) |
-| test_vmap_smooth | 12 | Vmap-compatible smooth dynamics |
-| test_gravcomp | 7 | Gravity compensation |
-| test_cfrc_ext | 6 | Contact force computation |
-| test_exclude | 6 | Collision exclusion filtering |
-| test_validation | 8 | Model validation warnings |
-| test_high_dof | 6 | High-DOF models (67 DOF) |
-| test_friction_condim3 | 7 | Pyramidal friction (condim=3) |
-| test_friction_condim46 | 7 | Torsion/rolling friction (condim=4,6) |
-| test_collision_box | 6 | Box collision pairs |
-| test_collision_cylinder | 6 | Cylinder collision pairs |
-| test_collision_mesh | 7 | Mesh/GJK/EPA collisions |
-| test_collision_hfield | 7 | Heightfield terrain collisions |
-| test_collision_ellipsoid | 7 | Ellipsoid collisions |
-| test_equality | 12 | Equality constraints (CONNECT/WELD/JOINT) |
-| test_dof_friction | 9 | DOF friction loss + solver clamping |
-| test_fixed_tendon | 9 | Fixed tendon system |
-| test_transmission | 7 | TENDON + SITE transmission |
-| test_tendon_constraint | 6 | Tendon limits + friction loss |
-| test_rk4 | 6 | RK4 integrator |
-| test_filter_dynamics | 7 | Activation dynamics (FILTER/INTEGRATOR) |
-| test_implicit | 7 | ImplicitFast integrator |
-| **TOTAL** | **237** | |
-
-## Consumers
-
-- **[MuJoCo-MLX](https://github.com/arghyasur1991/MuJoCo-MLX)** (Python) -- uses nanobind extension from this repo
-- **MuJoCo-MLX-Unity** (C#, planned) -- ships `libmjb.dylib` + P/Invoke bindings
+Images and videos must never be committed (they are git-ignored). Attach them on GitHub (PR/issue) and reference the `user-attachments` URL from the README or `docs/index.html`.
 
 ## License
 
