@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MuJoCo-MLX-Cpp — GPU-batched MuJoCo for robot learning</title>
+<meta name="description" content="MuJoCo physics and camera rendering on the GPU via Vulkan. 480K env-steps/s on Unitree Go2, thousands of cameras per step.">
+<style>
+:root{--bg:#07090f;--fg:#e8ecf4;--mut:#8b95a8;--acc:#6ee7ff;--acc2:#a78bfa;--card:#101522;--line:#1d2538;--hot:#ff7a59}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--acc)}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+pre{background:#0b0f1a;border:1px solid var(--line);border-radius:10px;padding:16px;overflow:auto;font-size:13.5px}
+code{background:#0b0f1a;padding:1px 6px;border-radius:5px;font-size:.92em}
+pre code{padding:0;background:none}
+nav{position:fixed;inset:0 0 auto 0;z-index:9;display:flex;gap:22px;align-items:center;padding:12px 28px;background:#07090fcc;backdrop-filter:blur(10px);border-bottom:1px solid var(--line);font-size:14px}
+nav b{margin-right:auto;letter-spacing:.3px}
+nav a{color:var(--mut);text-decoration:none}nav a:hover{color:var(--fg)}
+.hero{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:120px 24px 60px;background:radial-gradient(900px 500px at 50% 0%,#1b2a55 0%,transparent 70%),radial-gradient(700px 400px at 90% 90%,#3b1d6b55 0%,transparent 70%)}
+.hero h1{font-size:clamp(40px,8vw,96px);line-height:1.02;margin:0 0 18px;letter-spacing:-2px;background:linear-gradient(90deg,var(--acc),var(--acc2) 55%,var(--hot));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{max-width:760px;color:var(--mut);font-size:clamp(17px,2.2vw,22px);margin:0 0 36px}
+.big{display:flex;flex-wrap:wrap;gap:18px;justify-content:center;margin-bottom:38px}
+.big div{background:#ffffff08;border:1px solid var(--line);border-radius:16px;padding:20px 28px;min-width:200px}
+.big strong{display:block;font-size:clamp(32px,5vw,52px);line-height:1.1;color:var(--fg)}
+.big span{color:var(--mut);font-size:14px}
+.btn{display:inline-block;padding:12px 26px;border-radius:999px;background:var(--acc);color:#04202a;font-weight:700;text-decoration:none;margin:4px}
+.btn.o{background:none;border:1px solid var(--line);color:var(--fg)}
+.scroll{margin-top:44px;color:var(--mut);font-size:13px;animation:b 1.8s infinite}
+@keyframes b{50%{transform:translateY(8px)}}
+section{max-width:1040px;margin:0 auto;padding:96px 24px 20px}
+section h2{font-size:clamp(28px,4.4vw,46px);letter-spacing:-1px;margin:0 0 6px}
+section h2+p.lead{color:var(--mut);font-size:19px;margin:0 0 30px;max-width:780px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}
+.card h3{margin:0 0 8px;font-size:18px}.card p{margin:0;color:var(--mut);font-size:15px}
+.bars{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin:22px 0}
+.bars h4{margin:0 0 4px;font-size:16px}.bars small{color:var(--mut);display:block;margin-bottom:16px}
+.row{display:grid;grid-template-columns:150px 1fr;gap:12px;align-items:center;margin:9px 0;font-size:14px}
+.row i{display:block;height:24px;border-radius:6px;width:calc(var(--v)/var(--m)*100%);background:#3a4766;position:relative;min-width:2px}
+.row i b{position:absolute;left:calc(100% + 8px);top:0;line-height:24px;font-weight:600;color:var(--fg);white-space:nowrap}
+.row.us i{background:linear-gradient(90deg,var(--acc2),var(--acc))}
+.row.fast i{background:linear-gradient(90deg,var(--hot),#ffc15a)}
+.bars{overflow:hidden}.row>div{padding-right:92px}
+.slot{background:repeating-linear-gradient(45deg,#0d1220,#0d1220 12px,#0f1526 12px,#0f1526 24px);border:1px dashed #2d3957;border-radius:14px;min-height:240px;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mut);padding:24px;font-size:14px}
+.slot b{display:block;color:var(--fg);font-size:16px;margin-bottom:4px}
+figure{margin:22px 0}figcaption{color:var(--mut);font-size:14px;margin-top:8px}
+figure video,figure img{width:100%;border-radius:14px;border:1px solid var(--line);display:block}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin:18px 0}
+th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:600}td.w{color:var(--acc);font-weight:700}
+.pipe{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:18px 0}
+.pipe span{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:14px}.pipe em{color:var(--mut);font-style:normal}
+footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mut);border-top:1px solid var(--line);font-size:14px}
+.note{color:var(--mut);font-size:13.5px}
+@media(max-width:700px){nav a:not(.keep){display:none}.row{grid-template-columns:100px 1fr}}
+</style>
+</head>
+<body>
+<nav><b>MuJoCo-MLX-Cpp</b><a href="#perf">Performance</a><a href="#camera">Camera</a><a href="#cpu">vs MuJoCo CPU</a><a href="#robots">Robots</a><a href="#how">How it works</a><a href="#start">Start</a><a class="keep" href="https://github.com/20niship/MuJoCo-MLX-Cpp">GitHub ↗</a></nav>
+
+<header class="hero">
+  <h1>Train robots<br>at GPU speed.</h1>
+  <p>MuJoCo physics <em>and</em> tiled camera rendering, batched across thousands of environments on a single GPU — Vulkan compute on Linux (NVIDIA tested). C++ core, Python bindings, C API.</p>
+  <div class="big">
+    <div><strong>480K</strong><span>env-steps/s · Unitree Go2 · 4096 envs</span></div>
+    <div><strong>650K</strong><span>env-steps/s · 16384 envs</span></div>
+    <div><strong>338K</strong><span>env-steps/s with a camera on every env</span></div>
+  </div>
+  <div><a class="btn" href="#perf">See the numbers</a><a class="btn o" href="https://github.com/20niship/MuJoCo-MLX-Cpp">Source on GitHub</a></div>
+  <div class="scroll">scroll ↓</div>
+</header>
+
+<section id="what">
+  <h2>What it is</h2>
+  <p class="lead">A MuJoCo-compatible physics pipeline reimplemented as GPU compute, checked against MuJoCo C, built for reinforcement learning at scale.</p>
+  <div class="grid">
+    <div class="card"><h3>MuJoCo-faithful</h3><p>Pyramidal friction (condim 3/4/6), plane/box/cylinder/ellipsoid/mesh/SDF contacts, joint limits, friction loss, fixed + spatial tendons, sensors. GPU trajectories are compared against MuJoCo C in CI.</p></div>
+    <div class="card"><h3>Fast where it counts</h3><p>One hand-tuned solver kernel per env in shared memory, fused kinematics and Euler, GPU-side observation packing. No per-step CPU round trips.</p></div>
+    <div class="card"><h3>Cameras in the loop</h3><p>Every env × every camera in one indirect draw. RGB + depth land directly in CUDA tensors via Vulkan→CUDA interop. Zero CPU copy.</p></div>
+    <div class="card"><h3>Drop-in for RL</h3><p>Go2 environment, rsl_rl PPO training, Isaac Lab–style rewards. Also a C API (<code>mjb.h</code>) for Unity/C# and anything with FFI.</p></div>
+  </div>
+</section>
+
+<section id="perf">
+  <h2>Physics throughput</h2>
+  <p class="lead">Unitree Go2, flat ground, dt 0.005 × 4 substeps, random actions. Same hardware class, observations and rewards included.</p>
+
+  <div class="bars" style="--m:660000">
+    <h4>Go2 env.step — 16,384 envs</h4><small>RTX 3060 12 GB · env-steps/s · higher is better</small>
+    <div class="row"><span>Genesis</span><div><i style="--v:313000"><b>313K</b></i></div></div>
+    <div class="row us"><span>This repo</span><div><i style="--v:526000"><b>526K</b></i></div></div>
+    <div class="row fast"><span>This repo · fast mode</span><div><i style="--v:649000"><b>649K</b></i></div></div>
+  </div>
+  <div class="bars" style="--m:500000">
+    <h4>Go2 env.step — 4,096 envs</h4><small>RTX 3060 12 GB · env-steps/s</small>
+    <div class="row"><span>Isaac Lab</span><div><i style="--v:120000"><b>120K</b></i></div></div>
+    <div class="row"><span>Genesis</span><div><i style="--v:252000"><b>252K</b></i></div></div>
+    <div class="row us"><span>This repo</span><div><i style="--v:409000"><b>409K</b></i></div></div>
+    <div class="row fast"><span>This repo · fast mode</span><div><i style="--v:480000"><b>480K</b></i></div></div>
+  </div>
+  <p class="note">Fast mode = <code>self_collision=False, max_condim=3</code> (the setting Isaac Lab / Genesis use). Default stays exact. Isaac Lab / Genesis figures are earlier measurements, not re-run on the same session; Genesis measures bare <code>scene.step()</code>, ours include observation and reward. See the <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/docs/PERFORMANCE.md">full log</a> for conditions.</p>
+
+  <h3>How we got here</h3>
+  <div class="bars" style="--m:420000">
+    <h4>Go2 4096 envs, env-steps/s by milestone</h4><small>Each step measured by building that commit</small>
+    <div class="row"><span>PR #33 start</span><div><i style="--v:7200"><b>7.2K</b></i></div></div>
+    <div class="row"><span>Shared-mem solver</span><div><i style="--v:32000"><b>32K</b></i></div></div>
+    <div class="row"><span>VRAM residency</span><div><i style="--v:100000"><b>~100K</b></i></div></div>
+    <div class="row"><span>Cholesky + early exit</span><div><i style="--v:150000"><b>150K</b></i></div></div>
+    <div class="row"><span>Host overhead cut</span><div><i style="--v:192000"><b>192K</b></i></div></div>
+    <div class="row us"><span>Torch obs/reward + compile</span><div><i style="--v:409000"><b>409K</b></i></div></div>
+  </div>
+  <p class="note">Milestones are from different sessions and GPU clock states, so adjacent bars are indicative, not a strict series.</p>
+</section>
+
+<section id="train">
+  <h2>Trained policies</h2>
+  <p class="lead">Go2 locomotion trained end to end on this simulator with rsl_rl PPO, Isaac Lab–compatible observations and rewards.</p>
+  <div class="grid">
+    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · flat ground · cmd_vel tracking</b>Attach video to a PR, paste the user-attachments URL into <code>data-url</code></div></div><figcaption>Unitree Go2 following forward/back/left/right velocity commands.</figcaption></figure>
+    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · stairs terrain</b>Attach video, paste URL into <code>data-url</code></div></div><figcaption>Blind (proprioception-only) policy on stair terrain.</figcaption></figure>
+    <figure><div class="slot" data-type="video" data-url=""><div><b>Go2 · camera-in-the-loop (optional)</b>Attach video, paste URL into <code>data-url</code></div></div><figcaption>Policy rollout with onboard cameras.</figcaption></figure>
+    <figure><div class="slot" data-type="image" data-url=""><div><b>Training curves</b>Attach image, paste URL into <code>data-url</code></div></div><figcaption>Reward / episode length over iterations.</figcaption></figure>
+  </div>
+</section>
+
+<section id="camera">
+  <h2>Thousands of cameras, one draw call</h2>
+  <p class="lead">Vision-based RL needs an image per env per step. Frustum culling and LOD run on the GPU; pixels go straight into a CUDA tensor.</p>
+  <div class="bars" style="--m:360000">
+    <h4>Go2 + 1 camera/env, 64 px, 4096 envs — physics + render + tensor ready</h4><small>RTX 3060 · env-steps/s</small>
+    <div class="row"><span>Genesis (BatchRenderer)</span><div><i style="--v:82900"><b>83K</b></i></div></div>
+    <div class="row"><span>Before interop (CPU copy)</span><div><i style="--v:76654"><b>77K</b></i></div></div>
+    <div class="row us"><span>Vulkan→CUDA interop</span><div><i style="--v:337618"><b>338K</b> <small>4.1×</small></i></div></div>
+  </div>
+  <div class="bars" style="--m:20000">
+    <h4>Go2, physics + render, 1 camera/env, 64 px — vs Isaac Lab TiledCamera</h4><small>RTX 3060 · env-steps/s (Isaac timed out at ≥1024×128 and 4096)</small>
+    <div class="row"><span>Isaac · 64 envs</span><div><i style="--v:2238"><b>2.2K</b></i></div></div>
+    <div class="row us"><span>Ours · 64 envs</span><div><i style="--v:4180"><b>4.2K</b></i></div></div>
+    <div class="row"><span>Isaac · 1024 envs</span><div><i style="--v:7278"><b>7.3K</b></i></div></div>
+    <div class="row us"><span>Ours · 1024 envs</span><div><i style="--v:17604"><b>17.6K</b></i></div></div>
+    <div class="row us"><span>Ours · 4096 envs</span><div><i style="--v:19608"><b>19.6K</b></i></div></div>
+  </div>
+  <p class="note">Camera placement and FOV match, but shading and clip planes differ (Phong vs minimal RTX). Third-person orbit camera (whole robot visible, ~400K triangles/env) still reaches 124K env-steps/s at 4096 envs, 64 px.</p>
+  <figure><div class="slot" data-type="video" data-url=""><div><b>Camera views during training</b>Tiled RGB from thousands of envs at once — attach video, paste URL into <code>data-url</code></div></div><figcaption>What the policy sees: one camera per env, all rendered in a single pass.</figcaption></figure>
+</section>
+
+<section id="cpu">
+  <h2>Matches MuJoCo CPU</h2>
+  <p class="lead">Left: MuJoCo C. Right: this GPU engine. Arms agree exactly; legged robots diverge only after landing, where contact solutions are chaotic — so we judge by single-step error.</p>
+  <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b"></div><figcaption>piper / openarm / go2 / g1, CPU | GPU side by side (generated by <code>just check-video-export</code>).</figcaption></figure>
+  <table>
+    <tr><th>Go2, 1 control step vs MuJoCo C</th><th>joint angle mean</th><th>p95</th></tr>
+    <tr><td>Default model</td><td class="w">3.6e-5 rad</td><td>8e-7 rad</td></tr>
+    <tr><td><code>max_condim=3</code> (both sides)</td><td class="w">1.4e-5 rad</td><td>5e-7 rad</td></tr>
+  </table>
+  <figure><div class="slot" data-type="video" data-url=""><div><b>Divergence overlay (optional)</b>Attach a CPU-vs-GPU difference video, paste URL into <code>data-url</code></div></div></figure>
+</section>
+
+<section id="robots">
+  <h2>Robots &amp; scenes</h2>
+  <div class="grid">
+    <div class="card"><h3>Unitree Go2</h3><p>Flat and stair terrain, cmd_vel tracking PPO training, Isaac Lab reward presets, sensors (IMU, joint, frame). G1 and H1 are covered by CPU/GPU trajectory tests.</p></div>
+    <div class="card"><h3>Arms</h3><p>Agilex Piper, OpenArm — mesh collision validated against MuJoCo C.</p></div>
+    <div class="card"><h3>Humanoid &amp; HalfCheetah</h3><p>Gymnasium models; a HalfCheetah PPO example is included.</p></div>
+  </div>
+</section>
+
+<section id="how">
+  <h2>How it works</h2>
+  <p class="lead">A three-stage GPU pipeline per substep, no host synchronisation inside the loop.</p>
+  <div class="pipe"><span>qpos</span><em>→</em><span>Kinematics kernel</span><em>→</em><span>Forward / CRB / RNE</span><em>→</em><span>Collision (baked pair table)</span><em>→</em><span>Newton solver<br><small>1 workgroup per env, shared memory</small></span><em>→</em><span>Euler (direct from solver qacc)</span><em>→</em><span>GPU pack → torch</span></div>
+  <div class="grid">
+    <div class="card"><h3>Backends</h3><p>Vulkan compute through the <code>mlx_vulkan</code> (MKX) submodule. Tested on NVIDIA; CI runs on lavapipe (software Vulkan). The Metal backend was removed.</p></div>
+    <div class="card"><h3>Solver</h3><p>Newton with a shared-memory Cholesky direction, early exit on cost decrease, ~72 constraint rows/env. About 60–75% of GPU time.</p></div>
+    <div class="card"><h3>Camera</h3><p>Indirect draw of all (env, camera, geom); compute culling + vertex-clustered LOD; pack pass into <code>(env, cam, H, W)</code>.</p></div>
+    <div class="card"><h3>Verified</h3><p>CPU/GPU trajectory tests, per-feature MuJoCo conformance, robustness sweeps over <code>nv</code> × constraint types. Details in <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>.</p></div>
+  </div>
+</section>
+
+<section id="start">
+  <h2>Get started</h2>
+  <pre><code>git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp
+cd MuJoCo-MLX-Cpp
+uv sync --group build --group go2
+just build-python               # Vulkan
+
+uv run python scripts/train_go2_ppo.py --build-dir build \
+  --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500</code></pre>
+  <p>Full instructions, API reference and the benchmark recipes: <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#readme">README</a> · <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/README_JA.md">日本語</a> · <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/CONFORMANCE.md">Conformance</a>.</p>
+</section>
+
+<footer>Apache 2.0 · <a href="https://github.com/20niship/MuJoCo-MLX-Cpp">20niship/MuJoCo-MLX-Cpp</a>. Numbers are measured on the stated hardware, mostly an RTX 3060, and some are provisional.</footer>
+
+<script>
+// data-url が入っている .slot を動画/画像に置き換える(メディアはrepoに置かずuser-attachments URLを参照)
+document.querySelectorAll('.slot[data-url]').forEach(s=>{
+  const u=s.dataset.url; if(!u) return;
+  const el=document.createElement(s.dataset.type==='image'?'img':'video');
+  el.src=u; el.loading='lazy';
+  if(el.tagName==='VIDEO'){el.controls=el.muted=el.loop=el.playsInline=true;el.preload='metadata';}
+  s.replaceWith(el);
+});
+</script>
+</body>
+</html>
