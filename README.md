@@ -22,7 +22,7 @@ Unitree Go2, flat ground, dt 0.005 x 4 substeps, `env.step` with observations an
 | 4,096 | 409K | **480K** | ~120K | ~252K |
 | 16,384 | 526K | **649K** | - | ~313K |
 
-env-steps/s. Fast mode is `self_collision=False, max_condim=3` (what Isaac Lab/Genesis use); the default keeps the exact model. Isaac Lab / Genesis values are earlier single measurements and not re-run in the same session; Genesis measures a bare `scene.step()` while ours includes observation and reward. Details and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md) (Japanese).
+env-steps/s. Fast mode is `self_collision=False, max_condim=3` (what Isaac Lab/Genesis use); the default keeps the exact model. Isaac Lab / Genesis values are earlier single measurements and not re-run in the same session; Genesis measures a bare `scene.step()` while ours includes observation and reward. Details and caveats: [Detailed performance log](#detailed-performance-log).
 
 Camera RL step (physics x4 substeps + render + RGB/depth as CUDA tensors, 1 camera/env, 64 px, 4096 envs, front view): **337,618 env-steps/s** (Genesis past value: 82,900). Third-person orbit view (whole robot visible): 124,415.
 
@@ -129,7 +129,90 @@ just check-video-export                                                      # C
 just bench                                                                   # regression check against benchmarks/baseline.csv
 ```
 
-Go2 1-control-step difference from MuJoCo C (joint angles): mean 3.6e-5 rad, p95 8e-7 rad (default); mean 1.4e-5 rad with `--max-condim 3` applied to both sides. Isaac Lab setup instructions and the full measurement log (what each optimization bought, regressions, GPU clock effects): [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Go2 1-control-step difference from MuJoCo C (joint angles): mean 3.6e-5 rad, p95 8e-7 rad (default); mean 1.4e-5 rad with `--max-condim 3` applied to both sides. Isaac Lab setup and the full measurement log (what each optimization bought, regressions, GPU clock effects): [Detailed performance log](#detailed-performance-log).
+
+## Detailed performance log
+
+Provisional values, RTX 3060 12 GB unless noted. The original Japanese log with every table is in [README_JA.md](README_JA.md#性能測定ログ詳細). Compare **within one session, alternating** runs; the GPU clock state changes results by up to 2x.
+
+### Isaac Lab setup (for the comparison)
+
+```bash
+uv venv --python 3.11 ~/isaac/.venv && source ~/isaac/.venv/bin/activate
+uv pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
+git clone --depth 1 --branch v2.3.2 https://github.com/isaac-sim/IsaacLab.git ~/isaac/IsaacLab && cd ~/isaac/IsaacLab
+uv pip install "setuptools<81" wheel && uv pip install --no-build-isolation flatdict==4.0.1   # install first: isaaclab.sh --install fails building flatdict
+./isaaclab.sh --install rsl_rl
+OMNI_KIT_ACCEPT_EULA=YES ~/isaac/.venv/bin/python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless --max_iterations 20
+```
+
+On the RTX 3060: this repo ~1.3 s/iteration vs Isaac Lab ~2.2 s/iteration (4096 envs x 24 steps, measured earlier).
+
+### Go2 physics step history (4096 envs, dt 0.005 x 4, env-steps/s, each commit built and measured)
+
+| Commit | Change | env-steps/s |
+|---|---|---|
+| b0a2367 | start of PR #33 | 7,200 |
+| 087ef1c | dt aligned to Isaac (4 substeps) | 22,500 |
+| a829b7c | solver in shared memory | 32,000 |
+| 15faba3 | contact Jacobian in local arrays (solver ~2x) | 51,000 |
+| 4d35636 | buffers in VRAM | 93,000-107,000 |
+| 87bfbf9 | stricter solver convergence (SI=16, GTOL=1e-10, CG=30) | 77,000-83,000 |
+| 8da6ee2 | main after PR #40 | 86,000-89,000 |
+
+The regression after VRAM residency was the stricter solver settings (10-15%); sensor and camera PRs were within noise (+-10%). Much of the earlier "57k -> 53k" jitter was GPU contention and clock state.
+
+### Bottlenecks (4096 envs)
+
+- ~78% of GPU time was the solver; kinematics/forward/collision/Euler together ~0.9 ms per substep.
+- Read-back: the staging memory was uncached host memory (~200 MB/s); reading `cfrc_ext` (1.4 MB) took ~8 ms. `HOST_CACHED` staging brought it to 0.85 ms (`env.step` 48 -> 34 ms).
+- Host: graph build ~0.6 ms/substep, numpy ~3.5 ms/step. Newton iterations ~3 on average; CG often hit its 30-iteration cap.
+
+### What each optimization bought
+
+| Change | Effect |
+|---|---|
+| gather the read-back into one buffer / one transfer (`set_pack_spec/read_pack`) | ~82k -> 112k |
+| Newton direction by shared-memory Cholesky instead of CG (`MJMLX_SOLVER_CG=1` for the old behaviour) | 112k -> 150k (solver 6.9 -> 3.4 ms) |
+| merge equal-height terrain segments into one box (flat: 23 -> 1 box, pairs 739 -> 233) | collision ~4x |
+| `step(ctrl, n)`: one ctrl transfer per step | 6 fewer waits/step |
+| forward scratch in local arrays | forward 527 -> 300 us |
+| early exit on Newton decrease (`MJMLX_NTOL`, 1e-4) | solver 3.47 -> 2.25 ms |
+| line-search cut-off, symmetric H assembly, independent J^T f accumulators, shared-memory shrink (rows 96 -> 72) | solver 2300 -> 1620 us |
+| Euler straight from solver `qacc` (`MJMLX_EULER_EXACT=1` for the old path) | euler 390 -> 49 us |
+| collision pair table baked into the shader | collision 111 -> 70 us |
+| observation/reward in torch on the training device (+`torch.compile`) | 1.0-1.23x, more at large env counts |
+| no per-substep `cfrc_ext` zero allocation, `read_pack_into` into pinned memory | 12.2 -> 9.3 ms (4096 envs) |
+| fast mode `self_collision=False, max_condim=3` | +15-23% |
+
+Same-session alternating comparisons (env-steps/s): PR #42 -> solver PR: 112.6k -> 149.3k (1.33x); -> host-side cleanups: 156k -> 192k at 4096 envs, 176k -> 210k at 16384; torch obs/reward at `device=cuda`: 308k -> 312k (4096), 348k -> 427k (16384); host overhead PR: 319k -> 410k (4096, 1.28x) and 433k -> 526k (16384), 480k / 649k in fast mode.
+
+**GPU clock matters.** Without a CUDA context the SM clock stays near 550 MHz under pure Vulkan compute; with `device=cuda` (as in training) torch activity raises it to ~1140-1840 MHz, so the same code is 1.5-1.6x faster (4096 envs: 195k on cpu device vs 308k on cuda). Compare against Genesis (which runs on CUDA) only with `device=cuda`.
+
+Remaining gap/ideas: the solver is ~60-75% of GPU time and is bound by shared-memory instruction count (18 threads/env; 32 threads/env or sparse unit rows for friction loss/limits are worth ~10% each); small env counts are dominated by host graph build and ~22 serial dispatches per substep.
+
+### Camera-in-the-loop RL (Go2 flat, exactly 1 camera/env, RGB+depth, `device=cuda`, SM clock 1837 MHz, median of 3 alternating runs)
+
+Front view, env-steps/s: old path = render, read RGB/depth to CPU, upload to CUDA; new = Vulkan->CUDA interop.
+
+| envs | px | physics only | render only (env-frames/s) | old | **new (interop)** | new/old | Genesis (past) | new/Genesis |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 29,993 | 296,503 | 21,091 | **24,273** | 1.15x | 10,400 | 2.3x |
+| 256 | 64 | 102,601 | 849,761 | 55,566 | **76,307** | 1.37x | 32,100 | 2.4x |
+| 1024 | 64 | 269,492 | 1,698,282 | 91,594 | **199,027** | 2.17x | 64,400 | 3.1x |
+| 4096 | 64 | 456,442 | 2,112,591 | 76,654 | **337,618** | 4.40x | 82,900 | 4.1x |
+| 4096 | 128 | 473,909 | 1,285,141 | 21,983 | **273,812** | 12.5x | 66,100 | 4.1x |
+
+Third-person orbit view (whole robot visible, ~400K triangles/env): 64 px / 4096 envs 124,415 (Genesis 82,900, 1.5x); 128 px / 4096 envs 113,679 (7.0x vs old, 1.7x vs Genesis). Contributions at orbit 128 px / 4096 envs: old 16,239; + LOD K=4 20,093; + interop 50,218; both 113,679.
+
+Against Isaac Lab TiledCamera (physics x4 + render, 64 px): 64 envs 4,180 vs 2,238; 256 envs 10,972 vs 4,133; 1024 envs 17,604 vs 7,278; 4096 envs 19,608 (Isaac timed out for 1024x128 and 4096). Camera placement and FOV match; shading and clip planes differ (Phong vs minimal RTX). The old numbers (before GPU frustum/LOD culling) were 0.35-0.52x of Isaac at 64 px.
+
+Bottleneck at 4096 envs, per step (ms): physics 9.0; render 2.0 (front 64 px) / 23-25 (orbit), about half of that vertex processing; old CPU read-back of RGB+depth + upload 34-148 ms (dominant, removed by interop); pack pass 0.5-1.8; tensor handoff 0.01.
+
+LOD default: `MJMLX_CAM_LOD_K` = 16 below 128 px height, 4 at >= 128 px. Versus MuJoCo's renderer (third person, 16 envs): 64 px K=16 IoU 0.960, depth error 28.2/75.2 mm (mean/p95); 128 px K=4 IoU 0.965, 14.9/37.9 mm (similar to 64 px K=16, 3x faster); 64 px K=4 drops to IoU 0.899, so it is not the default.
+
+Not done (measured to be pointless or unjustified): reusing physics kinematics for rendering (0.2-0.3 ms saved), async physics/render pipeline (one queue, both GPU-bound; at most the 2 ms render share). Next: meshlet culling, back-face culling, Hi-Z occlusion. Interop is Linux + `VK_KHR_external_memory_fd` + CUDA only (sync via `vkQueueWaitIdle`).
 
 ## Tests
 
@@ -175,7 +258,7 @@ src/               batched.cpp (pipeline), *_vmap.cpp (smooth/constraint/solver 
 python/            nanobind bindings
 scripts/           Go2 env/training, benchmarks, comparisons
 tests/             C++ tests, fixture MJCFs
-docs/              index.html (GitHub Pages), PERFORMANCE.md
+docs/              index.html (GitHub Pages)
 extern/mlx_vulkan  Vulkan tensor backend (submodule)
 ```
 

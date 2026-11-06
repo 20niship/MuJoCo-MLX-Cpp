@@ -1,6 +1,6 @@
 # Architecture
 
-Design notes for MuJoCo-MLX-Cpp: how the batched GPU simulation is structured and why. Read this before changing the pipeline. Benchmark numbers live in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and the [README](README.md); feature coverage in [CONFORMANCE.md](CONFORMANCE.md).
+Design notes for MuJoCo-MLX-Cpp: how the batched GPU simulation is structured and why. Read this before changing the pipeline. Benchmark numbers live in [README](README.md#detailed-performance-log) and the [README](README.md); feature coverage in [CONFORMANCE.md](CONFORMANCE.md).
 
 ## Scope
 
@@ -91,5 +91,5 @@ The GPU engine is checked against MuJoCo C by running both on the same model and
 - Not in the batched path: equality constraints, actuator activation dynamics (FILTER/INTEGRATOR/MUSCLE), RK4, heightfield contacts, inverse dynamics, islands/noslip/sleep, differentiable physics (`mjmlx_grad_step` is a stub).
 - Constraint rows capped at 72/env on the shared-memory solver path.
 - `robust_known_issue_*` tests track configurations that still disagree with MuJoCo C.
-- Performance headroom (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)): solver shared-memory instruction count (32 threads/env instead of 18, sparse unit rows for friction loss/limits), host graph build, third-person camera vertex stage (meshlet culling, back-face culling, Hi-Z).
+- Performance headroom (see [README](README.md#detailed-performance-log)): solver shared-memory instruction count (32 threads/env instead of 18, sparse unit rows for friction loss/limits), host graph build, third-person camera vertex stage (meshlet culling, back-face culling, Hi-Z).
 - Camera interop is Linux/CUDA only; macOS (MoltenVK) is unverified.

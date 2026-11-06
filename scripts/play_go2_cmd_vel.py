@@ -76,7 +76,7 @@ def main() -> None:
         qpos[i, 0], qpos[i, 1] = x, y
         cmd[i, : len(d)] = np.array(d, np.float32) * args.speed
     env._sim.set_state(qpos, qvel)
-    env._commands[:] = cmd
+    env._commands[:] = torch.from_numpy(np.asarray(cmd, dtype=np.float32)).to(env._commands.device)
     env._elapsed[:] = 0
     env._last_action[:] = 0.0
     env._prev_joint_vel[:] = 0.0
@@ -97,7 +97,7 @@ def main() -> None:
             meas[t, :, 2] = v[:, 5]
             d = dones.numpy().astype(bool)
             first_done[(first_done < 0) & d] = t
-            env._commands[:] = cmd  # 終了して再サンプルされても指令は固定する
+            env._commands[:] = torch.from_numpy(np.asarray(cmd, dtype=np.float32)).to(env._commands.device)  # 終了して再サンプルされても指令は固定する
 
     warm = int(1.0 / e.CONTROL_DT)  # 立ち上がり1sを除いて評価
     summary = {"checkpoint": str(ckpt), "speed": args.speed, "cases": {}}
