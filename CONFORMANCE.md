@@ -50,12 +50,13 @@ Legend: **Yes** supported and tested against MuJoCo C. **Partial** see note. **N
 
 ## Sensors (batched only)
 
-IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint and ball pos/vel, actuator pos/vel, subtreecom: 19 types, `test_sensors`, G1's built-in MJCF sensors in `model_sensors_g1`. Not supported: force, torque, touch, rangefinder, camera sensors.
+IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint and ball pos/vel, actuator pos/vel, subtreecom: 19 types, `test_sensors`, G1's built-in MJCF sensors in `model_sensors_g1`. Not supported: force, torque, touch, rangefinder, camera sensors (as MJCF `<sensor>` elements). The raycast API is the basis for rangefinder; the Python `RayCaster` (`scripts/mjmlx_sensors.py`) provides an Isaac Lab-style height scanner / LiDAR on top of it.
 
 ## Other
 
 | Feature | Status |
 |---|---|
+| Raycast (`mj_ray`: dist + geom id, `bodyexclude` / `flg_static` / `geomgroup` / `max_dist`) | Yes for plane/sphere/capsule/ellipsoid/cylinder/box/mesh (`raycast` test: 2400 random rays x 5 settings, max distance error 9e-6, no hit/miss or geom-id mismatch); hfield and SDF geoms are never hit; no surface normal output; meshes are brute force over faces |
 | Camera rendering (RGB + depth), compared against MuJoCo's renderer | Yes (`camera_vs_mujoco`; shadows/translucency/moving lights unsupported) |
 | Differentiable physics (`grad(step)`) | No (`mjmlx_grad_step` is a stub) |
 | Inverse dynamics, `mj_forward`-style single-env API | No (removed) |

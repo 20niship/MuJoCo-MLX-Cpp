@@ -132,3 +132,78 @@ class ContactSensor:
             t[m] = 0.0
         self.net_forces_w[m] = 0.0
         self.is_contact[m] = False
+
+
+def grid_pattern(size=(1.6, 1.0), resolution: float = 0.1) -> np.ndarray:
+    """Isaac Labの GridPatternCfg 相当。センサ座標のxy格子(N, 2)。端を含む。"""
+    xs = np.arange(-size[0] / 2, size[0] / 2 + 1e-9, resolution)
+    ys = np.arange(-size[1] / 2, size[1] / 2 + 1e-9, resolution)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    return np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
+
+
+def _yaw_quat(q: torch.Tensor) -> torch.Tensor:
+    """wxyzクォータニオンからyaw成分だけのクォータニオンを作る。"""
+    w, x, y, z = q.unbind(-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return torch.stack([torch.cos(yaw / 2), torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw / 2)], dim=-1)
+
+
+def _quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """wxyzクォータニオンqでvを回転する(body->世界)。vは(..., n, 3)、qは(..., 4)。"""
+    w, xyz = q[..., :1], q[..., 1:]
+    xyz, w = xyz.unsqueeze(-2), w.unsqueeze(-2)
+    t = 2.0 * torch.cross(xyz.expand_as(v), v, dim=-1)
+    return v + w * t + torch.cross(xyz.expand_as(v), t, dim=-1)
+
+
+class RayCaster:
+    """Isaac Labの RayCaster / height scanner 相当。bodyに追従する格子状のレイをGPUで一括して撃つ。
+
+    alignment: "yaw"(胴体のyawだけに追従、Isaac Labの既定。height scanner向け)/ "base"(姿勢に完全追従)/ "world"。
+    sim, nativeは_mjmlx_rl_native.create_batched()の戻り値とモジュール。body_idは追従するbody(name2idで取得)。
+    update()は現在の状態でレイを撃つ。pos/quatはstep時点のbody姿勢(1物理step遅れ)、geom側は常に最新のqposから再計算する。
+    miss(max_distを超える/何も無い)は distance=inf、geomid=-1。geomgroup_maskは地形のgeom groupだけを撃つのに使う(例: 1<<0)。
+    """
+
+    def __init__(self, native, sim, body_id: int, pattern_xy: np.ndarray | None = None, offset_z: float = 0.0,
+                 ray_dir=(0.0, 0.0, -1.0), alignment: str = "yaw", max_dist: float = 0.0, geomgroup_mask: int = -1,
+                 bodyexclude: int = -1, flg_static: bool = True, device: str = "cpu"):
+        if alignment not in ("yaw", "base", "world"):
+            raise ValueError("alignment must be 'yaw', 'base' or 'world'")
+        self._sim, self._body_id, self.alignment, self.device = sim, int(body_id), alignment, device
+        self._rc = native.create_raycaster(sim)
+        pat = grid_pattern() if pattern_xy is None else np.asarray(pattern_xy, np.float32)
+        self.num_rays = len(pat)
+        self._local = torch.from_numpy(np.concatenate([pat, np.full((self.num_rays, 1), offset_z, np.float32)], axis=1)).to(device)
+        d = torch.tensor(ray_dir, dtype=torch.float32, device=device)
+        self._dir_local = (d / d.norm()).expand(self.num_rays, 3).contiguous()
+        self._kw = dict(max_dist=float(max_dist), bodyexclude=int(bodyexclude), flg_static=bool(flg_static), geomgroup_mask=int(geomgroup_mask))
+        self.pos_w = self.ray_origins_w = self.ray_hits_w = self.distance = None
+        self.geomid = None
+
+    def update(self) -> None:
+        n = self._sim.xpos().shape[0]
+        pos = torch.from_numpy(self._sim.xpos().reshape(n, -1, 3)[:, self._body_id]).to(self.device)
+        quat = torch.from_numpy(self._sim.xquat().reshape(n, -1, 4)[:, self._body_id]).to(self.device)
+        if self.alignment == "yaw":
+            q = _yaw_quat(quat)
+        elif self.alignment == "base":
+            q = quat
+        else:
+            q = torch.tensor([1.0, 0, 0, 0], device=self.device).expand(n, 4)
+        local = self._local.expand(n, -1, -1)
+        origins = pos.unsqueeze(1) + _quat_rotate(q, local)
+        dirs = _quat_rotate(q, self._dir_local.expand(n, -1, -1)) if self.alignment == "base" else self._dir_local.expand(n, -1, -1)
+        dist, gid = self._rc.cast(np.ascontiguousarray(origins.cpu().numpy(), np.float32), np.ascontiguousarray(dirs.cpu().numpy(), np.float32), **self._kw)
+        dist = torch.from_numpy(dist).to(self.device)
+        miss = dist < 0
+        self.distance = torch.where(miss, torch.full_like(dist, float("inf")), dist)
+        self.geomid = torch.from_numpy(gid).to(self.device)
+        self.pos_w, self.ray_origins_w = pos, origins
+        hits = origins + dirs * dist.clamp(min=0).unsqueeze(-1)
+        self.ray_hits_w = torch.where(miss.unsqueeze(-1), torch.full_like(hits, float("inf")), hits)
+
+    def height_scan(self, offset: float = 0.5) -> torch.Tensor:
+        """Isaac Labの height_scan 観測: センサ高さ - ヒット点の高さ - offset (N, num_rays)。missはinfになるので呼び出し側でclipする。"""
+        return self.pos_w[:, 2:3] - self.ray_hits_w[..., 2] - offset

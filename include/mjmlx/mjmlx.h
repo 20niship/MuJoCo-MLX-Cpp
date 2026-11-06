@@ -275,6 +275,14 @@ MJMLX_API int mjmlx_camera_gpu_copy(MjmlxCameraRenderer* r); // render後に呼�
 // which=0: color(RGBA8, (env,cam,H,W,4)), 1: depth(float32, (env,cam,H,W))。新しいfd(所有権は呼び出し側)を返す。失敗は-1
 MJMLX_API int mjmlx_camera_gpu_export_fd(MjmlxCameraRenderer* r, int which, uint64_t* alloc_size);
 
+// Raycast: mj_ray for every env in one dispatch (GPU batched sim only). Returns NULL on failure.
+MJMLX_API MjmlxRaycaster* mjmlx_raycaster_create(MjmlxBatchedSim* sim);
+MJMLX_API void mjmlx_raycaster_free(MjmlxRaycaster* r);
+
+// origins/dirs: float[num_envs*nray*3] in world frame. Outputs are -1 on miss like mj_ray; max_dist<=0 means unlimited, geomgroup_mask=-1 hits all groups. hfield and SDF geoms are never hit.
+MJMLX_API int mjmlx_raycaster_cast(MjmlxRaycaster* r, const float* origins, const float* dirs, int nray, float max_dist,
+                                   int bodyexclude, int flg_static, int geomgroup_mask, float* dist_out, int* geomid_out);
+
 #ifdef __cplusplus
 }
 #endif

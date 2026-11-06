@@ -128,6 +128,7 @@ set(MJMLX_SOURCES
     src/forward_vmap.cpp
     src/batched.cpp
     src/sensor.cpp
+    src/raycast.cpp
 )
 
 # カメラ(Vulkan graphics + multi-draw indirect)は任意機能。OFFだとmjmlx_camera_*はスタブになり、カメラ無しの学習・ビルドには影響しない。
@@ -320,6 +321,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_raycast tests/test_raycast.cpp)
+    target_link_libraries(test_raycast PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_raycast PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     add_executable(diag_go2_compare tests/diag_go2_compare.cpp)
     target_link_libraries(diag_go2_compare PRIVATE mjmlx mujoco_imported tensor_backend)
     target_include_directories(diag_go2_compare PRIVATE
@@ -418,6 +426,10 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME sensors_air COMMAND test_sensors ${_M}/sensors.xml 60 1e-4 2.0)
     add_test(NAME sensors_contact COMMAND test_sensors ${_M}/sensors_contact.xml 300 1e-4)
     set_tests_properties(sensors_air sensors_contact PROPERTIES LABELS "correctness")
+
+    # バッチGPUレイキャスト vs mj_ray(自己完結のXML)
+    add_test(NAME raycast COMMAND test_raycast)
+    set_tests_properties(raycast PROPERTIES LABELS "correctness")
 
     # mesh付き実ロボットMJCFの軌道比較(関節角・body位置/姿勢のCPU-GPU差)。モデルは `just fetch-models` で benchmarks/models/external/ に取得(git管理外)。
     # 未取得なら登録しない。LABELS=modelsなのでCIの `just check-ci` には含まれず、`just check-models` で実行する。

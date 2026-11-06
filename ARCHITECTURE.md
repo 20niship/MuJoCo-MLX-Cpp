@@ -82,12 +82,17 @@ Subtle pitfall: per-thread early-exit decisions must be uniform across the workg
 
 `src/sensor.cpp`, batched only. Computed on demand from the step outputs (xpos/xquat/cvel/subtree_com/qpos/qvel) outside the compiled step, so models without `<sensor>` pay nothing. Values correspond to the state at the start of the last step (same as `d->sensordata` after `mj_step`). Supported: gyro/accelerometer/velocimeter/magnetometer, frame*, joint*/ball*, actuatorpos/vel, subtreecom (19 types; see `src/sensor.cpp`). Not yet: force/torque/touch, rangefinder, camera. `scripts/mjmlx_sensors.py` mirrors Isaac Lab's Imu / ContactSensor layout.
 
+## Raycast
+
+`src/raycast.cpp` + `compat/mkx_kernels/raycast.hpp`: a standalone compute kernel, one thread per ray over all envs x rays in one dispatch. Geom poses come from re-running the kinematics kernel on the current `qpos` (0.2-0.3 ms at 4096 envs, SoA `[(g*3+c)*B+env]` read directly); a per-geom table (type, body, mesh id, group, static flag, alpha 0 flag, local AABB, size) and the mesh vertex/face buffers are copied from `mjModel` at creation. Semantics follow `mj_ray` (plane only hit from the +z side, ray inside a primitive returns the exit hit, geoms with alpha 0 are skipped, `bodyexclude` / `flg_static` / `geomgroup`); verified against `mj_ray` in `tests/test_raycast.cpp`. Meshes are tested face by face with a local AABB prefilter (no BVH): mask large visual meshes out with `geomgroup`. hfield and SDF geoms are never hit. Inputs and outputs go through host memory (`mjmlx_raycaster_cast`), which dominates the cost for small ray counts.
+
 ## Testing strategy
 
 The GPU engine is checked against MuJoCo C by running both on the same model and comparing trajectories (`test_gpu_vs_cpu`, tolerances per model), plus targeted primitives (`test_batched_collision_primitives`), sensors, SDF, camera vs MuJoCo's renderer, and a robustness sweep (`test_robustness`) over `nv` x {free, limit, contact, tendon, frictionloss}: divergence, env-to-env mismatch, dependence on batch size/position, repeatability. CI uses lavapipe (software Vulkan), so tests there are a subset; real-GPU-only tests carry labels (`models`, `known_issue`). `ctest -L correctness|robust|robust_full|models|known_issue`.
 
 ## Known issues and future work
 
+- Raycast does not cover hfield/SDF geoms, has no BVH for meshes and no GPU-resident (zero-copy) I/O yet.
 - Not in the batched path: equality constraints, actuator activation dynamics (FILTER/INTEGRATOR/MUSCLE), RK4, heightfield contacts, inverse dynamics, islands/noslip/sleep, differentiable physics (`mjmlx_grad_step` is a stub).
 - Constraint rows capped at 72/env on the shared-memory solver path.
 - `robust_known_issue_*` tests track configurations that still disagree with MuJoCo C.
