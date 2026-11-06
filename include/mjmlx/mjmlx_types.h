@@ -85,6 +85,7 @@ typedef struct {
     MjmlxIntegrator integrator;       // integration method
     int use_gpu;                      // 1 = use GPU GPU, 0 = CPU
     int solver_iterations;            // 0 = use model default, >0 = override solver iterations
+    int domain_rand;                  // 1 = env別の物理ランダム化(mjmlx_batched_set_env_params)を有効にする(GPUパスのみ。カーネルのバッファ読みが少し増える)。0 = 従来どおり
 } MjmlxBatchedConfig;
 
 

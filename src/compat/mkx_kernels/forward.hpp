@@ -50,7 +50,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
                                              const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0,
                                              const std::vector<float>& act_gain1, const std::vector<float>& act_gain2, const std::vector<float>& act_bias1, const std::vector<float>& act_bias2,
-                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp, const TendonHost* th = nullptr) {
+                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp, const TendonHost* th = nullptr, bool rand = false) {
   using namespace detail_forward;
   const bool has_ten = th && th->nten > 0;
 
@@ -107,6 +107,12 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
 
   ss << "const int body_par[" << nb << "] = " << int_array_literal(body_parentid) << ";\n";
   ss << "const int body_root[" << nb << "] = " << int_array_literal(body_rootid) << ";\n";
+  // env別ランダム化(rand=true): mass_scale[b*NBATCH+env], com_delta[(b*3+k)*NBATCH+env](body座標系のCOM位置のずれ), gain_scale[a*NBATCH+env]。falseなら恒等(1.0f/素のxipos)でバッファは増えない。
+  if(rand) ss << "#define MSC(b) (mass_scale[uint(b)*NBATCH+bid])\n"
+              << "#define GSC(a) (gain_scale[uint(a)*NBATCH+bid])\n"
+              << "#define XIP(b,k) (xipos[uint((b)*3+(k))*NBATCH+bid] + xmat[uint((b)*9+(k)*3+0)*NBATCH+bid]*com_delta[uint((b)*3+0)*NBATCH+bid]"
+                 " + xmat[uint((b)*9+(k)*3+1)*NBATCH+bid]*com_delta[uint((b)*3+1)*NBATCH+bid] + xmat[uint((b)*9+(k)*3+2)*NBATCH+bid]*com_delta[uint((b)*3+2)*NBATCH+bid])\n";
+  else ss << "#define MSC(b) 1.0f\n#define GSC(a) 1.0f\n#define XIP(b,k) xipos[uint((b)*3+(k))*NBATCH+bid]\n";
   ss << "const float body_mass[" << nb << "] = " << float_array_literal(body_mass) << ";\n";
   ss << "const float body_inert[" << nb * 3 << "] = " << float_array_literal(body_inertia) << ";\n";
   ss << "const int dof_bodyid[" << nv << "] = " << int_array_literal(dof_bodyid) << ";\n";
@@ -138,10 +144,10 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
   ss << "// Phase A: subtree COM, cinert, cdof\n";
 
   ss << "for (int b = 0; b < NB; b++) {\n"
-     << "  float m = body_mass[b];\n"
+     << "  float m = body_mass[b]*MSC(b);\n"
      << "  scratch[SCR_IDX(S_SUBM + b)] = m;\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    scratch[SCR_IDX(S_SUBP + b*3+k)] = xipos[uint(b*3+k)*NBATCH+bid] * m;\n"
+     << "    scratch[SCR_IDX(S_SUBP + b*3+k)] = XIP(b,k) * m;\n"
      << "}\n";
 
   ss << "for (int b = NB-1; b >= 1; b--) {\n"
@@ -158,13 +164,13 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "}\n\n";
 
   ss << "for (int b = 0; b < NB; b++) {\n"
-     << "  float m = body_mass[b];\n"
+     << "  float m = body_mass[b]*MSC(b);\n"
      << "  int rid = body_root[b];\n"
      << "  float off[3];\n"
      << "  for (int k = 0; k < 3; k++)\n"
-     << "    off[k] = xipos[uint(b*3+k)*NBATCH+bid] - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
+     << "    off[k] = XIP(b,k) - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
      << "  float R[9]; for (int k=0;k<9;k++) R[k] = ximat[uint(b*9+k)*NBATCH+bid];\n"
-     << "  float Ix = body_inert[b*3], Iy = body_inert[b*3+1], Iz = body_inert[b*3+2];\n"
+     << "  float Ix = body_inert[b*3]*MSC(b), Iy = body_inert[b*3+1]*MSC(b), Iz = body_inert[b*3+2]*MSC(b);\n"
      << "  float RI[9] = float[](R[0]*Ix,R[1]*Iy,R[2]*Iz, R[3]*Ix,R[4]*Iy,R[5]*Iz, R[6]*Ix,R[7]*Iy,R[8]*Iz);\n"
      << "  float Ig[9];\n"
      << "  for (int r=0;r<3;r++) for (int c=0;c<3;c++) {\n"
@@ -418,7 +424,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss
        << "      float gain = act_g0[ai] + act_g1[ai]*len + act_g2[ai]*vel;\n"
        << "      float bias = act_b0[ai] + act_b1[ai]*len + act_b2[ai]*vel;\n"
-       << "      float force = gain * ctrl[u_off+ai] + bias;\n"
+       << "      float force = (gain * ctrl[u_off+ai] + bias) * GSC(ai);\n"
        << "      fa += mom * force;\n"
        << "    }\n"
        << "  }\n"
@@ -436,8 +442,9 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     float m = body_mass[static_cast<size_t>(b)] * gc;
     ss << "{\n"
        << "  float f[3] = float[](" << fmt_float(-m * gravity[0]) << "f," << fmt_float(-m * gravity[1]) << "f," << fmt_float(-m * gravity[2]) << "f);\n"
+       << "  for (int k=0;k<3;k++) f[k] *= MSC(" << b << ");\n"
        << "  int rid = body_root[" << b << "];\n"
-       << "  float o[3]; for (int k=0;k<3;k++) o[k] = xipos[uint(" << b << "*3+k)*NBATCH+bid] - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
+       << "  float o[3]; for (int k=0;k<3;k++) o[k] = XIP(" << b << ",k) - subtree_com_out[uint(rid*3+k)*NBATCH+bid];\n"
        << "  float w[6] = float[](o[1]*f[2]-o[2]*f[1], o[2]*f[0]-o[0]*f[2], o[0]*f[1]-o[1]*f[0], f[0], f[1], f[2]);\n";
     for(int a = b; a > 0; a = body_parentid[static_cast<size_t>(a)])
       for(int di : body_dofs[static_cast<size_t>(a)])
@@ -476,6 +483,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
       header = tendon_glsl_header(*th);
     }
   }
+  if(rand) for(const char* n : {"mass_scale", "com_delta", "gain_scale"}) in_names.push_back(n);
   return mkx::fast::compute_kernel("mjmlx_forward", in_names, out_names, src, header);
 }
 

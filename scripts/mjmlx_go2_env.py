@@ -29,6 +29,7 @@ CTRL_LOW = np.array([-0.9472, -1.4, -2.6227] * 4, dtype=np.float32)
 CTRL_HIGH = np.array([0.9472, 2.5, -0.84776] * 4, dtype=np.float32)
 FOOT_BODY_IDX = np.array([4, 7, 10, 13])  # FL,FR,RL,RR の calf(=foot)ボディ
 BASE_BODY_IDX = 1
+DR_FRICTION, DR_BASE_MASS_ADD, DR_BASE_COM, DR_GAIN = (0.5, 1.25), (-1.0, 3.0), 0.05, (0.9, 1.1)  # --domain-rand時のランダム化範囲
 
 # reward weights (velocity_env_cfg.RewardsCfg + go2 rough_env_cfg の上書き)
 W_TRACK_LIN = 1.5
@@ -219,6 +220,7 @@ class MjmlxGo2Env(VecEnv):
         use_sensors: bool = False,
         self_collision: bool = True,
         max_condim: int = 0,
+        domain_rand: bool = False,
     ):
         self._native = native_module
         self._w = PRESETS[reward_preset]
@@ -227,7 +229,7 @@ class MjmlxGo2Env(VecEnv):
 
         # self_collision=False/max_condim>0は読み込み時にモデルへ適用する簡略化オプション(MJCFファイルは変更しない。精度への影響はREADME参照)
         self._model = native_module.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS)
+        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS, domain_rand=domain_rand)
         self.nq = self._model.nq
         self.nv = self._model.nv
         self.nu = self._model.nu
@@ -263,6 +265,8 @@ class MjmlxGo2Env(VecEnv):
         self.cmd_vel_min = cmd_vel_min
         self.cmd_vel_max = cmd_vel_max
         self._rng = np.random.default_rng(seed)
+        if domain_rand:
+            self._randomize_physics(num_envs)
         self._elapsed = np.zeros(num_envs, dtype=np.int64)
         dev = self.device
         self._default_pos = torch.from_numpy(DEFAULT_JOINT_POS).to(dev)
@@ -281,6 +285,22 @@ class MjmlxGo2Env(VecEnv):
         qpos, qvel = qpos.copy(), qvel.copy()
         self._reset_envs(all_mask, qpos, qvel)
         self._sim.set_state(qpos, qvel)
+
+    def _randomize_physics(self, n: int) -> None:
+        """起動時に1回、env別の物理パラメータをサンプルする(Isaac Labのstartupイベント相当)。範囲: 摩擦倍率U(0.5,1.25)(legged_gym)、base質量に加える量U(-1,3)kg(Isaac Labのadd_base_mass)、
+        base COMずれ±0.05m、アクチュエータ出力倍率U(0.9,1.1)。"""
+        nb = self._model.nbody
+        base_m = self._model.body_mass(BASE_BODY_IDX)
+        mass = np.ones((n, nb), np.float32)
+        mass[:, BASE_BODY_IDX] = 1.0 + self._rng.uniform(*DR_BASE_MASS_ADD, size=n) / base_m
+        com = np.zeros((n, nb, 3), np.float32)
+        com[:, BASE_BODY_IDX] = self._rng.uniform(-DR_BASE_COM, DR_BASE_COM, size=(n, 3))
+        self._sim.set_env_params(
+            mass_scale=mass,
+            com_delta=com,
+            friction_scale=self._rng.uniform(*DR_FRICTION, size=n).astype(np.float32),
+            gain_scale=self._rng.uniform(*DR_GAIN, size=(n, self.nu)).astype(np.float32),
+        )
 
     @property
     def episode_length_buf(self) -> torch.Tensor:

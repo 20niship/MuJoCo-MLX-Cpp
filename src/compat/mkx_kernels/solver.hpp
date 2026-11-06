@@ -36,7 +36,7 @@ inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(
 inline int solver_h_floats(int nv) { return std::max(nv * nv, 3 * nv); }
 inline int solver_scratch_floats(int nv, int max_efc) { return solver_h_floats(nv) + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
-inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, int ntlim = 0, int ntfl = 0, bool export_qacc = false) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, int ntlim = 0, int ntfl = 0, bool export_qacc = false, bool rand = false) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
@@ -142,6 +142,7 @@ shared float tg_pAp;
 
   ss << "uint bid = gl_WorkGroupID.x;\n"
      << "uint NBATCH = gl_NumWorkGroups.x;\n"
+     << (rand ? "#define FSC (fric_scale[bid])\n" : "#define FSC 1.0f\n")  // env別の摩擦スケール(rand=true時のみバッファを読む)
      << "uint tid = gl_LocalInvocationID.x;\n"
      << "const int NV = " << nv << ";\n"
      << "const int NB = " << nb << ";\n"
@@ -389,8 +390,8 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
     int body2 = int(pair_props[pp+1]);
     int condim = int(pair_props[pp+2]);
     float pair_margin_v = pair_props[pp+3];
-    float fri0 = pair_props[pp+4];
-    float fri1 = pair_props[pp+5];
+    float fri0 = pair_props[pp+4]*FSC;
+    float fri1 = pair_props[pp+5]*FSC;
     float solref0 = pair_props[pp+9];
     float solref1_v = pair_props[pp+10];
     float si0 = pair_props[pp+11], si1 = pair_props[pp+12];
@@ -484,7 +485,7 @@ for (int ci = int(tid); ci < tg_ncp; ci += NV) {
             // 全方向: 0,1=接線(並進)、2=ねじり(法線まわり)、3,4=転がり(接線1,2まわり)。各方向でJ_normal ± mu_k*J_k の2行。
             int ndir = condim - 1;
             for (int tk = 0; tk < ndir; tk++) {
-                float mu_k = pair_props[pp+4+tk];
+                float mu_k = pair_props[pp+4+tk]*FSC;
                 vec3 dir = (tk == 0 || tk == 3) ? tt1 : ((tk == 1 || tk == 4) ? tt2 : nn);
                 for (int sg_i = 0; sg_i < 2; sg_i++) {
                     float sg = (sg_i == 0) ? 1.0f : -1.0f;
@@ -854,6 +855,7 @@ if (tid == 0u) {
   }
   std::vector<std::string> in_names = {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"};
   if(ntlim + ntfl > 0) { in_names.push_back("ten_in"); in_names.push_back("tlim_tab"); in_names.push_back("tfric_tab"); }
+  if(rand) in_names.push_back("fric_scale");
   return mkx::fast::compute_kernel("mjmlx_solver", in_names, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out", "qacc_out"}, ss.str(), header);
 }
 

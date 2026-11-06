@@ -122,7 +122,7 @@ uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir bui
 
 エンジンの制約により、IsaacLab版から以下を省略・簡略化している:
 - **height_scanner観測**: 本エンジンにレイキャストAPIが無いため、盲目(proprioception only)方策になる
-- **per-envの物理DR(質量/摩擦/COM)**: batched simが全envで単一モデルを共有するため、env別に質量・摩擦を変えるAPIが無い
+- **per-envの物理DR**: `--domain-rand`で起動時に1回、摩擦倍率U(0.5,1.25)・base質量加算U(-1,3)kg(Isaac Labのadd_base_mass)・base COMずれ±0.05m・アクチュエータ出力倍率U(0.9,1.1)をenv別にサンプルする(下記「env別の物理ランダム化」)。リセットごとの再サンプルや関節ごとのゲイン(kp/kdを別々に)は未対応
 - **地形カリキュラム**: 実装対象外(固定難度の階段地形のみ)
 - **heading_command方式のcmd_vel生成**: `||cmd_vel|| ∈ [--cmd-vel-min, --cmd-vel-max]`の直接サンプリングに簡略化
 
@@ -437,6 +437,23 @@ CLI: `bench_go2_step.py --no-self-collision --max-condim 3`、`train_go2_ppo.py 
 | `self_collision=False, max_condim=3` | 481,351(1.17倍) | 648,499(1.23倍) |
 
 CPUとの1step差(関節角、`compare_cpu_gpu_go2.py`): 既定は 平均3.6e-5 rad・p95 8e-7 rad、`--max-condim 3`(CPU・GPUの両方に同じオプション)は 平均1.4e-5 rad・p95 5e-7 rad。GPUとCPUが同じ簡略モデルを解いているかの確認であり、簡略化自体による本来の物理との差(足のねじり・転がり摩擦の欠落)は含まない。
+
+## env別の物理ランダム化
+
+質量・COM・摩擦・アクチュエータ出力をenvごとに変えられる(sim2real用のドメインランダマイズ)。`domain_rand`を有効にして作ったsimだけが、カーネルにenv別のバッファ読みを足す(無効=既定は従来と同じ速度・同じ結果)。
+
+```python
+sim = native.create_batched(model, 4096, frame_skip=1, domain_rand=True)
+sim.set_env_params(                       # env_idx=Noneなら全env、配列なら指定envだけ更新。Noneの引数は変更しない
+    env_idx=np.array([0, 5], np.int32),
+    mass_scale=np.ones((2, model.nbody), np.float32),      # (n, nbody) bodyごとの質量と慣性の倍率
+    com_delta=np.zeros((2, model.nbody, 3), np.float32),   # (n, nbody, 3) body座標系のCOMずれ[m]
+    friction_scale=np.array([0.5, 1.2], np.float32),       # (n,) 全geomの摩擦(滑り/ねじり/転がり)の倍率
+    gain_scale=np.ones((2, model.nu), np.float32),         # (n, nu) アクチュエータ出力(gain*ctrl+bias、kpとkv同時)の倍率
+)
+```
+
+C APIは`MjmlxBatchedConfig.domain_rand=1`と`mjmlx_batched_set_env_params`。MuJoCo Cで同じ値に`body_mass`/`body_inertia`(倍率)・`body_ipos`(加算)・`geom_friction`(倍率)・`actuator_gainprm/biasprm[:3]`(倍率)を書き換えたモデルと比べるテスト(`ctest -R env_rand`)で、接触のない腕は一致(差 8e-6)、摩擦による箱の滑り距離の変化は箱の接触solverの既存差の範囲内で一致する。`mj_setConst`相当(invweightなどのモデル定数)は再計算しない(MuJoCo Cで`mjModel`を書き換えた時と同じ)。GPU forwardカーネルを持たないモデル(衝突ペアが無い)は`domain_rand`を使えない。
 
 ## Architecture
 

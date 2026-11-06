@@ -2,6 +2,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -45,7 +46,7 @@ struct RlModel {
 struct RlBatchedSim {
     MjmlxBatchedSim* handle = nullptr;
     int num_envs = 0;
-    int nq = 0, nv = 0, nu = 0;
+    int nq = 0, nv = 0, nu = 0, nbody = 0;
     ~RlBatchedSim() { if (handle) mjmlx_batched_free(handle); }
 
     void step(FloatArray ctrl, int n) {
@@ -75,6 +76,27 @@ struct RlBatchedSim {
         if (static_cast<int>(qvel_full.shape(0)) != num_envs || static_cast<int>(qvel_full.shape(1)) != nv)
             throw std::runtime_error("mjmlx_rl: qvel must have shape (num_envs, nv)");
         mjmlx_batched_set_state(handle, qpos_full.data(), qvel_full.data());
+    }
+
+    // env別の物理ランダム化(create_batched(domain_rand=True)の時のみ)。env_idx=Noneなら全env、指定ならそのenvだけ更新する。Noneの引数は変更しない。
+    //   mass_scale (n,nbody) 質量・慣性の倍率 / com_delta (n,nbody,3) body座標系のCOMずれ[m] / friction_scale (n,) 摩擦係数の倍率 / gain_scale (n,nu) アクチュエータ出力の倍率
+    void set_env_params(std::optional<IntArray> env_idx, std::optional<FloatArray> mass_scale, std::optional<FloatArray> com_delta,
+                        std::optional<FloatArray> friction_scale, std::optional<FloatArray> gain_scale) {
+        int n = env_idx ? static_cast<int>(env_idx->shape(0)) : num_envs;
+        auto check = [&](const std::optional<FloatArray>& a, std::initializer_list<int> shape, const char* name) {
+            if (!a) return;
+            if (a->ndim() != shape.size()) throw std::runtime_error(std::string("mjmlx_rl: bad ndim for ") + name);
+            size_t d = 0;
+            for (int want : shape) if (static_cast<int>(a->shape(d++)) != want) throw std::runtime_error(std::string("mjmlx_rl: bad shape for ") + name);
+        };
+        check(mass_scale, {n, nbody}, "mass_scale (n, nbody)");
+        check(com_delta, {n, nbody, 3}, "com_delta (n, nbody, 3)");
+        check(friction_scale, {n}, "friction_scale (n,)");
+        check(gain_scale, {n, nu}, "gain_scale (n, nu)");
+        int rc = mjmlx_batched_set_env_params(handle, env_idx ? env_idx->data() : nullptr, n, mass_scale ? mass_scale->data() : nullptr,
+                                              com_delta ? com_delta->data() : nullptr, friction_scale ? friction_scale->data() : nullptr,
+                                              gain_scale ? gain_scale->data() : nullptr);
+        if (rc != 0) throw std::runtime_error("mjmlx_rl: set_env_params failed (create_batched(domain_rand=True) is required; env_idx must be in range)");
     }
 
     std::pair<FloatArray, FloatArray> state() {
@@ -175,7 +197,8 @@ NB_MODULE(_mjmlx_rl_native, m) {
             return out;
         })
         // mjtObj(body=1, joint=3, geom=5, site=6 ...)の名前からid。無ければ-1
-        .def("name2id", [](const RlModel& m, int obj_type, const std::string& name) { return mjmlx_name2id(m.handle, obj_type, name.c_str()); });
+        .def("name2id", [](const RlModel& m, int obj_type, const std::string& name) { return mjmlx_name2id(m.handle, obj_type, name.c_str()); })
+        .def("body_mass", [](const RlModel& m, int body_id) { return mjmlx_model_body_mass(m.handle, body_id); });
 
     nb::class_<RlBatchedSim>(m, "BatchedSim")
         .def_prop_ro("num_envs", [](const RlBatchedSim& s) { return s.num_envs; })
@@ -187,6 +210,8 @@ NB_MODULE(_mjmlx_rl_native, m) {
         .def("set_env_qpos", &RlBatchedSim::set_env_qpos, nb::arg("env_idx"), nb::arg("qpos"))
         .def("set_env_qvel", &RlBatchedSim::set_env_qvel, nb::arg("env_idx"), nb::arg("qvel"))
         .def("set_state", &RlBatchedSim::set_state, nb::arg("qpos"), nb::arg("qvel"))
+        .def("set_env_params", &RlBatchedSim::set_env_params, nb::arg("env_idx") = nb::none(), nb::arg("mass_scale") = nb::none(),
+             nb::arg("com_delta") = nb::none(), nb::arg("friction_scale") = nb::none(), nb::arg("gain_scale") = nb::none())
         .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)
@@ -236,12 +261,13 @@ NB_MODULE(_mjmlx_rl_native, m) {
     }, nb::arg("xml_path"), nb::arg("self_collision") = true, nb::arg("max_condim") = 0);
 
     m.def("create_batched", [](std::shared_ptr<RlModel> model, int num_envs, int frame_skip,
-                                bool use_gpu, int solver_iterations) -> std::shared_ptr<RlBatchedSim> {
+                                bool use_gpu, int solver_iterations, bool domain_rand) -> std::shared_ptr<RlBatchedSim> {
         MjmlxBatchedConfig cfg{};
         cfg.num_envs           = num_envs;
         cfg.integrator         = MJMLX_INTEGRATOR_EULER;
         cfg.use_gpu            = use_gpu ? 1 : 0;
         cfg.solver_iterations  = solver_iterations;
+        cfg.domain_rand        = domain_rand ? 1 : 0;
         (void)frame_skip; // frame skipping is done by calling step() repeatedly from Python
 
         auto sim = std::make_shared<RlBatchedSim>();
@@ -249,10 +275,10 @@ NB_MODULE(_mjmlx_rl_native, m) {
         if (!sim->handle) throw std::runtime_error("mjmlx_rl: failed to create batched sim");
         sim->num_envs = num_envs;
         auto info = mjmlx_model_info(model->handle);
-        sim->nq = info.nq; sim->nv = info.nv; sim->nu = info.nu;
+        sim->nq = info.nq; sim->nv = info.nv; sim->nu = info.nu; sim->nbody = info.nbody;
         return sim;
     }, nb::arg("model"), nb::arg("num_envs"), nb::arg("frame_skip") = 1,
-       nb::arg("use_gpu") = true, nb::arg("solver_iterations") = 0);
+       nb::arg("use_gpu") = true, nb::arg("solver_iterations") = 0, nb::arg("domain_rand") = false);
 
     m.def("version", []() -> std::string { return mjmlx_version(); });
 }

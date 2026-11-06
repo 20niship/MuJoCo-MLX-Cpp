@@ -137,6 +137,10 @@ subsets optimized for GPU-batched RL training, not full reimplementations.
 
 ---
 
+## Per-env domain randomization (batched GPU path)
+
+`create_batched(..., domain_rand=True)` + `set_env_params`: per-env body mass/inertia scale, body COM offset, friction scale, actuator output scale. Validated against MuJoCo C with the same per-env `mjModel` edits (`test_env_rand`, label `correctness`). Not randomized: joint damping/armature/stiffness, geom size, contact solref/solimp, gravity; actuator kp/kv cannot be scaled separately; model constants derived at compile time (`invweight0`) are not recomputed, as with an edited `mjModel` in MuJoCo C.
+
 ## Collision System
 
 The collision system is the largest divergence. MuJoCo C dedicates ~9,000 lines

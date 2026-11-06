@@ -566,6 +566,14 @@ struct Data {
 
 struct SensorCtx;  // sensor.cpp。モデルにsensorがあるときだけ確保する
 
+// env別の物理ランダム化(MjmlxBatchedConfig::domain_rand=1の時だけ作る)。ホスト側はenv主(AoS)、GPU側はカーネルが読むSoA(成分*B+env)。
+struct EnvRand {
+    int B = 0, nb = 0, nu = 0;
+    std::vector<float> mass, com, fric, gain;  // (B,nb) 質量スケール / (B,nb,3) body座標系のCOMずれ[m] / (B) 摩擦スケール / (B,nu) アクチュエータ出力スケール
+    mx::array mass_a = mx::array({}), com_a = mx::array({}), fric_a = mx::array({}), gain_a = mx::array({});
+    void upload();
+};
+
 struct BatchedSim {
     const Model* model;
     int num_envs;
@@ -592,6 +600,9 @@ struct BatchedSim {
 
     // sensor (MJCF <sensor>)。nsensor==0なら空で、stepに追加コストはない
     std::shared_ptr<SensorCtx> sensor;
+
+    // env別の物理ランダム化。nullptrならカーネルにバッファを足さない(従来と同一のシェーダ)
+    std::shared_ptr<EnvRand> env_rand;
 };
 
 // sensor.cpp
@@ -656,7 +667,8 @@ Data rne_post_constraint(const Model& m, Data d);
 // batched.cpp
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override = 0, const void* owner = nullptr,
-                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out = nullptr);
+                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out = nullptr,
+                  std::shared_ptr<EnvRand> env_rand = nullptr);
 
 // ── Vmap-compatible functions (pure MLX graph, no eval/data) ──
 
