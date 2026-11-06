@@ -45,6 +45,7 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--out", default="runs/video/cmd_vel.mp4")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--plain-floor", action="store_true", help="地面を市松模様にしない(既定は市松)")
     ap.add_argument("--reward-preset", default="relaxed")
     args = ap.parse_args()
 
@@ -108,7 +109,13 @@ def main() -> None:
         print(f"{name:9s} cmd=({cmd[i,0]:+.2f},{cmd[i,1]:+.2f}) mean(vx,vy,wz)=({m[0]:+.2f},{m[1]:+.2f},{m[2]:+.2f}) |err|={err:.2f}"
               + (f"  終了/リセット step={first_done[i]}" if first_done[i] >= 0 else ""))
 
-    model = mujoco.MjModel.from_xml_path(xml_path)
+    # 描画専用: 地形のbox(物理用のrgba 0.5 0.5 0.55)に市松模様のテクスチャを貼る(物理・衝突は変えない)
+    xml = Path(xml_path).read_text()
+    if not args.plain_floor:
+        tex = ('<texture name="floor_checker" type="2d" builtin="checker" rgb1="0.50 0.62 0.74" rgb2="0.92 0.94 0.97" width="512" height="512" mark="edge" markrgb="0.9 0.9 0.9"/>'
+               '<material name="floor_checker" texture="floor_checker" texuniform="true" texrepeat="1 1" reflectance="0.05"/>')
+        xml = xml.replace("<asset>", "<asset>" + tex, 1).replace('rgba="0.5 0.5 0.55 1"', 'material="floor_checker"')
+    model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, TILE_H, TILE_W)
     cam = mujoco.MjvCamera()

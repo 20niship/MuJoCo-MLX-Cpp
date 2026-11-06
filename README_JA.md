@@ -85,6 +85,10 @@ tensorboard --logdir runs/
 
 Isaac Lab版からの簡略化: height_scannerなし(盲目方策)、env別の物理ドメインランダマイズなし(全envで単一モデル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
 
+学習済み方策の再生(Go2、平地、`isaac_flat`、500 iteration、前後左右に0.5 m/sで指令。後退・左・右は追従するが前進だけ静止するので途中経過):
+
+https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
+
 HalfCheetah-v4のPPOサンプル(stable-baselines3)は`scripts/train_ppo.py`(`just train-ppo`)。
 
 ## シミュレーション簡略化オプション(読み込み時)

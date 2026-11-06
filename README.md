@@ -85,6 +85,10 @@ Useful flags: `--reward-preset {relaxed,isaac_flat}`, `--device cuda`, `--no-sel
 
 Simplifications versus Isaac Lab: no height scanner (blind policy), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
 
+Trained policy rollout (Go2, flat ground, `isaac_flat` preset, 500 iterations, commands forward/back/left/right at 0.5 m/s; the policy tracks back/left/right but stays still for forward, so this is a work in progress):
+
+https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
+
 A self-contained HalfCheetah-v4 PPO example (stable-baselines3) is in `scripts/train_ppo.py` (`just train-ppo`).
 
 ## Simulation simplification options (load time)
