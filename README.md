@@ -112,6 +112,41 @@ https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
 
 A self-contained HalfCheetah-v4 PPO example (stable-baselines3) is in `scripts/train_ppo.py` (`just train-ppo`).
 
+## Train G1 (PPO, rsl_rl; reproduces Isaac Lab `Isaac-Velocity-Flat-G1-v0`)
+
+```bash
+uv sync --group build --group go2 && just fetch-models        # menagerie unitree_g1 (29 DoF)
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/train_g1_ppo.py --build-dir build --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
+uv run python scripts/play_g1_cmd_vel.py --logdir runs/g1_flat --build-dir build           # forward / forward 1.0 / lateral / turn tiles -> runs/video/g1_cmd_vel.mp4
+uv run python scripts/compare_cpu_gpu_g1.py --build-dir build                              # 1-step difference vs MuJoCo C
+```
+
+**Reference chosen and why.** We reproduce Isaac Lab v2.3.2 `Isaac-Velocity-Flat-G1-v0`: [`flat_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/flat_env_cfg.py), [`rough_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/rough_env_cfg.py) (rewards inherited), [`rsl_rl_ppo_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/agents/rsl_rl_ppo_cfg.py) (`G1FlatPPORunnerCfg`), [`velocity_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py), [`mdp/rewards.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py) and the `G1_CFG` actuator/default-pose table in [`isaaclab_assets/robots/unitree.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_assets/isaaclab_assets/robots/unitree.py). Reasons: the code exists and every number is readable; it uses the same training library (rsl_rl PPO) as our Go2 environment; the *flat* config needs no height scanner, no mass/COM randomisation and no pushes (friction is a fixed 0.8), so this engine's gaps (no ray casting, one model per batch, no terrain curriculum) do not matter; and Isaac Lab 2.3.2 can be run locally under the same conditions for a curve comparison.
+
+Considered and not used:
+- [unitree_rl_gym](https://github.com/unitreerobotics/unitree_rl_gym) (`legged_gym/envs/g1/g1_config.py`): 12-DoF G1 URDF, a recurrent actor-critic with hidden size 32 and a gait-phase style reward set (`feet_swing_height`, `contact`, ...) on the legged_gym stack; different library and robot definition, so curves would not be comparable with our rsl_rl setup.
+- MuJoCo Playground G1 joystick ([`rss2025/.../locomotion/g1/joystick.py`](https://github.com/google-deepmind/mujoco_playground/blob/main/rss2025/mujoco_playground/_src/locomotion/g1/joystick.py)): MJX/Warp + Brax PPO, 0.02 s control with 0.002 s physics, `feet_phase`/`pose` rewards, pushes and per-env domain randomisation (`randomize.py`) that needs per-env model parameters we do not have.
+- HumanoidVerse / humanoid-gym / Genesis locomotion examples: not investigated (the Genesis example is Go2).
+
+**What matches Isaac Lab:** dt 0.005 x decimation 4, 20 s episodes, action = default + 0.5 x action, observation (99 = base lin/ang vel, projected gravity, command, joint pos/vel, last action) with the same uniform observation noise, heading-mode yaw command with 2% standing envs and 10 s resampling (vx 0..1, vy -0.5..0.5), the full flat reward set (termination -200, track_lin 1.0, track_ang 1.0, lin_vel_z -0.2, ang_vel_xy -0.05, torques/acc on hip+knee, action_rate -0.005, biped feet_air_time 0.75 / 0.4 s, feet_slide -0.1, flat_orientation -1.0, ankle limits, hip/arm/waist deviation) each multiplied by the control step like Isaac's `RewardManager`, termination on torso contact, PD gains from `G1_CFG` (legs 150-200/5, ankles 20/2, arms 40/10), default pose, no self-collision, reset to the default pose with random yaw, and the PPO runner (actor/critic [256, 128, 128] ELU, entropy 0.008, lr 1e-3 adaptive, 24 steps/env).
+
+**Differences (be aware when comparing):**
+- Robot: menagerie `g1.xml` has 29 DoF (3 waist axes, 7 arm axes, no fingers) while Isaac's G1 has a 1-axis waist, 5 arm axes and 14 finger joints. Extra waist/wrist joints use the same stiff gains and are covered by the existing deviation penalties. The pelvis start height is computed so the feet touch the floor (0.80 m vs 0.74 m).
+- Collision: only foot spheres, pelvis, torso and knees collide with the floor (like Isaac's `G1_MINIMAL_CFG`, exact set differs). `actuatorfrcrange` is removed and Isaac's `effort_limit_sim` (300/20) is not applied: the engine does not clamp actuator force. Joint `frictionloss` is set to 0 (as in Isaac), floor friction 0.8.
+- Torque and joint acceleration for the rewards are computed from the PD law and finite differences per control step; contact/air time and foot speed are sampled once per control step (Isaac samples per physics step); foot speed uses a MuJoCo `framelinvel` sensor (one substep lag).
+- Integrator: `implicitfast` handles the PD velocity term (PhysX implicit actuators in Isaac).
+
+**Measured (RTX 3060, shared with other jobs, 1024 envs, seed 42, 100 iterations x 24 steps; mean episode reward / mean episode length in steps):**
+
+| iteration | this repo | Isaac Lab 2.3.2 (same task, same settings) |
+|---|---|---|
+| 10 | -7.28 / 39.0 | -5.96 / 40.6 |
+| 40 | -5.64 / 40.3 | -5.47 / 44.1 |
+| 80 | -5.39 / 52.4 | -5.15 / 48.4 |
+| 99 | -5.22 / 57.1 | -5.13 / 55.6 |
+
+Both are still early in training (episodes end after ~1 s by falling; the default run is 1500 iterations x 4096 envs) but the curves track each other. G1 physics is currently **slow in this engine**: about 4-5K env-steps/s (nv=35: the solver spends 50 ms per substep at 1024 envs, saturating at about 8 Newton iterations; Go2 is ~100x faster per env), so long runs take hours. CPU/GPU agreement for G1 (`scripts/compare_cpu_gpu_g1.py`, 1 control step, joint angles): contact-free 2.5e-6 rad mean; standing with foot contact about 5e-5 rad; random-action states with impacts 5.8e-4 mean / 2.3e-3 p95 (looser than Go2's 3.6e-5; not caused by solver iterations or condim). H1 is not done yet.
+
 ## Simulation simplification options (load time)
 
 The MJCF is not modified; the in-memory model is overridden before compilation, only for articulated bodies (terrain is untouched). Defaults are exact MuJoCo behaviour.

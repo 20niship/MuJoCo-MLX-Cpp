@@ -1,0 +1,50 @@
+"""G1平地速度追従のPPO学習(rsl_rl)。設定はIsaac Lab v2.3.2のG1FlatPPORunnerCfg(config/g1/agents/rsl_rl_ppo_cfg.py)。"""
+
+import argparse
+import os
+import sys
+
+from rsl_rl.runners import OnPolicyRunner
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from train_go2_ppo import make_train_cfg
+
+
+def make_g1_train_cfg(seed: int, max_iterations: int) -> dict:
+    """Go2と共通のPPO設定から、G1FlatPPORunnerCfgとの差(ネットワーク[256,128,128]、entropy_coef 0.008)だけ変える。"""
+    cfg = make_train_cfg(seed, max_iterations)
+    cfg["experiment_name"] = "g1_flat"
+    cfg["actor"]["hidden_dims"] = cfg["critic"]["hidden_dims"] = [256, 128, 128]
+    cfg["algorithm"]["entropy_coef"] = 0.008
+    return cfg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--envs", type=int, default=4096)
+    parser.add_argument("--max-iterations", type=int, default=1500)
+    parser.add_argument("--logdir", type=str, default="runs/g1_flat")
+    parser.add_argument("--build-dir", type=str, default="build")
+    parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cpu", help="PPO更新のデバイス(cuda可)")
+    parser.add_argument("--self-collision", action="store_true", help="自己衝突を入れる(Isaac LabのG1_CFGは無効。既定は無効)")
+    parser.add_argument("--max-condim", type=int, default=0, help="簡略化オプション: ロボットのgeomのcondim上限")
+    parser.add_argument("--no-obs-noise", action="store_true", help="観測ノイズ(Isaac LabのUnoise)を切る")
+    args = parser.parse_args()
+
+    sys.path.insert(0, args.build_dir)
+    import _mjmlx_rl_native as native
+
+    from mjmlx_g1_env import MjmlxG1Env
+
+    env = MjmlxG1Env(native, args.envs, use_gpu=not args.cpu, seed=args.seed, device=args.device, self_collision=args.self_collision,
+                     max_condim=args.max_condim, obs_noise=not args.no_obs_noise)
+    train_cfg = make_g1_train_cfg(args.seed, args.max_iterations)
+    train_cfg["device"] = args.device
+    runner = OnPolicyRunner(env, train_cfg, log_dir=args.logdir, device=train_cfg["device"])
+    runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=train_cfg["init_at_random_ep_len"])
+
+
+if __name__ == "__main__":
+    main()

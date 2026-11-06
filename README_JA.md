@@ -112,6 +112,41 @@ https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
 
 HalfCheetah-v4のPPOサンプル(stable-baselines3)は`scripts/train_ppo.py`(`just train-ppo`)。
 
+## G1の学習(PPO、rsl_rl。Isaac Lab `Isaac-Velocity-Flat-G1-v0` の再現)
+
+```bash
+uv sync --group build --group go2 && just fetch-models        # menagerieのunitree_g1(29DoF)
+PYTHONPATH=<cu126等のtorch> uv run python scripts/train_g1_ppo.py --build-dir build --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
+uv run python scripts/play_g1_cmd_vel.py --logdir runs/g1_flat --build-dir build           # 前進/前進1.0/横/旋回のタイル動画 -> runs/video/g1_cmd_vel.mp4
+uv run python scripts/compare_cpu_gpu_g1.py --build-dir build                              # MuJoCo Cとの1 step差
+```
+
+**再現元とその理由。** Isaac Lab v2.3.2の`Isaac-Velocity-Flat-G1-v0`を再現する: [`flat_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/flat_env_cfg.py)、[`rough_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/rough_env_cfg.py)(報酬を継承)、[`rsl_rl_ppo_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/agents/rsl_rl_ppo_cfg.py)(`G1FlatPPORunnerCfg`)、[`velocity_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py)、[`mdp/rewards.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py)、[`isaaclab_assets/robots/unitree.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_assets/isaaclab_assets/robots/unitree.py)の`G1_CFG`(アクチュエータ・初期姿勢)。理由: コードが実在し数値を全て読める、学習ライブラリ(rsl_rl PPO)がGo2環境と同じ、**平地(flat)cfgはheight scanner・質量/COMのランダム化・押しを使わない**(摩擦は0.8固定)ので本エンジンの制約(レイキャスト無し・1バッチ1モデル・地形カリキュラム無し)が影響しない、ローカルのIsaac Lab 2.3.2で同条件の学習曲線を比較できる。
+
+検討して採用しなかったもの:
+- [unitree_rl_gym](https://github.com/unitreerobotics/unitree_rl_gym)(`legged_gym/envs/g1/g1_config.py`): 12DoFのG1 URDF、隠れ層32のリカレントactor-critic、歩容位相寄りの報酬(`feet_swing_height`、`contact`など)でlegged_gym系。ライブラリもロボット定義も異なり、rsl_rlの学習と曲線を比較できない。
+- MuJoCo Playground G1 joystick([`rss2025/.../locomotion/g1/joystick.py`](https://github.com/google-deepmind/mujoco_playground/blob/main/rss2025/mujoco_playground/_src/locomotion/g1/joystick.py)): MJX/Warp + Brax PPO、制御0.02s・物理0.002s、`feet_phase`/`pose`報酬、押しとenv別のドメインランダマイズ(`randomize.py`、env別モデルパラメータが必要で本エンジンには無い)。
+- HumanoidVerse / humanoid-gym / Genesisのlocomotion例: 未調査(Genesisの例はGo2)。
+
+**Isaac Labと一致させたもの:** dt 0.005 x decimation 4、20秒エピソード、action=既定姿勢+0.5 x action、観測(99次元=胴体の線/角速度・重力投影・指令・関節角/速度・前回action)とIsaacと同じ一様観測ノイズ、heading方式のyaw指令・静止env 2%・10秒ごとの再サンプル(vx 0..1、vy -0.5..0.5)、平地の報酬一式(termination -200、track_lin 1.0、track_ang 1.0、lin_vel_z -0.2、ang_vel_xy -0.05、hip+kneeのtorque/acc、action_rate -0.005、二足のfeet_air_time 0.75 / 0.4s、feet_slide -0.1、flat_orientation -1.0、足首のリミット、hip/腕/腰の偏差。Isaacの`RewardManager`と同じく制御stepを掛ける)、胴体接触で終了、`G1_CFG`のPDゲイン(脚150-200/5、足首20/2、腕40/10)、既定姿勢、自己衝突なし、既定姿勢とランダムyawでリセット、PPO設定(actor/critic [256, 128, 128] ELU、entropy 0.008、lr 1e-3 adaptive、24 step/env)。
+
+**差分(比較時の注意):**
+- ロボット: menagerieの`g1.xml`は29DoF(腰3軸、腕7軸、指なし)。IsaacのG1は腰1軸・腕5軸・指14関節。余分な腰/手首の関節は同じ高い剛性にし、既存の偏差ペナルティの対象にした。骨盤の初期高さは足が床に付くように計算(0.80m、Isaacは0.74m)。
+- 衝突: 床と衝突するのは足の球・骨盤・胴体・膝のみ(Isaacの`G1_MINIMAL_CFG`に相当、厳密な集合は異なる)。`actuatorfrcrange`は外し、Isaacの`effort_limit_sim`(300/20)は未適用(エンジンがアクチュエータ力をクランプしない)。関節の`frictionloss`は0(Isaacと同じ)、床摩擦0.8。
+- 報酬のトルクと関節加速度はPD則と制御step間の差分で計算。接触/滞空時間と足速度は制御stepに1回のサンプル(Isaacは物理stepごと)。足速度はMuJoCoの`framelinvel`センサ(1 substep遅れ)。
+- 積分: `implicitfast`でPDの速度項を陰的に扱う(IsaacはPhysXの陰的アクチュエータ)。
+
+**実測(RTX 3060、他のジョブと共有、1024 env、seed 42、100 iteration x 24 step。エピソード平均報酬 / 平均エピソード長[step]):**
+
+| iteration | 本リポジトリ | Isaac Lab 2.3.2(同じタスク・同じ設定) |
+|---|---|---|
+| 10 | -7.28 / 39.0 | -5.96 / 40.6 |
+| 40 | -5.64 / 40.3 | -5.47 / 44.1 |
+| 80 | -5.39 / 52.4 | -5.15 / 48.4 |
+| 99 | -5.22 / 57.1 | -5.13 / 55.6 |
+
+どちらも学習の初期(約1秒で転倒する。既定の学習は1500 iteration x 4096 env)だが、曲線は近い。G1の物理は現状このエンジンで**遅い**: 約4〜5K env-steps/s(nv=35。1024 envでsolverが1 substepあたり50ms、Newton約8反復で頭打ち。Go2はenvあたり約100倍速い)ので、長い学習は数時間かかる。G1のCPU/GPU一致(`scripts/compare_cpu_gpu_g1.py`、1制御step、関節角): 接触なし 平均2.5e-6 rad、足の接触で立っている状態 約5e-5 rad、衝撃を含むランダムaction状態 平均5.8e-4 / p95 2.3e-3(Go2の3.6e-5より緩い。solver反復数・condimが原因ではない)。H1は未対応。
+
 ## シミュレーション簡略化オプション(読み込み時)
 
 MJCFは変更せず、読み込み時にメモリ上のモデルを上書きしてからコンパイルする。対象は関節を持つbody以下のみ(地形は触らない)。既定はMuJoCoと同じ正確な挙動。

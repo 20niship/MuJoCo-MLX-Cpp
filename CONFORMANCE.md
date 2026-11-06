@@ -52,6 +52,14 @@ Legend: **Yes** supported and tested against MuJoCo C. **Partial** see note. **N
 
 IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint and ball pos/vel, actuator pos/vel, subtreecom: 19 types, `test_sensors`, G1's built-in MJCF sensors in `model_sensors_g1`. Not supported: force, torque, touch, rangefinder, camera sensors.
 
+## Robots in the RL environments
+
+| Robot | Status |
+|---|---|
+| Unitree Go2 | training env (`mjmlx_go2_env.py`), flat + stairs |
+| Unitree G1 (menagerie, 29 DoF) | training env (`mjmlx_g1_env.py`, flat, Isaac Lab `Isaac-Velocity-Flat-G1-v0`); runs on the non-shared solver path (nv=35), about 4-5K env-steps/s |
+| Unitree H1 | CPU/GPU trajectory test only |
+
 ## Other
 
 | Feature | Status |
