@@ -5,13 +5,17 @@ from __future__ import annotations
 import math
 import os
 import re
+import sys
 
 import numpy as np
 import torch
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
-from mjmlx_go2_env import _projected_gravity_t, _quat_rotate_inverse_t, _yaw_to_quat
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
+
+from common import _projected_gravity_t, _quat_rotate_inverse_t, _yaw_to_quat  # noqa: E402
 
 PHYSICS_DT = 0.005  # velocity_env_cfg: sim.dt=0.005, decimation=4
 DECIMATION = 4
@@ -93,7 +97,7 @@ FOOT_BODIES = ("left_ankle_roll_link", "right_ankle_roll_link")
 
 
 def _g1_dir() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "benchmarks", "models", "external", "mujoco_menagerie", "unitree_g1"))
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "benchmarks", "models", "external", "mujoco_menagerie", "unitree_g1"))
 
 
 def build_g1_xml(out_path: str, floor_friction: float = 0.8, kp: np.ndarray = KP, kv: np.ndarray = KV) -> None:

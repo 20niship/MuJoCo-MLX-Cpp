@@ -62,7 +62,7 @@ build-python: _venv
 
 # Train PPO on HalfCheetah via the batched GPU physics. Run build-python first.
 train-ppo *ARGS: _venv
-    .venv/bin/python scripts/train_ppo.py {{ARGS}}
+    .venv/bin/python scripts/examples/halfcheetah/train_ppo.py {{ARGS}}
 
 _venv:
     uv sync --group build

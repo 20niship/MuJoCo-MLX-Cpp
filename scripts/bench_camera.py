@@ -10,6 +10,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "go2"))  # mjmlx_go2_env
 os.environ["MJMLX_GO2_XML_SUBST"] = (
     '<camera name="track"->'
     '<camera name="orbit" mode="targetbody" target="base" pos="-1.4 -1.4 0.7" fovy="45"/><camera name="track";'

@@ -13,6 +13,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "examples", "go2"))  # mjmlx_go2_env
 
 
 def bench_mjmlx(n, iters, self_collision=True):

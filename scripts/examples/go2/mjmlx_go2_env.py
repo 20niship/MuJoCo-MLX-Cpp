@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 
 import numpy as np
 import torch
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
-from go2_terrain import CORRIDOR_WIDTH, StairsTerrain
-from mjmlx_sensors import ContactSensor, Imu, SensorHub
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
+
+from common import _projected_gravity_t, _quat_rotate_inverse_t, _yaw_to_quat  # noqa: E402
+from go2_terrain import CORRIDOR_WIDTH, StairsTerrain  # noqa: E402
+from mjmlx_sensors import ContactSensor, Imu, SensorHub  # noqa: E402
 
 PHYSICS_DT = 0.005  # Isaac LabのGo2と同じdt(0.005s x decimation 4)。0.01以上ではPD(kp=50,armature=0.01)が陽的積分で不安定
 DECIMATION = 4  # 4*0.005 = 0.02s -> 50Hz制御
@@ -76,26 +81,11 @@ def _rowdot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.einsum("ij,ij->i", a, b)
 
 
-def _quat_rotate_inverse_t(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """ワールド座標系のvをbody座標系へ(qの逆回転)。q: (N,4)wxyz, v: (N,3)。"""
-    w, xyz = q[:, :1], q[:, 1:]
-    t = 2.0 * torch.cross(-xyz, v, dim=1)
-    return v + w * t + torch.cross(-xyz, t, dim=1)
-
-
-def _projected_gravity_t(q: torch.Tensor) -> torch.Tensor:
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    return torch.stack([2.0 * (w * y - x * z), -2.0 * (y * z + w * x), 2.0 * (x * x + y * y) - 1.0], dim=1)
-
-
-def _yaw_to_quat(yaw: np.ndarray) -> np.ndarray:
-    half = yaw / 2.0
-    return np.stack([np.cos(half), np.zeros_like(yaw), np.zeros_like(yaw), np.sin(half)], axis=1).astype(np.float32)
-
-
 def _go2_xml_path() -> str:
     return os.path.join(
         os.path.dirname(__file__),
+        "..",
+        "..",
         "..",
         "benchmarks",
         "models",

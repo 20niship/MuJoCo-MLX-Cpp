@@ -16,7 +16,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
 
 TILE_W, TILE_H = 480, 360
 # (ラベル, 指令[vx, vy, wz])。学習時の指令範囲は vx 0..1, vy -0.5..0.5, wz -1..1

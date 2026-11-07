@@ -6,14 +6,14 @@ import sys
 
 from rsl_rl.runners import OnPolicyRunner
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_go2_ppo import make_train_cfg
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
+from common import make_train_cfg  # noqa: E402
 
 
 def make_g1_train_cfg(seed: int, max_iterations: int, experiment_name: str = "g1_flat") -> dict:
     """Go2と共通のPPO設定から、G1FlatPPORunnerCfgとの差(ネットワーク[256,128,128]、entropy_coef 0.008)だけ変える。"""
-    cfg = make_train_cfg(seed, max_iterations)
-    cfg["experiment_name"] = experiment_name
+    cfg = make_train_cfg(seed, max_iterations, experiment_name)
     cfg["actor"]["hidden_dims"] = cfg["critic"]["hidden_dims"] = [256, 128, 128]
     cfg["algorithm"]["entropy_coef"] = 0.008
     return cfg
