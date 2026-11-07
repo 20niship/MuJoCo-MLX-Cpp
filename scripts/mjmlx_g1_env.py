@@ -34,6 +34,9 @@ W = dict(
     action_rate=-0.005, feet_air_time=0.75, feet_slide=-0.1, flat_orientation=-1.0, dof_pos_limits=-1.0,
     joint_deviation_hip=-0.1, joint_deviation_arms=-0.1, joint_deviation_torso=-0.1,
 )
+# 前進専用(--forward-only)の報酬重み: 前進速度追従を主にし、生存(alive)を足す。他はIsaac Labのflat G1と同じ
+W_FWD = dict(W, track_lin=2.0, track_ang=2.0, alive=0.5)  # track_ang 0.5だと旋回しながら進む方策(yaw 0.65 rad/s)に収束したので2.0に上げた
+FWD_RANGE = (0.4, 0.8)  # 前進専用の指令 vx[m/s]
 TRACK_STD = 0.5  # exp(-err/std^2)
 FEET_AIR_THRESHOLD = 0.4
 SOFT_LIMIT_FACTOR = 0.9  # G1_CFG.soft_joint_pos_limit_factor
@@ -49,10 +52,13 @@ JOINTS = [
 NJ = len(JOINTS)
 
 
-def _gains(j: str) -> tuple[float, float]:
+ISAAC_ANKLE_GAINS = (20.0, 2.0)  # G1_CFG.actuators["feet"]。この剛性では零actionで立てない(ankle kp < m*g*h_com≈240 Nm/rad)ので、前進専用タスクは(200, 5)にする
+
+
+def _gains(j: str, ankle: tuple[float, float] = ISAAC_ANKLE_GAINS) -> tuple[float, float]:
     """G1_CFG.actuators(legs/feet/arms)の(stiffness, damping)。waist_roll/pitchはIsaac側に無いのでtorso_jointと同じにする"""
     if "ankle" in j:
-        return 20.0, 2.0
+        return ankle
     if "hip_pitch" in j or "knee" in j or j.startswith("waist"):
         return 200.0, 5.0
     if "hip" in j:
@@ -60,8 +66,12 @@ def _gains(j: str) -> tuple[float, float]:
     return 40.0, 10.0  # shoulder/elbow/wrist(arms)
 
 
-KP = np.array([_gains(j)[0] for j in JOINTS], dtype=np.float32)
-KV = np.array([_gains(j)[1] for j in JOINTS], dtype=np.float32)
+def make_gains(ankle: tuple[float, float] = ISAAC_ANKLE_GAINS) -> tuple[np.ndarray, np.ndarray]:
+    g = [_gains(j, ankle) for j in JOINTS]
+    return np.array([a for a, _ in g], dtype=np.float32), np.array([b for _, b in g], dtype=np.float32)
+
+
+KP, KV = make_gains()
 # G1_CFG.init_state.joint_pos(正規表現で他は0)。elbow_pitch=menagerieのelbow
 _DEFAULT = {"hip_pitch": -0.20, "knee": 0.42, "ankle_pitch": -0.23, "elbow": 0.87, "left_shoulder_roll": 0.16, "left_shoulder_pitch": 0.35,
             "right_shoulder_roll": -0.16, "right_shoulder_pitch": 0.35}
@@ -86,7 +96,7 @@ def _g1_dir() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "benchmarks", "models", "external", "mujoco_menagerie", "unitree_g1"))
 
 
-def build_g1_xml(out_path: str, floor_friction: float = 0.8) -> None:
+def build_g1_xml(out_path: str, floor_friction: float = 0.8, kp: np.ndarray = KP, kv: np.ndarray = KV) -> None:
     """menagerieのg1.xmlを学習用に書き換えて保存する(元ファイルは変えない)。"""
     # PDゲインとfrictionloss=0はIsaac LabのG1_CFG、床摩擦0.8はphysics_material(静摩擦0.8)に合わせる。
     # actuatorfrcrange(実機トルク)はGPUに実装が無くCPU/GPUで挙動が分かれるため外す(Isaac Labのeffort_limit_sim=300/20も未適用)。
@@ -107,7 +117,7 @@ def build_g1_xml(out_path: str, floor_friction: float = 0.8) -> None:
         return g.replace("<geom ", '<geom contype="0" conaffinity="0" ', 1)
 
     xml = re.sub(r'<geom\b[^>]*class="collision"[^>]*/>', collision, xml)
-    act = "\n".join(f'    <position class="g1" name="{j}_joint" joint="{j}_joint" kp="{KP[i]:g}" kv="{KV[i]:g}"/>' for i, j in enumerate(JOINTS))
+    act = "\n".join(f'    <position class="g1" name="{j}_joint" joint="{j}_joint" kp="{kp[i]:g}" kv="{kv[i]:g}"/>' for i, j in enumerate(JOINTS))
     xml = re.sub(r"<actuator>.*?</actuator>", f"<actuator>\n{act}\n  </actuator>", xml, flags=re.S)
     sens = "\n".join(f'    <framelinvel name="{b}_linvel" objtype="body" objname="{b}"/>' for b in FOOT_BODIES)  # feet_slideの足速度
     xml = re.sub(r"<sensor>.*?</sensor>", f"<sensor>\n{sens}\n  </sensor>", xml, flags=re.S)
@@ -141,7 +151,7 @@ def _rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 TERM_NAMES = [
     "termination", "track_lin_vel_xy_exp", "track_ang_vel_z_exp", "lin_vel_z_l2", "ang_vel_xy_l2", "dof_torques_l2", "dof_acc_l2", "action_rate_l2",
-    "feet_air_time", "feet_slide", "flat_orientation_l2", "dof_pos_limits", "joint_deviation_hip", "joint_deviation_arms", "joint_deviation_torso",
+    "feet_air_time", "feet_slide", "flat_orientation_l2", "dof_pos_limits", "joint_deviation_hip", "joint_deviation_arms", "joint_deviation_torso", "alive",
 ]
 METRIC_NAMES = [f"Reward/{k}" for k in TERM_NAMES] + [
     "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/base_tilt", "Metrics/joint_pos_dev",
@@ -162,11 +172,17 @@ class MjmlxG1Env(VecEnv):
         max_condim: int = 0,
         obs_noise: bool = True,
         solver_iterations: int = SOLVER_ITERATIONS,
+        forward_only: bool = False,  # 前進専用: 指令はvx in [0.4, 0.8]のみ(vy=wz=0、heading/静止envなし)、報酬はW_FWD
+        ankle_gains: tuple[float, float] | None = None,  # 省略時: 全方向=Isaac Lab(20, 2)、前進専用=(200, 5)
     ):
         import mujoco
 
         self._native = native_module
-        build_g1_xml(generated_xml_path)
+        self.forward_only = forward_only
+        self._w = W_FWD if forward_only else W
+        ankle = ankle_gains or ((200.0, 5.0) if forward_only else ISAAC_ANKLE_GAINS)
+        kp_arr, kv_arr = make_gains(ankle)
+        build_g1_xml(generated_xml_path, kp=kp_arr, kv=kv_arr)
         mjm = mujoco.MjModel.from_xml_path(generated_xml_path)
         assert mjm.nu == NJ and mjm.nq == 7 + NJ
         assert [mujoco.mj_id2name(mjm, mujoco.mjtObj.mjOBJ_JOINT, 1 + i) for i in range(NJ)] == [f"{j}_joint" for j in JOINTS]
@@ -206,7 +222,7 @@ class MjmlxG1Env(VecEnv):
         self._gen.manual_seed(0 if seed is None else seed)
         dev, f32 = device, torch.float32
         t = lambda a: torch.from_numpy(np.asarray(a, dtype=np.float32)).to(dev)
-        self._default_pos, self._kp, self._kv = t(DEFAULT_JOINT_POS), t(KP), t(KV)
+        self._default_pos, self._kp, self._kv = t(DEFAULT_JOINT_POS), t(kp_arr), t(kv_arr)
         self._lo, self._hi = t(self._joint_lo), t(self._joint_hi)
         mid, half = 0.5 * (self._lo + self._hi), 0.5 * (self._hi - self._lo) * SOFT_LIMIT_FACTOR
         self._soft_lo, self._soft_hi = mid - half, mid + half
@@ -240,6 +256,13 @@ class MjmlxG1Env(VecEnv):
         n = len(idx)
         it = torch.from_numpy(idx).to(self.device)
         u = lambda lo, hi: torch.empty(n, device=self.device).uniform_(lo, hi, generator=self._gen)
+        if self.forward_only:
+            cmd = torch.stack([u(*FWD_RANGE), torch.zeros(n, device=self.device), torch.zeros(n, device=self.device)], dim=1)
+            self._commands[it] = cmd
+            self._heading_target[it] = 0.0
+            self._is_heading[it] = False
+            self._cmd_timer[idx] = 0
+            return
         cmd = torch.stack([u(*CMD_RANGES["lin_vel_x"]), u(*CMD_RANGES["lin_vel_y"]), u(*CMD_RANGES["ang_vel_z"])], dim=1)
         standing = torch.rand(n, device=self.device, generator=self._gen) <= REL_STANDING_ENVS
         cmd[standing] = 0.0
@@ -360,10 +383,12 @@ class MjmlxG1Env(VecEnv):
             "joint_deviation_hip": dev[:, G_HIP].sum(dim=1),
             "joint_deviation_arms": dev[:, G_ARMS].sum(dim=1),
             "joint_deviation_torso": dev[:, G_TORSO].sum(dim=1),
+            "alive": torch.ones_like(lim),
         }
-        wmap = dict(zip(TERM_NAMES, [W["termination"], W["track_lin"], W["track_ang"], W["lin_vel_z"], W["ang_vel_xy"], W["dof_torques"], W["dof_acc"],
-                                     W["action_rate"], W["feet_air_time"], W["feet_slide"], W["flat_orientation"], W["dof_pos_limits"],
-                                     W["joint_deviation_hip"], W["joint_deviation_arms"], W["joint_deviation_torso"]]))
+        w = self._w
+        wmap = dict(zip(TERM_NAMES, [w["termination"], w["track_lin"], w["track_ang"], w["lin_vel_z"], w["ang_vel_xy"], w["dof_torques"], w["dof_acc"],
+                                     w["action_rate"], w["feet_air_time"], w["feet_slide"], w["flat_orientation"], w["dof_pos_limits"],
+                                     w["joint_deviation_hip"], w["joint_deviation_arms"], w["joint_deviation_torso"], w.get("alive", 0.0)]))
         terms = torch.stack([wmap[k] * raw[k] * CONTROL_DT for k in TERM_NAMES])
         rewards = torch.where(blew_up, torch.zeros_like(terms[0]), terms.sum(dim=0).clamp(-50.0, 50.0))  # 発散時のvalue爆発防止(Go2と同じ最終防衛線)
         self.last_reward_terms = dict(zip(TERM_NAMES, terms))

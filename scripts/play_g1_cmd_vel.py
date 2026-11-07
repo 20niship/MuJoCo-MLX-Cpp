@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TILE_W, TILE_H = 480, 360
 # (ラベル, 指令[vx, vy, wz])。学習時の指令範囲は vx 0..1, vy -0.5..0.5, wz -1..1
-CASES = [("forward 0.5", (0.5, 0.0, 0.0)), ("forward 1.0", (1.0, 0.0, 0.0)), ("left 0.4", (0.0, 0.4, 0.0)), ("turn 0.8", (0.0, 0.0, 0.8))]
+ALL_CASES = [("forward 0.5", (0.5, 0.0, 0.0)), ("forward 1.0", (1.0, 0.0, 0.0)), ("left 0.4", (0.0, 0.4, 0.0)), ("turn 0.8", (0.0, 0.0, 0.8))]
+FWD_CASES = [("forward 0.4", (0.4, 0.0, 0.0)), ("forward 0.5", (0.5, 0.0, 0.0)), ("forward 0.6", (0.6, 0.0, 0.0)), ("forward 0.8", (0.8, 0.0, 0.0))]
 
 
 def latest_checkpoint(logdir: Path) -> Path:
@@ -38,6 +39,7 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--out", default="runs/video/g1_cmd_vel.mp4")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--forward-only", action="store_true", help="前進専用タスクの方策を再生(指令 vx 0.4/0.5/0.6/0.8)")
     ap.add_argument("--plain-floor", action="store_true", help="地面を市松模様にしない")
     args = ap.parse_args()
 
@@ -50,10 +52,11 @@ def main() -> None:
 
     e.CMD_RESAMPLE_STEPS = 10**9  # 評価では指令を固定する
     xml_path = "/tmp/g1_play_generated.xml"
+    CASES = FWD_CASES if args.forward_only else ALL_CASES
     n = len(CASES)
-    env = e.MjmlxG1Env(native, n, use_gpu=not args.cpu, seed=0, generated_xml_path=xml_path, obs_noise=False)
+    env = e.MjmlxG1Env(native, n, use_gpu=not args.cpu, seed=0, generated_xml_path=xml_path, obs_noise=False, forward_only=args.forward_only)
     ckpt = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path(args.logdir))
-    runner = OnPolicyRunner(env, make_g1_train_cfg(0, 1), log_dir=None, device="cpu")
+    runner = OnPolicyRunner(env, make_g1_train_cfg(0, 1, "g1_forward" if args.forward_only else "g1_flat"), log_dir=None, device="cpu")
     runner.load(str(ckpt))
     policy = runner.get_inference_policy(device="cpu")
 

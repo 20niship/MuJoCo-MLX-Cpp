@@ -152,6 +152,23 @@ uv run python scripts/compare_cpu_gpu_g1.py --build-dir build                   
 
 G1の物理は現状このエンジンで**遅い**: 約4〜5K env-steps/s(nv=35。1024 envsでsolverが1 substepあたり約50ms、Newton約8反復を超えても遅くならない。Go2はenvあたり約100倍速い)。1024 envで1 iterationあたり本環境は約5秒、Isaac Labは空いたGPUで約1秒で、既定の1500 iteration x 4096 envは数時間以上かかる。共有メモリsolverの上限をnv<=32から40に上げる試行は効果が無く戻した。H1は未対応。
 
+### 前進専用タスク(`--forward-only`): G1が歩く
+
+上の全方向タスクは我々の学習では収束しなかったので、前進専用のタスクを追加した(全方向モードはそのまま): 指令は`vx`を[0.4, 0.8] m/sの範囲、`vy = wz = 0`、heading方式と静止envなし。
+
+```bash
+PYTHONPATH=<cu126等のtorch> uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
+# 最終の報酬重み(下記)で400 iteration追加学習
+uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
+uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 のタイル、市松模様の床
+```
+
+**以前「約1.5秒で転倒」した原因(MuJoCo Cで切り分け。GPUエンジンは無関係):** Isaac Labの足首ゲイン(kp 20、kd 2)では、既定姿勢は零actionでも立てない。静的に釣り合う倒立振子には足首の剛性がm*g*h_com(約35kg x 9.81 x 0.69m = 240 Nm/rad)より大きいことが必要で、足首のauthorityも小さい(action scale 0.5 rad x kp 20 = 10 Nm)。MuJoCo Cで既定姿勢を5秒走らせて足首kpを走査: kp 100は倒れ、kp 150は倒れるか傾く(kdによる)、kp 200以上は立つ(傾き0.05〜0.08 rad)。そこで前進専用タスクは足首PDを**200 / 5**にする(全方向の既定はIsaacの20 / 2のまま)。これでGPUエンジンでも零actionで6秒以上立っていられる。MuJoCo Cでも同じように倒れるので、GPUエンジンが原因ではない。未検証: effort limit、接触サンプリング頻度、足の形状。最終方策は`scripts/eval_g1_forward.py`で評価した。
+
+**報酬(前進専用):** Isaac Labのflat G1の項(termination -200、lin_vel_z、ang_vel_xy、hip/kneeのtorque・acc、action_rate、二足のfeet_air_time 0.75、feet_slide、flat_orientation、足首のリミット、hip/腕/腰の偏差。すべて制御stepを掛ける)に次の変更を加えた: `track_lin_vel_xy_exp` 1.0→**2.0**(前進速度が主タスク)、`track_ang_vel_z_exp` 1.0→**2.0**、新しく**alive +0.5**。最初に`track_ang`を0.5にした学習は、円を描いて歩く方策(yaw速度約0.65 rad/s、指令0.4〜0.8に対して前進速度は0.2〜0.3 m/sのみ)に収束したため、2.0に上げてそのチェックポイントから追加学習した。
+
+**結果(RTX 3060、1024 env、速度のため`--solver-iters 4`、800 + 400 iteration、合計約70分):** 学習時の平均エピソード長は799 iterationで965 / 1000(報酬16.2)、最後は954 / 1000(報酬30.0。最大エピソード長は1000 step=20秒)。最終チェックポイントを観測ノイズありで評価(256 env x 20秒、決定論的): **20秒以内に転倒したenvは0 %**、平均前進速度**0.54 m/s(平均指令0.60 m/s)**(12秒の再生では指令0.4 / 0.5 / 0.6 / 0.8に対して0.45 / 0.49 / 0.53 / 0.60 m/s、転倒なし)、横方向のずれ0.08 m/s。**完全には解決していない:** 歩きながらまだ旋回する(平均yaw速度0.45 rad/s。最初の試行の0.65から低下)ので直線でなく弧を描いて進み、指令0.8では速度が指令に届かない。Isaac Labには前進専用の設定が無いので、このタスクではIsaac Labの比較は行っていない。
+
 ## シミュレーション簡略化オプション(読み込み時)
 
 MJCFは変更せず、読み込み時にメモリ上のモデルを上書きしてからコンパイルする。対象は関節を持つbody以下のみ(地形は触らない)。既定はMuJoCoと同じ正確な挙動。

@@ -152,6 +152,23 @@ Considered and not used:
 
 G1 physics is also currently **slow in this engine**: about 4-5K env-steps/s (nv=35: the solver spends ~50 ms per substep at 1024 envs and stops getting slower beyond about 8 Newton iterations; Go2 is ~100x faster per env), i.e. ~5 s per iteration here versus ~1 s for Isaac Lab at 1024 envs on an idle GPU, so the default 1500 x 4096 run would take many hours. Raising the shared-memory solver limit from nv<=32 to 40 was tried and did not help, so it was reverted. H1 is not done yet.
 
+### Forward-only task (`--forward-only`): the G1 walks
+
+The omnidirectional task above did not converge in our runs, so a forward-only task was added on top (the omnidirectional mode is unchanged): command `vx` in [0.4, 0.8] m/s fixed, `vy = wz = 0`, no heading mode and no standing envs.
+
+```bash
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
+# then continue with the final reward weights (see below) for 400 more iterations
+uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
+uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 tiles, checkerboard floor
+```
+
+**Root cause of the earlier fall after ~1.5 s (isolated with MuJoCo C, no GPU engine involved):** with Isaac Lab's ankle gains (kp 20, kd 2) the default pose cannot stand even with zero action. A statically balanced inverted pendulum needs ankle stiffness above m*g*h_com (about 35 kg x 9.81 x 0.69 m = 240 Nm/rad) and the ankles have little authority (action scale 0.5 rad x kp 20 = 10 Nm). Scan with MuJoCo C, default pose, 5 s: ankle kp 100 falls, kp 150 falls or leans (depends on kd), kp >= 200 stands (tilt 0.05-0.08 rad). The forward-only task therefore uses ankle PD **200 / 5** (the omnidirectional default stays Isaac's 20 / 2). Zero action then stands for 6+ s on the GPU engine. The fall also happens in MuJoCo C, so the GPU engine is not the cause. Not tested: effort limits, contact sampling frequency, foot geometry. The final policy was evaluated with `scripts/eval_g1_forward.py`.
+
+**Reward (forward-only):** Isaac Lab's flat G1 terms (termination -200, lin_vel_z, ang_vel_xy, hip/knee torque and acceleration, action_rate, biped feet_air_time 0.75, feet_slide, flat_orientation, ankle limits, hip/arm/waist deviation, all scaled by the control step) with changes: `track_lin_vel_xy_exp` 1.0 -> **2.0** (forward speed is the main task), `track_ang_vel_z_exp` 1.0 -> **2.0** and a new **alive +0.5** term. First attempt with `track_ang` 0.5 converged to a policy that walks in a circle (yaw rate ~0.65 rad/s, forward speed only 0.2-0.3 m/s for commands 0.4-0.8), so it was raised to 2.0 and training was continued from that checkpoint.
+
+**Result (RTX 3060, 1024 envs, `--solver-iters 4` for speed, 800 + 400 iterations, about 70 min total):** training mean episode length 965 / 1000 at iteration 799 (reward 16.2) and 954 / 1000 at the end (reward 30.0; max episode length is 1000 steps = 20 s). Evaluation of the final checkpoint with observation noise on (256 envs x 20 s, `deterministic`): **0 % of envs fell within 20 s**, mean forward speed **0.54 m/s for a mean command of 0.60 m/s** (commands 0.4 / 0.5 / 0.6 / 0.8 -> 0.45 / 0.49 / 0.53 / 0.60 m/s in the 12 s playback, no falls), lateral drift 0.08 m/s. **Not fully solved:** the robot still turns while walking (mean yaw rate 0.45 rad/s, down from 0.65 in the first attempt), so it walks along an arc rather than a straight line, and speed saturates below the command at 0.8. Isaac Lab was not run for the forward-only task (it has no such configuration).
+
 ## Simulation simplification options (load time)
 
 The MJCF is not modified; the in-memory model is overridden before compilation, only for articulated bodies (terrain is untouched). Defaults are exact MuJoCo behaviour.
