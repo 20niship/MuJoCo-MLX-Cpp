@@ -19,7 +19,6 @@ scripts/examples/
 <tr>
 <td align="center"><video src="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3" controls muted width="400"></video><br><b>Go2</b> 平地cmd_vel(途中経過)</td>
 <td align="center"><video src="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615" controls muted width="400"></video><br><b>G1</b> 前進専用、横から</td>
-<td align="center"><video src="https://github.com/user-attachments/assets/539b7676-baa8-4600-8a9c-ddae2274d4c8" controls muted width="400"></video><br><b>G1</b> 前進専用、真上から</td>
 </tr>
 </table>
 

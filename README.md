@@ -93,9 +93,6 @@ Training, evaluation and comparison code lives in [`scripts/examples/`](scripts/
 <td align="center"><video src="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3" controls muted width="400"></video><br><b>Go2</b>, flat ground, cmd_vel tracking (work in progress: tracks backward / left / right, stays still for forward)</td>
 <td align="center"><video src="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615" controls muted width="400"></video><br><b>G1</b>, forward-only task, 20 s, side view (walks straight; speed stays below the command)</td>
 </tr>
-<tr>
-<td align="center" colspan="2"><video src="https://github.com/user-attachments/assets/539b7676-baa8-4600-8a9c-ddae2274d4c8" controls muted width="600"></video><br><b>G1</b>, forward-only task, top view with the pelvis trail (red) and a 1 m reference line</td>
-</tr>
 </table>
 
 ## Simulation simplification options (load time)

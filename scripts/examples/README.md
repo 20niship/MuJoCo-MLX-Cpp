@@ -19,7 +19,6 @@ Videos referenced here are attached on GitHub and are not stored in the reposito
 <tr>
 <td align="center"><video src="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3" controls muted width="400"></video><br><b>Go2</b> flat ground cmd_vel (work in progress)</td>
 <td align="center"><video src="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615" controls muted width="400"></video><br><b>G1</b> forward-only, side view</td>
-<td align="center"><video src="https://github.com/user-attachments/assets/539b7676-baa8-4600-8a9c-ddae2274d4c8" controls muted width="400"></video><br><b>G1</b> forward-only, top view</td>
 </tr>
 </table>
 
