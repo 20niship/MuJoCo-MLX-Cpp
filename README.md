@@ -136,16 +136,21 @@ Considered and not used:
 - Torque and joint acceleration for the rewards are computed from the PD law and finite differences per control step; contact/air time and foot speed are sampled once per control step (Isaac samples per physics step); foot speed uses a MuJoCo `framelinvel` sensor (one substep lag).
 - Integrator: `implicitfast` handles the PD velocity term (PhysX implicit actuators in Isaac).
 
-**Measured (RTX 3060, shared with other jobs, 1024 envs, seed 42, 100 iterations x 24 steps; mean episode reward / mean episode length in steps):**
+**Measured (RTX 3060, 1024 envs, seed 42, 24 steps/env/iteration, 300 iterations each; mean episode reward / mean episode length in steps, max 1000):**
 
-| iteration | this repo | Isaac Lab 2.3.2 (same task, same settings) |
+| iteration | this repo | Isaac Lab 2.3.2 (same task, same PPO settings) |
 |---|---|---|
-| 10 | -7.28 / 39.0 | -5.96 / 40.6 |
-| 40 | -5.64 / 40.3 | -5.47 / 44.1 |
-| 80 | -5.39 / 52.4 | -5.15 / 48.4 |
-| 99 | -5.22 / 57.1 | -5.13 / 55.6 |
+| 10 | -7.27 / 40.2 | -5.96 / 40.6 |
+| 50 | -5.45 / 42.1 | -5.40 / 47.1 |
+| 100 | -5.29 / 61.9 | -5.12 / 54.9 |
+| 150 | -4.99 / 69.0 | -5.24 / 72.8 |
+| 200 | -4.86 / 71.3 | -6.87 / 179.2 |
+| 250 | -4.92 / 81.6 | -11.76 / 802.9 |
+| 299 | -4.95 / 86.8 | -8.64 / 967.8 |
 
-Both are still early in training (episodes end after ~1 s by falling; the default run is 1500 iterations x 4096 envs) but the curves track each other. G1 physics is currently **slow in this engine**: about 4-5K env-steps/s (nv=35: the solver spends 50 ms per substep at 1024 envs, saturating at about 8 Newton iterations; Go2 is ~100x faster per env), so long runs take hours. CPU/GPU agreement for G1 (`scripts/compare_cpu_gpu_g1.py`, 1 control step, joint angles): contact-free 2.5e-6 rad mean; standing with foot contact about 5e-5 rad; random-action states with impacts 5.8e-4 mean / 2.3e-3 p95 (looser than Go2's 3.6e-5; not caused by solver iterations or condim). H1 is not done yet.
+**The curves track each other for the first ~150 iterations, then Isaac Lab's G1 learns to stay up (episodes reach ~970 of 1000 steps) while ours does not (~87 steps, i.e. it still falls after ~1.7 s). Isaac Lab's behaviour is therefore not reproduced yet.** The cause is not identified. What we know: with zero action (default pose, the PD gains above) the menagerie G1 tips over within ~1.5 s under both MuJoCo C and this engine, so it is not specific to the GPU engine; CPU/GPU agree in contact-free steps (2.5e-6 rad mean) and with foot contact when standing (~5e-5 rad), and are looser in random-action states with impacts (5.8e-4 rad mean, 2.3e-3 p95; Go2: 3.6e-5; not caused by solver iterations or condim). Candidate causes we have not tested: mass/inertia and foot-geometry differences between the menagerie model and Isaac's G1 USD (hands, 4-sphere feet), contact softness versus PhysX, missing effort limits, the 1-per-control-step contact sampling. Playback of the 300-iteration policy (`scripts/play_g1_cmd_vel.py`) shows it falling after ~1.5 s for all four commands.
+
+G1 physics is also currently **slow in this engine**: about 4-5K env-steps/s (nv=35: the solver spends ~50 ms per substep at 1024 envs and stops getting slower beyond about 8 Newton iterations; Go2 is ~100x faster per env), i.e. ~5 s per iteration here versus ~1 s for Isaac Lab at 1024 envs on an idle GPU, so the default 1500 x 4096 run would take many hours. Raising the shared-memory solver limit from nv<=32 to 40 was tried and did not help, so it was reverted. H1 is not done yet.
 
 ## Simulation simplification options (load time)
 
