@@ -35,7 +35,7 @@ W = dict(
     joint_deviation_hip=-0.1, joint_deviation_arms=-0.1, joint_deviation_torso=-0.1,
 )
 # 前進専用(--forward-only)の報酬重み: 前進速度追従を主にし、生存(alive)を足す。他はIsaac Labのflat G1と同じ
-W_FWD = dict(W, track_lin=2.0, track_ang=2.0, alive=0.5)  # track_ang 0.5だと旋回しながら進む方策(yaw 0.65 rad/s)に収束したので2.0に上げた
+W_FWD = dict(W, track_lin=2.0, track_ang=2.0, alive=0.5, yaw_rate=-0.5, heading_hold=-1.0, lateral_vel=-1.0)  # track_ang 0.5だと旋回しながら進んだので2.0。後ろ3つは直進用(yaw速度・開始時の向きからのずれ・横速度の罰則)
 FWD_RANGE = (0.4, 0.8)  # 前進専用の指令 vx[m/s]
 TRACK_STD = 0.5  # exp(-err/std^2)
 FEET_AIR_THRESHOLD = 0.4
@@ -152,6 +152,7 @@ def _rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 TERM_NAMES = [
     "termination", "track_lin_vel_xy_exp", "track_ang_vel_z_exp", "lin_vel_z_l2", "ang_vel_xy_l2", "dof_torques_l2", "dof_acc_l2", "action_rate_l2",
     "feet_air_time", "feet_slide", "flat_orientation_l2", "dof_pos_limits", "joint_deviation_hip", "joint_deviation_arms", "joint_deviation_torso", "alive",
+    "yaw_rate_l2", "heading_hold", "lateral_vel_l2",
 ]
 METRIC_NAMES = [f"Reward/{k}" for k in TERM_NAMES] + [
     "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/base_tilt", "Metrics/joint_pos_dev",
@@ -173,13 +174,14 @@ class MjmlxG1Env(VecEnv):
         obs_noise: bool = True,
         solver_iterations: int = SOLVER_ITERATIONS,
         forward_only: bool = False,  # 前進専用: 指令はvx in [0.4, 0.8]のみ(vy=wz=0、heading/静止envなし)、報酬はW_FWD
-        ankle_gains: tuple[float, float] | None = None,  # 省略時: 全方向=Isaac Lab(20, 2)、前進専用=(200, 5)
+        ankle_gains: tuple[float, float] | None = None,
+        fwd_weights: dict | None = None,  # 前進専用の報酬重みの上書き(yaw_rate, heading_hold, lateral_vel, track_lin, track_ang, alive)  # 省略時: 全方向=Isaac Lab(20, 2)、前進専用=(200, 5)
     ):
         import mujoco
 
         self._native = native_module
         self.forward_only = forward_only
-        self._w = W_FWD if forward_only else W
+        self._w = dict(W_FWD, **(fwd_weights or {})) if forward_only else W
         ankle = ankle_gains or ((200.0, 5.0) if forward_only else ISAAC_ANKLE_GAINS)
         kp_arr, kv_arr = make_gains(ankle)
         build_g1_xml(generated_xml_path, kp=kp_arr, kv=kv_arr)
@@ -230,6 +232,7 @@ class MjmlxG1Env(VecEnv):
         z = lambda *s, **k: torch.zeros(*s, device=dev, **k)
         self._commands = z((num_envs, 3))
         self._heading_target = z(num_envs)
+        self._yaw0 = z(num_envs)  # エピソード開始時のyaw(前進専用はこの向きへ直進させる)
         self._is_heading = torch.ones(num_envs, dtype=torch.bool, device=dev)
         self._cmd_timer = np.zeros(num_envs, dtype=np.int64)
         self._last_action, self._prev_joint_vel = z((num_envs, NJ)), z((num_envs, NJ))
@@ -259,8 +262,8 @@ class MjmlxG1Env(VecEnv):
         if self.forward_only:
             cmd = torch.stack([u(*FWD_RANGE), torch.zeros(n, device=self.device), torch.zeros(n, device=self.device)], dim=1)
             self._commands[it] = cmd
-            self._heading_target[it] = 0.0
-            self._is_heading[it] = False
+            self._heading_target[it] = self._yaw0[it]  # 開始時の向きを保つheading指令(wz指令=0.5*向きのずれ。直進のためにずれを観測できるようにする)
+            self._is_heading[it] = self._w.get("heading_cmd", 1.0) != 0.0  # heading_cmd=0でwz指令=0固定(旧v1/v2の挙動)
             self._cmd_timer[idx] = 0
             return
         cmd = torch.stack([u(*CMD_RANGES["lin_vel_x"]), u(*CMD_RANGES["lin_vel_y"]), u(*CMD_RANGES["ang_vel_z"])], dim=1)
@@ -280,7 +283,9 @@ class MjmlxG1Env(VecEnv):
         qpos[idx, 0] = self._rng.uniform(-0.5, 0.5, size=n)
         qpos[idx, 1] = self._rng.uniform(-0.5, 0.5, size=n)
         qpos[idx, 2] = self.init_height
-        qpos[idx, 3:7] = _yaw_to_quat(self._rng.uniform(-math.pi, math.pi, size=n))
+        yaw0 = self._rng.uniform(-math.pi, math.pi, size=n)
+        qpos[idx, 3:7] = _yaw_to_quat(yaw0)
+        self._yaw0[torch.from_numpy(idx).to(self.device)] = torch.from_numpy(yaw0.astype(np.float32)).to(self.device)
         qpos[idx, 7:] = DEFAULT_JOINT_POS
         qvel[idx] = 0.0
         self._elapsed[idx] = 0
@@ -384,11 +389,15 @@ class MjmlxG1Env(VecEnv):
             "joint_deviation_arms": dev[:, G_ARMS].sum(dim=1),
             "joint_deviation_torso": dev[:, G_TORSO].sum(dim=1),
             "alive": torch.ones_like(lim),
+            "yaw_rate_l2": yaw_rate_w**2,
+            "heading_hold": _wrap_to_pi(_yaw_from_quat(quat) - self._yaw0) ** 2,
+            "lateral_vel_l2": base_lin[:, 1] ** 2,
         }
         w = self._w
         wmap = dict(zip(TERM_NAMES, [w["termination"], w["track_lin"], w["track_ang"], w["lin_vel_z"], w["ang_vel_xy"], w["dof_torques"], w["dof_acc"],
                                      w["action_rate"], w["feet_air_time"], w["feet_slide"], w["flat_orientation"], w["dof_pos_limits"],
-                                     w["joint_deviation_hip"], w["joint_deviation_arms"], w["joint_deviation_torso"], w.get("alive", 0.0)]))
+                                     w["joint_deviation_hip"], w["joint_deviation_arms"], w["joint_deviation_torso"], w.get("alive", 0.0),
+                                     w.get("yaw_rate", 0.0), w.get("heading_hold", 0.0), w.get("lateral_vel", 0.0)]))
         terms = torch.stack([wmap[k] * raw[k] * CONTROL_DT for k in TERM_NAMES])
         rewards = torch.where(blew_up, torch.zeros_like(terms[0]), terms.sum(dim=0).clamp(-50.0, 50.0))  # 発散時のvalue爆発防止(Go2と同じ最終防衛線)
         self.last_reward_terms = dict(zip(TERM_NAMES, terms))

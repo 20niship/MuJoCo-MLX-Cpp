@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--forward-only", action="store_true", help="前進専用タスク(指令 vx 0.4..0.8、足首PD 200/5、報酬はW_FWD)。既定は全方向のIsaac Lab flat G1")
     parser.add_argument("--ankle-kp", type=float, default=None)
     parser.add_argument("--ankle-kd", type=float, default=None)
+    parser.add_argument("--fwd-weights", type=str, default="", help="前進専用の報酬重みの上書き 例: yaw_rate=-0.5,heading_hold=-1,lateral_vel=-1")
     parser.add_argument("--solver-iters", type=int, default=16)
     parser.add_argument("--resume", type=str, default=None, help="チェックポイントから学習を続ける(報酬を変えた後の追加学習用)")
     parser.add_argument("--no-obs-noise", action="store_true", help="観測ノイズ(Isaac LabのUnoise)を切る")
@@ -45,7 +46,8 @@ def main() -> None:
 
     env = MjmlxG1Env(native, args.envs, use_gpu=not args.cpu, seed=args.seed, device=args.device, self_collision=args.self_collision,
                      max_condim=args.max_condim, obs_noise=not args.no_obs_noise, forward_only=args.forward_only,
-                     ankle_gains=(args.ankle_kp, args.ankle_kd) if args.ankle_kp is not None else None, solver_iterations=args.solver_iters)
+                     ankle_gains=(args.ankle_kp, args.ankle_kd) if args.ankle_kp is not None else None, solver_iterations=args.solver_iters,
+                     fwd_weights={k: float(v) for k, v in (kv.split("=") for kv in args.fwd_weights.split(",") if kv)} or None)
     train_cfg = make_g1_train_cfg(args.seed, args.max_iterations, "g1_forward" if args.forward_only else "g1_flat")
     train_cfg["device"] = args.device
     runner = OnPolicyRunner(env, train_cfg, log_dir=args.logdir, device=train_cfg["device"])

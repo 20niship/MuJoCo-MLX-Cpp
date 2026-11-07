@@ -158,7 +158,8 @@ The omnidirectional task above did not converge in our runs, so a forward-only t
 
 ```bash
 PYTHONPATH=<torch-cu126 etc.> uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
-# then continue with the final reward weights (see below) for 400 more iterations
+# then continue with the final reward weights (see below), e.g. 400 more iterations; the straight-walking v3 adds --fwd-weights yaw_rate=-0.5,heading_hold=-1,lateral_vel=-1 and resumes from it
+uv run python scripts/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt --build-dir build   # 256 envs x 20 s: falls, speed, yaw rate, heading change
 uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
 uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 tiles, checkerboard floor
 ```
@@ -167,7 +168,27 @@ uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward
 
 **Reward (forward-only):** Isaac Lab's flat G1 terms (termination -200, lin_vel_z, ang_vel_xy, hip/knee torque and acceleration, action_rate, biped feet_air_time 0.75, feet_slide, flat_orientation, ankle limits, hip/arm/waist deviation, all scaled by the control step) with changes: `track_lin_vel_xy_exp` 1.0 -> **2.0** (forward speed is the main task), `track_ang_vel_z_exp` 1.0 -> **2.0** and a new **alive +0.5** term. First attempt with `track_ang` 0.5 converged to a policy that walks in a circle (yaw rate ~0.65 rad/s, forward speed only 0.2-0.3 m/s for commands 0.4-0.8), so it was raised to 2.0 and training was continued from that checkpoint.
 
-**Result (RTX 3060, 1024 envs, `--solver-iters 4` for speed, 800 + 400 iterations, about 70 min total):** training mean episode length 965 / 1000 at iteration 799 (reward 16.2) and 954 / 1000 at the end (reward 30.0; max episode length is 1000 steps = 20 s). Evaluation of the final checkpoint with observation noise on (256 envs x 20 s, `deterministic`): **0 % of envs fell within 20 s**, mean forward speed **0.54 m/s for a mean command of 0.60 m/s** (commands 0.4 / 0.5 / 0.6 / 0.8 -> 0.45 / 0.49 / 0.53 / 0.60 m/s in the 12 s playback, no falls), lateral drift 0.08 m/s. **Not fully solved:** the robot still turns while walking (mean yaw rate 0.45 rad/s, down from 0.65 in the first attempt), so it walks along an arc rather than a straight line, and speed saturates below the command at 0.8. Isaac Lab was not run for the forward-only task (it has no such configuration).
+**Result (RTX 3060, 1024 envs, `--solver-iters 4` for speed, 800 + 400 iterations, about 70 min total):** training mean episode length 965 / 1000 at iteration 799 (reward 16.2) and 954 / 1000 at the end (reward 30.0; max episode length is 1000 steps = 20 s). Evaluation of the final checkpoint with observation noise on (256 envs x 20 s, `deterministic`): **0 % of envs fell within 20 s**, mean forward speed **0.54 m/s for a mean command of 0.60 m/s** (commands 0.4 / 0.5 / 0.6 / 0.8 -> 0.45 / 0.49 / 0.53 / 0.60 m/s in the 12 s playback, no falls), lateral drift 0.08 m/s. **This v2 policy still turned while walking** (mean yaw rate 0.45 rad/s), walking along an arc; this is fixed in v3 below. Speed still saturates below the command at 0.8. Isaac Lab was not run for the forward-only task (it has no such configuration).
+
+#### Going straight (v3): rewards added and results
+
+Added (forward-only mode only; the omnidirectional rewards are unchanged), all scaled by the control step like the other terms:
+- `yaw_rate_l2` (weight -0.5): world-frame yaw rate squared.
+- `heading_hold` (-1.0): squared deviation of the yaw from the heading at episode start.
+- `lateral_vel_l2` (-1.0): squared lateral body velocity.
+- The command now includes Isaac Lab's heading mode: `wz` command = clip(0.5 x (start heading - yaw)), so the heading error is observable by the policy without changing the 99-dim observation (checkpoints stay compatible); `track_ang` (2.0) tracks it.
+
+Weights were chosen with short runs (512 envs, 150 iterations each, resumed from v2). Evaluation: `scripts/eval_g1_forward.py` (256 envs x 20 s, observation noise on; heading change is accumulated, so circling shows as >360 deg):
+
+| model | fell < 20 s | mean vx (cmd 0.60) | mean vy | mean yaw rate | mean abs yaw rate | 20 s heading change | along / cross-track displacement | course angle |
+|---|---|---|---|---|---|---|---|---|
+| v1: `track_ang` 0.5 (800 it) | 0 % | 0.31 | 0.14 | 0.75 | 1.31 | +817 deg | 0.34 m / 0.40 m | 51 deg |
+| v2: `track_ang` 2.0 (+400 it) | 0 % | 0.54 | 0.08 | 0.45 | 0.58 | +399 deg | 1.23 m / 0.94 m | 43 deg |
+| A: yaw -0.5, heading -1, lateral -1 (+150 it) | 0 % | 0.54 | 0.04 | 0.11 | 0.40 | +7.9 deg (abs 11.4) | 10.5 m / 1.52 m | 8.5 deg |
+| B: yaw -2, heading -3, lateral -2 (+150 it) | 0.4 % | 0.50 | 0.07 | 0.11 | 0.42 | +23.8 deg | 9.1 m / 3.23 m | 20 deg |
+| **v3: A weights, +400 it (final)** | 0.4 % (1/256, at 7 s) | 0.51 | -0.00 | **0.06** | 0.29 | **-2.6 deg (abs 4.0)** | 10.2 m / 0.74 m | **4.1 deg** |
+
+(Yaw rate in rad/s, speeds in m/s. Cross-track = lateral displacement from the start heading line at 20 s, mean absolute value.) The stronger weights (B) were worse after the same 150 iterations. The final policy walks in an essentially straight line (heading changes by about 4 deg in 20 s; the playback tiles show straight trails with a slight drift to one side, up to ~0.6 m at 9.5 m for vx 0.8). The mean signed yaw rate is 0.06 rad/s (target ~0.1); the mean absolute yaw rate (0.29) is the left-right sway of the gait, not a turn. Forward speed still saturates below the command (0.51 vs 0.60 m/s, 0.60 vs 0.80 at the highest command) and one of 256 envs fell. Videos (local, not committed): `runs/video/g1_forward_straight.mp4` (side view, checkerboard floor, 20 s) and `runs/video/g1_forward_straight_topdown.mp4` (top-down with the pelvis trail in red and a 1 m reference line).
 
 ## Simulation simplification options (load time)
 

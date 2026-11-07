@@ -158,7 +158,8 @@ G1の物理は現状このエンジンで**遅い**: 約4〜5K env-steps/s(nv=35
 
 ```bash
 PYTHONPATH=<cu126等のtorch> uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
-# 最終の報酬重み(下記)で400 iteration追加学習
+# 最終の報酬重み(下記)で追加学習(例: 400 iteration)。直進版v3は --fwd-weights yaw_rate=-0.5,heading_hold=-1,lateral_vel=-1 を付けてこれから再開
+uv run python scripts/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt --build-dir build   # 256 env x 20秒: 転倒・速度・yaw速度・向きの変化
 uv run python scripts/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
 uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 のタイル、市松模様の床
 ```
@@ -167,7 +168,27 @@ uv run python scripts/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward
 
 **報酬(前進専用):** Isaac Labのflat G1の項(termination -200、lin_vel_z、ang_vel_xy、hip/kneeのtorque・acc、action_rate、二足のfeet_air_time 0.75、feet_slide、flat_orientation、足首のリミット、hip/腕/腰の偏差。すべて制御stepを掛ける)に次の変更を加えた: `track_lin_vel_xy_exp` 1.0→**2.0**(前進速度が主タスク)、`track_ang_vel_z_exp` 1.0→**2.0**、新しく**alive +0.5**。最初に`track_ang`を0.5にした学習は、円を描いて歩く方策(yaw速度約0.65 rad/s、指令0.4〜0.8に対して前進速度は0.2〜0.3 m/sのみ)に収束したため、2.0に上げてそのチェックポイントから追加学習した。
 
-**結果(RTX 3060、1024 env、速度のため`--solver-iters 4`、800 + 400 iteration、合計約70分):** 学習時の平均エピソード長は799 iterationで965 / 1000(報酬16.2)、最後は954 / 1000(報酬30.0。最大エピソード長は1000 step=20秒)。最終チェックポイントを観測ノイズありで評価(256 env x 20秒、決定論的): **20秒以内に転倒したenvは0 %**、平均前進速度**0.54 m/s(平均指令0.60 m/s)**(12秒の再生では指令0.4 / 0.5 / 0.6 / 0.8に対して0.45 / 0.49 / 0.53 / 0.60 m/s、転倒なし)、横方向のずれ0.08 m/s。**完全には解決していない:** 歩きながらまだ旋回する(平均yaw速度0.45 rad/s。最初の試行の0.65から低下)ので直線でなく弧を描いて進み、指令0.8では速度が指令に届かない。Isaac Labには前進専用の設定が無いので、このタスクではIsaac Labの比較は行っていない。
+**結果(RTX 3060、1024 env、速度のため`--solver-iters 4`、800 + 400 iteration、合計約70分):** 学習時の平均エピソード長は799 iterationで965 / 1000(報酬16.2)、最後は954 / 1000(報酬30.0。最大エピソード長は1000 step=20秒)。最終チェックポイントを観測ノイズありで評価(256 env x 20秒、決定論的): **20秒以内に転倒したenvは0 %**、平均前進速度**0.54 m/s(平均指令0.60 m/s)**(12秒の再生では指令0.4 / 0.5 / 0.6 / 0.8に対して0.45 / 0.49 / 0.53 / 0.60 m/s、転倒なし)、横方向のずれ0.08 m/s。**このv2の方策は歩きながらまだ旋回していた**(平均yaw速度0.45 rad/s)ので弧を描いて進んだ。下のv3で直した。指令0.8では速度が指令に届かないのは残っている。Isaac Labには前進専用の設定が無いので、このタスクではIsaac Labの比較は行っていない。
+
+#### 直進させる(v3): 追加した報酬と結果
+
+追加(前進専用モードのみ。全方向の報酬は不変。他の項と同じく制御stepを掛ける):
+- `yaw_rate_l2`(重み -0.5): 世界座標のyaw速度の2乗。
+- `heading_hold`(-1.0): エピソード開始時の向きからのyawのずれの2乗。
+- `lateral_vel_l2`(-1.0): 胴体の横方向速度の2乗。
+- 指令にIsaac Labのheading方式を入れた: `wz`指令 = clip(0.5 x (開始時の向き - yaw))。観測(99次元)を変えずに向きのずれを方策が観測できる(チェックポイントは互換)。`track_ang`(2.0)がこれを追従する。
+
+重みは短い試験(512 env、各150 iteration、v2から再開)で決めた。評価は`scripts/eval_g1_forward.py`(256 env x 20秒、観測ノイズあり。向きの変化は累積なので、旋回すると360度を超える):
+
+| モデル | 20秒以内の転倒 | 平均vx(指令0.60) | 平均vy | yaw速度の平均 | yaw速度の絶対平均 | 20秒の向きの変化 | 進行方向/横方向の変位 | 進行角 |
+|---|---|---|---|---|---|---|---|---|
+| v1: `track_ang` 0.5(800 it) | 0 % | 0.31 | 0.14 | 0.75 | 1.31 | +817度 | 0.34 m / 0.40 m | 51度 |
+| v2: `track_ang` 2.0(+400 it) | 0 % | 0.54 | 0.08 | 0.45 | 0.58 | +399度 | 1.23 m / 0.94 m | 43度 |
+| A: yaw -0.5、heading -1、lateral -1(+150 it) | 0 % | 0.54 | 0.04 | 0.11 | 0.40 | +7.9度(絶対値11.4) | 10.5 m / 1.52 m | 8.5度 |
+| B: yaw -2、heading -3、lateral -2(+150 it) | 0.4 % | 0.50 | 0.07 | 0.11 | 0.42 | +23.8度 | 9.1 m / 3.23 m | 20度 |
+| **v3: Aの重みで+400 it(最終)** | 0.4 %(256中1、7秒で転倒) | 0.51 | -0.00 | **0.06** | 0.29 | **-2.6度(絶対値4.0)** | 10.2 m / 0.74 m | **4.1度** |
+
+(yaw速度はrad/s、速度はm/s。横方向の変位=20秒時点の開始時の向きの直線からの横ずれの絶対値の平均。)同じ150 iterationでは強い重み(B)の方が悪かった。最終方策はほぼ直線で歩く(20秒で向きは約4度しか変わらない。再生のタイルでも軌跡はほぼ直線で、指令0.8では9.5 mで最大約0.6 mの片寄りがある)。yaw速度の平均は0.06 rad/s(目標は約0.1)。絶対値の平均(0.29)は歩容の左右の揺れであり、旋回ではない。前進速度は指令に届かない(0.51 / 0.60 m/s、最大指令では0.60 / 0.80)ことと、256 envのうち1つが転倒したことは未解決。動画(ローカル、commitしない): `runs/video/g1_forward_straight.mp4`(横から、市松模様の床、20秒)と`runs/video/g1_forward_straight_topdown.mp4`(真上から、胴体の軌跡を赤、1 m刻みの基準線)。
 
 ## シミュレーション簡略化オプション(読み込み時)
 

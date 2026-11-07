@@ -40,6 +40,7 @@ def main() -> None:
     ap.add_argument("--out", default="runs/video/g1_cmd_vel.mp4")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--forward-only", action="store_true", help="前進専用タスクの方策を再生(指令 vx 0.4/0.5/0.6/0.8)")
+    ap.add_argument("--topdown", action="store_true", help="上から見た固定カメラ + 胴体軌跡と基準線(直進性の確認用)")
     ap.add_argument("--plain-floor", action="store_true", help="地面を市松模様にしない")
     args = ap.parse_args()
 
@@ -67,8 +68,12 @@ def main() -> None:
     qpos[:, 0:2], qpos[:, 3:7], qpos[:, 2], qpos[:, 7:] = 0.0, [1, 0, 0, 0], env.init_height, e.DEFAULT_JOINT_POS
     env._sim.set_state(qpos, qvel)
     cmd = torch.tensor([c for _, c in CASES], dtype=torch.float32)
-    env._commands[:] = cmd
-    env._is_heading[:] = False
+    if args.forward_only:  # 向きは開始時(yaw=0)を保つheading指令。vxだけ固定する
+        env._yaw0[:], env._heading_target[:] = 0.0, 0.0
+        env._commands[:, 0] = cmd[:, 0]
+    else:
+        env._commands[:] = cmd
+        env._is_heading[:] = False
     env._elapsed[:] = 0
     env._last_action[:] = 0.0
     env._prev_joint_vel[:] = 0.0
@@ -89,8 +94,11 @@ def main() -> None:
             frames_q[t] = q
             d = dones.numpy().astype(bool)
             first_done[(first_done < 0) & d] = t
-            env._commands[:] = cmd
-            env._is_heading[:] = False
+            if args.forward_only:
+                env._commands[:, 0] = cmd[:, 0]
+            else:
+                env._commands[:] = cmd
+                env._is_heading[:] = False
 
     warm = int(2.0 / e.CONTROL_DT)  # 立ち上がり2sを除いて評価
     summary = {"checkpoint": str(ckpt), "cases": {}}
@@ -111,6 +119,10 @@ def main() -> None:
     renderer = mujoco.Renderer(model, TILE_H, TILE_W)
     cam = mujoco.MjvCamera()
     cam.distance, cam.azimuth, cam.elevation = 3.2, 135, -15
+    if args.topdown:  # 真上から、開始点の前方を中央にした固定カメラ(+xが画面の右)
+        cam.distance, cam.azimuth, cam.elevation = 15.0, 90, -89
+        cam.lookat[:] = [5.5, 0.0, 0.0]
+    trail = [[] for _ in CASES]
     font = ImageFont.load_default(size=18)
     win = int(0.5 / e.CONTROL_DT)
 
@@ -125,8 +137,18 @@ def main() -> None:
         for i, (name, c) in enumerate(CASES):
             data.qpos[:] = frames_q[t, i]
             mujoco.mj_forward(model, data)
-            cam.lookat[:] = data.qpos[:3]
+            if not args.topdown:
+                cam.lookat[:] = data.qpos[:3]
             renderer.update_scene(data, cam)
+            if args.topdown:
+                trail[i].append(data.qpos[:2].copy())
+                sc = renderer.scene
+                marks = [np.array([x, 0.0]) for x in np.arange(0.0, 12.01, 1.0)]  # 基準線(+x方向、0.5 m刻み)
+                for p_, rgba, r_ in [(m_, (1, 1, 1, 1), 0.04) for m_ in marks] + [(p_, (1, 0.2, 0.2, 1), 0.05) for p_ in trail[i][::5]]:
+                    if sc.ngeom >= sc.maxgeom:
+                        break
+                    mujoco.mjv_initGeom(sc.geoms[sc.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, np.array([r_, 0, 0]), np.array([p_[0], p_[1], 0.02]), np.eye(3).flatten(), np.array(rgba, dtype=np.float32))
+                    sc.ngeom += 1
             im = Image.fromarray(renderer.render())
             mv = meas[max(0, t - win + 1) : t + 1, i].mean(axis=0)
             d = ImageDraw.Draw(im)
