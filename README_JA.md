@@ -84,33 +84,16 @@ CMakeオプション: `MJMLX_BUILD_TESTS`、`MJMLX_BUILD_BENCHMARKS`、`MJMLX_BU
 just fetch-models
 ```
 
-## Go2の学習(PPO、rsl_rl)
+## 学習した方策
 
-```bash
-uv sync --group build --group go2
+学習・評価・比較のコードは[`scripts/examples/`](scripts/examples/)(Go2、G1、HalfCheetah)にある。実行方法、再現元の選定、Isaac Labとの差分、学習結果は**[scripts/examples/README_JA.md](scripts/examples/README_JA.md)**([English](scripts/examples/README.md))。
 
-# 平地 + Isaac Lab(UnitreeGo2FlatEnvCfg)準拠の報酬、PPO更新はCUDA
-PYTHONPATH=<cu126等のtorch> uv run python scripts/train_go2_ppo.py --build-dir build \
-  --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
-
-# 階段地形(既定)。チェックポイントは--logdir配下に50 iterationごと
-uv run python scripts/train_go2_ppo.py --build-dir build --envs 2048 --logdir runs/go2_stairs
-
-# 学習済み方策で前後左右のcmd_velを与え、タイル動画(runs/video/)と追従誤差を出す
-uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
-
-tensorboard --logdir runs/
-```
-
-主なオプション: `--reward-preset {relaxed,isaac_flat}`、`--device cuda`、`--no-self-collision --max-condim 3`(高速モード)、`--use-sensors`(batchedのIMU/接触センサ経由の観測)、`--cpu`(GPUエンジンの代わりにMuJoCo C)。`MJMLX_GO2_INTEGRATOR=implicitfast`でPDアクチュエータを陰的に積分する。
-
-Isaac Lab版からの簡略化: height_scannerなし(盲目方策)、env別の物理ドメインランダマイズなし(全envで単一モデル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
-
-学習済み方策の再生(Go2、平地、`isaac_flat`、500 iteration、前後左右に0.5 m/sで指令。後退・左・右は追従するが前進だけ静止するので途中経過):
-
-https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
-
-HalfCheetah-v4のPPOサンプル(stable-baselines3)は`scripts/train_ppo.py`(`just train-ppo`)。
+<table>
+<tr>
+<td align="center"><video src="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3" controls muted width="400"></video><br><b>Go2</b>、平地のcmd_vel追従(途中経過: 後退・左・右は追従、前進だけ静止)</td>
+<td align="center"><video src="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615" controls muted width="400"></video><br><b>G1</b>、前進専用タスク、20秒、横から(直進する。速度は指令に届かない)</td>
+</tr>
+</table>
 
 ## シミュレーション簡略化オプション(読み込み時)
 
@@ -147,7 +130,7 @@ gcam = CudaCamera.try_create(cam)               # 非対応環境はNone -> 上�
 cam.render(); rgba, depth = gcam.read()         # CUDAテンソル、CPUコピーなし
 ```
 
-未対応: 影、半透明、可動bodyに付いたlight、trackcom(body原点で近似)。interopはLinux + `VK_KHR_external_memory_fd` + CUDA版torchが必要で、複数GPUでは`MKX_VULKAN_DEVICE_INDEX`をCUDAのデバイスと揃える。カメラにはgraphics+compute queue、`multiDrawIndirect`、`drawIndirectFirstInstance`、`shaderClipDistance`が必要(満たさない時は`create_camera`だけが失敗)。例: `scripts/example_go2_camera.py`、MuJoCo描画との比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera*.py`。
+未対応: 影、半透明、可動bodyに付いたlight、trackcom(body原点で近似)。interopはLinux + `VK_KHR_external_memory_fd` + CUDA版torchが必要で、複数GPUでは`MKX_VULKAN_DEVICE_INDEX`をCUDAのデバイスと揃える。カメラにはgraphics+compute queue、`multiDrawIndirect`、`drawIndirectFirstInstance`、`shaderClipDistance`が必要(満たさない時は`create_camera`だけが失敗)。例: `scripts/examples/go2/example_go2_camera.py`、MuJoCo描画との比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera*.py`。
 
 ## ベンチマークと比較
 
@@ -159,7 +142,7 @@ MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build       # �
 uv run python scripts/bench_physics_vs_others.py ...                         # 本リポジトリ / Isaac Lab / Genesis
 uv run python scripts/bench_camera_vs_isaac.py --build-dir build             # Isaac Lab TiledCameraとの比較
 PYTHONPATH=<cu126等のtorch> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build               # MuJoCo Cとの1 step差
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build               # MuJoCo Cとの1 step差
 just check-video-export                                                      # CPU|GPU並べたタイル動画
 just bench                                                                   # benchmarks/baseline.csvとの退行チェック
 ```
@@ -197,8 +180,8 @@ RTX 3060(12 GB)での実測は `docs/wip_isaac_comparison.md`(本リポジトリ
 
 ### 3. CPU(MuJoCo C)とGPUの物理の差
 ```bash
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
 just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
 ```
 
@@ -524,7 +507,8 @@ batched GPU経路。MuJoCo Cとの照合結果。全機能表と既知の欠落�
 include/mjmlx/     公開Cヘッダ (mjmlx.h, mjb.h)
 src/               batched.cpp (パイプライン), *_vmap.cpp (smooth/constraint/solverのグラフ), compat/mkx_kernels (GLSLカーネル), camera.cpp, sensor.cpp, io.cpp, mjb.cpp
 python/            nanobindバインディング
-scripts/           Go2環境・学習、ベンチ、比較
+scripts/           ベンチ、カメラ/センサのヘルパー、ツール
+scripts/examples/  Go2 / G1 / HalfCheetahの環境・学習・再生・CPU/GPU比較(scripts/examples/README_JA.mdを参照)
 tests/             C++テスト、MJCFフィクスチャ
 docs/              index.html (GitHub Pages)
 extern/mlx_vulkan  Vulkanテンソルバックエンド (submodule)

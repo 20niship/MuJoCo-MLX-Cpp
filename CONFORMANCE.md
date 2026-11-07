@@ -52,6 +52,14 @@ Legend: **Yes** supported and tested against MuJoCo C. **Partial** see note. **N
 
 IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint and ball pos/vel, actuator pos/vel, subtreecom: 19 types, `test_sensors`, G1's built-in MJCF sensors in `model_sensors_g1`. Not supported: force, torque, touch, rangefinder, camera sensors.
 
+## Robots in the RL environments
+
+| Robot | Status |
+|---|---|
+| Unitree Go2 | training env (`mjmlx_go2_env.py`), flat + stairs |
+| Unitree G1 (menagerie, 29 DoF) | training env (`mjmlx_g1_env.py`, flat, Isaac Lab `Isaac-Velocity-Flat-G1-v0`); runs on the non-shared solver path (nv=35), about 4-5K env-steps/s |
+| Unitree H1 | CPU/GPU trajectory test only |
+
 ## Other
 
 | Feature | Status |
@@ -63,7 +71,7 @@ IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint
 
 ## Measured agreement with MuJoCo C
 
-- Go2, one control step from the same contact state, joint angles: mean 3.6e-5 rad, p95 8e-7 rad. With `max_condim=3` applied to both sides: mean 1.4e-5 rad, p95 5e-7 rad (`scripts/compare_cpu_gpu_go2.py`).
+- Go2, one control step from the same contact state, joint angles: mean 3.6e-5 rad, p95 8e-7 rad. With `max_condim=3` applied to both sides: mean 1.4e-5 rad, p95 5e-7 rad (`scripts/examples/go2/compare_cpu_gpu_go2.py`).
 - Long trajectories with contact diverge chaotically; tests bound them per model rather than expecting bitwise agreement. Arms (piper, openarm) match over the whole video; go2/g1 diverge after landing.
 - Camera vs MuJoCo's renderer (third person, 16 envs, 128 px): robot silhouette IoU 0.965, depth error 14.9 mm mean / 37.9 mm p95 at the default LOD.
 - `ctest -L correctness` (sensors, SDF, tendons, humanoid/high-DOF/contact stress), `-L robust` / `robust_full` (nv x constraint sweep), `-L models` (real robots, local only), `-L known_issue` (tracked failures).

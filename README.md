@@ -84,33 +84,16 @@ Fetch robot models (mesh MJCFs for piper/openarm/go2/g1/h1, git-ignored):
 just fetch-models
 ```
 
-## Train Go2 (PPO, rsl_rl)
+## Trained policies
 
-```bash
-uv sync --group build --group go2
+Training, evaluation and comparison code lives in [`scripts/examples/`](scripts/examples/) (Go2, G1, HalfCheetah); how to run it, the choice of reference implementations, differences from Isaac Lab and all training results are in **[scripts/examples/README.md](scripts/examples/README.md)** ([日本語](scripts/examples/README_JA.md)).
 
-# flat ground, Isaac Lab (UnitreeGo2FlatEnvCfg)-style rewards, PPO update on CUDA
-PYTHONPATH=<torch-cu126 etc.> uv run python scripts/train_go2_ppo.py --build-dir build \
-  --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
-
-# stairs terrain (default), checkpoints every 50 iterations under --logdir
-uv run python scripts/train_go2_ppo.py --build-dir build --envs 2048 --logdir runs/go2_stairs
-
-# roll out the trained policy with forward/back/left/right commands -> tiled mp4 in runs/video/
-uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
-
-tensorboard --logdir runs/
-```
-
-Useful flags: `--reward-preset {relaxed,isaac_flat}`, `--device cuda`, `--no-self-collision --max-condim 3` (fast mode), `--use-sensors` (observations via the batched IMU / contact sensors), `--cpu` (MuJoCo C instead of the GPU engine). `MJMLX_GO2_INTEGRATOR=implicitfast` integrates PD actuators implicitly.
-
-Simplifications versus Isaac Lab: no height scanner (blind policy), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
-
-Trained policy rollout (Go2, flat ground, `isaac_flat` preset, 500 iterations, commands forward/back/left/right at 0.5 m/s; the policy tracks back/left/right but stays still for forward, so this is a work in progress):
-
-https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3
-
-A self-contained HalfCheetah-v4 PPO example (stable-baselines3) is in `scripts/train_ppo.py` (`just train-ppo`).
+<table>
+<tr>
+<td align="center"><video src="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3" controls muted width="400"></video><br><b>Go2</b>, flat ground, cmd_vel tracking (work in progress: tracks backward / left / right, stays still for forward)</td>
+<td align="center"><video src="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615" controls muted width="400"></video><br><b>G1</b>, forward-only task, 20 s, side view (walks straight; speed stays below the command)</td>
+</tr>
+</table>
 
 ## Simulation simplification options (load time)
 
@@ -147,7 +130,7 @@ gcam = CudaCamera.try_create(cam)               # None if unsupported -> fall ba
 cam.render(); rgba, depth = gcam.read()         # CUDA tensors, no CPU copy
 ```
 
-Not supported: shadows, translucency, lights attached to moving bodies, trackcom (approximated by the body origin). Interop needs Linux + `VK_KHR_external_memory_fd` + CUDA torch; set `MKX_VULKAN_DEVICE_INDEX` to match the CUDA device on multi-GPU hosts. Camera needs a graphics+compute queue, `multiDrawIndirect`, `drawIndirectFirstInstance`, `shaderClipDistance` (only `create_camera` fails otherwise). Examples: `scripts/example_go2_camera.py`, comparison with MuJoCo's renderer: `scripts/compare_camera_mujoco.py`, speed: `scripts/bench_camera*.py`.
+Not supported: shadows, translucency, lights attached to moving bodies, trackcom (approximated by the body origin). Interop needs Linux + `VK_KHR_external_memory_fd` + CUDA torch; set `MKX_VULKAN_DEVICE_INDEX` to match the CUDA device on multi-GPU hosts. Camera needs a graphics+compute queue, `multiDrawIndirect`, `drawIndirectFirstInstance`, `shaderClipDistance` (only `create_camera` fails otherwise). Examples: `scripts/examples/go2/example_go2_camera.py`, comparison with MuJoCo's renderer: `scripts/compare_camera_mujoco.py`, speed: `scripts/bench_camera*.py`.
 
 ## Benchmarks and comparisons
 
@@ -159,7 +142,7 @@ MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build       # p
 uv run python scripts/bench_physics_vs_others.py ...                         # this repo / Isaac Lab / Genesis
 uv run python scripts/bench_camera_vs_isaac.py --build-dir build             # camera vs Isaac Lab TiledCamera
 PYTHONPATH=<torch-cu126> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build               # 1-step difference vs MuJoCo C
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build               # 1-step difference vs MuJoCo C
 just check-video-export                                                      # CPU|GPU tiled comparison video
 just bench                                                                   # regression check against benchmarks/baseline.csv
 ```
@@ -291,7 +274,8 @@ Batched GPU path, checked against MuJoCo C. Full matrix and known gaps: [CONFORM
 include/mjmlx/     public C headers (mjmlx.h, mjb.h)
 src/               batched.cpp (pipeline), *_vmap.cpp (smooth/constraint/solver graph), compat/mkx_kernels (GLSL kernels), camera.cpp, sensor.cpp, io.cpp, mjb.cpp
 python/            nanobind bindings
-scripts/           Go2 env/training, benchmarks, comparisons
+scripts/           benchmarks, camera/sensor helpers, tools
+scripts/examples/  Go2 / G1 / HalfCheetah environments, training, playback, CPU-GPU checks (see scripts/examples/README.md)
 tests/             C++ tests, fixture MJCFs
 docs/              index.html (GitHub Pages)
 extern/mlx_vulkan  Vulkan tensor backend (submodule)

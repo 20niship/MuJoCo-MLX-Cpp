@@ -16,7 +16,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
 
 TILE_W, TILE_H = 480, 360
 HOME_Z = 0.40  # 平地でのスポーン高さ(mjmlx_go2_env._reset_envsと同じ)

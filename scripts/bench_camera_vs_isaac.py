@@ -17,6 +17,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "examples", "go2"))  # mjmlx_go2_env
 # Isaacの水平画角 2*atan(20.955/(2*24)) = 47.5度に合わせた前方カメラ1台(baseの+x方向)。
 # --camera orbit: ロボット全体が写る三人称カメラ(mjmlxのみ。frontはIsaacと同じ前方視点でロボット自身はほぼ写らない)
 _orbit = "--camera" in sys.argv and sys.argv[sys.argv.index("--camera") + 1] == "orbit"

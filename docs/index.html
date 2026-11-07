@@ -133,9 +133,10 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
 
 <section id="train">
   <h2>Trained policies</h2>
-  <p class="lead">Go2 locomotion trained end to end on this simulator with rsl_rl PPO, Isaac Lab–compatible observations and rewards.</p>
+  <p class="lead">Go2 and G1 trained end to end on this simulator with rsl_rl PPO and Isaac Lab–compatible observations and rewards. Go2 is a work in progress (tracks backward / left / right, stays still for forward); G1 is a forward-only task that walks straight (speed stays below the command). Code, settings and results: <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/scripts/examples/README.md">scripts/examples/README.md</a>.</p>
   <div class="grid">
     <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/6b5d210c-da5b-401b-8277-287d5a3b85c3"><div><b>Go2 · flat ground · cmd_vel tracking</b>Attach video to a PR, paste the user-attachments URL into <code>data-url</code></div></div><figcaption>Unitree Go2 following forward/back/left/right velocity commands.</figcaption></figure>
+    <figure><div class="slot" data-type="video" data-url="https://github.com/user-attachments/assets/1c79aae8-1332-4f13-b42b-4f6cc9de6615"></div><figcaption>Unitree G1, forward-only task, side view (20 s, checkerboard floor).</figcaption></figure>
     <figure><div class="slot" data-type="image" data-url="https://github.com/user-attachments/assets/0364072b-e79a-4201-b6e9-0bc79388c605"><div><b>Training curves</b>Attach image, paste URL into <code>data-url</code></div></div><figcaption>Reward / episode length over iterations.</figcaption></figure>
   </div>
 </section>
@@ -214,9 +215,9 @@ qpos, qvel = sim.state()                                    # numpy (4096, nq) /
 
   <h3>3 · Train Go2 with rsl_rl PPO</h3>
 <pre><code>uv sync --group build --group go2
-uv run python scripts/train_go2_ppo.py --build-dir build --flat --reward-preset isaac_flat \
+uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build --flat --reward-preset isaac_flat \
     --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
-uv run python scripts/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build \
+uv run python scripts/examples/go2/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build \
     --reward-preset isaac_flat --speed 0.5            # tiled video + tracking error
 tensorboard --logdir runs/</code></pre>
   <p class="note">Flags: <code>--reward-preset {relaxed,isaac_flat}</code>, stairs terrain by default (drop <code>--flat</code>), <code>--use-sensors</code>, <code>--no-self-collision --max-condim 3</code>, <code>--cpu</code> for MuJoCo C. Simplifications vs Isaac Lab: blind policy (no height scan), one physical model for all envs, no terrain curriculum.</p>
@@ -242,7 +243,7 @@ mjb_batched_step(sim, controls);</code></pre>
 <pre><code>just check-ci                     # CPU-vs-GPU trajectory tests (runs on lavapipe, no GPU needed)
 cd build &amp;&amp; ctest -L robust       # batch sanity sweep over nv x constraint types
 uv run python scripts/bench_go2_step.py --build-dir build --envs 4096
-uv run python scripts/compare_cpu_gpu_go2.py --build-dir build   # 1-step error vs MuJoCo C
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build   # 1-step error vs MuJoCo C
 just check-video-export           # CPU | GPU side-by-side video</code></pre>
 </section>
 
@@ -284,7 +285,7 @@ cd MuJoCo-MLX-Cpp
 uv sync --group build --group go2
 just build-python               # any Vulkan device (needs libvulkan-dev + glslang-tools)
 
-uv run python scripts/train_go2_ppo.py --build-dir build \
+uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build \
   --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500</code></pre>
   <p>Full instructions, API reference and the benchmark recipes: <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#readme">README</a> · <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/README_JA.md">日本語</a> · <a href="https://github.com/20niship/MuJoCo-MLX-Cpp/blob/main/CONFORMANCE.md">Conformance</a>.</p>
 </section>
