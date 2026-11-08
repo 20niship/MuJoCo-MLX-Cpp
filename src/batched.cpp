@@ -266,6 +266,7 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
         int sub = i - da;
         int rotax = -1;
         if (jt == 0 && sub >= 3) rotax = sub - 3;
+        if (jt == 0 && sub < 3) rotax = -1 - sub;  // 並進DOF: 関節内のindexを負値で持つ(自由関節が先頭でない場合も正しいcdofにするため)
         if (jt == 1) rotax = sub;
         k.dof_rotaxis[i] = rotax;
     }

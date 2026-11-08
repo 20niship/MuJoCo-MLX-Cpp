@@ -209,7 +209,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
      << "    c6[0]=ax[0]; c6[1]=ax[1]; c6[2]=ax[2];\n"
      << "    c6[3]=ax[1]*d[2]-ax[2]*d[1]; c6[4]=ax[2]*d[0]-ax[0]*d[2]; c6[5]=ax[0]*d[1]-ax[1]*d[0];\n"
      << "  } else if (jt == 0 && ra < 0) {\n"
-     << "    int sub = di - " << (njnt > 0 ? jnt_dofadr0 : 0) << ";\n"
+     << "    int sub = -1 - ra;\n"
      << "    c6[3+sub] = 1.0f;\n"
      << "  } else if (jt == 0 && ra >= 0) {\n"
      << "    float rm[9]; for (int k=0;k<9;k++) rm[k] = xmat[uint(bdi*9+k)*NBATCH+bid];\n"
