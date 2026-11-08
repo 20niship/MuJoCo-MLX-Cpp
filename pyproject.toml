@@ -70,3 +70,7 @@ ignore = [
 [tool.mypy]
 files = ["python/vkmujoco"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["mujoco"]
+ignore_missing_imports = true

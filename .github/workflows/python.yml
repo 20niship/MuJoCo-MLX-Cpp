@@ -16,7 +16,7 @@ jobs:
       - name: ruff format --check
         run: uvx ruff format --check .
       - name: mypy (stub を含む python/vkmujoco)
-        run: uvx --with numpy mypy
+        run: uvx --with numpy --with mujoco==3.5.0 mypy
 
   # 生成したstub(_core.pyi)がコミット済みのものと一致するか(wheelをビルドして確認する)
   stub:
