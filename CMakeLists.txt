@@ -144,7 +144,7 @@ else()
     list(APPEND MJMLX_SOURCES src/camera_stub.cpp)
 endif()
 
-# wheel(SKBUILD)ではvkmujoco._coreに静的リンクして、同梱する共有ライブラリを無くす(auditwheel/delocate不要)
+# wheel(SKBUILD)ではvkmujocoに静的リンクして、同梱する共有ライブラリを無くす(auditwheel/delocate不要)
 if(SKBUILD)
     add_library(mjmlx STATIC ${MJMLX_SOURCES})
 else()
@@ -527,13 +527,13 @@ if(MJMLX_BUILD_PYTHON)
     message(STATUS "nanobind found: ${nanobind_DIR}")
 
     # Numpy-facing RL bindings (mjmlx.h only, no mlx.core NB_DOMAIN sharing -- see python/rl_bindings.cpp)
-    # パッケージvkmujoco._coreとして出力する。
-    nanobind_add_module(_core
+    # 単一モジュール`vkmujoco`(vkmujoco.abi3.so)として出力する。
+    nanobind_add_module(vkmujoco
         NB_STATIC STABLE_ABI LTO NOMINSIZE
         python/rl_bindings.cpp
     )
-    target_link_libraries(_core PRIVATE mjmlx)
-    target_include_directories(_core PRIVATE
+    target_link_libraries(vkmujoco PRIVATE mjmlx)
+    target_include_directories(vkmujoco PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     # MuJoCo Renderer(GL要)とのhfield/texture比較。GL環境が無いCIでは回さないのでcorrectnessには含めない。
@@ -544,30 +544,30 @@ if(MJMLX_BUILD_PYTHON)
         add_test(NAME camera_cuda COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_cuda.py ${CMAKE_BINARY_DIR})
         set_tests_properties(camera_cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS "camera")
     endif()
-    # pip版mujoco(site-packages/mujoco)をwheel内で実行時に解決する(vkmujoco/_core.so -> ../mujoco)。
+    # pip版mujoco(site-packages/mujoco)を実行時に解決する(site-packages/vkmujoco.so -> mujoco/)。
     if(APPLE)
-        set(_core_rpath "@loader_path/../mujoco")
+        set(_vk_rpath "@loader_path/mujoco")
     else()
-        set(_core_rpath "$ORIGIN/../mujoco")
+        set(_vk_rpath "$ORIGIN/mujoco")
     endif()
-    set_target_properties(_core PROPERTIES
-        BUILD_RPATH "${_core_rpath}"
-        INSTALL_RPATH "${_core_rpath}"
+    set_target_properties(vkmujoco PROPERTIES
+        BUILD_RPATH "${_vk_rpath}"
+        INSTALL_RPATH "${_vk_rpath}"
     )
     if(SKBUILD)
-        # scikit-build-core: wheelのvkmujoco/へ(__init__.py等はwheel.packagesで同梱)
-        install(TARGETS _core LIBRARY DESTINATION vkmujoco)
+        # scikit-build-core: site-packages直下へ(型情報のvkmujoco.pyiも一緒に)
+        install(TARGETS vkmujoco LIBRARY DESTINATION .)
+        install(FILES python/vkmujoco.pyi DESTINATION .)
     else()
-        # 開発ビルド: build/vkmujoco/ を作り、build/をsys.pathに足せば`import vkmujoco`できるようにする
-        set_target_properties(_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vkmujoco")
-        file(COPY python/vkmujoco/__init__.py python/vkmujoco/py.typed DESTINATION "${CMAKE_BINARY_DIR}/vkmujoco")
+        # 開発ビルド: build/をsys.pathに足せば`import vkmujoco`できる
+        set_target_properties(vkmujoco PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
     endif()
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        add_custom_command(TARGET _core POST_BUILD
+        add_custom_command(TARGET vkmujoco POST_BUILD
             COMMAND install_name_tool -change
                 "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                "$<TARGET_FILE:_core>"
-            COMMENT "Fixing MuJoCo dylib for _core"
+                "$<TARGET_FILE:vkmujoco>"
+            COMMENT "Fixing MuJoCo dylib for vkmujoco"
         )
     endif()
 endif()

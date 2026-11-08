@@ -15,10 +15,10 @@ jobs:
         run: uvx ruff check .
       - name: ruff format --check
         run: uvx ruff format --check .
-      - name: mypy (stub を含む python/vkmujoco)
+      - name: mypy (python/vkmujoco.pyi)
         run: uvx --with numpy mypy
 
-  # 生成したstub(_core.pyi)がコミット済みのものと一致するか(wheelをビルドして確認する)
+  # 生成したstub(vkmujoco.pyi)がコミット済みのものと一致するか(wheelをビルドして確認する)
   stub:
     runs-on: ubuntu-latest
     steps:
@@ -32,5 +32,5 @@ jobs:
         run: |
           uv venv
           uv pip install . nanobind ruff
-          uv run python -m nanobind.stubgen -m vkmujoco._core -o /tmp/_core.pyi
-          diff -u python/vkmujoco/_core.pyi /tmp/_core.pyi
+          uv run python -m nanobind.stubgen -m vkmujoco -o /tmp/vkmujoco.pyi
+          diff -u python/vkmujoco.pyi /tmp/vkmujoco.pyi

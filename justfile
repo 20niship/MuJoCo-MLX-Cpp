@@ -71,9 +71,9 @@ format:
     uv run --only-group lint ruff check --fix .
     uv run --only-group lint ruff format .
 
-# Regenerate python/vkmujoco/_core.pyi from the built extension
+# Regenerate python/vkmujoco.pyi from the built extension
 stubgen: build-python
-    uv run python -m nanobind.stubgen -m vkmujoco._core -o python/vkmujoco/_core.pyi
+    uv run python -m nanobind.stubgen -m vkmujoco -o python/vkmujoco.pyi
 
 # Remove build directory
 clean:
