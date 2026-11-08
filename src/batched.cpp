@@ -407,6 +407,52 @@ static std::vector<float> build_solver_limit_table(const Model& m, int& n_out) {
     return tab;
 }
 
+// joint型の等式拘束テーブル(1本あたり20float): dof1, dof2(-1=なし), qposadr1, qposadr2, qpos0_1, qpos0_2, polycoef(5), solref(2), solimp(5), invweight, is_tendon。
+// tendon型はdof1/dof2をtendon番号、qpos0_*をtendon_length0として同じ表に載せる。connect/weld型はGPUソルバ未対応(警告して無視)。
+static std::vector<float> build_solver_equality_table(const Model& m, int& n_out, int& nten_out) {
+    std::vector<float> tab;
+    n_out = 0; nten_out = 0;
+    if ((m.opt.disableflags & DisableBit::EQUALITY) || m.cache.equality_cache.empty()) return tab;
+    mx::eval(m.jnt_qposadr);
+    auto jqa = m.jnt_qposadr.data<int>();
+    bool warned = false;
+    for (const auto& e : m.cache.equality_cache) {
+        if (e.type == 3) {
+            mx::eval(m.tendon_length0, m.tendon_invweight0);
+            const float* tl0 = m.tendon_length0.data<float>();
+            const float* tiw = m.tendon_invweight0.data<float>();
+            const bool two = e.id2 >= 0;
+            const float row[] = {(float)e.id1, two ? (float)e.id2 : -1.0f, 0.0f, 0.0f, tl0[e.id1], two ? tl0[e.id2] : 0.0f};
+            tab.insert(tab.end(), row, row + 6);
+            for (int k = 0; k < 5; k++) tab.push_back(e.data[k]);
+            for (int k = 0; k < 2; k++) tab.push_back(e.solref[k]);
+            for (int k = 0; k < 5; k++) tab.push_back(e.solimp[k]);
+            tab.push_back(tiw[e.id1] + (two ? tiw[e.id2] : 0.0f));
+            tab.push_back(1.0f);
+            n_out++; nten_out++;
+            continue;
+        }
+        if (e.type != 2) {
+            if (!warned) fprintf(stderr, "[mjmlx WARNING] GPUソルバは等式拘束のconnect/weldに未対応のため無視します\n");
+            warned = true;
+            continue;
+        }
+        tab.push_back((float)e.da1);
+        tab.push_back((float)e.da2);
+        tab.push_back((float)jqa[e.id1]);
+        tab.push_back(e.da2 >= 0 ? (float)jqa[e.id2] : 0.0f);
+        tab.push_back(e.qpos0_ref1);
+        tab.push_back(e.qpos0_ref2);
+        for (int k = 0; k < 5; k++) tab.push_back(e.data[k]);
+        for (int k = 0; k < 2; k++) tab.push_back(e.solref[k]);
+        for (int k = 0; k < 5; k++) tab.push_back(e.solimp[k]);
+        tab.push_back(e.invweight);
+        tab.push_back(0.0f);
+        n_out++;
+    }
+    return tab;
+}
+
 // DOF摩擦損失(frictionloss)拘束の静的テーブル(1dofあたり10float): dof, frictionloss, solref(2), solimp(5), invweight。
 static std::vector<float> build_solver_friction_table(const Model& m, int& n_out) {
     std::vector<float> tab;
@@ -560,6 +606,8 @@ struct BatchedStepContext {
     mx::array ten_lim_tab = mx::zeros({1});
     mx::array ten_fric_tab = mx::zeros({1});
     int solver_ntlim = 0, solver_ntfl = 0;
+    mx::array solver_eq_tab = mx::zeros({1});
+    int solver_neq = 0, solver_nteq = 0;
 
     // Collision kernel
     std::optional<KernelFn> collision_kernel;
@@ -778,6 +826,10 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             ctx->ten_lim_tab = mx::array(tl.data(), {(int)tl.size()}, mx::float32);
             ctx->ten_fric_tab = mx::array(tf.data(), {(int)tf.size()}, mx::float32);
             mx::eval(ctx->ten_lim_tab, ctx->ten_fric_tab);
+            auto et = build_solver_equality_table(m, ctx->solver_neq, ctx->solver_nteq);
+            if (et.empty()) et.push_back(0.0f);
+            ctx->solver_eq_tab = mx::array(et.data(), {(int)et.size()}, mx::float32);
+            mx::eval(ctx->solver_eq_tab);
         }
         int raw_si = (solver_iters_override > 0) ? solver_iters_override : std::max(m.opt.iterations, 1);
         // モデル既定のiterations(CPU厳密Cholesky向けに100等)はGPUのCGソルバでは過大なので3で頭打ちにする。呼び出し側がsolver_iterationsで明示した値は尊重する(接触が複数重なると3回では収束せず速度が発散する場合がある)。
@@ -796,7 +848,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl, ctx->euler_acc_kernel.has_value(), er != nullptr);  // ABL_*: 計測用(物理が変わる)
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl, ctx->solver_neq, ctx->solver_nteq, ctx->euler_acc_kernel.has_value(), er != nullptr);  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
@@ -1074,8 +1126,8 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                  ctx->solver_pair_props, ctx->solver_body_dof_masks,
                                  ctx->solver_body_rootid,
                                  mx::astype(mx::flatten(qpos_batch), mx::float32),
-                                 ctx->solver_limit_tab, ctx->solver_fric_tab};
-                            if (ctx->solver_ntlim + ctx->solver_ntfl > 0) { solver_in.push_back(fwd[8]); solver_in.push_back(ctx->ten_lim_tab); solver_in.push_back(ctx->ten_fric_tab); }
+                                 ctx->solver_limit_tab, ctx->solver_fric_tab, ctx->solver_eq_tab};
+                            if (ctx->solver_ntlim + ctx->solver_ntfl + ctx->solver_nteq > 0) { solver_in.push_back(fwd[8]); solver_in.push_back(ctx->ten_lim_tab); solver_in.push_back(ctx->ten_fric_tab); }
                             if (ctx->er) solver_in.push_back(ctx->er->fric_a);
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs(solver_in),

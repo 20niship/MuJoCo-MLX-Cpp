@@ -371,6 +371,10 @@ if(MJMLX_BUILD_TESTS)
     set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
 
     # tendon(固定/空間)のGPUバッチ vs MuJoCo C。arm26はcylinder wrap+sidesite+2geom、sphereは球wrap+sidesite+spring、pulleyは滑車+limit+frictionloss+tendon駆動actuator。
+    # MJCF <equality>(joint / tendon)のGPUソルバ vs MuJoCo C。connect/weldはGPUソルバ非対応(実装予定なし)。
+    add_test(NAME gpu_vs_cpu_equality_joint COMMAND test_gpu_vs_cpu ${_M}/equality_joint.xml --seconds 2 --ctrl sin --tol-joint 1e-2)
+    add_test(NAME gpu_vs_cpu_equality_tendon COMMAND test_gpu_vs_cpu ${_M}/equality_tendon.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
+    set_tests_properties(gpu_vs_cpu_equality_joint gpu_vs_cpu_equality_tendon PROPERTIES LABELS "correctness")
     add_test(NAME gpu_vs_cpu_tendon_arm26 COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
     add_test(NAME gpu_vs_cpu_tendon_arm26_step COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml 1e-4 1e-4 1e-3)
     add_test(NAME gpu_vs_cpu_tendon_sphere COMMAND test_gpu_vs_cpu ${_M}/tendon_sphere.xml 1e-4 1e-4 1e-2)
@@ -439,7 +443,7 @@ if(MJMLX_BUILD_TESTS)
         endif()
     endfunction()
     set(_MG "mujoco_menagerie")
-    mjmlx_add_model_test(piper ${_MG}/agilex_piper/scene.xml --seconds 4 --ctrl sin --bodies base_link,link6,link8 --tol-joint 0.08 --tol-pos 0.08 --tol-rot 0.01)
+    mjmlx_add_model_test(piper ${_MG}/agilex_piper/scene.xml --seconds 4 --ctrl sin --bodies base_link,link6,link7,link8 --tol-joint 5e-3 --tol-pos 5e-3 --tol-rot 5e-3)  # gripperのjoint等式(joint8=-joint7)込みでCPUと一致
     mjmlx_add_model_test(openarm openarm_mujoco/v1/scene.xml --seconds 4 --ctrl sin --bodies openarm_left_link7,openarm_left_hand_tcp,openarm_right_hand_tcp --tol-joint 0.25 --tol-pos 0.06 --tol-rot 0.4)
     mjmlx_add_model_test(go2_freefall ${_MG}/unitree_go2/scene.xml --seconds 0.6 --lift 3 --ctrl sin --bodies base,FL_calf,FR_calf --tol-joint 1e-3 --tol-pos 1e-2 --tol-rot 5e-3)
     mjmlx_add_model_test(go2_landing ${_MG}/unitree_go2/scene.xml --seconds 1 --lift 0.3 --ctrl sin --bodies base,FL_calf,FR_calf --tol-joint 0.5 --tol-pos 0.15 --tol-rot 0.6)
