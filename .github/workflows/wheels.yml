@@ -36,7 +36,7 @@ jobs:
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
           CIBW_ARCHS_LINUX: x86_64
           CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
-          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_34
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_34_x86_64
           CIBW_BEFORE_ALL_LINUX: dnf install -y epel-release && dnf install -y vulkan-headers vulkan-loader-devel glslang
           CIBW_BEFORE_ALL_MACOS: brew install vulkan-headers vulkan-loader molten-vk glslang
           CIBW_BEFORE_ALL_WINDOWS: choco install -y vulkan-sdk
