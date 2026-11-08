@@ -42,7 +42,7 @@ tensorboard --logdir runs/
 
 主なオプション: `--reward-preset {relaxed,isaac_flat}`、`--device cuda`、`--no-self-collision --max-condim 3`(高速モード)、`--use-sensors`(batchedのIMU/接触センサ経由の観測)、`--cpu`(GPUエンジンの代わりにMuJoCo C)。`MJMLX_GO2_INTEGRATOR=implicitfast`でPDアクチュエータを陰的に積分する。
 
-Isaac Lab版からの簡略化: height_scannerなし(盲目方策)、env別の物理ドメインランダマイズなし(全envで単一モデル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
+Isaac Lab版からの簡略化: height_scannerなし(盲目方策)、env別ドメインランダマイズは`--domain-rand`のみ(起動時に1回サンプル)、地形カリキュラムなし、`cmd_vel`はheading方式でなく`||cmd_vel||`範囲の直接サンプリング。
 
 学習済み方策の再生(Go2、平地、`isaac_flat`、500 iteration、前後左右に0.5 m/sで指令。後退・左・右は追従するが前進だけ静止するので途中経過):
 
@@ -125,3 +125,20 @@ uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir run
 | **v3: Aの重みで+400 it(最終)** | 0.4 %(256中1、7秒で転倒) | 0.51 | -0.00 | **0.06** | 0.29 | **-2.6度(絶対値4.0)** | 10.2 m / 0.74 m | **4.1度** |
 
 (yaw速度はrad/s、速度はm/s。横方向の変位=20秒時点の開始時の向きの直線からの横ずれの絶対値の平均。)同じ150 iterationでは強い重み(B)の方が悪かった。最終方策はほぼ直線で歩く(20秒で向きは約4度しか変わらない。再生のタイルでも軌跡はほぼ直線で、指令0.8では9.5 mで最大約0.6 mの片寄りがある)。yaw速度の平均は0.06 rad/s(目標は約0.1)。絶対値の平均(0.29)は歩容の左右の揺れであり、旋回ではない。前進速度は指令に届かない(0.51 / 0.60 m/s、最大指令では0.60 / 0.80)ことと、256 envのうち1つが転倒したことは未解決。動画(ローカル、commitしない): `runs/video/g1_forward_straight.mp4`(横から、市松模様の床、20秒)と`runs/video/g1_forward_straight_topdown.mp4`(真上から、胴体の軌跡を赤、1 m刻みの基準線)。
+
+### env別の物理ランダム化
+
+質量・COM・摩擦・アクチュエータ出力をenvごとに変えられる(sim2real用のドメインランダマイズ)。`domain_rand`を有効にして作ったsimだけが、カーネルにenv別のバッファ読みを足す(無効=既定は従来と同じ速度・同じ結果)。
+
+```python
+sim = native.create_batched(model, 4096, frame_skip=1, domain_rand=True)
+sim.set_env_params(                       # env_idx=Noneなら全env、配列なら指定envだけ更新。Noneの引数は変更しない
+    env_idx=np.array([0, 5], np.int32),
+    mass_scale=np.ones((2, model.nbody), np.float32),      # (n, nbody) bodyごとの質量と慣性の倍率
+    com_delta=np.zeros((2, model.nbody, 3), np.float32),   # (n, nbody, 3) body座標系のCOMずれ[m]
+    friction_scale=np.array([0.5, 1.2], np.float32),       # (n,) 全geomの摩擦の倍率
+    gain_scale=np.ones((2, model.nu), np.float32),         # (n, nu) アクチュエータ出力の倍率
+)
+```
+
+Go2学習は`--domain-rand`で、摩擦倍率U(0.5,1.25)・base質量加算U(-1,3)kg・base COMずれ±0.05m・アクチュエータ出力倍率U(0.9,1.1)を起動時にenv別サンプルする(リセットごとの再サンプルは未対応)。MuJoCo Cで同じ値に書き換えたモデルとの比較テストは`ctest -R env_rand`。`invweight`などのモデル定数は再計算しない。

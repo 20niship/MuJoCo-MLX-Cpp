@@ -527,6 +527,7 @@ static mx::array build_body_rootid(const Model& m) {
 using KernelFn = mkx::fast::Kernel<>;
 
 struct BatchedStepContext {
+    std::shared_ptr<EnvRand> er;  // nullptrならランダム化なし(カーネルは従来のまま)
     std::optional<KernelFn> kin_kernel;
     std::optional<KernelFn> euler_kernel;
     std::optional<KernelFn> euler_devmem_kernel;
@@ -589,8 +590,9 @@ struct BatchedStepContext {
     int nbody = 0, njnt = 0, nq = 0, nv = 0, nu = 0, ngeom = 0;
 };
 
-static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int solver_iters_override = 0) {
+static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int solver_iters_override = 0, std::shared_ptr<EnvRand> er = nullptr) {
     auto ctx = std::make_shared<BatchedStepContext>();
+    ctx->er = er;
     ctx->nbody = m.nbody;
     ctx->njnt = m.njnt;
     ctx->nq = m.nq;
@@ -727,7 +729,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
             fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0,
             fc.act_gain1, fc.act_gain2, fc.act_bias1, fc.act_bias2,
-            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp, ctx->ten.nten > 0 ? &ctx->ten : nullptr);
+            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp, ctx->ten.nten > 0 ? &ctx->ten : nullptr, er != nullptr);
         ctx->uses_gpu_forward = true;
     }
 
@@ -794,7 +796,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
         bool use_pyramidal = (m.opt.cone == ConeType::PYRAMIDAL);
         bool refsafe = (m.opt.disableflags & DisableBit::REFSAFE) == 0;
         ctx->solver_kernel = mkx_kernels::make_solver_kernel(
-            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl, ctx->euler_acc_kernel.has_value());  // ABL_*: 計測用(物理が変わる)
+            m.nbody, m.nv, m.nq, m.opt.timestep, use_pyramidal, refsafe, m.opt.impratio, si, cgi, getenv("MJMLX_ABL_NOLIM") ? 0 : ctx->solver_nlim, getenv("MJMLX_ABL_NOFL") ? 0 : ctx->solver_nfl, ctx->solver_ntlim, ctx->solver_ntfl, ctx->euler_acc_kernel.has_value(), er != nullptr);  // ABL_*: 計測用(物理が変わる)
         ctx->cfrc_ext_kernel = mkx_kernels::make_cfrc_ext_kernel(m.nbody, CONTACT_STRIDE, MAX_CONTACTS_PER_ENV);
         ctx->uses_gpu_solver = true;
     }
@@ -834,9 +836,10 @@ static std::vector<mx::array> mkx_vmap_batch0(
 
 std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
 make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterations_override, const void* owner,
-                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out) {
+                  std::function<std::vector<mx::array>(const mx::array&)>* kinematics_out, std::shared_ptr<EnvRand> env_rand) {
     m.init_cache();
-    auto ctx = build_context(m, solver_iterations_override);
+    auto ctx = build_context(m, solver_iterations_override, env_rand);
+    if (env_rand && !ctx->uses_gpu_forward) throw std::runtime_error("domain_rand needs the GPU forward kernel (the model must have collision pairs)");
     int B = num_envs;
 
     int nq = m.nq, nv = m.nv, nu = m.nu;
@@ -1004,6 +1007,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         fwd_shapes.push_back({B * mkx_kernels::tendon_scratch_floats(ctx->ten.nten, nv)});
                         if (ctx->ten.has_spatial) { fwd_in.push_back(mx::flatten(xpos)); fwd_in.push_back(mx::flatten(kin[7])); fwd_in.push_back(mx::flatten(kin[8])); }
                     }
+                    if (ctx->er) { fwd_in.push_back(ctx->er->mass_a); fwd_in.push_back(ctx->er->com_a); fwd_in.push_back(ctx->er->gain_a); }
                     auto fwd_raw = (*ctx->forward_kernel)(
                         mx::fast::kernel_inputs(fwd_in),
                         mx::fast::kernel_shapes(fwd_shapes),
@@ -1072,6 +1076,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                                  mx::astype(mx::flatten(qpos_batch), mx::float32),
                                  ctx->solver_limit_tab, ctx->solver_fric_tab};
                             if (ctx->solver_ntlim + ctx->solver_ntfl > 0) { solver_in.push_back(fwd[8]); solver_in.push_back(ctx->ten_lim_tab); solver_in.push_back(ctx->ten_fric_tab); }
+                            if (ctx->er) solver_in.push_back(ctx->er->fric_a);
                             auto solver_raw = (*ctx->solver_kernel)(
                                 mx::fast::kernel_inputs(solver_in),
                                 mx::fast::kernel_shapes({{B * nv}, {B * scratch_sz}, {B * MAX_CONTACTS_PER_ENV}, {B * nv}}),
@@ -1285,6 +1290,22 @@ MJMLX_API void cpu_batched_step(MjmlxBatchedSim* handle, const float* ctrl_flat,
 #endif
 }
 
+// ホストのenv主配列をカーネルが読むSoA(成分*B+env)へ転置してGPUへ上げる。
+namespace mjmlx {
+void EnvRand::upload() {
+    auto soa = [&](const std::vector<float>& h, int per) {
+        std::vector<float> t(h.size());
+        for (int e = 0; e < B; e++) for (int k = 0; k < per; k++) t[(size_t)k * B + e] = h[(size_t)e * per + k];
+        return mx::array(t.data(), {(int)t.size()}, mx::float32);
+    };
+    mass_a = soa(mass, nb);
+    com_a = soa(com, nb * 3);
+    fric_a = mx::array(fric.data(), {B}, mx::float32);
+    gain_a = soa(gain, std::max(nu, 1));
+    mx::eval(mass_a, com_a, fric_a, gain_a);
+}
+} // namespace mjmlx
+
 // ── C API ────────────────────────────────────────────────────────────────────
 
 extern "C" {
@@ -1361,8 +1382,18 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
                 handle->sim.cfrc_ext = mx::zeros({B, nb, 6});
             }
 
+            if (config->domain_rand) {
+                auto er = std::make_shared<mjmlx::EnvRand>();
+                er->B = B; er->nb = model->model.nbody; er->nu = model->model.nu;
+                er->mass.assign((size_t)B * er->nb, 1.0f);
+                er->com.assign((size_t)B * er->nb * 3, 0.0f);
+                er->fric.assign((size_t)B, 1.0f);
+                er->gain.assign((size_t)B * std::max(er->nu, 1), 1.0f);
+                er->upload();
+                handle->sim.env_rand = er;
+            }
             handle->sim.compiled_step = mjmlx::make_batched_step(
-                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim, &handle->sim.kinematics);
+                model->model, B, config->use_gpu, config->solver_iterations, &handle->sim, &handle->sim.kinematics, handle->sim.env_rand);
             handle->mj_model = model->mj_model;
             handle->sim.sensor = mjmlx::make_sensor_ctx(model->mj_model, B);
         }
@@ -1412,6 +1443,23 @@ MJMLX_API void mjmlx_batched_step_n(MjmlxBatchedSim* sim, const float* ctrl_flat
 }
 
 MJMLX_API void mjmlx_batched_step(MjmlxBatchedSim* sim, const float* ctrl_flat) { mjmlx_batched_step_n(sim, ctrl_flat, 1); }
+
+MJMLX_API int mjmlx_batched_set_env_params(MjmlxBatchedSim* sim, const int* env_idx, int n, const float* mass_scale, const float* com_delta, const float* friction_scale, const float* gain_scale) {
+    if (!sim || sim->cpu_mode || !sim->sim.env_rand || n < 0) return -1;
+    auto& er = *sim->sim.env_rand;
+    if (!env_idx && n != er.B) return -1;
+    for (int i = 0; i < n; i++) if (env_idx && (env_idx[i] < 0 || env_idx[i] >= er.B)) return -2;
+    int nug = std::max(er.nu, 1);
+    for (int i = 0; i < n; i++) {
+        size_t e = env_idx ? (size_t)env_idx[i] : (size_t)i;
+        if (mass_scale) std::copy(mass_scale + (size_t)i * er.nb, mass_scale + (size_t)(i + 1) * er.nb, er.mass.begin() + e * er.nb);
+        if (com_delta) std::copy(com_delta + (size_t)i * er.nb * 3, com_delta + (size_t)(i + 1) * er.nb * 3, er.com.begin() + e * er.nb * 3);
+        if (friction_scale) er.fric[e] = friction_scale[i];
+        if (gain_scale && er.nu > 0) std::copy(gain_scale + (size_t)i * er.nu, gain_scale + (size_t)(i + 1) * er.nu, er.gain.begin() + e * nug);
+    }
+    er.upload();
+    return 0;
+}
 
 MJMLX_API void mjmlx_batched_get_state(
     const MjmlxBatchedSim* sim, float* qpos_out, float* qvel_out,

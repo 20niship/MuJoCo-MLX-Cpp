@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--terrain-seed", type=int, default=0)
     parser.add_argument("--no-self-collision", action="store_true", help="簡略化オプション: 脚/胴体同士の衝突を切る(Isaac Labと同じ。既定は自己衝突あり)")
     parser.add_argument("--max-condim", type=int, default=0, help="簡略化オプション: ロボットのgeomのcondim上限。3で足のねじり・転がり摩擦が無くなる(既定0=モデルのまま)")
+    parser.add_argument("--domain-rand", action="store_true", help="env別の物理ランダム化(摩擦・base質量・base COM・アクチュエータ出力)を起動時に1回適用する")
     parser.add_argument("--use-sensors", action="store_true", help="観測のbase速度・重力と接触判定をMJCFの<sensor>/ContactSensor(Isaac Lab形式)から取る")
     parser.add_argument("--cmd-vel-min", type=float, default=0.2, help="||cmd_vel||の下限[m/s or rad/s]")
     parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
@@ -50,6 +51,7 @@ def main() -> None:
         use_sensors=args.use_sensors,
         self_collision=not args.no_self_collision,
         max_condim=args.max_condim,
+        domain_rand=args.domain_rand,
     )
 
     train_cfg = make_train_cfg(args.seed, args.max_iterations)

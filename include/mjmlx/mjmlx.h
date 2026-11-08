@@ -224,6 +224,14 @@ MJMLX_API const float* mjmlx_batched_get_sensordata(const MjmlxBatchedSim* sim, 
 MJMLX_API void mjmlx_batched_set_env_qpos(MjmlxBatchedSim* sim, int env_idx, const float* qpos, int nq);
 MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx, const float* qvel, int nv);
 
+// env別の物理ランダム化(MjmlxBatchedConfig.domain_rand=1の時のみ。初期値は恒等)。env_idx[n]の各envに対し、NULLでない引数だけ更新する(env_idx=NULLならn=num_envsで全env)。
+//   mass_scale[n*nbody]: bodyごとの質量と慣性の倍率(MuJoCoでbody_mass/body_inertiaを倍するのと同じ)
+//   com_delta[n*nbody*3]: body座標系のCOM位置(body_ipos)に足すずれ[m]
+//   friction_scale[n]: 全geomの摩擦係数(滑り/ねじり/転がり)の倍率
+//   gain_scale[n*nu]: アクチュエータ出力(gain*ctrl+bias)の倍率(位置アクチュエータのkpとkvを同時に倍する)
+// 戻り値: 0=OK, -1=ハンドル不正/domain_randが無効/CPUモード/n不正, -2=env_idxが範囲外。
+MJMLX_API int mjmlx_batched_set_env_params(MjmlxBatchedSim* sim, const int* env_idx, int n, const float* mass_scale, const float* com_delta, const float* friction_scale, const float* gain_scale);
+
 // ホスト読み戻しは配列ごとに遅い(ステージングが非キャッシュ)ので、[qpos, qvel, 指定bodyの接触力ノルム, 指定dof範囲のqfrc_actuatorの二乗和と絶対値和]を1転送にまとめる。set_pack_specはstrideを返す(失敗-1)。
 MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof);
 MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out);

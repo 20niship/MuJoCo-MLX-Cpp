@@ -42,7 +42,7 @@ tensorboard --logdir runs/
 
 Useful flags: `--reward-preset {relaxed,isaac_flat}`, `--device cuda`, `--no-self-collision --max-condim 3` (fast mode), `--use-sensors` (observations via the batched IMU / contact sensors), `--cpu` (MuJoCo C instead of the GPU engine). `MJMLX_GO2_INTEGRATOR=implicitfast` integrates PD actuators implicitly.
 
-Simplifications versus Isaac Lab: no height scanner (blind policy), no per-env physical domain randomization (one model shared by all envs), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
+Simplifications versus Isaac Lab: no height scanner (blind policy), per-env domain randomization only via `--domain-rand` (sampled once at start), no terrain curriculum, `cmd_vel` sampled directly in a norm range instead of heading-command mode.
 
 Trained policy rollout (Go2, flat ground, `isaac_flat` preset, 500 iterations, commands forward/back/left/right at 0.5 m/s; the policy tracks back/left/right but stays still for forward, so this is a work in progress):
 
@@ -125,3 +125,20 @@ Weights were chosen with short runs (512 envs, 150 iterations each, resumed from
 | **v3: A weights, +400 it (final)** | 0.4 % (1/256, at 7 s) | 0.51 | -0.00 | **0.06** | 0.29 | **-2.6 deg (abs 4.0)** | 10.2 m / 0.74 m | **4.1 deg** |
 
 (Yaw rate in rad/s, speeds in m/s. Cross-track = lateral displacement from the start heading line at 20 s, mean absolute value.) The stronger weights (B) were worse after the same 150 iterations. The final policy walks in an essentially straight line (heading changes by about 4 deg in 20 s; the playback tiles show straight trails with a slight drift to one side, up to ~0.6 m at 9.5 m for vx 0.8). The mean signed yaw rate is 0.06 rad/s (target ~0.1); the mean absolute yaw rate (0.29) is the left-right sway of the gait, not a turn. Forward speed still saturates below the command (0.51 vs 0.60 m/s, 0.60 vs 0.80 at the highest command) and one of 256 envs fell. Videos (local, not committed): `runs/video/g1_forward_straight.mp4` (side view, checkerboard floor, 20 s) and `runs/video/g1_forward_straight_topdown.mp4` (top-down with the pelvis trail in red and a 1 m reference line).
+
+### Per-env domain randomization
+
+Per-env mass, COM, friction and actuator output (sim2real domain randomization). Only a sim created with `domain_rand` adds per-env buffer reads to the kernels; the default is unchanged in speed and results.
+
+```python
+sim = native.create_batched(model, 4096, frame_skip=1, domain_rand=True)
+sim.set_env_params(                       # env_idx=None: all envs; None args are left unchanged
+    env_idx=np.array([0, 5], np.int32),
+    mass_scale=np.ones((2, model.nbody), np.float32),      # (n, nbody) mass and inertia scale
+    com_delta=np.zeros((2, model.nbody, 3), np.float32),   # (n, nbody, 3) COM offset in body frame [m]
+    friction_scale=np.array([0.5, 1.2], np.float32),       # (n,) scale of all geom friction
+    gain_scale=np.ones((2, model.nu), np.float32),         # (n, nu) actuator output scale
+)
+```
+
+Go2 training takes `--domain-rand`: friction scale U(0.5,1.25), base mass offset U(-1,3) kg, base COM offset +-0.05 m, actuator scale U(0.9,1.1), sampled once per env at start (no per-reset resampling). Test against MuJoCo C with identically edited models: `ctest -R env_rand`. Derived constants such as `invweight` are not recomputed; models without collision pairs cannot use `domain_rand`.

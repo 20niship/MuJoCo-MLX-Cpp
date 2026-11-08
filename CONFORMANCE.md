@@ -67,7 +67,7 @@ IMU (gyro/accelerometer/velocimeter/magnetometer), frame pos/quat/vel/acc, joint
 | Camera rendering (RGB + depth), compared against MuJoCo's renderer | Yes (`camera_vs_mujoco`; shadows/translucency/moving lights unsupported) |
 | Differentiable physics (`grad(step)`) | No (`mjmlx_grad_step` is a stub) |
 | Inverse dynamics, `mj_forward`-style single-env API | No (removed) |
-| Per-env models (mass/friction randomisation) | No (one model per batch) |
+| Per-env models | Partial | `domain_rand=True` + `set_env_params`: per-env body mass/inertia scale, COM offset, friction scale, actuator output scale; validated against MuJoCo C with the same `mjModel` edits (`test_env_rand`). Not randomised: damping/armature/stiffness, geom size, solref/solimp, gravity; `invweight0` is not recomputed |
 
 ## Measured agreement with MuJoCo C
 

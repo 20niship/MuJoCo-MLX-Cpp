@@ -58,6 +58,10 @@ For `nv <= 32` the solver keeps its constraint matrices in workgroup shared memo
 
 Subtle pitfall: per-thread early-exit decisions must be uniform across the workgroup or barriers diverge. Models with tendon constraint rows therefore skip the per-thread line-search early exit (it diverged on lavapipe and blew up `qvel`).
 
+## Per-env domain randomization
+
+`MjmlxBatchedConfig::domain_rand=1` allocates an `EnvRand` (host AoS vectors plus SoA GPU buffers `mass_a`, `com_a`, `fric_a`, `gain_a`) and compiles the forward and solver kernels with `rand=true`, which only adds buffer reads: `MSC(b)` (mass/inertia scale), `XIP(b,k)` (xipos plus `xmat * com_delta`, so the kinematics kernel and its shared `body_ipos` stay untouched), `GSC(a)` (actuator output scale) in `forward.hpp`, and `FSC` (friction scale applied to the pair friction in `pair_props`) in `solver.hpp`. With `rand=false` the macros expand to `1.0f` / the plain `xipos` read, so the default path computes the same values. `mjmlx_batched_set_env_params` updates the host vectors for the given envs and re-uploads the full transposed buffers (about 1 MB at 16384 envs for Go2); the step graph reads `ctx->er` each step, so changes apply from the next step.
+
 ## Host side
 
 - **Zero host evaluation inside the substep graph**: no `eval()` / `.data<>()` in the per-step path; model constants live in `ModelCache`, built once at load time (`init_cache`, where eval is allowed). Avoid `mx::zeros` for large per-substep buffers: host-side zero fill was most of the graph build time (~250 us/substep); the contact-free path no longer allocates a `cfrc_ext` zero array.

@@ -294,6 +294,13 @@ if(MJMLX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    add_executable(test_env_rand tests/test_env_rand.cpp)
+    target_link_libraries(test_env_rand PRIVATE mjmlx mujoco_imported tensor_backend)
+    target_include_directories(test_env_rand PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     if(MJMLX_BUILD_CAMERA)
     add_executable(bench_camera tests/bench_camera.cpp)
     target_link_libraries(bench_camera PRIVATE mjmlx)
@@ -345,6 +352,8 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME math_full COMMAND test_math_full)
     add_test(NAME linalg_full COMMAND test_linalg_full)
     add_test(NAME batched_collision_primitives COMMAND test_batched_collision_primitives)
+    add_test(NAME env_rand COMMAND test_env_rand)
+    set_tests_properties(env_rand PROPERTIES LABELS "correctness")
     if(MJMLX_BUILD_CAMERA)
         add_test(NAME camera COMMAND test_camera)
         add_test(NAME camera_tendon COMMAND test_camera_tendon)
