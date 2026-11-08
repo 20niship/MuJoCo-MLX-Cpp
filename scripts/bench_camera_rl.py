@@ -19,6 +19,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "examples", "go2"))  # mjmlx_go2_env
 # モデル同梱のtrackカメラを置き換えて、全envで丁度1カメラにする。
 # front: Isaac比較と同じ前方視点(ロボット自身はほぼ写らず軽い) / orbit: ロボット全体が写る三人称視点(約40万三角形/envが写り重い)
 _FRONT = '<camera name="front" pos="0.4 0 0.15" xyaxes="0 -1 0 0 0 1" fovy="47.5"/>'

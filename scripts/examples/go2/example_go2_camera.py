@@ -9,7 +9,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
 
 # Go2のMJCFに前方カメラ(base搭載)と平行光源を足す(学習envは環境変数のXML置換を読む)。
 os.environ["MJMLX_GO2_XML_SUBST"] = (

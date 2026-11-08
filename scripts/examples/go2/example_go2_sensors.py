@@ -1,6 +1,6 @@
 """Go2のMJCFに書かれた<sensor>(gyro/accelerometer/orientation...)と足裏の接触力を、Isaac Lab形式で読む最小例。事前に `cmake --build build --target _mjmlx_rl_native` が必要。
 
-    .venv/bin/python scripts/example_go2_sensors.py --envs 64
+    .venv/bin/python scripts/examples/go2/example_go2_sensors.py --envs 64
 """
 
 import argparse
@@ -9,7 +9,8 @@ import sys
 
 import torch
 
-sys.path.insert(0, os.path.dirname(__file__))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE))]  # このディレクトリ、examples/(common.py)、scripts/(mjmlx_sensors.py等)
 from mjmlx_go2_env import FOOT_BODY_IDX  # noqa: E402
 from mjmlx_sensors import ContactSensor, Imu, SensorHub  # noqa: E402
 
