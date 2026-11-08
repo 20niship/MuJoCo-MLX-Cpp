@@ -232,6 +232,11 @@ MJMLX_API void mjmlx_batched_set_env_qvel(MjmlxBatchedSim* sim, int env_idx, con
 // 戻り値: 0=OK, -1=ハンドル不正/domain_randが無効/CPUモード/n不正, -2=env_idxが範囲外。
 MJMLX_API int mjmlx_batched_set_env_params(MjmlxBatchedSim* sim, const int* env_idx, int n, const float* mass_scale, const float* com_delta, const float* friction_scale, const float* gain_scale);
 
+// 自由関節(ボール等)の二乗空気抵抗 F=-k|v|v [N s^2/m^2] をenv別に設定する。drag_kは(n, 自由関節数)で、自由関節はMJCFの出現順。既定は0(抵抗なし)。
+// domain_rand=1のGPUシムのみ。戻り値: 0=OK, -1=ハンドル不正/domain_randが無効/CPUモード/n不正, -2=env_idxが範囲外, -3=自由関節が無い。
+MJMLX_API int mjmlx_batched_set_free_drag(MjmlxBatchedSim* sim, const int* env_idx, int n, const float* drag_k);
+MJMLX_API int mjmlx_batched_num_free_joints(const MjmlxBatchedSim* sim);
+
 // ホスト読み戻しは配列ごとに遅い(ステージングが非キャッシュ)ので、[qpos, qvel, 指定bodyの接触力ノルム, 指定dof範囲のqfrc_actuatorの二乗和と絶対値和]を1転送にまとめる。set_pack_specはstrideを返す(失敗-1)。
 MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof);
 MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out);

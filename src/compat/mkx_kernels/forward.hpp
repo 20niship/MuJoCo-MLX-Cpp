@@ -50,7 +50,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
                                              const std::vector<float>& qpos_spring, const std::vector<float>& act_gain0, const std::vector<float>& act_bias0, const std::vector<int>& dof_jtype, const std::vector<int>& dof_rotaxis, const std::vector<int>& dof_jid,
                                              const std::vector<std::vector<int>>& body_dofs, int jnt_dofadr0,
                                              const std::vector<float>& act_gain1, const std::vector<float>& act_gain2, const std::vector<float>& act_bias1, const std::vector<float>& act_bias2,
-                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp, const TendonHost* th = nullptr, bool rand = false) {
+                                             const std::vector<float>& act_gear, const std::vector<int>& act_qposadr, const std::vector<int>& act_dofadr, const std::vector<float>& body_gravcomp, const TendonHost* th = nullptr, bool rand = false, const std::vector<int>& free_dofs = {}) {
   using namespace detail_forward;
   const bool has_ten = th && th->nten > 0;
 
@@ -452,6 +452,18 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     ss << "}\n";
   }
 
+  // 自由関節(ボール等)の二乗空気抵抗 F=-k|v|v をqfrc_gcへ足す(rand時のみ。kはenv別の既定0)。
+  if(rand && !free_dofs.empty()) {
+    for(size_t f = 0; f < free_dofs.size(); f++) {
+      int d = free_dofs[f];
+      ss << "{\n"
+         << "  float vx = qvel[v_off+" << d << "], vy = qvel[v_off+" << d + 1 << "], vz = qvel[v_off+" << d + 2 << "];\n"
+         << "  float kd = -drag_k[uint(" << f << ")*NBATCH+bid] * sqrt(vx*vx+vy*vy+vz*vz);\n"
+         << "  qfrc_gc[" << d << "] += kd*vx; qfrc_gc[" << d + 1 << "] += kd*vy; qfrc_gc[" << d + 2 << "] += kd*vz;\n"
+         << "}\n";
+    }
+  }
+
   ss << "for (int di=0;di<NV;di++) {\n"
      << "  qfrc_smooth_out[uint(di)*NBATCH+bid] = scratch[SCR_IDX(S_PASS+di)] - scratch[SCR_IDX(S_BIAS+di)] + qfrc_actuator_out[uint(di)*NBATCH+bid] + qfrc_gc[di];\n"
      << "}\n";
@@ -484,6 +496,7 @@ inline mkx::fast::Kernel<> make_forward_kernel(int nb, int nv, int nq, int nu, i
     }
   }
   if(rand) for(const char* n : {"mass_scale", "com_delta", "gain_scale"}) in_names.push_back(n);
+  if(rand && !free_dofs.empty()) in_names.push_back("drag_k");
   return mkx::fast::compute_kernel("mjmlx_forward", in_names, out_names, src, header);
 }
 
