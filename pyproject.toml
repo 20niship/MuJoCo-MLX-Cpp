@@ -17,6 +17,7 @@ dependencies = [
 [tool.scikit-build]
 wheel.packages = ["python/vkmujoco"]
 wheel.py-api = "cp312"  # 3.12+はabi3 wheel、3.10/3.11はバージョン別wheel
+wheel.exclude = ["include/**", "lib/**", "lib64/**"]  # mlx_vulkan経由のdoctest等のinstall物を除外
 minimum-version = "build-system.requires"
 build-dir = "build/skbuild/{wheel_tag}"
 sdist.include = ["extern/mlx_vulkan"]

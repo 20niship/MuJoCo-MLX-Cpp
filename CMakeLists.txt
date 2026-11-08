@@ -130,7 +130,12 @@ else()
     list(APPEND MJMLX_SOURCES src/camera_stub.cpp)
 endif()
 
-add_library(mjmlx SHARED ${MJMLX_SOURCES})
+# wheel(SKBUILD)ではvkmujoco._coreに静的リンクして、同梱する共有ライブラリを無くす(auditwheel/delocate不要)
+if(SKBUILD)
+    add_library(mjmlx STATIC ${MJMLX_SOURCES})
+else()
+    add_library(mjmlx SHARED ${MJMLX_SOURCES})
+endif()
 target_include_directories(mjmlx
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -201,11 +206,13 @@ if(_MJ_DYLIB_PATH AND _MJ_OLD_NAME)
     )
 endif()
 
-install(TARGETS mjb
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
-)
+if(NOT SKBUILD)
+    install(TARGETS mjb
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
+endif()
 
 # ── Tests ─────────────────────────────────────────────────────
 if(MJMLX_BUILD_TESTS)
@@ -493,7 +500,7 @@ endif()
 
 # ── Python bindings ───────────────────────────────────────────
 if(MJMLX_BUILD_PYTHON)
-    find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+    find_package(Python 3.9 COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 
     # Find nanobind via Python
     execute_process(
@@ -525,11 +532,10 @@ if(MJMLX_BUILD_PYTHON)
     endif()
     # pip版mujoco(site-packages/mujoco)をwheel内で実行時に解決する(vkmujoco/_core.so -> ../mujoco)。
     if(APPLE)
-        set(_core_rpath "@loader_path;@loader_path/../mujoco")
+        set(_core_rpath "@loader_path/../mujoco")
     else()
-        set(_core_rpath "$ORIGIN:$ORIGIN/../mujoco")
+        set(_core_rpath "$ORIGIN/../mujoco")
     endif()
-    set(_core_rpath_mjmlx "${_core_rpath}")
     set_target_properties(_core PROPERTIES
         BUILD_RPATH "${_core_rpath}"
         INSTALL_RPATH "${_core_rpath}"
@@ -537,9 +543,6 @@ if(MJMLX_BUILD_PYTHON)
     if(SKBUILD)
         # scikit-build-core: wheelのvkmujoco/へ(__init__.py等はwheel.packagesで同梱)
         install(TARGETS _core LIBRARY DESTINATION vkmujoco)
-        # _coreが依存する共有ライブラリlibmjmlxも同じ場所へ(RPATHは$ORIGIN)。libmujocoはpip版mujocoを参照。
-        set_target_properties(mjmlx PROPERTIES INSTALL_RPATH "${_core_rpath_mjmlx}")
-        install(TARGETS mjmlx LIBRARY DESTINATION vkmujoco RUNTIME DESTINATION vkmujoco)
     else()
         # 開発ビルド: build/vkmujoco/ を作り、build/をsys.pathに足せば`import vkmujoco`できるようにする
         set_target_properties(_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vkmujoco")
