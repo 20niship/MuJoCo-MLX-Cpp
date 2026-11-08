@@ -381,7 +381,9 @@ if(MJMLX_BUILD_TESTS)
     add_test(NAME gpu_vs_cpu_humanoid COMMAND test_gpu_vs_cpu ${_M}/humanoid.xml 1e-4 1e-3 1.0)
     add_test(NAME gpu_vs_cpu_high_dof COMMAND test_gpu_vs_cpu ${_M}/high_dof_tree.xml 0.5 0.5 3.0)
     add_test(NAME gpu_vs_cpu_contact_stress COMMAND test_gpu_vs_cpu ${_M}/contact_stress.xml 1e-2 5e-2 0.5)
-    set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
+    # 固定ベースのアームより後ろに別ツリーの自由関節ボールがある(自由関節が先頭でない)+台のsolref直接指定。ボールの落下・バウンドがCPUと合うこと。
+    add_test(NAME gpu_vs_cpu_ball_after_arm COMMAND test_gpu_vs_cpu ${_M}/ball_after_arm.xml --seconds 1 --tol-joint 5e-2)
+    set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress gpu_vs_cpu_ball_after_arm PROPERTIES LABELS "correctness")
 
     # tendon(固定/空間)のGPUバッチ vs MuJoCo C。arm26はcylinder wrap+sidesite+2geom、sphereは球wrap+sidesite+spring、pulleyは滑車+limit+frictionloss+tendon駆動actuator。
     # MJCF <equality>(joint / tendon)のGPUソルバ vs MuJoCo C。connect/weldはGPUソルバ非対応(実装予定なし)。
@@ -541,6 +543,9 @@ if(MJMLX_BUILD_PYTHON)
         add_test(NAME camera_vs_mujoco COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_mujoco.py ${CMAKE_BINARY_DIR})
         set_tests_properties(camera_vs_mujoco PROPERTIES LABELS "mujoco_render")
         # Vulkan->CUDA interopのテンソルがCPU読み出しとビット一致するか。torch+cudaやinteropが無ければskip(77)。
+        # 自由関節ボールの二乗空気抵抗(set_free_drag)がMuJoCo(xfrc_applied)と一致するか。
+        add_test(NAME free_drag COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_free_drag.py ${CMAKE_BINARY_DIR})
+        set_tests_properties(free_drag PROPERTIES LABELS "correctness")
         add_test(NAME camera_cuda COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_cuda.py ${CMAKE_BINARY_DIR})
         set_tests_properties(camera_cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS "camera")
     endif()

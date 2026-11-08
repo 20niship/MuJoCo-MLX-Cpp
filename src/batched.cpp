@@ -266,6 +266,7 @@ static ForwardHostConsts extract_forward_host_consts(const Model& m) {
         int sub = i - da;
         int rotax = -1;
         if (jt == 0 && sub >= 3) rotax = sub - 3;
+        if (jt == 0 && sub < 3) rotax = -1 - sub;  // 並進DOF: 関節内のindexを負値で持つ(自由関節が先頭でない場合も正しいcdofにするため)
         if (jt == 1) rotax = sub;
         k.dof_rotaxis[i] = rotax;
     }
@@ -777,7 +778,7 @@ static std::shared_ptr<BatchedStepContext> build_context(const Model& m, int sol
             fc.dof_stiffness, fc.dof_qposadr, fc.qpos_spring, fc.act_gain0, fc.act_bias0,
             fc.dof_jtype, fc.dof_rotaxis, fc.dof_jid, fc.body_dofs, fc.jnt_dofadr0,
             fc.act_gain1, fc.act_gain2, fc.act_bias1, fc.act_bias2,
-            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp, ctx->ten.nten > 0 ? &ctx->ten : nullptr, er != nullptr);
+            fc.act_gear, fc.act_qposadr, fc.act_dofadr, fc.body_gravcomp, ctx->ten.nten > 0 ? &ctx->ten : nullptr, er != nullptr, er ? er->free_dof : std::vector<int>{});
         ctx->uses_gpu_forward = true;
     }
 
@@ -1059,7 +1060,7 @@ make_batched_step(const Model& m, int num_envs, bool use_gpu, int solver_iterati
                         fwd_shapes.push_back({B * mkx_kernels::tendon_scratch_floats(ctx->ten.nten, nv)});
                         if (ctx->ten.has_spatial) { fwd_in.push_back(mx::flatten(xpos)); fwd_in.push_back(mx::flatten(kin[7])); fwd_in.push_back(mx::flatten(kin[8])); }
                     }
-                    if (ctx->er) { fwd_in.push_back(ctx->er->mass_a); fwd_in.push_back(ctx->er->com_a); fwd_in.push_back(ctx->er->gain_a); }
+                    if (ctx->er) { fwd_in.push_back(ctx->er->mass_a); fwd_in.push_back(ctx->er->com_a); fwd_in.push_back(ctx->er->gain_a); if (ctx->er->nfree > 0) fwd_in.push_back(ctx->er->drag_a); }
                     auto fwd_raw = (*ctx->forward_kernel)(
                         mx::fast::kernel_inputs(fwd_in),
                         mx::fast::kernel_shapes(fwd_shapes),
@@ -1354,7 +1355,9 @@ void EnvRand::upload() {
     com_a = soa(com, nb * 3);
     fric_a = mx::array(fric.data(), {B}, mx::float32);
     gain_a = soa(gain, std::max(nu, 1));
+    if (nfree > 0) drag_a = soa(drag, nfree);
     mx::eval(mass_a, com_a, fric_a, gain_a);
+    if (nfree > 0) mx::eval(drag_a);
 }
 } // namespace mjmlx
 
@@ -1441,6 +1444,12 @@ MJMLX_API MjmlxBatchedSim* mjmlx_batched_create(
                 er->com.assign((size_t)B * er->nb * 3, 0.0f);
                 er->fric.assign((size_t)B, 1.0f);
                 er->gain.assign((size_t)B * std::max(er->nu, 1), 1.0f);
+                if (model->mj_model) {
+                    for (int j = 0; j < model->mj_model->njnt; j++)
+                        if (model->mj_model->jnt_type[j] == mjJNT_FREE) er->free_dof.push_back(model->mj_model->jnt_dofadr[j]);
+                }
+                er->nfree = (int)er->free_dof.size();
+                er->drag.assign((size_t)B * er->nfree, 0.0f);
                 er->upload();
                 handle->sim.env_rand = er;
             }
@@ -1511,6 +1520,25 @@ MJMLX_API int mjmlx_batched_set_env_params(MjmlxBatchedSim* sim, const int* env_
     }
     er.upload();
     return 0;
+}
+
+// 自由関節ごとの二乗空気抵抗係数k[N s^2/m^2](F=-k|v|v)をenv別に設定する。drag_kは(n, nfree)。domain_rand=1のGPUシムのみ。戻り値: 0=成功, 負=失敗。
+MJMLX_API int mjmlx_batched_set_free_drag(MjmlxBatchedSim* sim, const int* env_idx, int n, const float* drag_k) {
+    if (!sim || sim->cpu_mode || !sim->sim.env_rand || n < 0 || !drag_k) return -1;
+    auto& er = *sim->sim.env_rand;
+    if (er.nfree == 0) return -3;
+    if (!env_idx && n != er.B) return -1;
+    for (int i = 0; i < n; i++) if (env_idx && (env_idx[i] < 0 || env_idx[i] >= er.B)) return -2;
+    for (int i = 0; i < n; i++) {
+        size_t e = env_idx ? (size_t)env_idx[i] : (size_t)i;
+        std::copy(drag_k + (size_t)i * er.nfree, drag_k + (size_t)(i + 1) * er.nfree, er.drag.begin() + e * er.nfree);
+    }
+    er.upload();
+    return 0;
+}
+
+MJMLX_API int mjmlx_batched_num_free_joints(const MjmlxBatchedSim* sim) {
+    return (sim && sim->sim.env_rand) ? sim->sim.env_rand->nfree : 0;
 }
 
 MJMLX_API void mjmlx_batched_get_state(

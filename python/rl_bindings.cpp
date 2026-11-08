@@ -44,6 +44,7 @@ struct RlModel {
 };
 
 struct RlBatchedSim {
+    std::shared_ptr<RlModel> model_ref;  // simがmodelを参照し続けるので、Python側でModelが先に破棄されても生かしておく
     MjmlxBatchedSim* handle = nullptr;
     int num_envs = 0;
     int nq = 0, nv = 0, nu = 0, nbody = 0;
@@ -98,6 +99,17 @@ struct RlBatchedSim {
                                               gain_scale ? gain_scale->data() : nullptr);
         if (rc != 0) throw std::runtime_error("mjmlx_rl: set_env_params failed (create_batched(domain_rand=True) is required; env_idx must be in range)");
     }
+
+    // 自由関節ごとの二乗空気抵抗係数 k [N s^2/m^2] (F=-k|v|v)。drag_k は (n, num_free_joints)。create_batched(domain_rand=True) が必要
+    void set_free_drag(FloatArray drag_k, std::optional<IntArray> env_idx) {
+        int nf = mjmlx_batched_num_free_joints(handle);
+        int n = env_idx ? static_cast<int>(env_idx->shape(0)) : num_envs;
+        if (drag_k.ndim() != 2 || static_cast<int>(drag_k.shape(0)) != n || static_cast<int>(drag_k.shape(1)) != nf)
+            throw std::runtime_error("mjmlx_rl: drag_k must have shape (n, num_free_joints)");
+        int rc = mjmlx_batched_set_free_drag(handle, env_idx ? env_idx->data() : nullptr, n, drag_k.data());
+        if (rc != 0) throw std::runtime_error("mjmlx_rl: set_free_drag failed (create_batched(domain_rand=True) is required; the model needs a free joint)");
+    }
+    int num_free_joints() { return mjmlx_batched_num_free_joints(handle); }
 
     std::pair<FloatArray, FloatArray> state() {
         std::vector<float> qp(static_cast<size_t>(num_envs) * nq);
@@ -212,6 +224,8 @@ NB_MODULE(vkmujoco, m) {
         .def("set_state", &RlBatchedSim::set_state, nb::arg("qpos"), nb::arg("qvel"))
         .def("set_env_params", &RlBatchedSim::set_env_params, nb::arg("env_idx") = nb::none(), nb::arg("mass_scale") = nb::none(),
              nb::arg("com_delta") = nb::none(), nb::arg("friction_scale") = nb::none(), nb::arg("gain_scale") = nb::none())
+        .def("set_free_drag", &RlBatchedSim::set_free_drag, nb::arg("drag_k"), nb::arg("env_idx") = nb::none())
+        .def_prop_ro("num_free_joints", [](RlBatchedSim& s) { return s.num_free_joints(); })
         .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)
@@ -273,6 +287,7 @@ NB_MODULE(vkmujoco, m) {
         auto sim = std::make_shared<RlBatchedSim>();
         sim->handle = mjmlx_batched_create(model->handle, &cfg);
         if (!sim->handle) throw std::runtime_error("mjmlx_rl: failed to create batched sim");
+        sim->model_ref = model;
         sim->num_envs = num_envs;
         auto info = mjmlx_model_info(model->handle);
         sim->nq = info.nq; sim->nv = info.nv; sim->nu = info.nu; sim->nbody = info.nbody;

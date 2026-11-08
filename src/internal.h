@@ -570,6 +570,11 @@ struct SensorCtx;  // sensor.cpp。モデルにsensorがあるときだけ確保
 // env別の物理ランダム化(MjmlxBatchedConfig::domain_rand=1の時だけ作る)。ホスト側はenv主(AoS)、GPU側はカーネルが読むSoA(成分*B+env)。
 struct EnvRand {
     int B = 0, nb = 0, nu = 0;
+    // 自由関節ボール等の二乗空気抵抗: F=-k|v|v を自由関節の並進DOFへ掛ける。drag(B,nfree)は[N s^2/m^2]で既定0(抵抗なし)。free_dofは各自由関節の先頭DOF。
+    int nfree = 0;
+    std::vector<int> free_dof;
+    std::vector<float> drag;
+    mx::array drag_a = mx::array({});
     std::vector<float> mass, com, fric, gain;  // (B,nb) 質量スケール / (B,nb,3) body座標系のCOMずれ[m] / (B) 摩擦スケール / (B,nu) アクチュエータ出力スケール
     mx::array mass_a = mx::array({}), com_a = mx::array({}), fric_a = mx::array({}), gain_a = mx::array({});
     void upload();
