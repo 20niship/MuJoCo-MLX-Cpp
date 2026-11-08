@@ -371,13 +371,10 @@ if(MJMLX_BUILD_TESTS)
     set_tests_properties(gpu_vs_cpu_humanoid gpu_vs_cpu_high_dof gpu_vs_cpu_contact_stress PROPERTIES LABELS "correctness")
 
     # tendon(固定/空間)のGPUバッチ vs MuJoCo C。arm26はcylinder wrap+sidesite+2geom、sphereは球wrap+sidesite+spring、pulleyは滑車+limit+frictionloss+tendon駆動actuator。
-    # MJCF <equality>(joint / tendon)のGPUソルバ vs MuJoCo C。connect/weldはGPUソルバ未対応のため下の2件はCIの `-R gpu_vs_cpu` に掛からない名前+known_issueラベルで追跡する(実装したら gpu_vs_cpu_ へ改名)。
+    # MJCF <equality>(joint / tendon)のGPUソルバ vs MuJoCo C。connect/weldはGPUソルバ非対応(実装予定なし)。
     add_test(NAME gpu_vs_cpu_equality_joint COMMAND test_gpu_vs_cpu ${_M}/equality_joint.xml --seconds 2 --ctrl sin --tol-joint 1e-2)
     add_test(NAME gpu_vs_cpu_equality_tendon COMMAND test_gpu_vs_cpu ${_M}/equality_tendon.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
-    add_test(NAME known_issue_equality_connect COMMAND test_gpu_vs_cpu ${_M}/equality_connect.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
-    add_test(NAME known_issue_equality_weld COMMAND test_gpu_vs_cpu ${_M}/equality_weld.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
     set_tests_properties(gpu_vs_cpu_equality_joint gpu_vs_cpu_equality_tendon PROPERTIES LABELS "correctness")
-    set_tests_properties(known_issue_equality_connect known_issue_equality_weld PROPERTIES LABELS "known_issue")
     add_test(NAME gpu_vs_cpu_tendon_arm26 COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml --seconds 2 --ctrl sin --tol-joint 1e-3)
     add_test(NAME gpu_vs_cpu_tendon_arm26_step COMMAND test_gpu_vs_cpu ${_M}/tendon_arm26.xml 1e-4 1e-4 1e-3)
     add_test(NAME gpu_vs_cpu_tendon_sphere COMMAND test_gpu_vs_cpu ${_M}/tendon_sphere.xml 1e-4 1e-4 1e-2)
