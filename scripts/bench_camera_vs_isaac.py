@@ -4,7 +4,7 @@
 こちら(mjmlx)はこのプロセス内で、Isaac Labは ~/isaac/.venv のPythonを子プロセスで起動して測る(1構成1プロセス)。
 指標: 描画のみ env-frames/s、物理+描画 env-steps/s(制御1step=物理4substep+描画1回)。JSONと比較表を出力する。
 
-usage: bench_camera_vs_isaac.py [--build-dir build] [--envs 64 256 1024 4096] [--sizes 64 128] [--out runs/camera_vs_isaac.json]
+usage: bench_camera_vs_isaac.py [--envs 64 256 1024 4096] [--sizes 64 128] [--out runs/camera_vs_isaac.json]
        [--only mjmlx|isaac] [--isaac-python ~/isaac/.venv/bin/python] [--isaac-lab-dir ~/isaac/IsaacLab]
 """
 
@@ -21,23 +21,21 @@ sys.path.insert(0, os.path.join(HERE, "examples", "go2"))  # mjmlx_go2_env
 # Isaacの水平画角 2*atan(20.955/(2*24)) = 47.5度に合わせた前方カメラ1台(baseの+x方向)。
 # --camera orbit: ロボット全体が写る三人称カメラ(mjmlxのみ。frontはIsaacと同じ前方視点でロボット自身はほぼ写らない)
 _orbit = "--camera" in sys.argv and sys.argv[sys.argv.index("--camera") + 1] == "orbit"
-_cam = ('<camera name="front" mode="targetbody" target="base" pos="-1.4 -1.4 0.7" fovy="45"/>' if _orbit else '<camera name="front" pos="0.4 0 0.15" xyaxes="0 -1 0 0 0 1" fovy="47.5"/>')
+_cam = '<camera name="front" mode="targetbody" target="base" pos="-1.4 -1.4 0.7" fovy="45"/>' if _orbit else '<camera name="front" pos="0.4 0 0.15" xyaxes="0 -1 0 0 0 1" fovy="47.5"/>'
 os.environ["MJMLX_GO2_XML_SUBST"] = (
-    '<camera name="track"->' + _cam + '<camera name="track";'
-    "<worldbody>-><worldbody>"
-    '<light pos="0 0 4" dir="0.3 0.2 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>'
+    '<camera name="track"->' + _cam + '<camera name="track";<worldbody>-><worldbody><light pos="0 0 4" dir="0.3 0.2 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>'
 )
 
 
 def bench_mjmlx(args, n, size):
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
+    import vkmujoco
     from mjmlx_go2_env import MjmlxGo2Env
 
-    env = MjmlxGo2Env(native, n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+    env = MjmlxGo2Env(n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
     env.reset()
-    cam = native.create_camera(env._sim, size, size)
+    cam = vkmujoco.create_camera(env._sim, size, size)
     rng = np.random.default_rng(0)
     act = lambda: torch.from_numpy(rng.normal(0, 0.5, (n, 12)).astype(np.float32))
     for _ in range(3):
@@ -73,7 +71,7 @@ def bench_isaac(args, n, size):
         return {"skip": f"timeout {args.isaac_timeout}s"}
     for line in p.stdout.splitlines():
         if line.startswith("ISAAC_RESULT "):
-            return json.loads(line[len("ISAAC_RESULT "):])
+            return json.loads(line[len("ISAAC_RESULT ") :])
     err = [l for l in (p.stdout + p.stderr).splitlines() if "out of memory" in l.lower() or "ISAAC_ERROR" in l or "Error" in l]
     return {"skip": (err[-1][:200] if err else f"no result (exit={p.returncode})")}
 
@@ -86,14 +84,13 @@ def bench_genesis(args, n, size):
         return {"skip": f"timeout {args.isaac_timeout}s"}
     for line in p.stdout.splitlines():
         if line.startswith("GENESIS_RESULT "):
-            return json.loads(line[len("GENESIS_RESULT "):])
+            return json.loads(line[len("GENESIS_RESULT ") :])
     err = [l for l in (p.stdout + p.stderr).splitlines() if "rror" in l or "out of memory" in l.lower()]
     return {"skip": (err[-1][:200] if err else f"no result (exit={p.returncode})")}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, nargs="+", default=[64, 256, 1024, 4096])
     ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128])
     ap.add_argument("--iters", type=int, default=10)
@@ -105,7 +102,6 @@ def main():
     ap.add_argument("--genesis-python", default=os.path.expanduser("~/genesis/.venv/bin/python"))
     ap.add_argument("--isaac-timeout", type=int, default=1800)
     args = ap.parse_args()
-    sys.path.insert(0, args.build_dir)
 
     results = json.load(open(args.out)) if os.path.exists(args.out) else {}
     for n in args.envs:
@@ -133,8 +129,10 @@ def main():
         return "skip" if "skip" in d else f(r["num_envs"], d.get(key))
 
     for r in results.values():
-        print(f"| {r['num_envs']} | {r['size']} | {cell(r, 'mjmlx', 'render_gpu_s')} | {cell(r, 'isaac', 'render_only_s')} | {cell(r, 'genesis', 'render_only_s')} | "
-              f"{cell(r, 'mjmlx', 'step_plus_render_s')} | {cell(r, 'isaac', 'step_plus_render_s')} | {cell(r, 'genesis', 'step_plus_render_s')} |")
+        print(
+            f"| {r['num_envs']} | {r['size']} | {cell(r, 'mjmlx', 'render_gpu_s')} | {cell(r, 'isaac', 'render_only_s')} | {cell(r, 'genesis', 'render_only_s')} | "
+            f"{cell(r, 'mjmlx', 'step_plus_render_s')} | {cell(r, 'isaac', 'step_plus_render_s')} | {cell(r, 'genesis', 'step_plus_render_s')} |"
+        )
 
 
 if __name__ == "__main__":

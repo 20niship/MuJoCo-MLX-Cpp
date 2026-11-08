@@ -1,6 +1,6 @@
 """カメラのRGB/depthをCPUを経由せずGPU上のtorchテンソルとして取る(Vulkan->CUDA external memory interop、Linuxのみ)。
 
-使い方: cam = native.create_camera(...); gcam = CudaCamera.try_create(cam)  # 非対応ならNone -> cam.rgb()/depth()のCPU読み出しを使う
+使い方: cam = vkmujoco.create_camera(...); gcam = CudaCamera.try_create(cam)  # 非対応ならNone -> cam.rgb()/depth()のCPU読み出しを使う
         cam.render(); rgb, depth = gcam.read()   # rgb: uint8 (env,cam,H,W,4)のRGBA, depth: float32 (env,cam,H,W)
 テンソルは常に同じメモリを指し、次のread()で上書きされる(必要なら呼び出し側でclone)。CUDAランタイムはtorchが読み込み済みのlibcudartをctypesで使う(ビルド時のCUDA依存なし)。
 """

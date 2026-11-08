@@ -7,7 +7,7 @@
   - step_render: step + render(読み出しなし)
   - rl_cpu:      step + render + CPU読み出し(numpy) + torch.cuda へアップロード(従来経路)
   - rl_gpu:      step + render + Vulkan->CUDA interopのゼロコピーテンソル(CudaCamera.read()が使える場合)
-usage: PYTHONPATH=/home/owner/torch-cu126 bench_camera_rl.py [--build-dir build] [--envs 256 1024 4096] [--sizes 64 128] [--iters 20] [--out runs/camera_rl.json]
+usage: PYTHONPATH=/home/owner/torch-cu126 bench_camera_rl.py [--envs 256 1024 4096] [--sizes 64 128] [--iters 20] [--out runs/camera_rl.json]
 """
 
 import argparse
@@ -42,14 +42,14 @@ def sm_clock():
 def run_one(args, n, size):
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
+    import vkmujoco
     from mjmlx_go2_env import MjmlxGo2Env
 
     dev = torch.device("cuda")
     torch.zeros(1, device=dev)  # CUDAコンテキストを先に作る(学習と同条件)
-    env = MjmlxGo2Env(native, n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+    env = MjmlxGo2Env(n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
     env.reset()
-    cam = native.create_camera(env._sim, size, size)
+    cam = vkmujoco.create_camera(env._sim, size, size)
     assert cam.num_cameras == 1, cam.num_cameras
     rng = np.random.default_rng(0)
     act = torch.from_numpy(rng.normal(0, 0.5, (n, 12)).astype(np.float32))
@@ -94,7 +94,6 @@ def run_one(args, n, size):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, nargs="+", default=[256, 1024, 4096])
     ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128])
     ap.add_argument("--camera", choices=["front", "orbit"], default="front")
@@ -105,7 +104,6 @@ def main():
     ap.add_argument("--reps", type=int, default=3, help="cpu/gpuプロセスを交互に起こす回数(中央値を採用)")
     ap.add_argument("--one", type=int, nargs=2, default=None, help="(内部用) n size を1構成だけ測りJSONを標準出力へ")
     args = ap.parse_args()
-    sys.path.insert(0, args.build_dir)
     if args.one:
         print("RL_RESULT " + json.dumps(run_one(args, *args.one)))
         return
@@ -117,14 +115,13 @@ def main():
             runs = {}
             for _ in range(args.reps):
                 for mode in ("cpu", "gpu"):
-                    cmd = [sys.executable, os.path.abspath(__file__), "--build-dir", os.path.abspath(args.build_dir), "--iters", str(args.iters), "--rounds", str(args.rounds),
-                           "--camera", args.camera, "--mode", mode, "--one", str(n), str(size)]
+                    cmd = [sys.executable, os.path.abspath(__file__), "--iters", str(args.iters), "--rounds", str(args.rounds), "--camera", args.camera, "--mode", mode, "--one", str(n), str(size)]
                     p = subprocess.run(cmd, capture_output=True, text=True)
                     line = [l for l in p.stdout.splitlines() if l.startswith("RL_RESULT ")]
                     if not line:
                         print(f"| {n} | {size} | skip({mode}): {(p.stderr.strip().splitlines() or ['?'])[-1][:120]} |")
                         continue
-                    for k, v in json.loads(line[0][len("RL_RESULT "):]).items():
+                    for k, v in json.loads(line[0][len("RL_RESULT ") :]).items():
                         runs.setdefault(k, []).append(v)
             if not runs:
                 continue

@@ -200,7 +200,10 @@ def main() -> int:
             try:
                 result = subprocess.run(
                     [str(bench_baseline), humanoid, str(history_csv), str(go2_model), str(h1_model)],
-                    env=env, capture_output=True, text=True, timeout=timeout_sec,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
                 )
             except subprocess.TimeoutExpired:
                 crashes.append((i, name))

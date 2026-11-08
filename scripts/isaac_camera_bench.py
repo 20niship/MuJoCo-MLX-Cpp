@@ -23,8 +23,8 @@ args.enable_cameras = not args.no_camera
 args.headless = True
 app = AppLauncher(args).app
 
-import torch
 import isaaclab.sim as sim_utils
+import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sensors import TiledCameraCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import UnitreeGo2FlatEnvCfg
@@ -39,14 +39,14 @@ cfg.sim.render.enable_global_illumination = False
 cfg.sim.render.antialiasing_mode = "Off"
 cfg.sim.render.enable_dlssg = False
 if not args.no_camera:
-  cfg.scene.tiled_camera = TiledCameraCfg(
-      prim_path="{ENV_REGEX_NS}/Robot/base/front_cam",
-      offset=TiledCameraCfg.OffsetCfg(pos=(0.4, 0.0, 0.15), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"),  # baseの前方(+x)を向く
-      data_types=["rgb", "distance_to_camera"],
-      spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.05, 100.0)),
-      width=args.size,
-      height=args.size,
-  )
+    cfg.scene.tiled_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base/front_cam",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.4, 0.0, 0.15), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"),  # baseの前方(+x)を向く
+        data_types=["rgb", "distance_to_camera"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.05, 100.0)),
+        width=args.size,
+        height=args.size,
+    )
 import traceback
 
 try:
@@ -58,10 +58,8 @@ try:
     def rand_act():
         return 0.5 * torch.randn(args.num_envs, adim, device=env.device)  # mjmlx/Genesisと同じランダムaction
 
-
     def sync():
         torch.cuda.synchronize()
-
 
     for _ in range(args.warmup):
         env.step(rand_act())
@@ -94,5 +92,5 @@ try:
     env.close()
     app.close()
 except Exception:
-    print('ISAAC_ERROR ' + traceback.format_exc(), flush=True)
+    print("ISAAC_ERROR " + traceback.format_exc(), flush=True)
     raise

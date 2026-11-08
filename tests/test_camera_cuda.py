@@ -25,13 +25,13 @@ try:
 except Exception as e:
     print("skip: torch+cuda unavailable:", e)
     sys.exit(77)
-import _mjmlx_rl_native as native
+import vkmujoco
 from mjmlx_camera_cuda import CudaCamera
 from mjmlx_go2_env import MjmlxGo2Env
 
-env = MjmlxGo2Env(native, 8, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+env = MjmlxGo2Env(8, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
 env.reset()
-cam = native.create_camera(env._sim, 64, 48)
+cam = vkmujoco.create_camera(env._sim, 64, 48)
 g = CudaCamera.try_create(cam)
 if g is None:
     print("skip: CUDA interop unsupported")

@@ -33,7 +33,8 @@ set(MJMLX_RPATH_DIR "")
 # ── Find MuJoCo ──────────────────────────────────────────────
 set(MUJOCO_ROOT "" CACHE PATH "Path to MuJoCo installation")
 
-if(NOT MUJOCO_ROOT)
+# wheelビルド(SKBUILD)は実行時に依存するpip版mujoco(==3.5.0)のみを使う(システムの別バージョンにリンクしない)
+if(NOT MUJOCO_ROOT AND NOT SKBUILD)
     # Try common locations
     foreach(candidate
         "/usr/local"
@@ -48,29 +49,20 @@ if(NOT MUJOCO_ROOT)
 endif()
 
 # Also try Python mujoco package (pip install mujoco puts headers inside the package)
-if(NOT MUJOCO_ROOT OR NOT EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
-    # Try to find via pip's mujoco package
-    execute_process(
-        COMMAND pip show -f mujoco
-        OUTPUT_VARIABLE _PIP_SHOW
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    execute_process(
-        COMMAND pip show mujoco
-        OUTPUT_VARIABLE _PIP_INFO
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    # Extract Location from pip show output
-    string(REGEX MATCH "Location: ([^\n]+)" _LOC_MATCH "${_PIP_INFO}")
-    if(_LOC_MATCH)
-        string(REGEX REPLACE "Location: " "" _PIP_LOC "${_LOC_MATCH}")
-        set(MUJOCO_PKG_DIR "${_PIP_LOC}/mujoco")
-        if(EXISTS "${MUJOCO_PKG_DIR}/include/mujoco/mujoco.h")
+if(SKBUILD OR NOT MUJOCO_ROOT OR NOT EXISTS "${MUJOCO_ROOT}/include/mujoco/mujoco.h")
+    # pipのmujocoパッケージを、使うPython自身(scikit-build-coreの分離環境含む)のimportで探す
+    if(NOT Python_EXECUTABLE)
+        find_package(Python COMPONENTS Interpreter)
+    endif()
+    if(Python_EXECUTABLE)
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -c "import mujoco, os; print(os.path.dirname(mujoco.__file__), end='')"
+            OUTPUT_VARIABLE _PY_MUJOCO_DIR
+            ERROR_QUIET
+        )
+        if(_PY_MUJOCO_DIR AND EXISTS "${_PY_MUJOCO_DIR}/include/mujoco/mujoco.h")
+            set(MUJOCO_PKG_DIR "${_PY_MUJOCO_DIR}")
             message(STATUS "MuJoCo found via pip at: ${MUJOCO_PKG_DIR}")
-        else()
-            set(MUJOCO_PKG_DIR "")
         endif()
     endif()
 endif()
@@ -514,12 +506,13 @@ if(MJMLX_BUILD_PYTHON)
     message(STATUS "nanobind found: ${nanobind_DIR}")
 
     # Numpy-facing RL bindings (mjmlx.h only, no mlx.core NB_DOMAIN sharing -- see python/rl_bindings.cpp)
-    nanobind_add_module(_mjmlx_rl_native
+    # パッケージvkmujoco._coreとして出力する。
+    nanobind_add_module(_core
         NB_STATIC STABLE_ABI LTO NOMINSIZE
         python/rl_bindings.cpp
     )
-    target_link_libraries(_mjmlx_rl_native PRIVATE mjmlx)
-    target_include_directories(_mjmlx_rl_native PRIVATE
+    target_link_libraries(_core PRIVATE mjmlx)
+    target_include_directories(_core PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     # MuJoCo Renderer(GL要)とのhfield/texture比較。GL環境が無いCIでは回さないのでcorrectnessには含めない。
@@ -530,24 +523,45 @@ if(MJMLX_BUILD_PYTHON)
         add_test(NAME camera_cuda COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_cuda.py ${CMAKE_BINARY_DIR})
         set_tests_properties(camera_cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS "camera")
     endif()
-    set_target_properties(_mjmlx_rl_native PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    # pip版mujoco(site-packages/mujoco)をwheel内で実行時に解決する(vkmujoco/_core.so -> ../mujoco)。
+    if(APPLE)
+        set(_core_rpath "@loader_path;@loader_path/../mujoco")
+    else()
+        set(_core_rpath "$ORIGIN:$ORIGIN/../mujoco")
+    endif()
+    set(_core_rpath_mjmlx "${_core_rpath}")
+    set_target_properties(_core PROPERTIES
+        BUILD_RPATH "${_core_rpath}"
+        INSTALL_RPATH "${_core_rpath}"
     )
+    if(SKBUILD)
+        # scikit-build-core: wheelのvkmujoco/へ(__init__.py等はwheel.packagesで同梱)
+        install(TARGETS _core LIBRARY DESTINATION vkmujoco)
+        # _coreが依存する共有ライブラリlibmjmlxも同じ場所へ(RPATHは$ORIGIN)。libmujocoはpip版mujocoを参照。
+        set_target_properties(mjmlx PROPERTIES INSTALL_RPATH "${_core_rpath_mjmlx}")
+        install(TARGETS mjmlx LIBRARY DESTINATION vkmujoco RUNTIME DESTINATION vkmujoco)
+    else()
+        # 開発ビルド: build/vkmujoco/ を作り、build/をsys.pathに足せば`import vkmujoco`できるようにする
+        set_target_properties(_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vkmujoco")
+        file(COPY python/vkmujoco/__init__.py python/vkmujoco/py.typed DESTINATION "${CMAKE_BINARY_DIR}/vkmujoco")
+    endif()
     if(_MJ_OLD_NAME AND _MJ_DYLIB_PATH)
-        add_custom_command(TARGET _mjmlx_rl_native POST_BUILD
+        add_custom_command(TARGET _core POST_BUILD
             COMMAND install_name_tool -change
                 "${_MJ_OLD_NAME}" "${_MJ_DYLIB_PATH}"
-                "$<TARGET_FILE:_mjmlx_rl_native>"
-            COMMENT "Fixing MuJoCo dylib for _mjmlx_rl_native"
+                "$<TARGET_FILE:_core>"
+            COMMENT "Fixing MuJoCo dylib for _core"
         )
     endif()
 endif()
 
 # ── Install ───────────────────────────────────────────────────
+if(NOT SKBUILD)
 install(TARGETS mjmlx
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
 )
 install(DIRECTORY include/mjmlx DESTINATION include)
+endif()
 

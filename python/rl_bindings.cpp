@@ -178,7 +178,7 @@ struct RlCamera {
     }
 };
 
-NB_MODULE(_mjmlx_rl_native, m) {
+NB_MODULE(_core, m) {
     m.doc() = "Minimal numpy-facing mjmlx bindings for RL training (no mlx.core dependency at the Python boundary)";
 
     nb::class_<RlModel>(m, "Model")

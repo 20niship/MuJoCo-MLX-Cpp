@@ -4,6 +4,7 @@
 usage: plot_perf_comparison.py [--out runs/media]
 数値はREADMEの計測値(RTX 3060、Go2、env-steps/s)。Isaac Lab/Genesisは過去の単発計測で、同一セッションの再計測ではない。
 """
+
 import argparse
 import os
 
@@ -46,12 +47,16 @@ def main():
     foot = "RTX 3060 12GB, Unitree Go2. Isaac Lab / Genesis: earlier single measurements (not re-run in the same session)."
 
     fig, ax = plt.subplots(figsize=(10, 5.5))
-    bars(ax, ["256", "1,024", "4,096", "16,384"], [
-        ("Isaac Lab", [16615, 57738, 120091, None], ISAAC),
-        ("Genesis", [59705, 154430, 252518, 313000], GEN),
-        ("This repo", [63297, 192823, 409549, 526102], OURS),
-        ("This repo (fast mode)", [None, None, 480278, 649196], FAST),
-    ])
+    bars(
+        ax,
+        ["256", "1,024", "4,096", "16,384"],
+        [
+            ("Isaac Lab", [16615, 57738, 120091, None], ISAAC),
+            ("Genesis", [59705, 154430, 252518, 313000], GEN),
+            ("This repo", [63297, 192823, 409549, 526102], OURS),
+            ("This repo (fast mode)", [None, None, 480278, 649196], FAST),
+        ],
+    )
     ax.set_xlabel("parallel envs")
     ax.set_title("Go2 env.step throughput vs Isaac Lab / Genesis")
     fig.text(0.01, 0.005, foot + " Ours include obs+reward; Genesis is bare scene.step().", fontsize=7.5, color="#666")
@@ -76,8 +81,19 @@ def main():
     save(fig, out, "camera_vs_isaac.png")
 
     fig, ax = plt.subplots(figsize=(11, 5.5))
-    steps = [("PR #33 start", 7200), ("dt=0.005 x4", 22500), ("shared-mem solver", 32000), ("local Jacobian", 51000), ("VRAM buffers", 100000), ("packed readback + Cholesky", 150000),
-             ("solver tuning", 149338), ("host numpy cleanup", 192412), ("torch obs/reward\n(device=cuda)", 307812), ("host overhead cut", 409549), ("fast mode", 480278)]
+    steps = [
+        ("PR #33 start", 7200),
+        ("dt=0.005 x4", 22500),
+        ("shared-mem solver", 32000),
+        ("local Jacobian", 51000),
+        ("VRAM buffers", 100000),
+        ("packed readback + Cholesky", 150000),
+        ("solver tuning", 149338),
+        ("host numpy cleanup", 192412),
+        ("torch obs/reward\n(device=cuda)", 307812),
+        ("host overhead cut", 409549),
+        ("fast mode", 480278),
+    ]
     ax.bar(range(len(steps)), [v for _, v in steps], color=[OURS] * (len(steps) - 1) + [FAST])
     for i, (_, v) in enumerate(steps):
         ax.text(i, v, f"{v / 1000:.0f}K", ha="center", va="bottom", fontsize=9)

@@ -22,9 +22,9 @@ p.add_argument("--warmup", type=int, default=5)
 p.add_argument("--renderer", choices=["batch_rasterizer", "batch_raytracer", "rasterizer"], default="batch_rasterizer")
 args = p.parse_args()
 
+import genesis as gs
 import numpy as np
 import torch
-import genesis as gs
 
 gs.init(backend=gs.gpu, logging_level="warning")
 DT, DECIMATION = 0.005, 4
@@ -54,7 +54,20 @@ if cam is not None:
     T[:3, :3] = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])  # ベース前方(+x)を見る(OpenGL: -z前方)
     cam.attach(robot.base_link, T)
 
-names = ["FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint", "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint", "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint"]
+names = [
+    "FL_hip_joint",
+    "FR_hip_joint",
+    "RL_hip_joint",
+    "RR_hip_joint",
+    "FL_thigh_joint",
+    "FR_thigh_joint",
+    "RL_thigh_joint",
+    "RR_thigh_joint",
+    "FL_calf_joint",
+    "FR_calf_joint",
+    "RL_calf_joint",
+    "RR_calf_joint",
+]
 default = np.array([0.0] * 4 + [0.8, 0.8, 1.0, 1.0] + [-1.5] * 4, dtype=np.float32)
 dofs = [robot.get_joint(n).dofs_idx_local[0] for n in names]
 robot.set_dofs_kp(np.full(12, 20.0), dofs)

@@ -1,6 +1,6 @@
-"""Go2のMJCFに書かれた<sensor>(gyro/accelerometer/orientation...)と足裏の接触力を、Isaac Lab形式で読む最小例。事前に `cmake --build build --target _mjmlx_rl_native` が必要。
+"""Go2のMJCFに書かれた<sensor>(gyro/accelerometer/orientation...)と足裏の接触力を、Isaac Lab形式で読む最小例。事前に `uv pip install -e .` (vkmujoco) が必要。
 
-    .venv/bin/python scripts/examples/go2/example_go2_sensors.py --envs 64
+.venv/bin/python scripts/examples/go2/example_go2_sensors.py --envs 64
 """
 
 import argparse
@@ -16,16 +16,13 @@ from mjmlx_sensors import ContactSensor, Imu, SensorHub  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--envs", type=int, default=64)
-parser.add_argument("--build-dir", default="build")
 parser.add_argument("--cpu", action="store_true")
 args = parser.parse_args()
-sys.path.insert(0, args.build_dir)
-import _mjmlx_rl_native as native  # noqa: E402
 
 from mjmlx_go2_env import MjmlxGo2Env  # noqa: E402
 
 # 学習envと同じMJCF(go2_mjx.xml由来、<sensor>入り)・同じ初期化でsimを作り、その上にセンサを載せる
-env = MjmlxGo2Env(native, args.envs, 0.2, 1.0, use_gpu=not args.cpu, flat_terrain=True, seed=0)
+env = MjmlxGo2Env(args.envs, 0.2, 1.0, use_gpu=not args.cpu, flat_terrain=True, seed=0)
 sim, model = env._sim, env._model
 hub = SensorHub(sim, model)
 imu = Imu(hub)  # go2_mjx.xmlの<sensor>名が既定

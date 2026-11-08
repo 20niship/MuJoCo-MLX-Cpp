@@ -12,23 +12,25 @@ sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint")
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, default=256)
     ap.add_argument("--solver-iters", type=int, default=4)
     ap.add_argument("--fwd-weights", type=str, default="")
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
+    import mjmlx_g1_env as e
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
     from rsl_rl.runners import OnPolicyRunner
-
-    import mjmlx_g1_env as e
     from train_g1_ppo import make_g1_train_cfg
 
-    env = e.MjmlxG1Env(native, args.envs, use_gpu=True, seed=1, forward_only=True, solver_iterations=args.solver_iters,
-                       fwd_weights={k: float(v) for k, v in (kv.split("=") for kv in args.fwd_weights.split(",") if kv)} or None)
+    env = e.MjmlxG1Env(
+        args.envs,
+        use_gpu=True,
+        seed=1,
+        forward_only=True,
+        solver_iterations=args.solver_iters,
+        fwd_weights={k: float(v) for k, v in (kv.split("=") for kv in args.fwd_weights.split(",") if kv)} or None,
+    )
     runner = OnPolicyRunner(env, make_g1_train_cfg(0, 1, "g1_forward"), log_dir=None, device="cpu")
     runner.load(args.checkpoint)
     policy = runner.get_inference_policy(device="cpu")
@@ -63,7 +65,9 @@ def main() -> None:
     warm = int(2.0 / e.CONTROL_DT)
     vx, vy, wz = (np.array(a)[warm:] for a in (vx, vy, wz))
     print(f"fell within 20 s: {np.isfinite(fell_at).mean():.3f}  (median fall time {np.nanmedian(fell_at) if np.isfinite(fell_at).any() else 'none'})")
-    print(f"20 s accumulated heading change [deg]: mean {dyaw.mean():.1f}, mean |.| {np.abs(dyaw).mean():.1f}; displacement along {along.mean():.2f} m, cross-track mean |.| {np.abs(cross).mean():.2f} m, course angle mean |.| {np.abs(course).mean():.1f} deg")
+    print(
+        f"20 s accumulated heading change [deg]: mean {dyaw.mean():.1f}, mean |.| {np.abs(dyaw).mean():.1f}; displacement along {along.mean():.2f} m, cross-track mean |.| {np.abs(cross).mean():.2f} m, course angle mean |.| {np.abs(course).mean():.1f} deg"
+    )
     print(f"mean vx {vx.mean():.3f} (mean cmd {np.mean(cmd):.3f})  mean vy {vy.mean():.3f}  mean wz {wz.mean():.3f}  mean |wz| {np.abs(wz).mean():.3f}")
 
 

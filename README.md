@@ -69,7 +69,7 @@ Requirements: a Vulkan driver (NVIDIA tested; lavapipe `mesa-vulkan-drivers` is 
 git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp
 cd MuJoCo-MLX-Cpp
 just build                      # libmjmlx + libmjb + tests/benchmarks (Release) into build/
-just build-python               # also builds the nanobind extension (_mjmlx_rl_native)
+just build-python               # also installs the Python package `vkmujoco` (nanobind + scikit-build-core)
 ```
 
 Equivalent raw CMake: `cmake -B build -DCMAKE_BUILD_TYPE=Release -DMJMLX_BUILD_PYTHON=ON && cmake --build build -j`.
@@ -108,8 +108,8 @@ opt.self_collision = 0; opt.max_condim = 3;
 MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);
 ```
 ```python
-model = native.load_model(path, self_collision=False, max_condim=3)
-env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)
+model = vkmujoco.load_model(path, self_collision=False, max_condim=3)
+env = MjmlxGo2Env(4096, ..., self_collision=False, max_condim=3)
 ```
 
 Go2 4096 / 16384 envs, env-steps/s: default 409K / 528K; `max_condim=3` 468K / 639K; both options 481K / 648K.
@@ -119,13 +119,15 @@ Go2 4096 / 16384 envs, env-steps/s: default 409K / 528K; `max_condim=3` 468K / 6
 `<camera>` / `<light>` / geom rgba from the MJCF; Phong shading, RGB + depth, hfield and 2D textures (plane/box/hfield), spatial tendons drawn as cylinders. GPU-side frustum culling and LOD (mesh vertex clustering, `MJMLX_CAM_LOD_K`), one `vkCmdDrawIndexedIndirect` for all envs and cameras.
 
 ```python
-cam = native.create_camera(sim, 128, 128)       # sim from create_batched(use_gpu=True)
+cam = vkmujoco.create_camera(sim, 128, 128)  # sim from create_batched(use_gpu=True)
 cam.render()
-rgb, depth = cam.rgb(), cam.depth()             # (num_envs, ncam, H, W, 3) uint8 / (..., H, W) float32 [m]
+rgb, depth = cam.rgb(), cam.depth()  # (num_envs, ncam, H, W, 3) uint8 / (..., H, W) float32 [m]
 
-from mjmlx_camera_cuda import CudaCamera        # Vulkan -> CUDA external-memory interop (Linux)
-gcam = CudaCamera.try_create(cam)               # None if unsupported -> fall back to the CPU readback above
-cam.render(); rgba, depth = gcam.read()         # CUDA tensors, no CPU copy
+from mjmlx_camera_cuda import CudaCamera  # Vulkan -> CUDA external-memory interop (Linux)
+
+gcam = CudaCamera.try_create(cam)  # None if unsupported -> fall back to the CPU readback above
+cam.render()
+rgba, depth = gcam.read()  # CUDA tensors, no CPU copy
 ```
 
 Not supported: shadows, translucency, lights attached to moving bodies, trackcom (approximated by the body origin). Interop needs Linux + `VK_KHR_external_memory_fd` + CUDA torch; set `MKX_VULKAN_DEVICE_INDEX` to match the CUDA device on multi-GPU hosts. Camera needs a graphics+compute queue, `multiDrawIndirect`, `drawIndirectFirstInstance`, `shaderClipDistance` (only `create_camera` fails otherwise). Examples: `scripts/examples/go2/example_go2_camera.py`, comparison with MuJoCo's renderer: `scripts/compare_camera_mujoco.py`, speed: `scripts/bench_camera*.py`.
@@ -135,12 +137,12 @@ Not supported: shadows, translucency, lights attached to moving bodies, trackcom
 Check that nothing else (ollama, desktop compositing, other GPU jobs) is using the GPU; it changes timings by 2x. Compare commits/settings **alternately within one session**, not across days.
 
 ```bash
-uv run python scripts/bench_go2_step.py --build-dir build --envs 4096        # env.step speed
-MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build       # per-stage GPU/host time
+uv run python scripts/bench_go2_step.py --envs 4096        # env.step speed
+MJMLX_PROF=1 uv run python scripts/bench_go2_step.py       # per-stage GPU/host time
 uv run python scripts/bench_physics_vs_others.py ...                         # this repo / Isaac Lab / Genesis
-uv run python scripts/bench_camera_vs_isaac.py --build-dir build             # camera vs Isaac Lab TiledCamera
+uv run python scripts/bench_camera_vs_isaac.py             # camera vs Isaac Lab TiledCamera
 PYTHONPATH=<torch-cu126> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
-uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build               # 1-step difference vs MuJoCo C
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py               # 1-step difference vs MuJoCo C
 just check-video-export                                                      # CPU|GPU tiled comparison video
 just bench                                                                   # regression check against benchmarks/baseline.csv
 ```

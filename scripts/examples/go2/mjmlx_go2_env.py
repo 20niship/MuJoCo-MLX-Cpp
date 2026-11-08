@@ -8,6 +8,7 @@ import sys
 
 import numpy as np
 import torch
+import vkmujoco
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
@@ -27,9 +28,7 @@ MAX_EPISODE_STEPS = int(EPISODE_LENGTH_S / CONTROL_DT)
 
 ACTION_SCALE = 0.25  # rough_env_cfgでのgo2上書き値(base既定は0.5)
 # IsaacLabのUNITREE_GO2_CFG.init_state.joint_pos(FL,FR,RL,RRの順): hip=左0.1/右-0.1、thigh=前0.8/後1.0、calf=-1.5
-DEFAULT_JOINT_POS = np.array(
-    [0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5], dtype=np.float32
-)
+DEFAULT_JOINT_POS = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5], dtype=np.float32)
 CTRL_LOW = np.array([-0.9472, -1.4, -2.6227] * 4, dtype=np.float32)
 CTRL_HIGH = np.array([0.9472, 2.5, -0.84776] * 4, dtype=np.float32)
 FOOT_BODY_IDX = np.array([4, 7, 10, 13])  # FL,FR,RL,RR の calf(=foot)ボディ
@@ -41,10 +40,8 @@ W_TRACK_LIN = 1.5
 W_TRACK_ANG = 0.75
 # 報酬重みとreset乱数のプリセット。relaxed=罰則を弱めた従来設定、isaac_flat=IsaacLabのUnitreeGo2FlatEnvCfg準拠
 PRESETS = {
-    "relaxed": dict(lin_vel_z=-0.4, ang_vel_xy=-0.02, torque=-5e-6, dof_acc=-1e-7, action_rate=-0.003, feet_air_time=0.01,
-                    flat_orientation=0.0, joint_reset_scale=(0.5, 1.5), reset_vel=0.5),
-    "isaac_flat": dict(lin_vel_z=-2.0, ang_vel_xy=-0.05, torque=-2e-4, dof_acc=-2.5e-7, action_rate=-0.01, feet_air_time=0.25,
-                       flat_orientation=-2.5, joint_reset_scale=(1.0, 1.0), reset_vel=0.0),
+    "relaxed": dict(lin_vel_z=-0.4, ang_vel_xy=-0.02, torque=-5e-6, dof_acc=-1e-7, action_rate=-0.003, feet_air_time=0.01, flat_orientation=0.0, joint_reset_scale=(0.5, 1.5), reset_vel=0.5),
+    "isaac_flat": dict(lin_vel_z=-2.0, ang_vel_xy=-0.05, torque=-2e-4, dof_acc=-2.5e-7, action_rate=-0.01, feet_air_time=0.25, flat_orientation=-2.5, joint_reset_scale=(1.0, 1.0), reset_vel=0.0),
 }
 FEET_AIR_TIME_TARGET = 0.5
 TRACK_STD_SQ = 0.25
@@ -107,7 +104,7 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
     if 'timestep="' in xml:
         xml = re.sub(r'timestep="[^"]*"', f'timestep="{PHYSICS_DT}"', xml, count=1)
     else:
-        xml = xml.replace('<option ', f'<option timestep="{PHYSICS_DT}" ', 1)
+        xml = xml.replace("<option ", f'<option timestep="{PHYSICS_DT}" ', 1)
     for kv in filter(None, os.environ.get("MJMLX_GO2_XML_SUBST", "").split(";")):  # 切り分け用: 'old->new;old2->new2' をXMLに文字列置換する
         old, new = kv.split("->", 1)
         xml = xml.replace(old, new)
@@ -115,8 +112,8 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
         if 'integrator="' in xml:
             xml = re.sub(r'integrator="[^"]*"', f'integrator="{INTEGRATOR}"', xml, count=1)
         else:
-            xml = xml.replace('<option ', f'<option integrator="{INTEGRATOR}" ', 1)
-    terrain_geoms = f"<body name=\"terrain\">\n    {terrain.to_mjcf_bodies()}\n  </body>\n</worldbody>"
+            xml = xml.replace("<option ", f'<option integrator="{INTEGRATOR}" ', 1)
+    terrain_geoms = f'<body name="terrain">\n    {terrain.to_mjcf_bodies()}\n  </body>\n</worldbody>'
     xml = xml.replace("</worldbody>", terrain_geoms)
     with open(out_path, "w") as f:
         f.write(xml)
@@ -124,9 +121,23 @@ def build_terrain_model_xml(terrain: StairsTerrain, out_path: str) -> None:
 
 TERM_NAMES = ["track_lin", "track_ang", "lin_vel_z", "ang_vel_xy", "dof_acc", "action_rate", "feet_air_time", "torque", "flat_orientation"]
 METRIC_NAMES = [f"Reward/{k}" for k in TERM_NAMES] + [
-    "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/action_abs", "Metrics/action_rate_abs",
-    "Metrics/ctrl_saturated_frac", "Metrics/joint_vel_abs", "Metrics/joint_pos_dev", "Metrics/base_tilt", "Metrics/feet_air_time",
-    "Metrics/joint_torque_abs", "Metrics/foot_contact_frac", "Termination/base_contact", "Termination/blew_up", "Termination/out_of_terrain", "Termination/time_out",
+    "Metrics/lin_vel_error",
+    "Metrics/ang_vel_error",
+    "Metrics/cmd_speed",
+    "Metrics/base_height",
+    "Metrics/action_abs",
+    "Metrics/action_rate_abs",
+    "Metrics/ctrl_saturated_frac",
+    "Metrics/joint_vel_abs",
+    "Metrics/joint_pos_dev",
+    "Metrics/base_tilt",
+    "Metrics/feet_air_time",
+    "Metrics/joint_torque_abs",
+    "Metrics/foot_contact_frac",
+    "Termination/base_contact",
+    "Termination/blew_up",
+    "Termination/out_of_terrain",
+    "Termination/time_out",
 ]
 
 
@@ -138,7 +149,26 @@ def _make_step_fns(w: dict, terrain_length: float, default_pos: torch.Tensor, ct
         ctrl = torch.minimum(torch.maximum(ctrl_target, ctrl_low), ctrl_high)
         return ctrl, (ctrl_target != ctrl).float().mean()
 
-    def core(qpos, qvel, contact_force, torque_sq, torque_abs_mean, ctrl_sat, action, last_action, prev_joint_vel, feet_air, last_foot_contact, commands, truncated, ov_base, ov_foot, ov_lin, ov_ang, ov_grav):
+    def core(
+        qpos,
+        qvel,
+        contact_force,
+        torque_sq,
+        torque_abs_mean,
+        ctrl_sat,
+        action,
+        last_action,
+        prev_joint_vel,
+        feet_air,
+        last_foot_contact,
+        commands,
+        truncated,
+        ov_base,
+        ov_foot,
+        ov_lin,
+        ov_ang,
+        ov_grav,
+    ):
         blew_up = ~(torch.cat([qpos, qvel], dim=1).abs().amax(dim=1) <= 1000.0)  # NaN/infはamaxがNaN/infで比較がFalseになる
         base_contact = (contact_force[:, 0] > BASE_CONTACT_FORCE_THRESHOLD) if ov_base is None else ov_base
         foot_contact = (contact_force[:, 1:] > BASE_CONTACT_FORCE_THRESHOLD) if ov_foot is None else ov_foot
@@ -178,11 +208,28 @@ def _make_step_fns(w: dict, terrain_length: float, default_pos: torch.Tensor, ct
         dones = truncated | base_contact | blew_up | out_of_terrain
         obs = torch.cat([base_lin_vel, base_ang_vel, projected_gravity, cmd, qpos[:, 7:19] - default_pos, qvel[:, 6:18], last_action], dim=1)
         f = lambda x: x.float().mean()
-        metrics = torch.stack(list(terms.mean(dim=1)) + [
-            lin_err.sqrt().mean(), ang_err.sqrt().mean(), cmd.norm(dim=1).mean(), qpos[:, 2].mean(), action.abs().mean(), d_act.abs().mean(),
-            ctrl_sat, joint_vel.abs().mean(), (qpos[:, 7:19] - default_pos).abs().mean(), tilt2.sqrt().mean(), feet_air.mean(),
-            torch.as_tensor(torque_abs_mean, dtype=torch.float32, device=qpos.device), f(foot_contact), f(base_contact), f(blew_up), f(out_of_terrain), f(truncated),
-        ])
+        metrics = torch.stack(
+            list(terms.mean(dim=1))
+            + [
+                lin_err.sqrt().mean(),
+                ang_err.sqrt().mean(),
+                cmd.norm(dim=1).mean(),
+                qpos[:, 2].mean(),
+                action.abs().mean(),
+                d_act.abs().mean(),
+                ctrl_sat,
+                joint_vel.abs().mean(),
+                (qpos[:, 7:19] - default_pos).abs().mean(),
+                tilt2.sqrt().mean(),
+                feet_air.mean(),
+                torch.as_tensor(torque_abs_mean, dtype=torch.float32, device=qpos.device),
+                f(foot_contact),
+                f(base_contact),
+                f(blew_up),
+                f(out_of_terrain),
+                f(truncated),
+            ]
+        )
         return obs, rewards, dones, terms, feet_air_new, foot_contact, metrics, joint_vel.clone(), action.clone()
 
     if os.environ.get("MJMLX_ENV_COMPILE", "1") != "0" and default_pos.is_cuda:
@@ -196,7 +243,6 @@ def _make_step_fns(w: dict, terrain_length: float, default_pos: torch.Tensor, ct
 class MjmlxGo2Env(VecEnv):
     def __init__(
         self,
-        native_module,
         num_envs: int,
         cmd_vel_min: float,
         cmd_vel_max: float,
@@ -212,14 +258,13 @@ class MjmlxGo2Env(VecEnv):
         max_condim: int = 0,
         domain_rand: bool = False,
     ):
-        self._native = native_module
         self._w = PRESETS[reward_preset]
         self.terrain = StairsTerrain(seed=terrain_seed, flat=flat_terrain)
         build_terrain_model_xml(self.terrain, generated_xml_path)
 
         # self_collision=False/max_condim>0は読み込み時にモデルへ適用する簡略化オプション(MJCFファイルは変更しない。精度への影響はREADME参照)
-        self._model = native_module.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS, domain_rand=domain_rand)
+        self._model = vkmujoco.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
+        self._sim = vkmujoco.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=SOLVER_ITERATIONS, domain_rand=domain_rand)
         self.nq = self._model.nq
         self.nv = self._model.nv
         self.nu = self._model.nu
@@ -398,9 +443,9 @@ class MjmlxGo2Env(VecEnv):
             self._sim.read_pack_into(self._pk_np)  # ピン留めバッファへ直接読む
             pk = self._pk_np
             pk_t = self._pk_pin.to(self.device, non_blocking=True)
-            qpos_h, qvel_h = pk[:, :nq], pk[:, nq:nq + nv]
-            qpos, qvel = pk_t[:, :nq], pk_t[:, nq:nq + nv]
-            contact_force = pk_t[:, nq + nv:nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
+            qpos_h, qvel_h = pk[:, :nq], pk[:, nq : nq + nv]
+            qpos, qvel = pk_t[:, :nq], pk_t[:, nq : nq + nv]
+            contact_force = pk_t[:, nq + nv : nq + nv + 5]  # [base, FL, FR, RL, RR]の力ノルム
             torque_sq, torque_abs_mean = pk_t[:, nq + nv + 5], pk_t[:, nq + nv + 6].sum() / (N * 12)
         else:
             qpos_h, qvel_h = self._sim.state()
@@ -423,8 +468,25 @@ class MjmlxGo2Env(VecEnv):
         self._elapsed += 1
         truncated = self._to_dev(self._elapsed >= MAX_EPISODE_STEPS)
         obs, rewards, dones, terms, feet_air, foot_contact, metrics, joint_vel, last_action = self._core(
-            qpos, qvel, contact_force, torque_sq, torque_abs_mean, ctrl_sat, action, self._last_action, self._prev_joint_vel, self._feet_air_time,
-            self._last_foot_contact, self._commands, truncated, ov_base, ov_foot, ov_lin, ov_ang, ov_grav)
+            qpos,
+            qvel,
+            contact_force,
+            torque_sq,
+            torque_abs_mean,
+            ctrl_sat,
+            action,
+            self._last_action,
+            self._prev_joint_vel,
+            self._feet_air_time,
+            self._last_foot_contact,
+            self._commands,
+            truncated,
+            ov_base,
+            ov_foot,
+            ov_lin,
+            ov_ang,
+            ov_grav,
+        )
         self.last_reward_terms = dict(zip(TERM_NAMES, terms))
         self._feet_air_time, self._last_foot_contact = feet_air, foot_contact
         self._last_action, self._prev_joint_vel = last_action, joint_vel

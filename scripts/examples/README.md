@@ -11,7 +11,7 @@ scripts/examples/
   halfcheetah/     train_ppo.py, mjmlx_halfcheetah_vec_env.py (stable-baselines3 example)
 ```
 
-Run from the repository root, e.g. `PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/go2/train_go2_ppo.py ...`. Each script puts its own directory, `scripts/examples/` and `scripts/` on `sys.path`, so cross-imports (`common`, `mjmlx_sensors`, `mjmlx_camera_cuda`) work from any location. Build the Python extension first (see the [top README](../../README.md#build)); `--build-dir` points at it.
+Run from the repository root, e.g. `PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/go2/train_go2_ppo.py ...`. Each script puts its own directory, `scripts/examples/` and `scripts/` on `sys.path`, so cross-imports (`common`, `mjmlx_sensors`, `mjmlx_camera_cuda`) work from any location. Install the Python package first (`uv pip install -e .` or `just build-python`; see the [top README](../../README.md#build)); scripts `import vkmujoco`.
 
 Videos referenced here are attached on GitHub and are not stored in the repository.
 
@@ -28,14 +28,14 @@ Videos referenced here are attached on GitHub and are not stored in the reposito
 uv sync --group build --group go2
 
 # flat ground, Isaac Lab (UnitreeGo2FlatEnvCfg)-style rewards, PPO update on CUDA
-PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build \
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/go2/train_go2_ppo.py \
   --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
 
 # stairs terrain (default), checkpoints every 50 iterations under --logdir
-uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build --envs 2048 --logdir runs/go2_stairs
+uv run python scripts/examples/go2/train_go2_ppo.py --envs 2048 --logdir runs/go2_stairs
 
 # roll out the trained policy with forward/back/left/right commands -> tiled mp4 in runs/video/
-uv run python scripts/examples/go2/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
+uv run python scripts/examples/go2/play_go2_cmd_vel.py --logdir runs/go2_flat --reward-preset isaac_flat --speed 0.5
 
 tensorboard --logdir runs/
 ```
@@ -52,9 +52,9 @@ A self-contained HalfCheetah-v4 PPO example (stable-baselines3) is in `scripts/e
 
 ```bash
 uv sync --group build --group go2 && just fetch-models        # menagerie unitree_g1 (29 DoF)
-PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
-uv run python scripts/examples/g1/play_g1_cmd_vel.py --logdir runs/g1_flat --build-dir build           # forward / forward 1.0 / lateral / turn tiles -> runs/video/g1_cmd_vel.mp4
-uv run python scripts/examples/g1/compare_cpu_gpu_g1.py --build-dir build                              # 1-step difference vs MuJoCo C
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/g1/train_g1_ppo.py --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
+uv run python scripts/examples/g1/play_g1_cmd_vel.py --logdir runs/g1_flat           # forward / forward 1.0 / lateral / turn tiles -> runs/video/g1_cmd_vel.mp4
+uv run python scripts/examples/g1/compare_cpu_gpu_g1.py                              # 1-step difference vs MuJoCo C
 ```
 
 **Reference chosen and why.** We reproduce Isaac Lab v2.3.2 `Isaac-Velocity-Flat-G1-v0`: [`flat_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/flat_env_cfg.py), [`rough_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/rough_env_cfg.py) (rewards inherited), [`rsl_rl_ppo_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/agents/rsl_rl_ppo_cfg.py) (`G1FlatPPORunnerCfg`), [`velocity_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py), [`mdp/rewards.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py) and the `G1_CFG` actuator/default-pose table in [`isaaclab_assets/robots/unitree.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_assets/isaaclab_assets/robots/unitree.py). Reasons: the code exists and every number is readable; it uses the same training library (rsl_rl PPO) as our Go2 environment; the *flat* config needs no height scanner, no mass/COM randomisation and no pushes (friction is a fixed 0.8), so this engine's gaps (no ray casting, one model per batch, no terrain curriculum) do not matter; and Isaac Lab 2.3.2 can be run locally under the same conditions for a curve comparison.
@@ -93,11 +93,11 @@ G1 physics is also currently **slow in this engine**: about 4-5K env-steps/s (nv
 The omnidirectional task above did not converge in our runs, so a forward-only task was added on top (the omnidirectional mode is unchanged): command `vx` in [0.4, 0.8] m/s fixed, `vy = wz = 0`, no heading mode and no standing envs.
 
 ```bash
-PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
+PYTHONPATH=<torch-cu126 etc.> uv run python scripts/examples/g1/train_g1_ppo.py --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
 # then continue with the final reward weights (see below), e.g. 400 more iterations; the straight-walking v3 adds --fwd-weights yaw_rate=-0.5,heading_hold=-1,lateral_vel=-1 and resumes from it
-uv run python scripts/examples/g1/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt --build-dir build   # 256 envs x 20 s: falls, speed, yaw rate, heading change
-uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
-uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 tiles, checkerboard floor
+uv run python scripts/examples/g1/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt   # 256 envs x 20 s: falls, speed, yaw rate, heading change
+uv run python scripts/examples/g1/train_g1_ppo.py --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
+uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 tiles, checkerboard floor
 ```
 
 **Root cause of the earlier fall after ~1.5 s (isolated with MuJoCo C, no GPU engine involved):** with Isaac Lab's ankle gains (kp 20, kd 2) the default pose cannot stand even with zero action. A statically balanced inverted pendulum needs ankle stiffness above m*g*h_com (about 35 kg x 9.81 x 0.69 m = 240 Nm/rad) and the ankles have little authority (action scale 0.5 rad x kp 20 = 10 Nm). Scan with MuJoCo C, default pose, 5 s: ankle kp 100 falls, kp 150 falls or leans (depends on kd), kp >= 200 stands (tilt 0.05-0.08 rad). The forward-only task therefore uses ankle PD **200 / 5** (the omnidirectional default stays Isaac's 20 / 2). Zero action then stands for 6+ s on the GPU engine. The fall also happens in MuJoCo C, so the GPU engine is not the cause. Not tested: effort limits, contact sampling frequency, foot geometry. The final policy was evaluated with `scripts/examples/g1/eval_g1_forward.py`.
@@ -131,13 +131,13 @@ Weights were chosen with short runs (512 envs, 150 iterations each, resumed from
 Per-env mass, COM, friction and actuator output (sim2real domain randomization). Only a sim created with `domain_rand` adds per-env buffer reads to the kernels; the default is unchanged in speed and results.
 
 ```python
-sim = native.create_batched(model, 4096, frame_skip=1, domain_rand=True)
-sim.set_env_params(                       # env_idx=None: all envs; None args are left unchanged
+sim = vkmujoco.create_batched(model, 4096, frame_skip=1, domain_rand=True)
+sim.set_env_params(  # env_idx=None: all envs; None args are left unchanged
     env_idx=np.array([0, 5], np.int32),
-    mass_scale=np.ones((2, model.nbody), np.float32),      # (n, nbody) mass and inertia scale
-    com_delta=np.zeros((2, model.nbody, 3), np.float32),   # (n, nbody, 3) COM offset in body frame [m]
-    friction_scale=np.array([0.5, 1.2], np.float32),       # (n,) scale of all geom friction
-    gain_scale=np.ones((2, model.nu), np.float32),         # (n, nu) actuator output scale
+    mass_scale=np.ones((2, model.nbody), np.float32),  # (n, nbody) mass and inertia scale
+    com_delta=np.zeros((2, model.nbody, 3), np.float32),  # (n, nbody, 3) COM offset in body frame [m]
+    friction_scale=np.array([0.5, 1.2], np.float32),  # (n,) scale of all geom friction
+    gain_scale=np.ones((2, model.nu), np.float32),  # (n, nu) actuator output scale
 )
 ```
 
