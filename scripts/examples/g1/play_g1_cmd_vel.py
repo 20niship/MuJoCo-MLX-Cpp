@@ -36,7 +36,6 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--logdir", default="runs/g1_flat")
     ap.add_argument("--checkpoint", default=None, help="省略時はlogdir内の最新model_N.pt")
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--out", default="runs/video/g1_cmd_vel.mp4")
     ap.add_argument("--cpu", action="store_true")
@@ -45,18 +44,15 @@ def main() -> None:
     ap.add_argument("--plain-floor", action="store_true", help="地面を市松模様にしない")
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
-    import _mjmlx_rl_native as native
-    from rsl_rl.runners import OnPolicyRunner
-
     import mjmlx_g1_env as e
+    from rsl_rl.runners import OnPolicyRunner
     from train_g1_ppo import make_g1_train_cfg
 
     e.CMD_RESAMPLE_STEPS = 10**9  # 評価では指令を固定する
     xml_path = "/tmp/g1_play_generated.xml"
     CASES = FWD_CASES if args.forward_only else ALL_CASES
     n = len(CASES)
-    env = e.MjmlxG1Env(native, n, use_gpu=not args.cpu, seed=0, generated_xml_path=xml_path, obs_noise=False, forward_only=args.forward_only)
+    env = e.MjmlxG1Env(n, use_gpu=not args.cpu, seed=0, generated_xml_path=xml_path, obs_noise=False, forward_only=args.forward_only)
     ckpt = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path(args.logdir))
     runner = OnPolicyRunner(env, make_g1_train_cfg(0, 1, "g1_forward" if args.forward_only else "g1_flat"), log_dir=None, device="cpu")
     runner.load(str(ckpt))
@@ -107,13 +103,17 @@ def main() -> None:
         m = meas[warm:, i].mean(axis=0)
         err = float(np.linalg.norm(m - np.array(c)))
         summary["cases"][name] = {"cmd": list(c), "mean_vel": m.tolist(), "vel_error": err, "fell_or_reset_at_step": int(first_done[i])}
-        print(f"{name:12s} cmd=({c[0]:+.2f},{c[1]:+.2f},{c[2]:+.2f}) mean(vx,vy,wz)=({m[0]:+.2f},{m[1]:+.2f},{m[2]:+.2f}) |err|={err:.2f}"
-              + (f"  終了/リセット step={first_done[i]}" if first_done[i] >= 0 else ""))
+        print(
+            f"{name:12s} cmd=({c[0]:+.2f},{c[1]:+.2f},{c[2]:+.2f}) mean(vx,vy,wz)=({m[0]:+.2f},{m[1]:+.2f},{m[2]:+.2f}) |err|={err:.2f}"
+            + (f"  終了/リセット step={first_done[i]}" if first_done[i] >= 0 else "")
+        )
 
     xml = Path(xml_path).read_text()
     if not args.plain_floor:  # 描画専用: 床に市松模様(物理は変えない)
-        tex = ('<texture name="floor_checker" type="2d" builtin="checker" rgb1="0.50 0.62 0.74" rgb2="0.92 0.94 0.97" width="512" height="512" mark="edge" markrgb="0.9 0.9 0.9"/>'
-               '<material name="floor_checker" texture="floor_checker" texuniform="true" texrepeat="1 1" reflectance="0.05"/>')
+        tex = (
+            '<texture name="floor_checker" type="2d" builtin="checker" rgb1="0.50 0.62 0.74" rgb2="0.92 0.94 0.97" width="512" height="512" mark="edge" markrgb="0.9 0.9 0.9"/>'
+            '<material name="floor_checker" texture="floor_checker" texuniform="true" texrepeat="1 1" reflectance="0.05"/>'
+        )
         xml = xml.replace("<asset>", "<asset>" + tex, 1).replace('<geom name="floor" ', '<geom name="floor" material="floor_checker" ')
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
@@ -130,8 +130,29 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ff = subprocess.Popen(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{2 * TILE_W}x{2 * TILE_H}",
-         "-r", f"{fps:g}", "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)], stdin=subprocess.PIPE)
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{2 * TILE_W}x{2 * TILE_H}",
+            "-r",
+            f"{fps:g}",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(out),
+        ],
+        stdin=subprocess.PIPE,
+    )
     last = None
     for t in range(steps):
         tiles = []

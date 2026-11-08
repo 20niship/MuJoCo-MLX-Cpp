@@ -6,6 +6,7 @@ import os
 
 import gymnasium as gym
 import numpy as np
+import vkmujoco
 from stable_baselines3.common.vec_env import VecEnv
 
 FRAME_SKIP = 5
@@ -23,10 +24,9 @@ def _half_cheetah_xml_path() -> str:
 
 
 class MjmlxHalfCheetahVecEnv(VecEnv):
-    def __init__(self, native_module, num_envs: int, use_gpu: bool = True, seed: int | None = None):
-        self._native = native_module
-        self._model = native_module.load_model(_half_cheetah_xml_path())
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=0)
+    def __init__(self, num_envs: int, use_gpu: bool = True, seed: int | None = None):
+        self._model = vkmujoco.load_model(_half_cheetah_xml_path())
+        self._sim = vkmujoco.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=0)
         self.nq = self._model.nq
         self.nv = self._model.nv
         self.nu = self._model.nu

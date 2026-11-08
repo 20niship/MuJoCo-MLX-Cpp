@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Go2のカメラ描画時間(解像度 x env数)と物理stepに対する相対コストを計測する。
 
-usage: bench_camera.py [--build-dir build] [--envs 256 1024 4096] [--sizes 64 128]
+usage: bench_camera.py [--envs 256 1024 4096] [--sizes 64 128]
 """
 
 import argparse
@@ -21,21 +21,19 @@ os.environ["MJMLX_GO2_XML_SUBST"] = (
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, nargs="+", default=[256, 1024, 4096])
     ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128])
     ap.add_argument("--iters", type=int, default=10)
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
+    import vkmujoco
     from mjmlx_go2_env import MjmlxGo2Env
 
     print("envs size | step ms | render ms (GPU) | readback ms | render+readback ms | env-frames/s | render/step")
     for n in args.envs:
-        env = MjmlxGo2Env(native, n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+        env = MjmlxGo2Env(n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
         env.reset()
         rng = np.random.default_rng(0)
         act = lambda: torch.from_numpy(rng.normal(0, 0.5, (n, 12)).astype(np.float32))
@@ -49,7 +47,7 @@ def main() -> None:
             ts.append(time.perf_counter() - t0)
         step_ms = np.mean(ts) * 1e3
         for size in args.sizes:
-            cam = native.create_camera(env._sim, size, size)
+            cam = vkmujoco.create_camera(env._sim, size, size)
             cam.render()
             cam.rgb(), cam.depth()
             tr, tb = [], []

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Go2のカメラ画像をMuJoCo標準レンダラ(mujoco.Renderer)と比較する: depth誤差とロボットシルエットIoU、side-by-side画像を出力。
 
-usage: compare_camera_mujoco.py [--build-dir build] [--envs 8] [--size 128] [--cam orbit] [--out runs/camera_compare]
+usage: compare_camera_mujoco.py [--envs 8] [--size 128] [--cam orbit] [--out runs/camera_compare]
 """
 
 import argparse
@@ -22,7 +22,6 @@ os.environ["MJMLX_GO2_XML_SUBST"] = (
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, default=8)
     ap.add_argument("--size", type=int, default=128)
     ap.add_argument("--cam", default="orbit")
@@ -30,20 +29,19 @@ def main() -> None:
     ap.add_argument("--out", default="runs/camera_compare")
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
     import mujoco
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
-    from PIL import Image
+    import vkmujoco
     from mjmlx_go2_env import MjmlxGo2Env
+    from PIL import Image
 
-    env = MjmlxGo2Env(native, args.envs, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
+    env = MjmlxGo2Env(args.envs, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True)
     env.reset()
     rng = np.random.default_rng(0)
     for _ in range(args.steps):
         env.step(torch.from_numpy(rng.normal(0, 0.5, (args.envs, 12)).astype(np.float32)))
-    cam = native.create_camera(env._sim, args.size, args.size)
+    cam = vkmujoco.create_camera(env._sim, args.size, args.size)
     cam.render()
     rgb, depth = cam.rgb(), cam.depth()
     qpos = env._sim.qpos()

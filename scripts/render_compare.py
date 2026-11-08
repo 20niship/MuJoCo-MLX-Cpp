@@ -4,6 +4,7 @@
 usage: render_compare.py OUT_DIR MODEL.xml:TRACE.bin [MODEL.xml:TRACE.bin ...]
 出力: OUT_DIR/compare.mp4 と最終フレームの OUT_DIR/compare_last.png (ffmpegが必要)
 """
+
 import os
 import subprocess
 import sys
@@ -72,9 +73,29 @@ def main():
 
     mp4 = out_dir / "compare.mp4"
     ff = subprocess.Popen(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{2 * TILE_W}x{len(rows) * TILE_H}",
-         "-r", f"{fps:g}", "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)],
-        stdin=subprocess.PIPE)
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{2 * TILE_W}x{len(rows) * TILE_H}",
+            "-r",
+            f"{fps:g}",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(mp4),
+        ],
+        stdin=subprocess.PIPE,
+    )
     last = None
     for f in range(nframes):
         tiles = [[caption(r.render(c, f), f"{r.name} | {labels[c]} | t={f / fps:.2f}s", font) for c in range(2)] for r in rows]

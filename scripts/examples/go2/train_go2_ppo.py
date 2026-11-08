@@ -17,7 +17,6 @@ def main() -> None:
     parser.add_argument("--envs", type=int, default=4096)
     parser.add_argument("--max-iterations", type=int, default=1500)
     parser.add_argument("--logdir", type=str, default="runs/go2_stairs")
-    parser.add_argument("--build-dir", type=str, default="build")
     parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu", help="PPO更新のデバイス(cuda可)")
@@ -32,13 +31,9 @@ def main() -> None:
     parser.add_argument("--cmd-vel-max", type=float, default=1.0, help="||cmd_vel||の上限[m/s or rad/s]")
     args = parser.parse_args()
 
-    sys.path.insert(0, args.build_dir)
-    import _mjmlx_rl_native as native
-
     from mjmlx_go2_env import MjmlxGo2Env
 
     env = MjmlxGo2Env(
-        native,
         args.envs,
         cmd_vel_min=args.cmd_vel_min,
         cmd_vel_max=args.cmd_vel_max,

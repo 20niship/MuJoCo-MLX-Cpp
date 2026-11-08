@@ -52,20 +52,28 @@ check-video-export: fetch-models build
 bench: build
     BUILD_DIR=build HISTORY_CSV=benchmarks/history.csv ./scripts/bench_check.py
 
-# Build the RL Python extension into build/ using the uv-managed venv
-build-python: _venv
-    mkdir -p build
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-        -DMUJOCO_ROOT=.venv/lib/python3.10/site-packages/mujoco \
-        -DMJMLX_BUILD_PYTHON=ON -DPython_EXECUTABLE=.venv/bin/python
-    cmake --build build --target _mjmlx_rl_native -j
+# Install the Python package `vkmujoco` (editable, built by scikit-build-core) into the uv-managed venv
+build-python:
+    uv sync
 
-# Train PPO on HalfCheetah via the batched GPU physics. Run build-python first.
-train-ppo *ARGS: _venv
-    .venv/bin/python scripts/examples/halfcheetah/train_ppo.py {{ARGS}}
+# Train PPO on HalfCheetah via the batched GPU physics.
+train-ppo *ARGS: build-python
+    uv run python scripts/examples/halfcheetah/train_ppo.py {{ARGS}}
 
-_venv:
-    uv sync --group build
+# Python lint / format check / type check (same as CI)
+lint:
+    uv run --only-group lint ruff check .
+    uv run --only-group lint ruff format --check .
+    uv run --group lint mypy
+
+# Python format
+format:
+    uv run --only-group lint ruff check --fix .
+    uv run --only-group lint ruff format .
+
+# Regenerate python/vkmujoco.pyi from the built extension
+stubgen: build-python
+    uv run python -m nanobind.stubgen -m vkmujoco -o python/vkmujoco.pyi
 
 # Remove build directory
 clean:

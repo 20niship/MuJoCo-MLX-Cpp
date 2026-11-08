@@ -41,7 +41,6 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--logdir", default="runs/go2_stairs")
     ap.add_argument("--checkpoint", default=None, help="省略時はlogdir内の最新model_N.pt")
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--speed", type=float, default=0.5, help="指令の大きさ[m/s]")
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--out", default="runs/video/cmd_vel.mp4")
@@ -50,17 +49,13 @@ def main() -> None:
     ap.add_argument("--reward-preset", default="relaxed")
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
-    import _mjmlx_rl_native as native
-    from rsl_rl.runners import OnPolicyRunner
-
     import mjmlx_go2_env as e
+    from rsl_rl.runners import OnPolicyRunner
     from train_go2_ppo import make_train_cfg
 
     ckpt = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path(args.logdir))
     xml_path = "/tmp/go2_play_generated.xml"
-    env = e.MjmlxGo2Env(native, len(CASES), cmd_vel_min=0.0, cmd_vel_max=1.0, use_gpu=not args.cpu, seed=0, terrain_seed=0,
-                        flat_terrain=True, reward_preset=args.reward_preset, generated_xml_path=xml_path)
+    env = e.MjmlxGo2Env(len(CASES), cmd_vel_min=0.0, cmd_vel_max=1.0, use_gpu=not args.cpu, seed=0, terrain_seed=0, flat_terrain=True, reward_preset=args.reward_preset, generated_xml_path=xml_path)
     runner = OnPolicyRunner(env, make_train_cfg(0, 1), log_dir=None, device="cpu")
     runner.load(str(ckpt))
     policy = runner.get_inference_policy(device="cpu")
@@ -107,14 +102,18 @@ def main() -> None:
         m = meas[warm:, i].mean(axis=0)
         err = float(np.linalg.norm(m[:2] - cmd[i, :2]))
         summary["cases"][name] = {"cmd": cmd[i].tolist(), "mean_vel": m.tolist(), "vel_error": err, "fell_or_reset_at_step": int(first_done[i])}
-        print(f"{name:9s} cmd=({cmd[i,0]:+.2f},{cmd[i,1]:+.2f}) mean(vx,vy,wz)=({m[0]:+.2f},{m[1]:+.2f},{m[2]:+.2f}) |err|={err:.2f}"
-              + (f"  終了/リセット step={first_done[i]}" if first_done[i] >= 0 else ""))
+        print(
+            f"{name:9s} cmd=({cmd[i, 0]:+.2f},{cmd[i, 1]:+.2f}) mean(vx,vy,wz)=({m[0]:+.2f},{m[1]:+.2f},{m[2]:+.2f}) |err|={err:.2f}"
+            + (f"  終了/リセット step={first_done[i]}" if first_done[i] >= 0 else "")
+        )
 
     # 描画専用: 地形のbox(物理用のrgba 0.5 0.5 0.55)に市松模様のテクスチャを貼る(物理・衝突は変えない)
     xml = Path(xml_path).read_text()
     if not args.plain_floor:
-        tex = ('<texture name="floor_checker" type="2d" builtin="checker" rgb1="0.50 0.62 0.74" rgb2="0.92 0.94 0.97" width="512" height="512" mark="edge" markrgb="0.9 0.9 0.9"/>'
-               '<material name="floor_checker" texture="floor_checker" texuniform="true" texrepeat="1 1" reflectance="0.05"/>')
+        tex = (
+            '<texture name="floor_checker" type="2d" builtin="checker" rgb1="0.50 0.62 0.74" rgb2="0.92 0.94 0.97" width="512" height="512" mark="edge" markrgb="0.9 0.9 0.9"/>'
+            '<material name="floor_checker" texture="floor_checker" texuniform="true" texrepeat="1 1" reflectance="0.05"/>'
+        )
         xml = xml.replace("<asset>", "<asset>" + tex, 1).replace('rgba="0.5 0.5 0.55 1"', 'material="floor_checker"')
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
@@ -127,8 +126,29 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ff = subprocess.Popen(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{2 * TILE_W}x{2 * TILE_H}",
-         "-r", f"{fps:g}", "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)], stdin=subprocess.PIPE)
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{2 * TILE_W}x{2 * TILE_H}",
+            "-r",
+            f"{fps:g}",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(out),
+        ],
+        stdin=subprocess.PIPE,
+    )
     last = None
     for t in range(steps):
         tiles = []
@@ -141,7 +161,7 @@ def main() -> None:
             mv = meas[max(0, t - win + 1) : t + 1, i].mean(axis=0)
             d = ImageDraw.Draw(im)
             d.rectangle([0, 0, TILE_W, 50], fill=(0, 0, 0))
-            d.text((8, 4), f"{name}  cmd vx={cmd[i,0]:+.2f} vy={cmd[i,1]:+.2f}  t={t / fps:.1f}s", fill=(255, 255, 255), font=font)
+            d.text((8, 4), f"{name}  cmd vx={cmd[i, 0]:+.2f} vy={cmd[i, 1]:+.2f}  t={t / fps:.1f}s", fill=(255, 255, 255), font=font)
             d.text((8, 27), f"meas vx={mv[0]:+.2f} vy={mv[1]:+.2f} wz={mv[2]:+.2f}", fill=(120, 255, 120), font=font)
             tiles.append(np.asarray(im))
         last = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])])

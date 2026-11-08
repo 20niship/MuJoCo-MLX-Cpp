@@ -1,0 +1,36 @@
+name: Python
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff check
+        run: uvx ruff check .
+      - name: ruff format --check
+        run: uvx ruff format --check .
+      - name: mypy (python/vkmujoco.pyi)
+        run: uvx --with numpy mypy
+
+  # 生成したstub(vkmujoco.pyi)がコミット済みのものと一致するか(wheelをビルドして確認する)
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan-dev glslang-tools
+      - name: Build and generate stub
+        run: |
+          uv venv
+          uv pip install . nanobind ruff
+          uv run python -m nanobind.stubgen -m vkmujoco -o /tmp/vkmujoco.pyi
+          diff -u python/vkmujoco.pyi /tmp/vkmujoco.pyi

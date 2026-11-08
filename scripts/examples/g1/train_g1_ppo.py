@@ -24,7 +24,6 @@ def main() -> None:
     parser.add_argument("--envs", type=int, default=4096)
     parser.add_argument("--max-iterations", type=int, default=1500)
     parser.add_argument("--logdir", type=str, default="runs/g1_flat")
-    parser.add_argument("--build-dir", type=str, default="build")
     parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu", help="PPO更新のデバイス(cuda可)")
@@ -39,15 +38,21 @@ def main() -> None:
     parser.add_argument("--no-obs-noise", action="store_true", help="観測ノイズ(Isaac LabのUnoise)を切る")
     args = parser.parse_args()
 
-    sys.path.insert(0, args.build_dir)
-    import _mjmlx_rl_native as native
-
     from mjmlx_g1_env import MjmlxG1Env
 
-    env = MjmlxG1Env(native, args.envs, use_gpu=not args.cpu, seed=args.seed, device=args.device, self_collision=args.self_collision,
-                     max_condim=args.max_condim, obs_noise=not args.no_obs_noise, forward_only=args.forward_only,
-                     ankle_gains=(args.ankle_kp, args.ankle_kd) if args.ankle_kp is not None else None, solver_iterations=args.solver_iters,
-                     fwd_weights={k: float(v) for k, v in (kv.split("=") for kv in args.fwd_weights.split(",") if kv)} or None)
+    env = MjmlxG1Env(
+        args.envs,
+        use_gpu=not args.cpu,
+        seed=args.seed,
+        device=args.device,
+        self_collision=args.self_collision,
+        max_condim=args.max_condim,
+        obs_noise=not args.no_obs_noise,
+        forward_only=args.forward_only,
+        ankle_gains=(args.ankle_kp, args.ankle_kd) if args.ankle_kp is not None else None,
+        solver_iterations=args.solver_iters,
+        fwd_weights={k: float(v) for k, v in (kv.split("=") for kv in args.fwd_weights.split(",") if kv)} or None,
+    )
     train_cfg = make_g1_train_cfg(args.seed, args.max_iterations, "g1_forward" if args.forward_only else "g1_flat")
     train_cfg["device"] = args.device
     runner = OnPolicyRunner(env, train_cfg, log_dir=args.logdir, device=train_cfg["device"])

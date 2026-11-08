@@ -11,7 +11,6 @@ sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, default=256)
     ap.add_argument("--warm", type=int, default=40, help="状態を集めるためにGPU envを走らせるstep数")
     ap.add_argument("--samples", type=int, default=5)
@@ -22,17 +21,15 @@ def main() -> None:
     ap.add_argument("--solver-iters", type=int, default=None)
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
+    import mjmlx_g1_env as e
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
-    import mjmlx_g1_env as e
 
     kw = dict(seed=0, obs_noise=False, max_condim=args.max_condim, self_collision=args.self_collision)
     if args.solver_iters is not None:
         kw["solver_iterations"] = args.solver_iters
-    gpu = e.MjmlxG1Env(native, args.envs, use_gpu=True, generated_xml_path="/tmp/g1_cmp_gpu.xml", **kw)
-    cpu = e.MjmlxG1Env(native, args.envs, use_gpu=False, generated_xml_path="/tmp/g1_cmp_cpu.xml", **kw)
+    gpu = e.MjmlxG1Env(args.envs, use_gpu=True, generated_xml_path="/tmp/g1_cmp_gpu.xml", **kw)
+    cpu = e.MjmlxG1Env(args.envs, use_gpu=False, generated_xml_path="/tmp/g1_cmp_cpu.xml", **kw)
     rng = np.random.default_rng(1)
     gpu.reset()
     cpu.reset()

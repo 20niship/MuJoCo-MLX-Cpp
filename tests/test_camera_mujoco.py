@@ -12,7 +12,7 @@ os.environ.setdefault("MUJOCO_GL", "glfw" if os.environ.get("DISPLAY") else "egl
 sys.path.insert(0, sys.argv[1])
 import mujoco
 import numpy as np
-import _mjmlx_rl_native as native
+import vkmujoco
 from PIL import Image
 
 OUT = sys.argv[2] if len(sys.argv) > 2 else None
@@ -26,9 +26,9 @@ def render_both(xml, cam="c", assets=None):
         Image.fromarray(arr).save(os.path.join(d, name))
     path = os.path.join(d, "m.xml")
     open(path, "w").write(xml)
-    model = native.load_model(path)
-    sim = native.create_batched(model, 1, use_gpu=True)
-    c = native.create_camera(sim, W, H)
+    model = vkmujoco.load_model(path)
+    sim = vkmujoco.create_batched(model, 1, use_gpu=True)
+    c = vkmujoco.create_camera(sim, W, H)
     c.render()
     rgb, depth = c.rgb()[0, 0], c.depth()[0, 0]
     m = mujoco.MjModel.from_xml_path(path)
@@ -100,7 +100,7 @@ for name, (tex, matattr, gtype, size) in cases.items():
     save(name, rgb, rgb_m)
 
 # --- tendon: site間 + 球wrap(sidesite) + 円柱wrap。tendon色(緑)のマスクをMuJoCoと比べる ---
-xml = f'''<mujoco><option gravity="0 0 0"/>{UNLIT}
+xml = f"""<mujoco><option gravity="0 0 0"/>{UNLIT}
 <worldbody>
   <geom name="ball" type="sphere" size="0.3" pos="0 0 1" rgba="1 0 0 1" contype="0" conaffinity="0"/>
   <geom name="cyl" type="cylinder" size="0.15 0.3" pos="0 0 2.2" euler="90 0 0" rgba="0 0 1 1" contype="0" conaffinity="0"/>
@@ -116,7 +116,7 @@ xml = f'''<mujoco><option gravity="0 0 0"/>{UNLIT}
   <spatial width="0.05" rgba="0 1 0 1"><site site="sa"/><geom geom="ball" sidesite="top"/><site site="sb"/></spatial>
   <spatial width="0.05" rgba="0 1 0 1"><site site="sc"/><geom geom="cyl" sidesite="ctop"/><site site="sd"/></spatial>
   <spatial width="0.03" rgba="0 1 0 1"><site site="sa"/><site site="sc"/></spatial>
-</tendon></mujoco>'''
+</tendon></mujoco>"""
 rgb, depth, rgb_m, depth_m, _ = render_both(xml)
 green = lambda x: (x[..., 1] > 80) & (x[..., 1] > 3 * x[..., 0].astype(int)) & (x[..., 1] > 3 * x[..., 2].astype(int))
 go, gm = green(rgb), green(rgb_m)

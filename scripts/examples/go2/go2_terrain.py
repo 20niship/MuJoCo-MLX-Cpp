@@ -82,9 +82,5 @@ class StairsTerrain:
         for x0, x1, top in spans:
             cx = (x0 + x1) / 2.0
             hx = (x1 - x0) / 2.0
-            parts.append(
-                f'<geom type="box" pos="{cx:.4f} 0 {top / 2:.4f}" '
-                f'size="{hx:.4f} {CORRIDOR_WIDTH / 2:.4f} {top / 2:.4f}" '
-                f'friction="0.8 0.02 0.01" rgba="0.5 0.5 0.55 1"/>'
-            )
+            parts.append(f'<geom type="box" pos="{cx:.4f} 0 {top / 2:.4f}" size="{hx:.4f} {CORRIDOR_WIDTH / 2:.4f} {top / 2:.4f}" friction="0.8 0.02 0.01" rgba="0.5 0.5 0.55 1"/>')
         return "\n    ".join(parts)

@@ -15,7 +15,6 @@ sys.path[:0] = [_HERE, os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build-dir", default="build")
     ap.add_argument("--envs", type=int, default=256)
     ap.add_argument("--warm", type=int, default=60, help="状態を集めるためにGPU envを走らせるstep数")
     ap.add_argument("--samples", type=int, default=5, help="比較する状態の数(warmの後、10stepごと)")
@@ -25,17 +24,15 @@ def main() -> None:
     ap.add_argument("--max-condim", type=int, default=0, help="ロボットのgeomのcondim上限(CPUとGPUの両方に同じ値を使う)")
     args = ap.parse_args()
 
-    sys.path.insert(0, args.build_dir)
+    import mjmlx_go2_env as e
     import numpy as np
     import torch
-    import _mjmlx_rl_native as native
-    import mjmlx_go2_env as e
 
     if args.solver_iters is not None:
         e.SOLVER_ITERATIONS = args.solver_iters
     kw = dict(cmd_vel_min=0.2, cmd_vel_max=1.0, seed=0, terrain_seed=0, flat_terrain=True, reward_preset=args.preset, max_condim=args.max_condim)
-    gpu = e.MjmlxGo2Env(native, args.envs, use_gpu=True, generated_xml_path="/tmp/go2_cmp_gpu.xml", **kw)
-    cpu = e.MjmlxGo2Env(native, args.envs, use_gpu=False, generated_xml_path="/tmp/go2_cmp_cpu.xml", **kw)
+    gpu = e.MjmlxGo2Env(args.envs, use_gpu=True, generated_xml_path="/tmp/go2_cmp_gpu.xml", **kw)
+    cpu = e.MjmlxGo2Env(args.envs, use_gpu=False, generated_xml_path="/tmp/go2_cmp_cpu.xml", **kw)
     rng = np.random.default_rng(1)
     gpu.reset()
     cpu.reset()
@@ -59,9 +56,10 @@ def main() -> None:
             gpu._sim.step(ctrl)
         qc, vc = cpu._sim.state()
         qg, vg = gpu._sim.state()
-        dq.append(np.abs(qc - qg)[:, 7:19].max(axis=1))   # 関節角の最大差
-        dv.append(np.abs(vc - vg)[:, :6].max(axis=1))     # 胴体速度の最大差
-        dvl.append(np.abs(vc - vg)[:, :3].max(axis=1)); dva.append(np.abs(vc - vg)[:, 3:6].max(axis=1))
+        dq.append(np.abs(qc - qg)[:, 7:19].max(axis=1))  # 関節角の最大差
+        dv.append(np.abs(vc - vg)[:, :6].max(axis=1))  # 胴体速度の最大差
+        dvl.append(np.abs(vc - vg)[:, :3].max(axis=1))
+        dva.append(np.abs(vc - vg)[:, 3:6].max(axis=1))
         for _ in range(10):
             gpu.step(act())
     dq, dv, dvl, dva = np.concatenate(dq), np.concatenate(dv), np.concatenate(dvl), np.concatenate(dva)

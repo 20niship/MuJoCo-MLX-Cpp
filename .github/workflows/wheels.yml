@@ -1,0 +1,59 @@
+name: Wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "CMakeLists.txt"
+      - "python/**"
+      - "src/**"
+      - "include/**"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+# cibuildwheel + scikit-build-core でwheelを作る。libmujoco(pip mujoco==3.5.0に依存)とlibvulkan(ユーザー環境のローダー)は同梱しない。
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_34_x86_64
+          CIBW_BEFORE_ALL_LINUX: dnf install -y epel-release && dnf install -y vulkan-headers vulkan-loader-devel glslang
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: auditwheel repair --exclude "libmujoco.so.*" --exclude libvulkan.so.1 -w {dest_dir} {wheel}
+          # GPU無しのCIなのでimportまで確認する
+          CIBW_TEST_COMMAND: python -c "import vkmujoco; print(vkmujoco.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz

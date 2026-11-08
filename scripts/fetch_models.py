@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """mesh付き実ロボットMJCFをbenchmarks/models/external/へ取得する(.gitignore済み = git管理外)。取得済みならskip。"""
+
 import subprocess
 from pathlib import Path
 

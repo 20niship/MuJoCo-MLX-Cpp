@@ -1,8 +1,7 @@
-"""Train PPO on HalfCheetah via mjmlx's batched GPU physics. Requires the native extension built first: cmake --build build --target _mjmlx_rl_native"""
+"""Train PPO on HalfCheetah via mjmlx's batched GPU physics. Requires vkmujoco installed (uv pip install -e .)"""
 
 import argparse
 import os
-import sys
 import time
 
 from stable_baselines3 import PPO
@@ -15,17 +14,13 @@ def main() -> None:
     parser.add_argument("--envs", type=int, default=2048)
     parser.add_argument("--timesteps", type=int, default=2_000_000)
     parser.add_argument("--logdir", type=str, default="runs/halfcheetah")
-    parser.add_argument("--build-dir", type=str, default="build")
     parser.add_argument("--cpu", action="store_true", help="use CPU physics instead of GPU")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    sys.path.insert(0, args.build_dir)
-    import _mjmlx_rl_native as native
-
     from mjmlx_halfcheetah_vec_env import MjmlxHalfCheetahVecEnv
 
-    raw_env = MjmlxHalfCheetahVecEnv(native, args.envs, use_gpu=not args.cpu, seed=args.seed)
+    raw_env = MjmlxHalfCheetahVecEnv(args.envs, use_gpu=not args.cpu, seed=args.seed)
     env = VecMonitor(raw_env)
 
     model = PPO(

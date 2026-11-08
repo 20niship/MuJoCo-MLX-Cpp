@@ -69,7 +69,7 @@ https://github.com/user-attachments/assets/2575874e-0fe2-4981-a96e-c1e924d22542
 git clone --recursive https://github.com/20niship/MuJoCo-MLX-Cpp
 cd MuJoCo-MLX-Cpp
 just build                      # libmjmlx + libmjb + テスト/ベンチ (Release) を build/ へ
-just build-python               # nanobind拡張(_mjmlx_rl_native)も作る
+just build-python               # Pythonパッケージ`vkmujoco`(nanobind + scikit-build-core)もinstallする
 ```
 
 素のCMake: `cmake -B build -DCMAKE_BUILD_TYPE=Release -DMJMLX_BUILD_PYTHON=ON && cmake --build build -j`。
@@ -108,8 +108,8 @@ opt.self_collision = 0; opt.max_condim = 3;
 MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);
 ```
 ```python
-model = native.load_model(path, self_collision=False, max_condim=3)
-env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)
+model = vkmujoco.load_model(path, self_collision=False, max_condim=3)
+env = MjmlxGo2Env(4096, ..., self_collision=False, max_condim=3)
 ```
 
 Go2 4096 / 16384 envのenv-steps/s: 既定 409K / 528K、`max_condim=3` 468K / 639K、両方 481K / 648K。
@@ -119,13 +119,15 @@ Go2 4096 / 16384 envのenv-steps/s: 既定 409K / 528K、`max_condim=3` 468K / 6
 MJCFの`<camera>`/`<light>`/geomのrgbaを使う。Phong、RGB+depth、hfieldと2Dテクスチャ(plane/box/hfield)、空間tendon(円柱として描画)に対応。GPU上のフラスタムカリングとLOD(メッシュ頂点クラスタリング、`MJMLX_CAM_LOD_K`)で、全env x 全カメラを`vkCmdDrawIndexedIndirect` 1回で描く。
 
 ```python
-cam = native.create_camera(sim, 128, 128)       # simは create_batched(use_gpu=True) の戻り値
+cam = vkmujoco.create_camera(sim, 128, 128)  # simは create_batched(use_gpu=True) の戻り値
 cam.render()
-rgb, depth = cam.rgb(), cam.depth()             # (num_envs, ncam, H, W, 3) uint8 / (..., H, W) float32 [m]
+rgb, depth = cam.rgb(), cam.depth()  # (num_envs, ncam, H, W, 3) uint8 / (..., H, W) float32 [m]
 
-from mjmlx_camera_cuda import CudaCamera        # Vulkan -> CUDA external memory interop (Linux)
-gcam = CudaCamera.try_create(cam)               # 非対応環境はNone -> 上のCPU読み出しを使う
-cam.render(); rgba, depth = gcam.read()         # CUDAテンソル、CPUコピーなし
+from mjmlx_camera_cuda import CudaCamera  # Vulkan -> CUDA external memory interop (Linux)
+
+gcam = CudaCamera.try_create(cam)  # 非対応環境はNone -> 上のCPU読み出しを使う
+cam.render()
+rgba, depth = gcam.read()  # CUDAテンソル、CPUコピーなし
 ```
 
 未対応: 影、半透明、可動bodyに付いたlight、trackcom(body原点で近似)。interopはLinux + `VK_KHR_external_memory_fd` + CUDA版torchが必要で、複数GPUでは`MKX_VULKAN_DEVICE_INDEX`をCUDAのデバイスと揃える。カメラにはgraphics+compute queue、`multiDrawIndirect`、`drawIndirectFirstInstance`、`shaderClipDistance`が必要(満たさない時は`create_camera`だけが失敗)。例: `scripts/examples/go2/example_go2_camera.py`、MuJoCo描画との比較: `scripts/compare_camera_mujoco.py`、速度: `scripts/bench_camera*.py`。
@@ -135,12 +137,12 @@ cam.render(); rgba, depth = gcam.read()         # CUDAテンソル、CPUコピ�
 計測前に他のプロセス(ollama・デスクトップ描画・他のGPUジョブ)がGPUを使っていないか確認する(2倍ぶれる)。コミットや設定の比較は日をまたがず**同一セッションで交互に**行う。
 
 ```bash
-uv run python scripts/bench_go2_step.py --build-dir build --envs 4096        # env.stepの速度
-MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build       # 段ごとのGPU/ホスト時間
+uv run python scripts/bench_go2_step.py --envs 4096        # env.stepの速度
+MJMLX_PROF=1 uv run python scripts/bench_go2_step.py       # 段ごとのGPU/ホスト時間
 uv run python scripts/bench_physics_vs_others.py ...                         # 本リポジトリ / Isaac Lab / Genesis
-uv run python scripts/bench_camera_vs_isaac.py --build-dir build             # Isaac Lab TiledCameraとの比較
+uv run python scripts/bench_camera_vs_isaac.py             # Isaac Lab TiledCameraとの比較
 PYTHONPATH=<cu126等のtorch> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
-uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build               # MuJoCo Cとの1 step差
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py               # MuJoCo Cとの1 step差
 just check-video-export                                                      # CPU|GPU並べたタイル動画
 just bench                                                                   # benchmarks/baseline.csvとの退行チェック
 ```
@@ -153,15 +155,15 @@ Go2の1制御stepのMuJoCo Cとの差(関節角): 既定は平均3.6e-5 rad・p9
 
 ### Performance measurement(学習速度・CPU/GPU差・Isaac Labとの比較)
 
-事前に別プロセス(ollama等)がGPU/CPUを使っていないか確認する(各段の時間が2〜3倍ぶれる)。以降のスクリプトは `--build-dir`(既定 `build`)でPython拡張のビルド先を指す。
+事前に別プロセス(ollama等)がGPU/CPUを使っていないか確認する(各段の時間が2〜3倍ぶれる)。以降のスクリプトはインストール済みの`vkmujoco`を使う。
 
 ### 1. Go2のenv.step速度(4096 env)
 ```bash
-uv run python scripts/bench_go2_step.py --build-dir build --envs 4096     # 平均/最小[ms]とenv-steps/s
-MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --build-dir build --steps 40   # 段(kin/forward/collision/solver/cfrc/euler)ごとの.build/.eval[ms/substep]
+uv run python scripts/bench_go2_step.py --envs 4096     # 平均/最小[ms]とenv-steps/s
+MJMLX_PROF=1 uv run python scripts/bench_go2_step.py --steps 40   # 段(kin/forward/collision/solver/cfrc/euler)ごとの.build/.eval[ms/substep]
 scripts/prof_min.sh build 5                                              # 上を複数回回し、段ごとの最小値を出す(ぶれ対策)
 ```
-`--build-dir` を別コミットのビルドにすれば前後比較できる。`MJMLX_TG_<KERNEL>`(KIN/FWD/COLL)でスレッド数、`MJMLX_SOLVER_SHARED=0`・`MKX_DEVICE_LOCAL=0`で最適化を無効にして効果を切り分けられる。
+別コミットを`pip install`した環境で同じ引数を実行すれば前後比較できる。`MJMLX_TG_<KERNEL>`(KIN/FWD/COLL)でスレッド数、`MJMLX_SOLVER_SHARED=0`・`MKX_DEVICE_LOCAL=0`で最適化を無効にして効果を切り分けられる。
 
 ### 2. 学習1 iterationの時間(Isaac Labと比較)
 `train_go2_ppo.py` のログの `Iteration time` / `Collection time` が1 iteration(4096 env × 24 step)の時間。Isaac Labは別環境(Python 3.11)に入れて同じ条件で測る:
@@ -178,8 +180,8 @@ RTX 3060(12 GB)での実測は、本リポジトリ約1.3 s/iter、Isaac Lab約2
 
 ### 3. CPU(MuJoCo C)とGPUの物理の差
 ```bash
-uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
-uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --build-dir build --lift 1.0   # 接触なし(接触以外の物理の差)
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py              # 接触を含む状態で、同じ状態から1制御step進めた関節角・胴体速度の差
+uv run python scripts/examples/go2/compare_cpu_gpu_go2.py --lift 1.0   # 接触なし(接触以外の物理の差)
 just check-video-export   # CPU|GPUを並べた複数ロボットのタイル動画(runs/video/compare.mp4)
 ```
 
@@ -194,7 +196,7 @@ https://github.com/user-attachments/assets/349e410a-1bc7-4451-830a-485e4a42be4b
 
 ### 4. カメラ描画速度(Isaac Lab TiledCameraと比較)
 ```bash
-uv run python scripts/bench_camera_vs_isaac.py --build-dir build            # 両方測ってJSON(runs/camera_vs_isaac.json)と表を出す
+uv run python scripts/bench_camera_vs_isaac.py            # 両方測ってJSON(runs/camera_vs_isaac.json)と表を出す
 uv run python scripts/bench_camera_vs_isaac.py --only mjmlx --envs 256 --sizes 64   # こちらだけ
 ```
 Isaac側は `scripts/isaac_camera_bench.py`(`~/isaac/.venv`、1構成1プロセス、RTX機能を全て切り、Go2平地env、TiledCamera 1台/env、rgb+distance_to_camera)を子プロセスで呼ぶ。RTX 3060 12GB、Go2、1カメラ/env、env-frames/s(描画のみ)と env-steps/s(物理4substep+描画1回):
@@ -292,8 +294,8 @@ opt.self_collision = 0; opt.max_condim = 3;
 MjmlxModel* m = mjmlx_load_model_ex("go2.xml", &opt);      // mjmlx_load_model_from_string_ex もある。既存のmjmlx_load_modelは従来どおり
 ```
 ```python
-model = native.load_model(path, self_collision=False, max_condim=3)           # 低レベル
-env = MjmlxGo2Env(native, 4096, ..., self_collision=False, max_condim=3)       # Go2環境
+model = vkmujoco.load_model(path, self_collision=False, max_condim=3)  # 低レベル
+env = MjmlxGo2Env(4096, ..., self_collision=False, max_condim=3)  # Go2環境
 ```
 CLI: `bench_go2_step.py --no-self-collision --max-condim 3`、`train_go2_ppo.py --no-self-collision --max-condim 3`、`compare_cpu_gpu_go2.py --max-condim 3`。
 

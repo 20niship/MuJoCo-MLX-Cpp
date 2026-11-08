@@ -9,6 +9,7 @@ import sys
 
 import numpy as np
 import torch
+import vkmujoco
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
@@ -34,12 +35,26 @@ OBS_NOISE = dict(lin_vel=0.1, ang_vel=0.2, gravity=0.05, joint_pos=0.01, joint_v
 
 # G1FlatEnvCfg/G1Rewardsの重み。Isaac LabのRewardManagerは weight*func*step_dt を返すので、下のstepでCONTROL_DTを掛ける
 W = dict(
-    termination=-200.0, track_lin=1.0, track_ang=1.0, lin_vel_z=-0.2, ang_vel_xy=-0.05, dof_torques=-2.0e-6, dof_acc=-1.0e-7,
-    action_rate=-0.005, feet_air_time=0.75, feet_slide=-0.1, flat_orientation=-1.0, dof_pos_limits=-1.0,
-    joint_deviation_hip=-0.1, joint_deviation_arms=-0.1, joint_deviation_torso=-0.1,
+    termination=-200.0,
+    track_lin=1.0,
+    track_ang=1.0,
+    lin_vel_z=-0.2,
+    ang_vel_xy=-0.05,
+    dof_torques=-2.0e-6,
+    dof_acc=-1.0e-7,
+    action_rate=-0.005,
+    feet_air_time=0.75,
+    feet_slide=-0.1,
+    flat_orientation=-1.0,
+    dof_pos_limits=-1.0,
+    joint_deviation_hip=-0.1,
+    joint_deviation_arms=-0.1,
+    joint_deviation_torso=-0.1,
 )
 # 前進専用(--forward-only)の報酬重み: 前進速度追従を主にし、生存(alive)を足す。他はIsaac Labのflat G1と同じ
-W_FWD = dict(W, track_lin=2.0, track_ang=2.0, alive=0.5, yaw_rate=-0.5, heading_hold=-1.0, lateral_vel=-1.0)  # track_ang 0.5だと旋回しながら進んだので2.0。後ろ3つは直進用(yaw速度・開始時の向きからのずれ・横速度の罰則)
+W_FWD = dict(
+    W, track_lin=2.0, track_ang=2.0, alive=0.5, yaw_rate=-0.5, heading_hold=-1.0, lateral_vel=-1.0
+)  # track_ang 0.5だと旋回しながら進んだので2.0。後ろ3つは直進用(yaw速度・開始時の向きからのずれ・横速度の罰則)
 FWD_RANGE = (0.4, 0.8)  # 前進専用の指令 vx[m/s]
 TRACK_STD = 0.5  # exp(-err/std^2)
 FEET_AIR_THRESHOLD = 0.4
@@ -47,11 +62,35 @@ SOFT_LIMIT_FACTOR = 0.9  # G1_CFG.soft_joint_pos_limit_factor
 
 # menagerieのg1.xml(29DoF)の関節順。Isaac LabのG1_CFG(torso_joint=腰のyaw 1軸 + 腕5軸 + 指7軸)との対応は関節名の正規表現で取る
 JOINTS = [
-    "left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee", "left_ankle_pitch", "left_ankle_roll",
-    "right_hip_pitch", "right_hip_roll", "right_hip_yaw", "right_knee", "right_ankle_pitch", "right_ankle_roll",
-    "waist_yaw", "waist_roll", "waist_pitch",
-    "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw", "left_elbow", "left_wrist_roll", "left_wrist_pitch", "left_wrist_yaw",
-    "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw", "right_elbow", "right_wrist_roll", "right_wrist_pitch", "right_wrist_yaw",
+    "left_hip_pitch",
+    "left_hip_roll",
+    "left_hip_yaw",
+    "left_knee",
+    "left_ankle_pitch",
+    "left_ankle_roll",
+    "right_hip_pitch",
+    "right_hip_roll",
+    "right_hip_yaw",
+    "right_knee",
+    "right_ankle_pitch",
+    "right_ankle_roll",
+    "waist_yaw",
+    "waist_roll",
+    "waist_pitch",
+    "left_shoulder_pitch",
+    "left_shoulder_roll",
+    "left_shoulder_yaw",
+    "left_elbow",
+    "left_wrist_roll",
+    "left_wrist_pitch",
+    "left_wrist_yaw",
+    "right_shoulder_pitch",
+    "right_shoulder_roll",
+    "right_shoulder_yaw",
+    "right_elbow",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw",
 ]
 NJ = len(JOINTS)
 
@@ -77,8 +116,7 @@ def make_gains(ankle: tuple[float, float] = ISAAC_ANKLE_GAINS) -> tuple[np.ndarr
 
 KP, KV = make_gains()
 # G1_CFG.init_state.joint_pos(正規表現で他は0)。elbow_pitch=menagerieのelbow
-_DEFAULT = {"hip_pitch": -0.20, "knee": 0.42, "ankle_pitch": -0.23, "elbow": 0.87, "left_shoulder_roll": 0.16, "left_shoulder_pitch": 0.35,
-            "right_shoulder_roll": -0.16, "right_shoulder_pitch": 0.35}
+_DEFAULT = {"hip_pitch": -0.20, "knee": 0.42, "ankle_pitch": -0.23, "elbow": 0.87, "left_shoulder_roll": 0.16, "left_shoulder_pitch": 0.35, "right_shoulder_roll": -0.16, "right_shoulder_pitch": 0.35}
 DEFAULT_JOINT_POS = np.array([next((v for k, v in _DEFAULT.items() if j == k or j.endswith("_" + k)), 0.0) for j in JOINTS], dtype=np.float32)
 
 # 報酬の関節グループ(Isaac Lab G1のSceneEntityCfgの正規表現に対応)
@@ -154,20 +192,43 @@ def _rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 
 TERM_NAMES = [
-    "termination", "track_lin_vel_xy_exp", "track_ang_vel_z_exp", "lin_vel_z_l2", "ang_vel_xy_l2", "dof_torques_l2", "dof_acc_l2", "action_rate_l2",
-    "feet_air_time", "feet_slide", "flat_orientation_l2", "dof_pos_limits", "joint_deviation_hip", "joint_deviation_arms", "joint_deviation_torso", "alive",
-    "yaw_rate_l2", "heading_hold", "lateral_vel_l2",
+    "termination",
+    "track_lin_vel_xy_exp",
+    "track_ang_vel_z_exp",
+    "lin_vel_z_l2",
+    "ang_vel_xy_l2",
+    "dof_torques_l2",
+    "dof_acc_l2",
+    "action_rate_l2",
+    "feet_air_time",
+    "feet_slide",
+    "flat_orientation_l2",
+    "dof_pos_limits",
+    "joint_deviation_hip",
+    "joint_deviation_arms",
+    "joint_deviation_torso",
+    "alive",
+    "yaw_rate_l2",
+    "heading_hold",
+    "lateral_vel_l2",
 ]
 METRIC_NAMES = [f"Reward/{k}" for k in TERM_NAMES] + [
-    "Metrics/lin_vel_error", "Metrics/ang_vel_error", "Metrics/cmd_speed", "Metrics/base_height", "Metrics/base_tilt", "Metrics/joint_pos_dev",
-    "Metrics/foot_contact_frac", "Termination/base_contact", "Termination/blew_up", "Termination/time_out",
+    "Metrics/lin_vel_error",
+    "Metrics/ang_vel_error",
+    "Metrics/cmd_speed",
+    "Metrics/base_height",
+    "Metrics/base_tilt",
+    "Metrics/joint_pos_dev",
+    "Metrics/foot_contact_frac",
+    "Termination/base_contact",
+    "Termination/blew_up",
+    "Termination/time_out",
 ]
 
 
 class MjmlxG1Env(VecEnv):
     def __init__(
         self,
-        native_module,
         num_envs: int,
         use_gpu: bool = True,
         seed: int | None = None,
@@ -183,7 +244,6 @@ class MjmlxG1Env(VecEnv):
     ):
         import mujoco
 
-        self._native = native_module
         self.forward_only = forward_only
         self._w = dict(W_FWD, **(fwd_weights or {})) if forward_only else W
         ankle = ankle_gains or ((200.0, 5.0) if forward_only else ISAAC_ANKLE_GAINS)
@@ -192,21 +252,21 @@ class MjmlxG1Env(VecEnv):
         mjm = mujoco.MjModel.from_xml_path(generated_xml_path)
         assert mjm.nu == NJ and mjm.nq == 7 + NJ
         assert [mujoco.mj_id2name(mjm, mujoco.mjtObj.mjOBJ_JOINT, 1 + i) for i in range(NJ)] == [f"{j}_joint" for j in JOINTS]
-        rng_ = mjm.jnt_range[1:1 + NJ].astype(np.float32)
+        rng_ = mjm.jnt_range[1 : 1 + NJ].astype(np.float32)
         self._joint_lo, self._joint_hi = rng_[:, 0], rng_[:, 1]
         bid = lambda n: mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, n)
         self._torso_id, self._foot_ids = bid(TERMINATION_BODY), [bid(b) for b in FOOT_BODIES]
         # 初期の高さ: 既定姿勢で足底の球が床に触れる高さ + 余裕(Isaac LabのG1_CFGはz=0.74。menagerieのメッシュ寸法が違うので求め直す)
         d = mujoco.MjData(mjm)
         d.qpos[2], d.qpos[3] = 0.0, 1.0
-        d.qpos[7:7 + NJ] = DEFAULT_JOINT_POS
+        d.qpos[7 : 7 + NJ] = DEFAULT_JOINT_POS
         mujoco.mj_forward(mjm, d)
         sole = d.geom_xpos[:, 2] - np.where(mjm.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE, mjm.geom_size[:, 0], 0.0)
         foot_geoms = [g for g in range(mjm.ngeom) if mjm.geom_bodyid[g] in self._foot_ids and mjm.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
         self.init_height = float(-sole[foot_geoms].min() + 0.02)
 
-        self._model = native_module.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
-        self._sim = native_module.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=solver_iterations)
+        self._model = vkmujoco.load_model(generated_xml_path, self_collision=self_collision, max_condim=max_condim)
+        self._sim = vkmujoco.create_batched(self._model, num_envs, frame_skip=1, use_gpu=use_gpu, solver_iterations=solver_iterations)
         self.nq, self.nv, self.nu = self._model.nq, self._model.nv, self._model.nu
         assert (self.nq, self.nv, self.nu) == (7 + NJ, 6 + NJ, NJ)
         self.num_envs, self.num_actions, self.max_episode_length = num_envs, NJ, MAX_EPISODE_STEPS
@@ -339,8 +399,8 @@ class MjmlxG1Env(VecEnv):
         if self._pack is not None:
             self._sim.read_pack_into(self._pk_np)
             pk = self._pk_pin.to(self.device, non_blocking=True)
-            qpos_h, qvel_h = self._pk_np[:, :nq], self._pk_np[:, nq:nq + nv]
-            qpos, qvel, force = pk[:, :nq], pk[:, nq:nq + nv], pk[:, nq + nv:nq + nv + 3]  # [torso, left foot, right foot]の接触力ノルム
+            qpos_h, qvel_h = self._pk_np[:, :nq], self._pk_np[:, nq : nq + nv]
+            qpos, qvel, force = pk[:, :nq], pk[:, nq : nq + nv], pk[:, nq + nv : nq + nv + 3]  # [torso, left foot, right foot]の接触力ノルム
         else:  # CPU実行
             qpos_h, qvel_h = self._sim.state()
             qpos, qvel = self._to_dev(qpos_h), self._to_dev(qvel_h)
@@ -398,10 +458,32 @@ class MjmlxG1Env(VecEnv):
             "lateral_vel_l2": base_lin[:, 1] ** 2,
         }
         w = self._w
-        wmap = dict(zip(TERM_NAMES, [w["termination"], w["track_lin"], w["track_ang"], w["lin_vel_z"], w["ang_vel_xy"], w["dof_torques"], w["dof_acc"],
-                                     w["action_rate"], w["feet_air_time"], w["feet_slide"], w["flat_orientation"], w["dof_pos_limits"],
-                                     w["joint_deviation_hip"], w["joint_deviation_arms"], w["joint_deviation_torso"], w.get("alive", 0.0),
-                                     w.get("yaw_rate", 0.0), w.get("heading_hold", 0.0), w.get("lateral_vel", 0.0)]))
+        wmap = dict(
+            zip(
+                TERM_NAMES,
+                [
+                    w["termination"],
+                    w["track_lin"],
+                    w["track_ang"],
+                    w["lin_vel_z"],
+                    w["ang_vel_xy"],
+                    w["dof_torques"],
+                    w["dof_acc"],
+                    w["action_rate"],
+                    w["feet_air_time"],
+                    w["feet_slide"],
+                    w["flat_orientation"],
+                    w["dof_pos_limits"],
+                    w["joint_deviation_hip"],
+                    w["joint_deviation_arms"],
+                    w["joint_deviation_torso"],
+                    w.get("alive", 0.0),
+                    w.get("yaw_rate", 0.0),
+                    w.get("heading_hold", 0.0),
+                    w.get("lateral_vel", 0.0),
+                ],
+            )
+        )
         terms = torch.stack([wmap[k] * raw[k] * CONTROL_DT for k in TERM_NAMES])
         rewards = torch.where(blew_up, torch.zeros_like(terms[0]), terms.sum(dim=0).clamp(-50.0, 50.0))  # 発散時のvalue爆発防止(Go2と同じ最終防衛線)
         self.last_reward_terms = dict(zip(TERM_NAMES, terms))
@@ -409,10 +491,21 @@ class MjmlxG1Env(VecEnv):
 
         dones = truncated | base_contact | blew_up
         f = lambda x: x.float().mean()
-        metrics = torch.stack(list(terms.mean(dim=1)) + [
-            lin_err.sqrt().mean(), ang_err.sqrt().mean(), cmd.norm(dim=1).mean(), qpos[:, 2].mean(), grav[:, :2].norm(dim=1).mean(), dev.mean(),
-            f(feet_contact), f(base_contact), f(blew_up), f(truncated),
-        ])
+        metrics = torch.stack(
+            list(terms.mean(dim=1))
+            + [
+                lin_err.sqrt().mean(),
+                ang_err.sqrt().mean(),
+                cmd.norm(dim=1).mean(),
+                qpos[:, 2].mean(),
+                grav[:, :2].norm(dim=1).mean(),
+                dev.mean(),
+                f(feet_contact),
+                f(base_contact),
+                f(blew_up),
+                f(truncated),
+            ]
+        )
 
         # コマンドの再サンプル(10s毎)とheading指令の更新、リセット
         due = np.nonzero(self._cmd_timer >= CMD_RESAMPLE_STEPS)[0]

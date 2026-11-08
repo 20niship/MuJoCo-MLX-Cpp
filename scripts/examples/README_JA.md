@@ -11,7 +11,7 @@ scripts/examples/
   halfcheetah/     train_ppo.py, mjmlx_halfcheetah_vec_env.py(stable-baselines3のサンプル)
 ```
 
-リポジトリのルートから実行する(例: `PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/go2/train_go2_ppo.py ...`)。各スクリプトは自分のディレクトリ・`scripts/examples/`・`scripts/`を`sys.path`に入れるので、`common`・`mjmlx_sensors`・`mjmlx_camera_cuda`のimportはどこから実行しても通る。先にPython拡張をビルドしておく([トップREADME](../../README_JA.md#ビルド))。`--build-dir`でそのビルド先を指す。
+リポジトリのルートから実行する(例: `PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/go2/train_go2_ppo.py ...`)。各スクリプトは自分のディレクトリ・`scripts/examples/`・`scripts/`を`sys.path`に入れるので、`common`・`mjmlx_sensors`・`mjmlx_camera_cuda`のimportはどこから実行しても通る。先にPythonパッケージをインストールしておく(`uv pip install -e .` または `just build-python`、[トップREADME](../../README_JA.md#ビルド))。スクリプトは`import vkmujoco`する。
 
 ここで参照する動画はGitHubに添付したもので、リポジトリには含めない。
 
@@ -28,14 +28,14 @@ scripts/examples/
 uv sync --group build --group go2
 
 # 平地 + Isaac Lab(UnitreeGo2FlatEnvCfg)準拠の報酬、PPO更新はCUDA
-PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build \
+PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/go2/train_go2_ppo.py \
   --flat --reward-preset isaac_flat --device cuda --envs 4096 --max-iterations 1500 --logdir runs/go2_flat
 
 # 階段地形(既定)。チェックポイントは--logdir配下に50 iterationごと
-uv run python scripts/examples/go2/train_go2_ppo.py --build-dir build --envs 2048 --logdir runs/go2_stairs
+uv run python scripts/examples/go2/train_go2_ppo.py --envs 2048 --logdir runs/go2_stairs
 
 # 学習済み方策で前後左右のcmd_velを与え、タイル動画(runs/video/)と追従誤差を出す
-uv run python scripts/examples/go2/play_go2_cmd_vel.py --logdir runs/go2_flat --build-dir build --reward-preset isaac_flat --speed 0.5
+uv run python scripts/examples/go2/play_go2_cmd_vel.py --logdir runs/go2_flat --reward-preset isaac_flat --speed 0.5
 
 tensorboard --logdir runs/
 ```
@@ -52,9 +52,9 @@ HalfCheetah-v4のPPOサンプル(stable-baselines3)は`scripts/examples/halfchee
 
 ```bash
 uv sync --group build --group go2 && just fetch-models        # menagerieのunitree_g1(29DoF)
-PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
-uv run python scripts/examples/g1/play_g1_cmd_vel.py --logdir runs/g1_flat --build-dir build           # 前進/前進1.0/横/旋回のタイル動画 -> runs/video/g1_cmd_vel.mp4
-uv run python scripts/examples/g1/compare_cpu_gpu_g1.py --build-dir build                              # MuJoCo Cとの1 step差
+PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/g1/train_g1_ppo.py --device cuda --envs 4096 --max-iterations 1500 --logdir runs/g1_flat
+uv run python scripts/examples/g1/play_g1_cmd_vel.py --logdir runs/g1_flat           # 前進/前進1.0/横/旋回のタイル動画 -> runs/video/g1_cmd_vel.mp4
+uv run python scripts/examples/g1/compare_cpu_gpu_g1.py                              # MuJoCo Cとの1 step差
 ```
 
 **再現元とその理由。** Isaac Lab v2.3.2の`Isaac-Velocity-Flat-G1-v0`を再現する: [`flat_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/flat_env_cfg.py)、[`rough_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/rough_env_cfg.py)(報酬を継承)、[`rsl_rl_ppo_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/g1/agents/rsl_rl_ppo_cfg.py)(`G1FlatPPORunnerCfg`)、[`velocity_env_cfg.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py)、[`mdp/rewards.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py)、[`isaaclab_assets/robots/unitree.py`](https://github.com/isaac-sim/IsaacLab/blob/v2.3.2/source/isaaclab_assets/isaaclab_assets/robots/unitree.py)の`G1_CFG`(アクチュエータ・初期姿勢)。理由: コードが実在し数値を全て読める、学習ライブラリ(rsl_rl PPO)がGo2環境と同じ、**平地(flat)cfgはheight scanner・質量/COMのランダム化・押しを使わない**(摩擦は0.8固定)ので本エンジンの制約(レイキャスト無し・1バッチ1モデル・地形カリキュラム無し)が影響しない、ローカルのIsaac Lab 2.3.2で同条件の学習曲線を比較できる。
@@ -93,11 +93,11 @@ G1の物理は現状このエンジンで**遅い**: 約4〜5K env-steps/s(nv=35
 上の全方向タスクは我々の学習では収束しなかったので、前進専用のタスクを追加した(全方向モードはそのまま): 指令は`vx`を[0.4, 0.8] m/sの範囲、`vy = wz = 0`、heading方式と静止envなし。
 
 ```bash
-PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
+PYTHONPATH=<cu126等のtorch> uv run python scripts/examples/g1/train_g1_ppo.py --forward-only --solver-iters 4 --envs 1024 --max-iterations 800 --device cuda --logdir runs/g1_forward_v1
 # 最終の報酬重み(下記)で追加学習(例: 400 iteration)。直進版v3は --fwd-weights yaw_rate=-0.5,heading_hold=-1,lateral_vel=-1 を付けてこれから再開
-uv run python scripts/examples/g1/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt --build-dir build   # 256 env x 20秒: 転倒・速度・yaw速度・向きの変化
-uv run python scripts/examples/g1/train_g1_ppo.py --build-dir build --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
-uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --build-dir build --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 のタイル、市松模様の床
+uv run python scripts/examples/g1/eval_g1_forward.py runs/g1_forward_v3/model_1746.pt   # 256 env x 20秒: 転倒・速度・yaw速度・向きの変化
+uv run python scripts/examples/g1/train_g1_ppo.py --forward-only --solver-iters 4 --envs 1024 --max-iterations 400 --device cuda --logdir runs/g1_forward --resume runs/g1_forward_v1/model_799.pt
+uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir runs/g1_forward --seconds 12   # vx 0.4 / 0.5 / 0.6 / 0.8 のタイル、市松模様の床
 ```
 
 **以前「約1.5秒で転倒」した原因(MuJoCo Cで切り分け。GPUエンジンは無関係):** Isaac Labの足首ゲイン(kp 20、kd 2)では、既定姿勢は零actionでも立てない。静的に釣り合う倒立振子には足首の剛性がm*g*h_com(約35kg x 9.81 x 0.69m = 240 Nm/rad)より大きいことが必要で、足首のauthorityも小さい(action scale 0.5 rad x kp 20 = 10 Nm)。MuJoCo Cで既定姿勢を5秒走らせて足首kpを走査: kp 100は倒れ、kp 150は倒れるか傾く(kdによる)、kp 200以上は立つ(傾き0.05〜0.08 rad)。そこで前進専用タスクは足首PDを**200 / 5**にする(全方向の既定はIsaacの20 / 2のまま)。これでGPUエンジンでも零actionで6秒以上立っていられる。MuJoCo Cでも同じように倒れるので、GPUエンジンが原因ではない。未検証: effort limit、接触サンプリング頻度、足の形状。最終方策は`scripts/examples/g1/eval_g1_forward.py`で評価した。
@@ -131,13 +131,13 @@ uv run python scripts/examples/g1/play_g1_cmd_vel.py --forward-only --logdir run
 質量・COM・摩擦・アクチュエータ出力をenvごとに変えられる(sim2real用のドメインランダマイズ)。`domain_rand`を有効にして作ったsimだけが、カーネルにenv別のバッファ読みを足す(無効=既定は従来と同じ速度・同じ結果)。
 
 ```python
-sim = native.create_batched(model, 4096, frame_skip=1, domain_rand=True)
-sim.set_env_params(                       # env_idx=Noneなら全env、配列なら指定envだけ更新。Noneの引数は変更しない
+sim = vkmujoco.create_batched(model, 4096, frame_skip=1, domain_rand=True)
+sim.set_env_params(  # env_idx=Noneなら全env、配列なら指定envだけ更新。Noneの引数は変更しない
     env_idx=np.array([0, 5], np.int32),
-    mass_scale=np.ones((2, model.nbody), np.float32),      # (n, nbody) bodyごとの質量と慣性の倍率
-    com_delta=np.zeros((2, model.nbody, 3), np.float32),   # (n, nbody, 3) body座標系のCOMずれ[m]
-    friction_scale=np.array([0.5, 1.2], np.float32),       # (n,) 全geomの摩擦の倍率
-    gain_scale=np.ones((2, model.nu), np.float32),         # (n, nu) アクチュエータ出力の倍率
+    mass_scale=np.ones((2, model.nbody), np.float32),  # (n, nbody) bodyごとの質量と慣性の倍率
+    com_delta=np.zeros((2, model.nbody, 3), np.float32),  # (n, nbody, 3) body座標系のCOMずれ[m]
+    friction_scale=np.array([0.5, 1.2], np.float32),  # (n,) 全geomの摩擦の倍率
+    gain_scale=np.ones((2, model.nu), np.float32),  # (n, nu) アクチュエータ出力の倍率
 )
 ```
 

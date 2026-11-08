@@ -50,8 +50,7 @@ class Imu:
     lin_acc_bは重力込みの固有加速度(MuJoCoのaccelerometer)。Isaac LabのImuと同じく速度の1step差分で求めるため、接触の衝撃では厳密値からずれる。
     """
 
-    def __init__(self, hub: SensorHub, gyro="gyro", accelerometer="accelerometer", quat="orientation", pos="global_position",
-                 lin_vel_w="global_linvel", velocimeter: str | None = None):
+    def __init__(self, hub: SensorHub, gyro="gyro", accelerometer="accelerometer", quat="orientation", pos="global_position", lin_vel_w="global_linvel", velocimeter: str | None = None):
         self._hub = hub
         self._names = dict(gyro=gyro, acc=accelerometer, quat=quat, pos=pos, lin_vel_w=lin_vel_w, velocimeter=velocimeter)
         self._gravity_w = torch.tensor([0.0, 0.0, -1.0], device=hub.device)
