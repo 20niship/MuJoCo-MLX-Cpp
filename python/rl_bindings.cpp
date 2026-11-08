@@ -101,7 +101,7 @@ struct RlBatchedSim {
     }
 
     // 自由関節ごとの二乗空気抵抗係数 k [N s^2/m^2] (F=-k|v|v)。drag_k は (n, num_free_joints)。create_batched(domain_rand=True) が必要
-    void set_free_drag(std::optional<IntArray> env_idx, FloatArray drag_k) {
+    void set_free_drag(FloatArray drag_k, std::optional<IntArray> env_idx) {
         int nf = mjmlx_batched_num_free_joints(handle);
         int n = env_idx ? static_cast<int>(env_idx->shape(0)) : num_envs;
         if (drag_k.ndim() != 2 || static_cast<int>(drag_k.shape(0)) != n || static_cast<int>(drag_k.shape(1)) != nf)
@@ -224,7 +224,7 @@ NB_MODULE(vkmujoco, m) {
         .def("set_state", &RlBatchedSim::set_state, nb::arg("qpos"), nb::arg("qvel"))
         .def("set_env_params", &RlBatchedSim::set_env_params, nb::arg("env_idx") = nb::none(), nb::arg("mass_scale") = nb::none(),
              nb::arg("com_delta") = nb::none(), nb::arg("friction_scale") = nb::none(), nb::arg("gain_scale") = nb::none())
-        .def("set_free_drag", &RlBatchedSim::set_free_drag, nb::arg("env_idx") = nb::none(), nb::arg("drag_k"))
+        .def("set_free_drag", &RlBatchedSim::set_free_drag, nb::arg("drag_k"), nb::arg("env_idx") = nb::none())
         .def_prop_ro("num_free_joints", [](RlBatchedSim& s) { return s.num_free_joints(); })
         .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
