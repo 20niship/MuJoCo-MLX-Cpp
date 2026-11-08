@@ -117,18 +117,6 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   <p class="note">Fast mode = <code>self_collision=False, max_condim=3</code> (the setting Isaac Lab / Genesis use). Default stays exact. Isaac Lab / Genesis figures are earlier measurements, not re-run on the same session; Genesis measures bare <code>scene.step()</code>, ours include observation and reward. See the <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#detailed-performance-log">full log</a> for conditions.</p>
 
   <figure><img src="https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8" alt="Go2 env.step throughput vs Isaac Lab / Genesis" loading="lazy"><figcaption>Go2 env.step throughput vs Isaac Lab / Genesis</figcaption></figure>
-  <h3>How we got here</h3>
-  <div class="bars" style="--m:420000">
-    <h4>Go2 4096 envs, env-steps/s by milestone</h4><small>Each step measured by building that commit</small>
-    <div class="row"><span>PR #33 start</span><div><i style="--v:7200"><b>7.2K</b></i></div></div>
-    <div class="row"><span>Shared-mem solver</span><div><i style="--v:32000"><b>32K</b></i></div></div>
-    <div class="row"><span>VRAM residency</span><div><i style="--v:100000"><b>~100K</b></i></div></div>
-    <div class="row"><span>Cholesky + early exit</span><div><i style="--v:150000"><b>150K</b></i></div></div>
-    <div class="row"><span>Host overhead cut</span><div><i style="--v:192000"><b>192K</b></i></div></div>
-    <div class="row us"><span>Torch obs/reward + compile</span><div><i style="--v:409000"><b>409K</b></i></div></div>
-  </div>
-  <figure><img src="https://github.com/user-attachments/assets/e5522b76-834a-4d85-85ac-344f9079f0be" alt="Go2 4096 envs optimization history" loading="lazy"><figcaption>Go2 4096 envs optimization history</figcaption></figure>
-  <p class="note">Milestones are from different sessions and GPU clock states, so adjacent bars are indicative, not a strict series.</p>
 </section>
 
 <section id="train">
