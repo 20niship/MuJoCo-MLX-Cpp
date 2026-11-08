@@ -43,7 +43,7 @@ Legend: **Yes** supported and tested against MuJoCo C. **Partial** see note. **N
 | DOF friction loss | Yes | |
 | Fixed tendons (length, Jacobian, spring/damper, limits, friction loss) | Yes | |
 | Spatial tendons (sites, pulleys, sphere/cylinder wrap, sidesites) | Yes | `gpu_vs_cpu_tendon_sphere/_pulley` |
-| Equality constraints (connect/weld/joint/tendon) | No | |
+| Equality constraints (connect/weld/joint/tendon) | Partial | joint / tendon (polycoef) run in the GPU solver (`gpu_vs_cpu_equality_joint/_tendon`, piper/openarm gripper mimic). connect/weld exist only in the vmap path and are ignored by the GPU solver (`known_issue_equality_connect/_weld`, known_issue). `active="false"` is honoured at load time; runtime toggling is not supported |
 | Newton solver with exact line search | Yes | direction by shared-memory Cholesky |
 | CG solver | Partial | `MJMLX_SOLVER_CG=1` uses CG for the Newton direction; no separate PGS/CG solver types |
 | noslip, islands, sleep | No | |

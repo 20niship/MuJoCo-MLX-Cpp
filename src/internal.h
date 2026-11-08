@@ -258,6 +258,7 @@ struct Model {
     mx::array pair_solimp = mx::array({});
 
     // Equality constraint properties
+    std::vector<int> eq_active0;  // MJCF <equality active=...>の初期値(neq個)。実行中の切替は未対応
     mx::array eq_type = mx::array({});
     mx::array eq_obj1id = mx::array({});
     mx::array eq_obj2id = mx::array({});

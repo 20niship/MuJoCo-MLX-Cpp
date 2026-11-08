@@ -484,6 +484,7 @@ static Model convert_model(mjModel* m) {
         model.eq_data = to_mx_f2(m->eq_data, (int)m->neq, 11);
         model.eq_solref = to_mx_f2(m->eq_solref, (int)m->neq, 2);
         model.eq_solimp = to_mx_f2(m->eq_solimp, (int)m->neq, 5);
+        model.eq_active0.assign(m->eq_active0, m->eq_active0 + m->neq);
     }
 
     // Exclude body pairs
@@ -1701,6 +1702,7 @@ void Model::init_cache() const {
         auto biw = body_invweight0.data<float>();
 
         for (int i = 0; i < neq; i++) {
+            if (!eq_active0.empty() && !eq_active0[i]) continue;  // active="false"の等式は初期状態で無効
             ModelCache::EqualityCache ec;
             ec.type = et[i];
             ec.id1 = eo1[i];

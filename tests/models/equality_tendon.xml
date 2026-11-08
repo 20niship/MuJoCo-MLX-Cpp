@@ -1,0 +1,23 @@
+<mujoco model="equality tendon">
+  <option timestep="0.002" gravity="0 0 0" solver="Newton" iterations="50" tolerance="1e-10"/>
+  <worldbody>
+    <body name="a" pos="0 0 0">
+      <joint name="ja" type="hinge" axis="0 0 1" damping="0.1"/>
+      <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.02" mass="0.3"/>
+    </body>
+    <body name="b" pos="0 0.5 0">
+      <joint name="jb" type="hinge" axis="0 0 1" damping="0.1"/>
+      <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.02" mass="0.3"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <fixed name="ta"><joint joint="ja" coef="1"/></fixed>
+    <fixed name="tb"><joint joint="jb" coef="2"/></fixed>
+  </tendon>
+  <equality>
+    <tendon tendon1="tb" tendon2="ta" polycoef="0 1 0 0 0" solref="0.01 1"/>
+  </equality>
+  <actuator>
+    <motor joint="ja" gear="1"/>
+  </actuator>
+</mujoco>

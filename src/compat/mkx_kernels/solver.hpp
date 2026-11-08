@@ -36,13 +36,13 @@ inline int solver_max_efc_for(int nv) { return solver_use_shared(nv) ? std::min(
 inline int solver_h_floats(int nv) { return std::max(nv * nv, 3 * nv); }
 inline int solver_scratch_floats(int nv, int max_efc) { return solver_h_floats(nv) + max_efc * nv + 7 * max_efc + 5 * nv + 3 * nv * nv; }
 
-inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, int ntlim = 0, int ntfl = 0, bool export_qacc = false, bool rand = false) {
+inline mkx::fast::Kernel<> make_solver_kernel(int nb, int nv, int nq, float timestep, bool use_pyramidal, bool refsafe, float impratio, int solver_iters, int cg_iters, int nlim, int nfl, int ntlim = 0, int ntfl = 0, int neq = 0, int nteq = 0, bool export_qacc = false, bool rand = false) {
   using namespace detail_solver;
   const float cg_tol = getenv("MJMLX_CGTOL") ? (float)atof(getenv("MJMLX_CGTOL")) : 1e-6f;
   const float gtol_rel = getenv("MJMLX_GTOL") ? (float)atof(getenv("MJMLX_GTOL")) : 1e-10f;  // Newton反復の打ち切り閾値(勾配ノルム2乗の初期値比)。0で無効
   const float newton_tol = getenv("MJMLX_NTOL") ? (float)atof(getenv("MJMLX_NTOL")) : 1e-4f;  // Newton減少量(g.s)がtrace(M)のこの倍未満なら収束とみなす(CPUとの差は1e-4でも変わらない)。0で無効
   // tendonの拘束行があるモデルは、スレッドごとに判定する早期打ち切り(Newtonのbreakと同じ理由)を出さない。CIのlavapipeで一部のスレッドだけ抜けてbarrierがずれ、qvelが発散した。
-  const float ls_tol = (ntlim + ntfl > 0) ? 0.0f : (getenv("MJMLX_LSTOL") ? (float)atof(getenv("MJMLX_LSTOL")) : 1e-3f);  // 直線探索の二分法を、導関数が初期勾配のこの割合未満で打ち切る。0で無効
+  const float ls_tol = (ntlim + ntfl + nteq > 0) ? 0.0f : (getenv("MJMLX_LSTOL") ? (float)atof(getenv("MJMLX_LSTOL")) : 1e-3f);  // 直線探索の二分法を、導関数が初期勾配のこの割合未満で打ち切る。0で無効
   const int max_efc              = solver_max_efc_for(nv);
   const bool use_shared          = solver_use_shared(nv);
   const int contact_stride       = 8;
@@ -76,6 +76,7 @@ vec3 msl_norm(vec3 a) {
 }
 // 拘束1行のコスト。frictionloss行(fl>0)は二次域(|D*x|<fl)と線形域(飽和)の折れ線、それ以外は片側(x<0のみ)の二次。
 float efc_cost(float D, float x, float fl) {
+    if (fl < 0.0f) return 0.5f * D * x * x;  // 等式拘束行(fl<0)は常に有効な両側二次
     if (fl > 0.0f) {
         if (abs(D * x) < fl) return 0.5f * D * x * x;
         return fl * abs(x) - 0.5f * fl * fl / D;
@@ -165,7 +166,7 @@ shared float tg_pAp;
      << "const float MJMINIMP = 0.0001f;\n"
      << "const float MJMAXIMP = 0.9999f;\n\n";
   // tendonのlimit/frictionの行はforwardが出力したtendon値(ten_in: SoA、1tendonあたり[length, velocity, J(NV)])から作る。
-  if(ntlim + ntfl > 0) ss << "const int TEN_ROW = " << nv + 2 << ";\nconst int NTLIM = " << ntlim << ";\nconst int NTFL = " << ntfl << ";\n"
+  if(ntlim + ntfl + nteq > 0) ss << "const int TEN_ROW = " << nv + 2 << ";\nconst int NTLIM = " << ntlim << ";\nconst int NTFL = " << ntfl << ";\n"
                           << "#define TEN(i) ten_in[uint(i)*NBATCH+bid]\n\n";
 
   ss << "uint s_off = bid * " << SCRATCH_PER_ENV << ";\n";
@@ -228,7 +229,7 @@ shared float tg_pAp;
      << "for (; q_ + 3 < nefc; q_ += 4) { a0_ += J(q_,int(tid))*efc_force(q_); a1_ += J(q_+1,int(tid))*efc_force(q_+1); a2_ += J(q_+2,int(tid))*efc_force(q_+2); a3_ += J(q_+3,int(tid))*efc_force(q_+3); } "
      << "for (; q_ < nefc; q_++) a0_ += J(q_,int(tid))*efc_force(q_); S = (a0_ + a1_) + (a2_ + a3_); }\n";
   ss << "#define EFC_REFRESH(r) { float fl_ = efc_floss(r); float jr_ = Jaref(r); "
-     << "if (fl_ > 0.0f) { float fd_ = efc_D(r) * jr_; if (abs(fd_) < fl_) { act(r) = 1.0f; efc_force(r) = -fd_; } else { act(r) = 0.0f; efc_force(r) = (jr_ > 0.0f) ? -fl_ : fl_; } } "
+     << "if (fl_ < 0.0f) { act(r) = 1.0f; efc_force(r) = efc_D(r) * (-jr_); } else if (fl_ > 0.0f) { float fd_ = efc_D(r) * jr_; if (abs(fd_) < fl_) { act(r) = 1.0f; efc_force(r) = -fd_; } else { act(r) = 0.0f; efc_force(r) = (jr_ > 0.0f) ? -fl_ : fl_; } } "
      << "else { act(r) = (jr_ < 0.0f) ? 1.0f : 0.0f; efc_force(r) = efc_D(r) * (-jr_) * act(r); } }\n";
 
   ss << "#define cg_r(i)   H(i)\n"
@@ -255,7 +256,47 @@ shared float tg_pAp;
   }
 
   ss << "SABL0\n";
-  const int nfl_eff = std::min(nfl, max_efc - 4);
+  // 等式拘束(joint型)の行は最優先で先頭に並べる(efc_floss=-1が「常に有効な等式」の印)。行ごとに独立なので全スレッドで並列に作る。
+  const int neq_eff = std::min(neq, max_efc - 4);
+  ss << "const int NEQ_ROWS = " << neq_eff << ";\n";
+  if(neq_eff > 0) {
+    ss << "const int NEQ_EFF = " << neq_eff << ";\n";
+    // tendon型の等式はforwardが出したtendon値(ten_in)を使う。ten_inを持たない構成(nteq==0)ではマクロを空にする。
+    if(nteq > 0) ss << "#define TENLEN_(t) TEN((t)*TEN_ROW)\n#define TENVEL_(t) TEN((t)*TEN_ROW+1)\n#define TENJ_(t,d) TEN((t)*TEN_ROW+2+(d))\n";
+    else ss << "#define TENLEN_(t) 0.0f\n#define TENVEL_(t) 0.0f\n#define TENJ_(t,d) 0.0f\n";
+    ss << R"GLSL(
+for (int ei = int(tid); ei < NEQ_EFF; ei += NV) {
+    int ep = ei * 20;
+    int d1 = int(eq_tab[ep+0]);
+    int d2 = int(eq_tab[ep+1]);
+    bool is_ten = eq_tab[ep+19] > 0.5f;
+    float poly = eq_tab[ep+6];
+    float dpoly = 0.0f;
+    if (d2 >= 0) {
+        float x = (is_ten ? TENLEN_(d2) : qpos_in[qp_off + int(eq_tab[ep+3])]) - eq_tab[ep+5];
+        poly = eq_tab[ep+6] + x*(eq_tab[ep+7] + x*(eq_tab[ep+8] + x*(eq_tab[ep+9] + x*eq_tab[ep+10])));
+        dpoly = eq_tab[ep+7] + x*(2.0f*eq_tab[ep+8] + x*(3.0f*eq_tab[ep+9] + x*4.0f*eq_tab[ep+10]));
+    }
+    float pos = (is_ten ? TENLEN_(d1) : qpos_in[qp_off + int(eq_tab[ep+2])]) - eq_tab[ep+4] - poly;
+    float vel = is_ten ? (TENVEL_(d1) - ((d2 >= 0) ? dpoly * TENVEL_(d2) : 0.0f))
+                       : (qvel_in[qv_off + d1] - ((d2 >= 0) ? dpoly * qvel_in[qv_off + d2] : 0.0f));
+    float k_e, b_e, imp_e;
+    efc_kbi(eq_tab[ep+11], eq_tab[ep+12], eq_tab[ep+13], eq_tab[ep+14], eq_tab[ep+15], eq_tab[ep+16], eq_tab[ep+17], pos, k_e, b_e, imp_e);
+    float r_e = max(eq_tab[ep+18] * (1.0f - imp_e) / imp_e, MJMINVAL_CV);
+    for (int di = 0; di < NV; di++) {
+        float jv_ = 0.0f;
+        if (is_ten) { jv_ = TENJ_(d1, di) - ((d2 >= 0) ? dpoly * TENJ_(d2, di) : 0.0f); }
+        else { jv_ = (di == d1 ? 1.0f : 0.0f) - ((d2 >= 0 && di == d2) ? dpoly : 0.0f); }
+        J(ei, di) = jv_;
+    }
+    efc_D(ei) = 1.0f / r_e;
+    efc_aref(ei) = -b_e * vel - k_e * imp_e * pos;
+    efc_floss(ei) = -1.0f;
+}
+barrier();
+)GLSL";
+  }
+  const int nfl_eff = std::min(nfl, max_efc - 4 - neq_eff);
   if(nfl_eff > 0) {
     // frictionloss行は常に先頭に並び、行ごとに独立なので全スレッドで並列に作る。
     ss << "const int NFL_EFF = " << nfl_eff << ";\n";
@@ -267,19 +308,20 @@ for (int fi = int(tid); fi < NFL_EFF; fi += NV) {
     float k_f, b_f, imp_f;
     efc_kbi(fric_tab[fp+2], fric_tab[fp+3], fric_tab[fp+4], fric_tab[fp+5], fric_tab[fp+6], fric_tab[fp+7], fric_tab[fp+8], 0.0f, k_f, b_f, imp_f);
     float r_f = max(fric_tab[fp+9] * (1.0f - imp_f) / imp_f, MJMINVAL_CV);
-    for (int di = 0; di < NV; di++) J(fi, di) = 0.0f;
-    J(fi, dof) = 1.0f;
-    efc_D(fi) = 1.0f / r_f;
-    efc_aref(fi) = -b_f * qvel_in[qv_off + dof];
-    efc_floss(fi) = fl;
+    int row = NEQ_ROWS + fi;
+    for (int di = 0; di < NV; di++) J(row, di) = 0.0f;
+    J(row, dof) = 1.0f;
+    efc_D(row) = 1.0f / r_f;
+    efc_aref(row) = -b_f * qvel_in[qv_off + dof];
+    efc_floss(row) = fl;
 }
 barrier();
 )GLSL";
   }
-  const int ntfl_eff = std::max(0, std::min(ntfl, max_efc - 4 - nfl_eff));
+  const int ntfl_eff = std::max(0, std::min(ntfl, max_efc - 4 - neq_eff - nfl_eff));
   if(ntfl_eff > 0) {
     // tendonのfrictionloss行はDOF摩擦行の後ろに並べる。
-    ss << "const int NTFL_EFF = " << ntfl_eff << ";\nconst int FRIC_ROW0 = " << nfl_eff << ";\n";
+    ss << "const int NTFL_EFF = " << ntfl_eff << ";\nconst int FRIC_ROW0 = " << neq_eff + nfl_eff << ";\n";
     ss << R"GLSL(
 for (int fi = int(tid); fi < NTFL_EFF; fi += NV) {
     int fp = fi * 10;
@@ -299,7 +341,7 @@ barrier();
   }
   ss << "if (tid == 0u) {\n"
      << "int ncon = int(contact_count_in[bid]);\n"
-     << "int nefc = " << nfl_eff + ntfl_eff << ";\n\n";
+     << "int nefc = " << neq_eff + nfl_eff + ntfl_eff << ";\n\n";
 
   if(nlim > 0) {
     ss << R"GLSL(
@@ -638,7 +680,7 @@ LS_BEGIN
                     float x = Jaref(r2) + mid*Jv_arr(r2);
                     float fl = efc_floss(r2); float Dd = efc_D(r2);
                     float dc = 0.0f;
-                    if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
+                    if (fl < 0.0f) { dc = Dd*x; } else if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
                     else if (x < 0.0f) { dc = Dd*x; }
                     dd += dc*Jv_arr(r2);
                 }
@@ -769,7 +811,7 @@ if (tid == 0u) {
             float x = Jaref(r2) + mid*Jv_arr(r2);
             float fl = efc_floss(r2); float Dd = efc_D(r2);
             float dc = 0.0f;
-            if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
+            if (fl < 0.0f) { dc = Dd*x; } else if (fl > 0.0f) { dc = (abs(Dd*x) < fl) ? Dd*x : ((x > 0.0f) ? fl : -fl); }
             else if (x < 0.0f) { dc = Dd*x; }
             dd_p += dc*Jv_arr(r2);
         }
@@ -816,7 +858,7 @@ if (tid == 0u) {
     // tendonの拘束行があるモデルは早期打ち切り(break)を出さない。早期打ち切りがワークグループの一部のスレッドだけ抜けるとlavapipeで発散する(原因未特定、全反復を回せば厳密解と一致する)。tendonが無いモデルのGLSLは従来どおり。
     {
       const std::string tgb = "TG_BREAK";
-      const std::string rep_with = (ntlim + ntfl > 0) ? std::string() : "if (tg_done != 0) break;";
+      const std::string rep_with = (ntlim + ntfl + nteq > 0) ? std::string() : "if (tg_done != 0) break;";
       for(size_t q = body.find(tgb); q != std::string::npos; q = body.find(tgb, q)) body.replace(q, tgb.size(), rep_with);
     }
     // 早期returnで依存が切れると前段がコンパイラに消されるので、各点の状態を出力に書いてから終了する。
@@ -853,8 +895,8 @@ if (tid == 0u) {
     }
     ss.str(body);
   }
-  std::vector<std::string> in_names = {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab"};
-  if(ntlim + ntfl > 0) { in_names.push_back("ten_in"); in_names.push_back("tlim_tab"); in_names.push_back("tfric_tab"); }
+  std::vector<std::string> in_names = {"qM_in", "qfrc_smooth_in", "cdof_in", "subtree_com_in", "qvel_in", "contact_data_in", "contact_count_in", "pair_props", "body_dof_masks_buf", "body_rootid_buf", "qpos_in", "lim_tab", "fric_tab", "eq_tab"};
+  if(ntlim + ntfl + nteq > 0) { in_names.push_back("ten_in"); in_names.push_back("tlim_tab"); in_names.push_back("tfric_tab"); }
   if(rand) in_names.push_back("fric_scale");
   return mkx::fast::compute_kernel("mjmlx_solver", in_names, {"qfrc_constraint_out", "solver_scratch", "contact_fn_out", "qacc_out"}, ss.str(), header);
 }
