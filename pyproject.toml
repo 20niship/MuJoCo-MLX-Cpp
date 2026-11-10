@@ -44,6 +44,11 @@ go2 = [
     "tensordict>=0.7.0",
     "gitpython",
 ]
+# scripts/examples/pingpong(SO-101 keep-up): go2の依存 + 動画書き出し
+pingpong = [
+    { include-group = "go2" },
+    "opencv-python-headless",
+]
 lint = [
     "ruff",
     "mypy",

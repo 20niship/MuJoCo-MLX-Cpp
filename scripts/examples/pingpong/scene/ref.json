@@ -1,0 +1,29 @@
+{
+  "gravity": 9.81,
+  "nominal_face": [
+    0.3,
+    0.0,
+    0.18
+  ],
+  "footprint_step": 0.03,
+  "ball_radius": 0.02,
+  "ball_drag_k": 0.0003555528901626784,
+  "ball_drag_coefficient": 0.47,
+  "blade_radius": 0.055,
+  "face_site": "paddle_face",
+  "face0_z": 0.18000012554833714,
+  "steps_per_command": 67,
+  "timestep": 0.0005,
+  "ball_qpos_adr": 5,
+  "ball_dof_adr": 5,
+  "ball_body": 8,
+  "ref_ball_mass": 0.0027,
+  "nbody": 9,
+  "nu": 5,
+  "table": {
+    "arm_inset": 0.15,
+    "length": 1.257,
+    "width": 0.8
+  },
+  "side_camera": "cam_side"
+}
