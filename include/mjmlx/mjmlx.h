@@ -241,6 +241,12 @@ MJMLX_API int mjmlx_batched_num_free_joints(const MjmlxBatchedSim* sim);
 MJMLX_API int mjmlx_batched_set_pack_spec(MjmlxBatchedSim* sim, const int* body_ids, int nbody_sel, int dof_lo, int ndof);
 MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out);
 
+// レイキャスト(mj_ray相当)。全env x nray本を1回のGPU dispatchで解く(GPU batchedのみ、stepの直後の姿勢に対する結果)。
+// pnt/vec: [B*nray*3](vecは単位ベクトル。distはvec長単位)。dist_out: [B*nray](当たらなければ-1)、geomid_out: [B*nray](当たらなければ-1)。
+// bodyexclude: このbodyのgeomは無視(無効は-1)。geomgroup: 6要素のフラグ(NULLで全group)。flg_static=0で静的body(world固定)のgeomを無視。
+// 対応形状: plane / sphere / capsule / ellipsoid / cylinder / box。mesh / hfield / sdf は当たらない。成功0、失敗-1。
+MJMLX_API int mjmlx_batched_raycast(MjmlxBatchedSim* sim, const float* pnt, const float* vec, int nray, int bodyexclude, const unsigned char* geomgroup, int flg_static, float* dist_out, int* geomid_out);
+
 // Evaluate qpos + qvel in a single GPU fence. Call before get_qpos/get_qvel to
 // avoid two sequential GPU syncs.
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim);

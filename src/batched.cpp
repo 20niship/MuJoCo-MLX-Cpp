@@ -1726,6 +1726,172 @@ MJMLX_API int mjmlx_batched_get_pack(MjmlxBatchedSim* sim, float* out) {
     return 0;
 }
 
+// ── レイキャスト(mj_ray相当): 全env x 全rayを1回のGPU dispatchで解く ──
+// 対応形状は plane / sphere / capsule / ellipsoid / cylinder / box。mesh / hfield / sdf は当たらない(ray対象外)。
+// 1スレッド=1(env,ray)。geomの姿勢はcamera.cppと同じく運動学カーネル(kinematics)をqposから再実行して得るので、stepの直後に呼べば最新の姿勢に対する結果になる。
+namespace {
+struct RaySpec {
+    std::optional<mkx::fast::Kernel<>> kernel;
+    int ng = 0;
+};
+
+const char* kRayGlsl = R"GLSL(
+float ray_quad(float a, float b, float c) {
+    float det = b * b - a * c;
+    if (det < 1e-12 || abs(a) < 1e-12) return -1.0;
+    det = sqrt(det);
+    float x0 = (-b - det) / a, x1 = (-b + det) / a;
+    if (x0 >= 0.0) return x0;
+    if (x1 >= 0.0) return x1;
+    return -1.0;
+}
+float ray_min(float best, float t) { return (t >= 0.0 && (best < 0.0 || t < best)) ? t : best; }
+float ray_geom(int type, vec3 sz, vec3 p, vec3 v) {
+    float best = -1.0;
+    if (type == 0) {  // plane: 表(+z)側から来るrayだけ。size>0なら有限の矩形
+        if (v.z > -1e-9) return -1.0;
+        float t = -p.z / v.z;
+        if (t < 0.0) return -1.0;
+        vec2 h = p.xy + t * v.xy;
+        if ((sz.x > 0.0 && abs(h.x) > sz.x) || (sz.y > 0.0 && abs(h.y) > sz.y)) return -1.0;
+        return t;
+    } else if (type == 2) {  // sphere
+        return ray_quad(dot(v, v), dot(p, v), dot(p, p) - sz.x * sz.x);
+    } else if (type == 4) {  // ellipsoid
+        vec3 ps = p / sz, vs = v / sz;
+        return ray_quad(dot(vs, vs), dot(ps, vs), dot(ps, ps) - 1.0);
+    } else if (type == 5 || type == 3) {  // cylinder / capsule: 軸はz、sz.x=半径、sz.y=半長
+        float r = sz.x, h = sz.y;
+        float a = dot(v.xy, v.xy), b = dot(p.xy, v.xy), c = dot(p.xy, p.xy) - r * r;
+        float det = b * b - a * c;
+        if (a > 1e-12 && det >= 0.0) {
+            float sd = sqrt(det);
+            float t0 = (-b - sd) / a, t1 = (-b + sd) / a;
+            if (abs(p.z + t0 * v.z) <= h) best = ray_min(best, t0);
+            if (abs(p.z + t1 * v.z) <= h) best = ray_min(best, t1);
+        }
+        if (type == 5) {  // 両端の円盤
+            if (abs(v.z) > 1e-12) {
+                for (int s = -1; s <= 1; s += 2) {
+                    float t = (float(s) * h - p.z) / v.z;
+                    vec2 q = p.xy + t * v.xy;
+                    if (t >= 0.0 && dot(q, q) <= r * r) best = ray_min(best, t);
+                }
+            }
+        } else {  // 両端の半球
+            for (int s = -1; s <= 1; s += 2) {
+                vec3 pc = p - vec3(0.0, 0.0, float(s) * h);
+                float a2 = dot(v, v), b2 = dot(pc, v), c2 = dot(pc, pc) - r * r;
+                float d2 = b2 * b2 - a2 * c2;
+                if (d2 >= 0.0) {
+                    float sd = sqrt(d2);
+                    float u0 = (-b2 - sd) / a2, u1 = (-b2 + sd) / a2;
+                    if (float(s) * (p.z + u0 * v.z - float(s) * h) >= 0.0) best = ray_min(best, u0);
+                    if (float(s) * (p.z + u1 * v.z - float(s) * h) >= 0.0) best = ray_min(best, u1);
+                }
+            }
+        }
+        return best;
+    } else if (type == 6) {  // box: slab法。内側から出すと出口の面を返す
+        float tn = -1e30, tf = 1e30;
+        for (int i = 0; i < 3; i++) {
+            if (abs(v[i]) < 1e-12) {
+                if (abs(p[i]) > sz[i]) return -1.0;
+            } else {
+                float t0 = (-sz[i] - p[i]) / v[i], t1 = (sz[i] - p[i]) / v[i];
+                tn = max(tn, min(t0, t1));
+                tf = min(tf, max(t0, t1));
+            }
+        }
+        if (tn > tf || tf < 0.0) return -1.0;
+        return tn >= 0.0 ? tn : tf;
+    }
+    return -1.0;
+}
+)GLSL";
+
+RaySpec& ray_spec(MjmlxBatchedSim* sim) {
+    if (!sim->ray) {
+        auto spec = std::make_shared<RaySpec>();
+        spec->ng = sim->sim.model->ngeom;
+        std::ostringstream ss;
+        ss << "uint gid = gl_GlobalInvocationID.x;\n"
+           << "uint NB = uint(" << sim->sim.num_envs << ");\n"
+           << "uint NR = uint(rays_in[0]);\n"                // ray数(meta)。rays_in[1..]がray本体
+           << "if (gid >= NB * NR) return;\n"
+           << "uint e = gid % NB, r = gid / NB;\n"           // env方向を連続にして、geomの姿勢(SoA)の読みをコアレスさせる
+           << "uint ro = 1u + (e * NR + r) * 6u;\n"
+           << "vec3 po = vec3(rays_in[ro], rays_in[ro+1u], rays_in[ro+2u]);\n"
+           << "vec3 pv = vec3(rays_in[ro+3u], rays_in[ro+4u], rays_in[ro+5u]);\n"
+           << "float best = -1.0; float bestg = -1.0;\n"
+           << "for (uint g = 0u; g < " << spec->ng << "u; g++) {\n"
+           << "  uint gi = g * 8u;\n"
+           << "  if (ginfo_in[gi + 7u] < 0.5) continue;\n"   // 除外(bodyexclude/geomgroup/static)
+           << "  vec3 gp = vec3(gxp_in[(g*3u+0u)*NB+e], gxp_in[(g*3u+1u)*NB+e], gxp_in[(g*3u+2u)*NB+e]);\n"
+           << "  float m[9];\n"
+           << "  for (uint k = 0u; k < 9u; k++) m[k] = gxm_in[(g*9u+k)*NB+e];\n"
+           << "  vec3 d = po - gp;\n"
+           << "  vec3 lp = vec3(m[0]*d.x+m[3]*d.y+m[6]*d.z, m[1]*d.x+m[4]*d.y+m[7]*d.z, m[2]*d.x+m[5]*d.y+m[8]*d.z);\n"  // R^T
+           << "  vec3 lv = vec3(m[0]*pv.x+m[3]*pv.y+m[6]*pv.z, m[1]*pv.x+m[4]*pv.y+m[7]*pv.z, m[2]*pv.x+m[5]*pv.y+m[8]*pv.z);\n"
+           << "  float t = ray_geom(int(round(ginfo_in[gi])), vec3(ginfo_in[gi+1u], ginfo_in[gi+2u], ginfo_in[gi+3u]), lp, lv);\n"
+           << "  if (t >= 0.0 && (best < 0.0 || t < best)) { best = t; bestg = float(g); }\n"
+           << "}\n"
+           << "uint oi = (e * NR + r) * 2u;\n"
+           << "res_out[oi] = best; res_out[oi + 1u] = bestg;\n";
+        spec->kernel = mkx::fast::compute_kernel("mjmlx_raycast", {"gxp_in", "gxm_in", "ginfo_in", "rays_in"}, {"res_out"}, ss.str(), kRayGlsl);
+        sim->ray = spec;
+    }
+    return *static_cast<RaySpec*>(sim->ray.get());
+}
+}  // namespace
+
+MJMLX_API int mjmlx_batched_raycast(MjmlxBatchedSim* sim, const float* pnt, const float* vec, int nray, int bodyexclude, const unsigned char* geomgroup, int flg_static, float* dist_out, int* geomid_out) {
+    if (!sim || sim->cpu_mode || !sim->sim.kinematics || !sim->mj_model || !pnt || !vec || !dist_out || !geomid_out || nray <= 0) return -1;
+    auto& s = sim->sim;
+    const int B = s.num_envs;
+    const size_t total = static_cast<size_t>(B) * nray;
+    const mjModel* m = sim->mj_model;
+    if (m->ngeom == 0) {
+        std::fill(dist_out, dist_out + total, -1.0f);
+        std::fill(geomid_out, geomid_out + total, -1);
+        return 0;
+    }
+    auto& spec = ray_spec(sim);
+    std::vector<float> ginfo(static_cast<size_t>(m->ngeom) * 8, 0.0f);
+    for (int g = 0; g < m->ngeom; g++) {
+        float* gi = &ginfo[static_cast<size_t>(g) * 8];
+        gi[0] = static_cast<float>(m->geom_type[g]);
+        for (int k = 0; k < 3; k++) gi[1 + k] = static_cast<float>(m->geom_size[3 * g + k]);
+        const int body = m->geom_bodyid[g];
+        const int group = m->geom_group[g];
+        const bool group_ok = !geomgroup || (group >= 0 && group < 6 && geomgroup[group]);
+        const bool static_ok = flg_static || m->body_weldid[body] != 0;
+        const int type = m->geom_type[g];
+        const bool supported = type == mjGEOM_PLANE || type == mjGEOM_SPHERE || type == mjGEOM_CAPSULE || type == mjGEOM_ELLIPSOID || type == mjGEOM_CYLINDER || type == mjGEOM_BOX;
+        gi[7] = (body != bodyexclude && group_ok && static_ok && supported) ? 1.0f : 0.0f;
+    }
+    std::vector<float> rays(1 + total * 6);
+    rays[0] = static_cast<float>(nray);
+    for (size_t i = 0; i < total; i++) {
+        for (int k = 0; k < 3; k++) { rays[1 + i * 6 + k] = pnt[i * 3 + k]; rays[1 + i * 6 + 3 + k] = vec[i * 3 + k]; }
+    }
+    auto kin = s.kinematics(s.qpos);
+    auto raw = (*spec.kernel)(
+        mx::fast::kernel_inputs({kin[7], kin[8], mx::array(ginfo.data(), {(int)ginfo.size()}, mx::float32), mx::array(rays.data(), {(int)rays.size()}, mx::float32)}),
+        mx::fast::kernel_shapes({{static_cast<int>(total * 2)}}),
+        std::array<uint32_t, 3>{static_cast<uint32_t>(total), 1, 1}, std::array<uint32_t, 3>{64u, 1, 1});
+    auto res = mx::fast::kernel_outputs(raw)[0];
+    auto proxy = mx::to_raw(res);
+    mkx::eval<mx::Backend>(proxy);
+    std::vector<float> out(total * 2);
+    mx::Backend::download(mx::Backend::get_or_allocate(res.node().get(), out.size() * sizeof(float)), out.data(), out.size() * sizeof(float));
+    for (size_t i = 0; i < total; i++) {
+        dist_out[i] = out[i * 2];
+        geomid_out[i] = static_cast<int>(std::lround(out[i * 2 + 1]));
+    }
+    return 0;
+}
+
 MJMLX_API void mjmlx_batched_eval_state(const MjmlxBatchedSim* sim) {
     if (!sim || sim->cpu_mode) return;
     mx::eval({sim->sim.qpos, sim->sim.qvel});

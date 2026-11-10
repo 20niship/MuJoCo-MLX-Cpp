@@ -546,6 +546,10 @@ if(MJMLX_BUILD_PYTHON)
         # 自由関節ボールの二乗空気抵抗(set_free_drag)がMuJoCo(xfrc_applied)と一致するか。
         add_test(NAME free_drag COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_free_drag.py ${CMAKE_BINARY_DIR})
         set_tests_properties(free_drag PROPERTIES LABELS "correctness")
+
+        # レイキャスト(sim.raycast)がmj_rayと一致するか。
+        add_test(NAME raycast COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_raycast.py ${CMAKE_BINARY_DIR})
+        set_tests_properties(raycast PROPERTIES LABELS "correctness")
         add_test(NAME camera_cuda COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_camera_cuda.py ${CMAKE_BINARY_DIR})
         set_tests_properties(camera_cuda PROPERTIES SKIP_RETURN_CODE 77 LABELS "camera")
     endif()

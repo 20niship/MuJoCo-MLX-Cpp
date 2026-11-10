@@ -1,5 +1,7 @@
 // Minimal nanobind module for RL training: wraps mjmlx's plain C API (mjmlx.h) with numpy ndarrays instead of mlx::core::array, sidestepping bindings.cpp's NB_DOMAIN "mlx" cross-extension type sharing (requires the exact nanobind build mlx's own wheel used, which a locally pip-installed nanobind doesn't match in practice).
 
+#include <cstring>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
@@ -22,6 +24,7 @@ namespace nb = nanobind;
 
 using FloatArray = nb::ndarray<float, nb::numpy, nb::c_contig>;
 using IntArray = nb::ndarray<int32_t, nb::numpy, nb::c_contig>;
+using ByteArray = nb::ndarray<uint8_t, nb::numpy, nb::c_contig>;
 
 namespace {
 
@@ -138,6 +141,33 @@ struct RlBatchedSim {
     }
     FloatArray qfrc_actuator() { int n; auto* p = mjmlx_batched_get_qfrc_actuator(handle, &n); return copy_out(p, n, num_envs); }
 
+    // pnt/vec: (num_envs, nray, 3) か、全envで共通の (nray, 3)。戻りは (dist, geomid) = それぞれ (num_envs, nray)。
+    std::pair<FloatArray, IntArray> raycast(FloatArray pnt, FloatArray vec, int bodyexclude, std::optional<ByteArray> geomgroup, bool flg_static) {
+        auto per_env = [&](const FloatArray& a, const char* name) {
+            if (a.ndim() == 3 && static_cast<int>(a.shape(0)) == num_envs && a.shape(2) == 3) return true;
+            if (a.ndim() == 2 && a.shape(1) == 3) return false;
+            throw std::runtime_error(std::string("mjmlx_rl: ") + name + " must have shape (num_envs, nray, 3) or (nray, 3)");
+        };
+        const bool pe = per_env(pnt, "pnt"), ve = per_env(vec, "vec");
+        const size_t nray = pe ? pnt.shape(1) : pnt.shape(0);
+        if ((ve ? vec.shape(1) : vec.shape(0)) != nray) throw std::runtime_error("mjmlx_rl: pnt and vec must have the same number of rays");
+        if (geomgroup && geomgroup->size() != 6) throw std::runtime_error("mjmlx_rl: geomgroup must have 6 entries");
+        const size_t total = static_cast<size_t>(num_envs) * nray;
+        std::vector<float> p(total * 3), v(total * 3);
+        for (int e = 0; e < num_envs; e++) {
+            std::memcpy(&p[static_cast<size_t>(e) * nray * 3], pnt.data() + (pe ? static_cast<size_t>(e) * nray * 3 : 0), nray * 3 * sizeof(float));
+            std::memcpy(&v[static_cast<size_t>(e) * nray * 3], vec.data() + (ve ? static_cast<size_t>(e) * nray * 3 : 0), nray * 3 * sizeof(float));
+        }
+        float* dist = new float[total];
+        int32_t* gid = new int32_t[total];
+        nb::capsule od(dist, [](void* q) noexcept { delete[] static_cast<float*>(q); });
+        nb::capsule og(gid, [](void* q) noexcept { delete[] static_cast<int32_t*>(q); });
+        int rc = mjmlx_batched_raycast(handle, p.data(), v.data(), static_cast<int>(nray), bodyexclude, geomgroup ? geomgroup->data() : nullptr, flg_static ? 1 : 0, dist, gid);
+        if (rc != 0) throw std::runtime_error("mjmlx_rl: raycast failed (GPU sim required)");
+        size_t shape[2] = {static_cast<size_t>(num_envs), nray};
+        return {FloatArray(dist, 2, shape, od), IntArray(gid, 2, shape, og)};
+    }
+
     int pack_stride = 0;
     int set_pack_spec(IntArray body_ids, int dof_lo, int ndof) {
         pack_stride = mjmlx_batched_set_pack_spec(handle, body_ids.data(), static_cast<int>(body_ids.size()), dof_lo, ndof);
@@ -233,6 +263,7 @@ NB_MODULE(vkmujoco, m) {
         .def("cfrc_ext", &RlBatchedSim::cfrc_ext)
         .def("sensordata", &RlBatchedSim::sensordata)
         .def("qfrc_actuator", &RlBatchedSim::qfrc_actuator)
+        .def("raycast", &RlBatchedSim::raycast, nb::arg("pnt").noconvert(), nb::arg("vec").noconvert(), nb::arg("bodyexclude") = -1, nb::arg("geomgroup") = nb::none(), nb::arg("flg_static") = true)
         .def("set_pack_spec", &RlBatchedSim::set_pack_spec, nb::arg("body_ids"), nb::arg("dof_lo"), nb::arg("ndof"))
         .def("read_pack", &RlBatchedSim::read_pack)
         .def("read_pack_into", &RlBatchedSim::read_pack_into, nb::arg("out").noconvert());
