@@ -1,0 +1,5 @@
+runs/
+__pycache__/
+# SO-101 meshes: fetched from the official repository, see README.md
+scene/assets/*
+!scene/assets/.gitkeep
