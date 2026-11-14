@@ -63,11 +63,13 @@ def main():
     fig.text(0.01, 0.005, foot + " Ours include obs+reward; Genesis is bare scene.step().", fontsize=7.5, color="#666")
     save(fig, out, "physics_vs_isaac_genesis.png")
 
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    fig, ax = plt.subplots(figsize=(12, 5.5))
     bars(
         ax,
         ["1,024", "4,096", "16,384"],
         [
+            ("Isaac Lab (past value)", [57738, 120091, None], ISAAC),
+            ("Genesis (past value)", [154430, 252518, 313000], GEN),
             ("MuJoCo Warp (xml default, 1 iter)", [45000, 83000, 46000], WARP),
             ("MuJoCo Warp (16 iters)", [42000, 139000, 318000], WARP2),
             ("This repo env.step", [225000, 406000, 466000], OURS),
@@ -76,8 +78,10 @@ def main():
         ],
     )
     ax.set_xlabel("parallel envs")
+    ax.set_ylim(0, 680000)
+    ax.legend(frameon=False, ncol=2, fontsize=9)
     ax.set_title("Go2 throughput vs MuJoCo Warp (same session, median of 30 steps)")
-    fig.text(0.01, 0.005, "RTX 3060 12GB, Go2, dt 0.005 x4. MuJoCo Warp 4.0.1 + warp-lang 1.17.0 (driver CUDA 12.7). Speed only.", fontsize=7.5, color="#666")
+    fig.text(0.01, 0.005, "RTX 3060 12GB, Go2, dt 0.005 x4. Isaac Lab / Genesis: earlier single measurements. MuJoCo Warp 4.0.1 + warp-lang 1.17.0 (driver CUDA 12.7). Speed only.", fontsize=7.5, color="#666")
     save(fig, out, "physics_vs_mujoco_warp.png")
 
     fig, axs = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
