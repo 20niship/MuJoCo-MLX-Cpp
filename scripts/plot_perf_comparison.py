@@ -71,7 +71,8 @@ def main():
             ("MuJoCo Warp (xml default, 1 iter)", [45000, 83000, 46000], WARP),
             ("MuJoCo Warp (16 iters)", [42000, 139000, 318000], WARP2),
             ("This repo env.step", [225000, 406000, 466000], OURS),
-            ("This repo physics only", [291000, 501000, 503000], FAST),
+            ("This repo physics only", [291000, 501000, 503000], "#b9a8ff"),
+            ("This repo physics only, fast mode", [309000, 523000, 517000], FAST),
         ],
     )
     ax.set_xlabel("parallel envs")

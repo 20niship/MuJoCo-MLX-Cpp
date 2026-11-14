@@ -72,7 +72,7 @@ uv run python scripts/bench_physics_vs_others.py --envs 1024 4096 16384 --only m
 
 ![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
 
-![vs MuJoCo Warp](https://github.com/user-attachments/assets/2c8e598d-588f-4934-899e-55143ed920a9)
+![vs MuJoCo Warp](https://github.com/user-attachments/assets/36fbedf1-f723-485b-bb01-c7f0de1f7101)
 
 ![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
 
