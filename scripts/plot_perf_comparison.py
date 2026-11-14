@@ -81,7 +81,13 @@ def main():
     ax.set_ylim(0, 680000)
     ax.legend(frameon=False, ncol=2, fontsize=9)
     ax.set_title("Go2 throughput vs MuJoCo Warp (same session, median of 30 steps)")
-    fig.text(0.01, 0.005, "RTX 3060 12GB, Go2, dt 0.005 x4. Isaac Lab / Genesis: earlier single measurements. MuJoCo Warp 4.0.1 + warp-lang 1.17.0 (driver CUDA 12.7). Speed only.", fontsize=7.5, color="#666")
+    fig.text(
+        0.01,
+        0.005,
+        "RTX 3060 12GB, Go2, dt 0.005 x4. Isaac Lab / Genesis: earlier single measurements. MuJoCo Warp 4.0.1 + warp-lang 1.17.0 (driver CUDA 12.7). Speed only.",
+        fontsize=7.5,
+        color="#666",
+    )
     save(fig, out, "physics_vs_mujoco_warp.png")
 
     fig, axs = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
