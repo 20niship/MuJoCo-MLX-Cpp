@@ -726,6 +726,7 @@ struct MjmlxBatchedSim {
     std::vector<mjData*> cpu_datas;
     mutable std::vector<float> sensordata_buf;  // get_sensordataの返却用
     std::shared_ptr<void> pack;                 // mjmlx_batched_set_pack_specのGPUカーネルと配置(batched.cpp内のPackSpec)
+    std::shared_ptr<void> ray;                  // mjmlx_batched_raycastのGPUカーネル(batched.cpp内のRaySpec)
 
     ~MjmlxBatchedSim() {
         for (auto* d : cpu_datas) if (d) mj_deleteData(d);

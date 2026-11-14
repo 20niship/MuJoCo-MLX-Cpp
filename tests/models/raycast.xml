@@ -1,0 +1,13 @@
+<mujoco model="raycast">
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="0 0 0.1" pos="0 0 -0.1"/>
+    <geom name="finite_plane" type="plane" size="0.3 0.2 0.1" pos="1.5 0 0.2" group="1"/>
+    <geom name="wall" type="box" size="0.1 0.4 0.3" pos="-0.9 0 0.3" euler="0 0 20"/>
+    <body name="sphere" pos="0 0 0.3"><freejoint/><geom name="sphere" type="sphere" size="0.2" mass="1"/></body>
+    <body name="capsule" pos="0.4 0 0.3"><freejoint/><geom name="capsule" type="capsule" size="0.08 0.2" mass="1"/></body>
+    <body name="cylinder" pos="-0.4 0 0.3"><freejoint/><geom name="cylinder" type="cylinder" size="0.12 0.15" mass="1" group="2"/></body>
+    <body name="ellipsoid" pos="0 0.5 0.3"><freejoint/><geom name="ellipsoid" type="ellipsoid" size="0.25 0.12 0.18" mass="1"/></body>
+    <body name="box" pos="0 -0.5 0.3"><freejoint/><geom name="box" type="box" size="0.15 0.1 0.2" mass="1"/></body>
+  </worldbody>
+</mujoco>
