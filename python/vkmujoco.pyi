@@ -60,6 +60,11 @@ class BatchedSim:
     @property
     def num_free_joints(self) -> int: ...
 
+    def sync(self) -> None:
+        """
+        Wait until the queued steps have finished on the GPU (no host copy). step() is asynchronous, so use this to time it.
+        """
+
     def state(self) -> tuple[Annotated[NDArray[numpy.float32], dict(order='C')], Annotated[NDArray[numpy.float32], dict(order='C')]]: ...
 
     def qpos(self) -> Annotated[NDArray[numpy.float32], dict(order='C')]: ...

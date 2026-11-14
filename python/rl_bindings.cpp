@@ -256,6 +256,7 @@ NB_MODULE(vkmujoco, m) {
              nb::arg("com_delta") = nb::none(), nb::arg("friction_scale") = nb::none(), nb::arg("gain_scale") = nb::none())
         .def("set_free_drag", &RlBatchedSim::set_free_drag, nb::arg("drag_k"), nb::arg("env_idx") = nb::none())
         .def_prop_ro("num_free_joints", [](RlBatchedSim& s) { return s.num_free_joints(); })
+        .def("sync", [](RlBatchedSim& s) { mjmlx_batched_eval_state(s.handle); }, "Wait until the queued steps have finished on the GPU (no host copy). step() is asynchronous, so use this to time it.")
         .def("state", &RlBatchedSim::state)
         .def("qpos", &RlBatchedSim::qpos)
         .def("qvel", &RlBatchedSim::qvel)

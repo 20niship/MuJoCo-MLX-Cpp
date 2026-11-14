@@ -45,6 +45,27 @@ Unitree Go2、平地、dt 0.005 x 4 substep、観測・報酬込みの`env.step`
 
 単位はenv-steps/s。高速モードは`self_collision=False, max_condim=3`(Isaac Lab/Genesisと同じ設定)で、既定は正確なモデルのまま。Isaac Lab/Genesisは過去の単発計測で同一セッションでは再計測していない。Genesisは素の`scene.step()`、こちらは観測・報酬込み。条件と注意点は「性能測定ログ(詳細)」。
 
+### MuJoCo Warp(NVIDIA GPU上のMuJoCo)との比較(同一セッションで計測)
+
+同じモデル(menagerieの`go2_mjx`、平地)、dt 0.005 x 4 substep、ランダムな位置制御action、制御30 stepの中央値、env-steps/s、RTX 3060、サイズごとに別プロセス。「物理のみ」は観測・報酬なしの`sim.step`で、MuJoCo Warp(とGenesis)が測っている範囲。「env.step」は観測・報酬を含む。
+
+| env数 | 本リポジトリ 物理のみ | 本リポジトリ `env.step` | MuJoCo Warp(xml既定: Newton、1反復) | MuJoCo Warp(16反復、本リポジトリと同じ) |
+|---|---|---|---|---|
+| 1,024 | **291K** | 225K | 45K | 42K |
+| 4,096 | **501K** | 406K | 83K | 139K |
+| 16,384 | **503K** | 466K | 46K | 318K |
+
+`--no-self-collision`(Isaac Lab/Genesisと同じ設定)では本リポジトリは309K / 523K / 517K(物理のみ)。注意点:
+
+- MuJoCo Warp 4.0.1はCUDA 13向けで、このマシンのドライバはCUDA 12.7なので`warp-lang`を1.17.0に固定した。確保量はworldあたり`nconmax=16`、`njmax=64`(実測の最大は56拘束/world)。MuJoCo Warpの値はチューニングしておらず、反復数で大きく変わる: 16,384 envでは1反復が16反復より7倍遅い(再現する。46K vs 310〜320K。1反復だとロボットが低く沈み接触が増える)。MJX(JAX)は未計測。
+- 速度のみの比較。MuJoCo Warpについて、MuJoCo Cとの一致度は測っていない(本リポジトリの一致度は下の表)。
+- このマシンのGPUは他のジョブと共有していて、値は10%程度動く。Isaac LabとGenesisは再計測していない(環境が残っていない)ので、上の表の値は過去の単発計測のまま。
+
+```bash
+uv venv --python 3.12 ~/mjwarp/.venv && VIRTUAL_ENV=~/mjwarp/.venv uv pip install mujoco-warp "warp-lang==1.17.0"
+uv run python scripts/bench_physics_vs_others.py --envs 1024 4096 16384 --only mjmlx_bare   # mjmlx / mjwarp(--mjwarp-iterations 16)も同様
+```
+
 カメラ付きRLの1 step(物理4 substep + 描画 + RGB/depthがCUDAテンソルになるまで、1カメラ/env、64px、4096 env、前方視点): **337,618 env-steps/s**(Genesis過去値 82,900)。三人称視点(ロボット全体が写る): 124,415。
 
 **性能グラフ**
@@ -139,7 +160,7 @@ rgba, depth = gcam.read()  # CUDAテンソル、CPUコピーなし
 ```bash
 uv run python scripts/bench_go2_step.py --envs 4096        # env.stepの速度
 MJMLX_PROF=1 uv run python scripts/bench_go2_step.py       # 段ごとのGPU/ホスト時間
-uv run python scripts/bench_physics_vs_others.py ...                         # 本リポジトリ / Isaac Lab / Genesis
+uv run python scripts/bench_physics_vs_others.py ...                         # 本リポジトリ / MuJoCo Warp / Isaac Lab / Genesis
 uv run python scripts/bench_camera_vs_isaac.py             # Isaac Lab TiledCameraとの比較
 PYTHONPATH=<cu126等のtorch> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
 uv run python scripts/examples/go2/compare_cpu_gpu_go2.py               # MuJoCo Cとの1 step差
