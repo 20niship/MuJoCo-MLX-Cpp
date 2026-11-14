@@ -72,6 +72,8 @@ Camera RL step (physics x4 substeps + render + RGB/depth as CUDA tensors, 1 came
 
 ![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
 
+![vs MuJoCo Warp](https://github.com/user-attachments/assets/2c8e598d-588f-4934-899e-55143ed920a9)
+
 ![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
 
 ![camera vs Isaac](https://github.com/user-attachments/assets/cac72f15-a227-49ae-a040-4c669b0d8ed4)

@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 OURS, FAST, ISAAC, GEN = "#7c5cff", "#ff7a59", "#76b900", "#3aa6ff"
+WARP, WARP2 = "#b5d97a", "#4f7d0a"
 plt.rcParams.update({"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.alpha": 0.25, "axes.axisbelow": True})
 
 
@@ -61,6 +62,22 @@ def main():
     ax.set_title("Go2 env.step throughput vs Isaac Lab / Genesis")
     fig.text(0.01, 0.005, foot + " Ours include obs+reward; Genesis is bare scene.step().", fontsize=7.5, color="#666")
     save(fig, out, "physics_vs_isaac_genesis.png")
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    bars(
+        ax,
+        ["1,024", "4,096", "16,384"],
+        [
+            ("MuJoCo Warp (xml default, 1 iter)", [45000, 83000, 46000], WARP),
+            ("MuJoCo Warp (16 iters)", [42000, 139000, 318000], WARP2),
+            ("This repo env.step", [225000, 406000, 466000], OURS),
+            ("This repo physics only", [291000, 501000, 503000], FAST),
+        ],
+    )
+    ax.set_xlabel("parallel envs")
+    ax.set_title("Go2 throughput vs MuJoCo Warp (same session, median of 30 steps)")
+    fig.text(0.01, 0.005, "RTX 3060 12GB, Go2, dt 0.005 x4. MuJoCo Warp 4.0.1 + warp-lang 1.17.0 (driver CUDA 12.7). Speed only.", fontsize=7.5, color="#666")
+    save(fig, out, "physics_vs_mujoco_warp.png")
 
     fig, axs = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
     envs = ["64", "256", "1,024", "4,096"]

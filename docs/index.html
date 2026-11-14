@@ -116,7 +116,16 @@ footer{max-width:1040px;margin:80px auto 0;padding:30px 24px 60px;color:var(--mu
   </div>
   <p class="note">Fast mode = <code>self_collision=False, max_condim=3</code> (the setting Isaac Lab / Genesis use). Default stays exact. Isaac Lab / Genesis figures are earlier measurements, not re-run on the same session; Genesis measures bare <code>scene.step()</code>, ours include observation and reward. See the <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#detailed-performance-log">full log</a> for conditions.</p>
 
-  <figure><img src="https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8" alt="Go2 env.step throughput vs Isaac Lab / Genesis" loading="lazy"><figcaption>Go2 env.step throughput vs Isaac Lab / Genesis</figcaption></figure>
+  <div class="bars" style="--m:520000">
+    <h4>vs MuJoCo Warp (NVIDIA GPU) — 4,096 envs</h4><small>RTX 3060 · env-steps/s · same session, median · physics only</small>
+    <div class="row"><span>MuJoCo Warp · 1 iter (xml default)</span><div><i style="--v:83000"><b>83K</b></i></div></div>
+    <div class="row"><span>MuJoCo Warp · 16 iters</span><div><i style="--v:139000"><b>139K</b></i></div></div>
+    <div class="row us"><span>This repo · env.step</span><div><i style="--v:406000"><b>406K</b></i></div></div>
+    <div class="row fast"><span>This repo · physics only</span><div><i style="--v:501000"><b>501K</b></i></div></div>
+  </div>
+  <p class="note">MuJoCo Warp 4.0.1 with warp-lang 1.17.0 (driver is CUDA 12.7). Speed only, no accuracy comparison. At 16,384 envs: 318K (16 iters) vs 503K here. Details in the <a href="https://github.com/20niship/MuJoCo-MLX-Cpp#vs-mujoco-warp-nvidias-gpu-port-of-mujoco-measured-in-the-same-session">README</a>.</p>
+
+  <figure><img src="https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8" alt="Go2 env.step throughput vs Isaac Lab / Genesis" loading="lazy"><figcaption>Go2 env.step throughput vs Isaac Lab / Genesis</figcaption></figure><figure><img src="https://github.com/user-attachments/assets/2c8e598d-588f-4934-899e-55143ed920a9" alt="Go2 throughput vs MuJoCo Warp" loading="lazy"><figcaption>Go2 throughput vs MuJoCo Warp</figcaption></figure>
 </section>
 
 <section id="train">
