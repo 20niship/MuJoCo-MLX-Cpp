@@ -1,0 +1,163 @@
+{
+ "setup": "RTX 3060 12GB, Go2 flat (menagerie go2_mjx), dt 0.005 x 4 substeps, median of 30 control steps, fresh process per size. mjwarp: mujoco-warp 4.0.1, warp-lang 1.17.0 (driver CUDA 12.7), nconmax=16 njmax=64 per world.",
+ "default": {
+  "1024": {
+   "num_envs": 1024,
+   "mjmlx": {
+    "physics_step_s": 0.004461848763943029,
+    "physics_step_median_s": 0.004550809011561796
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.003620119199816448,
+    "physics_step_median_s": 0.00351894399500452
+   },
+   "mjwarp": {
+    "num_envs": 1024,
+    "physics_step_s": 0.022797072462465925,
+    "physics_step_median_s": 0.02274801698513329,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 1,
+    "ls_iterations": 5,
+    "finite": true,
+    "nefc_max": 56,
+    "nacon": 2667,
+    "base_z_mean": 0.2072330117225647,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   },
+   "mjwarp_it16": {
+    "num_envs": 1024,
+    "physics_step_s": 0.024524528999851705,
+    "physics_step_median_s": 0.024650557985296473,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 16,
+    "ls_iterations": 5,
+    "finite": true,
+    "nefc_max": 56,
+    "nacon": 1924,
+    "base_z_mean": 0.21219709515571594,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   }
+  },
+  "4096": {
+   "num_envs": 4096,
+   "mjmlx": {
+    "physics_step_s": 0.010046232937990377,
+    "physics_step_median_s": 0.010083335015224293
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.008025660934314753,
+    "physics_step_median_s": 0.008180239994544536
+   },
+   "mjwarp": {
+    "num_envs": 4096,
+    "physics_step_s": 0.04916219756317635,
+    "physics_step_median_s": 0.049392835004255176,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 1,
+    "ls_iterations": 5,
+    "finite": false,
+    "nefc_max": 56,
+    "nacon": 10634,
+    "base_z_mean": NaN,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   },
+   "mjwarp_it16": {
+    "num_envs": 4096,
+    "physics_step_s": 0.0290719630002665,
+    "physics_step_median_s": 0.029384335008217022,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 16,
+    "ls_iterations": 5,
+    "finite": true,
+    "nefc_max": 48,
+    "nacon": 7694,
+    "base_z_mean": 0.21189606189727783,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   }
+  },
+  "16384": {
+   "num_envs": 16384,
+   "mjmlx": {
+    "physics_step_s": 0.03522954582974004,
+    "physics_step_median_s": 0.0351963919820264
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.032508893131550094,
+    "physics_step_median_s": 0.03259796800557524
+   },
+   "mjwarp": {
+    "num_envs": 16384,
+    "physics_step_s": 0.3507873225986259,
+    "physics_step_median_s": 0.355071683996357,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 1,
+    "ls_iterations": 5,
+    "finite": false,
+    "nefc_max": 64,
+    "nacon": 42909,
+    "base_z_mean": NaN,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   },
+   "mjwarp_it16": {
+    "num_envs": 16384,
+    "physics_step_s": 0.05020109703376268,
+    "physics_step_median_s": 0.05152224501944147,
+    "solver": "mjSOL_NEWTON",
+    "iterations": 16,
+    "ls_iterations": 5,
+    "finite": true,
+    "nefc_max": 52,
+    "nacon": 30320,
+    "base_z_mean": 0.21152283251285553,
+    "mujoco": "4.0.1",
+    "warp": "1.17.0",
+    "mujoco_warp": "4.0.1"
+   }
+  }
+ },
+ "no_self_collision": {
+  "1024": {
+   "num_envs": 1024,
+   "mjmlx": {
+    "physics_step_s": 0.004373774596994433,
+    "physics_step_median_s": 0.0044427379907574505
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.0034029971051495523,
+    "physics_step_median_s": 0.003315923997433856
+   }
+  },
+  "4096": {
+   "num_envs": 4096,
+   "mjmlx": {
+    "physics_step_s": 0.009865762665867805,
+    "physics_step_median_s": 0.009889566019410267
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.007689686031274808,
+    "physics_step_median_s": 0.007837942015612498
+   }
+  },
+  "16384": {
+   "num_envs": 16384,
+   "mjmlx": {
+    "physics_step_s": 0.0344592537022739,
+    "physics_step_median_s": 0.03440988902002573
+   },
+   "mjmlx_bare": {
+    "physics_step_s": 0.03156438079895452,
+    "physics_step_median_s": 0.03168224499677308
+   }
+  }
+ }
+}

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""カメラ無しのGo2(平地)物理stepをmjmlx / Isaac Lab / Genesisで比較する。制御1step=dt 0.005 x decimation 4、ランダムaction。
+"""カメラ無しのGo2(平地)物理stepをmjmlx / MuJoCo Warp / Isaac Lab / Genesisで比較する。制御1step=dt 0.005 x decimation 4、ランダムaction。
 
-usage: bench_physics_vs_others.py [--envs 1024 4096] [--out runs/physics_vs_others.json] [--only mjmlx|isaac|genesis]
+mjmlx は2通り測る: `mjmlx`=環境のenv.step(観測・報酬まで含む、学習で実際に使う速さ)と `mjmlx_bare`=物理のsim.stepだけ(観測・報酬なし。MuJoCo Warp / Genesisの測り方と同じ)。
+
+usage: bench_physics_vs_others.py [--envs 1024 4096] [--out runs/physics_vs_others.json] [--only mjmlx|mjmlx_bare|mjwarp|isaac|genesis]
 """
 
 import argparse
@@ -33,7 +35,34 @@ def bench_mjmlx(n, iters, self_collision=True):
         t0 = time.perf_counter()
         env.step(a)
         t.append(time.perf_counter() - t0)
-    return {"physics_step_s": sum(t) / len(t)}
+    return {"physics_step_s": sum(t) / len(t), "physics_step_median_s": sorted(t)[len(t) // 2]}
+
+
+def bench_mjmlx_bare(n, iters, self_collision=True):
+    """物理のstepだけ(観測・報酬なし)。MuJoCo Warp / Genesisと同じ範囲を測る。"""
+    import numpy as np
+    from mjmlx_go2_env import MjmlxGo2Env
+
+    env = MjmlxGo2Env(n, cmd_vel_min=0.2, cmd_vel_max=1.0, use_gpu=True, seed=0, terrain_seed=0, flat_terrain=True, self_collision=self_collision)
+    env.reset()
+    sim = env._sim
+    rng = np.random.default_rng(0)
+    default = np.array([0.0, 0.9, -1.8] * 4, np.float32)
+    pool = [
+        (default + 0.5 * rng.standard_normal((n, 12))).astype(np.float32) for _ in range(4)
+    ]  # 学習ループと同じく、毎step新しい配列を確保せず入力を使い回す(確保のたびにGPUバッファの確保と転送が走り、16384 envで物理より遅くなる)
+    ctrl = lambda i: pool[i % 4]
+    for i in range(25):
+        sim.step(ctrl(i), 4)
+    sim.sync()
+    t = []
+    for i in range(iters):
+        c = ctrl(i)
+        t0 = time.perf_counter()
+        sim.step(c, 4)
+        sim.sync()  # vkmujocoのstepは非同期でtorch.cuda.synchronizeでは待てない。ホストへ転送せずGPUの完了だけを待つ
+        t.append(time.perf_counter() - t0)
+    return {"physics_step_s": sum(t) / len(t), "physics_step_median_s": sorted(t)[len(t) // 2]}
 
 
 def run_sub(cmd, tag, cwd=None, timeout=3600):
@@ -48,15 +77,24 @@ def run_sub(cmd, tag, cwd=None, timeout=3600):
     return {"skip": (err[-1][:200] if err else f"no result (exit={p.returncode})")}
 
 
+def child():
+    """1つの(kind, envs)を測って結果を1行出す。サイズごとに別プロセスで測る(同じプロセスで環境を作り直すとVulkanのメモリが解放されず、大きいサイズで遅くなる)。"""
+    _, _, kind, n, iters, self_collision = sys.argv
+    fn = bench_mjmlx if kind == "mjmlx" else bench_mjmlx_bare
+    print("MJMLX_RESULT " + json.dumps(fn(int(n), int(iters), self_collision == "1")), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", type=int, nargs="+", default=[1024, 4096])
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--out", default="runs/physics_vs_others.json")
     ap.add_argument("--no-self-collision", action="store_true", help="mjmlxの脚/胴体同士の衝突を切る(Isaac Lab/Genesisのベンチ設定に合わせる)")
-    ap.add_argument("--only", choices=["mjmlx", "isaac", "genesis"], default=None)
+    ap.add_argument("--only", choices=["mjmlx", "mjmlx_bare", "mjwarp", "isaac", "genesis"], default=None)
     ap.add_argument("--isaac-python", default=os.path.expanduser("~/isaac/.venv/bin/python"))
     ap.add_argument("--isaac-lab-dir", default=os.path.expanduser("~/isaac/IsaacLab"))
+    ap.add_argument("--mjwarp-python", default=os.path.expanduser("~/mjwarp/.venv/bin/python"))
+    ap.add_argument("--mjwarp-iterations", type=int, nargs="*", default=[], help="MuJoCo Warpのソルバ反復数を変えた行も測る(省略時はgo2_mjx.xml既定の1だけ)")
     ap.add_argument("--genesis-python", default=os.path.expanduser("~/genesis/.venv/bin/python"))
     args = ap.parse_args()
 
@@ -64,7 +102,13 @@ def main():
     for n in args.envs:
         r = results.setdefault(str(n), {"num_envs": n})
         if args.only in (None, "mjmlx"):
-            r["mjmlx"] = bench_mjmlx(n, args.iters, not args.no_self_collision)
+            r["mjmlx"] = run_sub([sys.executable, os.path.abspath(__file__), "--child", "mjmlx", str(n), str(args.iters), "0" if args.no_self_collision else "1"], "MJMLX_RESULT")
+        if args.only in (None, "mjmlx_bare"):
+            r["mjmlx_bare"] = run_sub([sys.executable, os.path.abspath(__file__), "--child", "mjmlx_bare", str(n), str(args.iters), "0" if args.no_self_collision else "1"], "MJMLX_RESULT")
+        if args.only in (None, "mjwarp"):
+            for it in [None] + list(args.mjwarp_iterations):
+                cmd = [args.mjwarp_python, "-u", os.path.join(HERE, "mjwarp_bench.py"), "--num_envs", str(n), "--iters", str(args.iters)] + ([] if it is None else ["--iterations", str(it)])
+                r["mjwarp" if it is None else f"mjwarp_it{it}"] = run_sub(cmd, "MJWARP_RESULT")
         if args.only in (None, "isaac"):
             r["isaac"] = run_sub(
                 [
@@ -89,11 +133,12 @@ def main():
         json.dump(results, open(args.out, "w"), indent=1)
         print(n, json.dumps(r), flush=True)
 
-    print("\n| envs | mjmlx (env-steps/s) | Isaac Lab | Genesis |\n|---|---|---|---|")
+    cols = ["mjmlx", "mjmlx_bare", "mjwarp"] + sorted({k for r in results.values() for k in r if k.startswith("mjwarp_it")}) + ["isaac", "genesis"]
+    print("\n| envs | " + " | ".join(cols) + " |\n|---|" + "---|" * len(cols))
     for r in results.values():
-        cells = [("skip" if "skip" in r[w] else f"{r['num_envs'] / r[w]['physics_step_s']:,.0f}") if w in r else "-" for w in ("mjmlx", "isaac", "genesis")]
+        cells = [("skip" if "skip" in r[w] else f"{r['num_envs'] / r[w].get('physics_step_median_s', r[w]['physics_step_s']):,.0f}") if w in r else "-" for w in cols]
         print(f"| {r['num_envs']} | " + " | ".join(cells) + " |")
 
 
 if __name__ == "__main__":
-    main()
+    child() if len(sys.argv) > 1 and sys.argv[1] == "--child" else main()

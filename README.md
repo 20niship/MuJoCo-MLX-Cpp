@@ -45,11 +45,34 @@ Unitree Go2, flat ground, dt 0.005 x 4 substeps, `env.step` with observations an
 
 env-steps/s. Fast mode is `self_collision=False, max_condim=3` (what Isaac Lab/Genesis use); the default keeps the exact model. Isaac Lab / Genesis values are earlier single measurements and not re-run in the same session; Genesis measures a bare `scene.step()` while ours includes observation and reward. Details and caveats: [Detailed performance log](#detailed-performance-log).
 
+### vs MuJoCo Warp (NVIDIA's GPU port of MuJoCo), measured in the same session
+
+Same model (menagerie `go2_mjx` on a flat floor), dt 0.005 x 4 substeps, random position-control actions, median of 30 control steps, env-steps/s, RTX 3060, each size in a fresh process. "Physics only" is `sim.step` without observations and rewards, which is what MuJoCo Warp (and Genesis) measure; "env.step" adds observations and rewards.
+
+| Envs | This repo, physics only | This repo, `env.step` | MuJoCo Warp (xml default: Newton, 1 iteration) | MuJoCo Warp (16 iterations, as ours) |
+|---|---|---|---|---|
+| 1,024 | **291K** | 225K | 45K | 42K |
+| 4,096 | **501K** | 406K | 83K | 139K |
+| 16,384 | **503K** | 466K | 46K | 318K |
+
+`--no-self-collision` (the Isaac Lab / Genesis setting) raises ours to 309K / 523K / 517K (physics only). Caveats:
+
+- MuJoCo Warp 4.0.1 targets CUDA 13; this machine's driver is CUDA 12.7, so `warp-lang` is pinned to 1.17.0. Allocation is `nconmax=16`, `njmax=64` per world (largest use seen: 56 constraints per world). The MuJoCo Warp numbers are untuned and not all that stable across iteration settings: at 16,384 envs 1 iteration is 7x slower than 16 (reproducible, 46K vs 310-320K; the robot sinks lower with 1 iteration and has more contacts). MJX (JAX) was not measured.
+- Speed only. No accuracy comparison against MuJoCo C was made for MuJoCo Warp; ours is in the table below.
+- The GPU is shared with other jobs on this machine, so values move by about 10%. Isaac Lab and Genesis were not re-run (their environments are no longer installed); their numbers above are the earlier single measurements.
+
+```bash
+uv venv --python 3.12 ~/mjwarp/.venv && VIRTUAL_ENV=~/mjwarp/.venv uv pip install mujoco-warp "warp-lang==1.17.0"
+uv run python scripts/bench_physics_vs_others.py --envs 1024 4096 16384 --only mjmlx_bare   # likewise mjmlx, mjwarp (--mjwarp-iterations 16)
+```
+
 Camera RL step (physics x4 substeps + render + RGB/depth as CUDA tensors, 1 camera/env, 64 px, 4096 envs, front view): **337,618 env-steps/s** (Genesis past value: 82,900). Third-person orbit view (whole robot visible): 124,415.
 
 **Performance charts**
 
 ![physics](https://github.com/user-attachments/assets/05cc46e9-9091-4535-a864-6a232b6297a8)
+
+![vs MuJoCo Warp](https://github.com/user-attachments/assets/014edaa3-4a51-4f6b-878f-6c1e9979fc89)
 
 ![camera vs Genesis](https://github.com/user-attachments/assets/6c4644cc-8e79-4f4e-a3f0-14c5ec7eca8e)
 
@@ -139,7 +162,7 @@ Check that nothing else (ollama, desktop compositing, other GPU jobs) is using t
 ```bash
 uv run python scripts/bench_go2_step.py --envs 4096        # env.step speed
 MJMLX_PROF=1 uv run python scripts/bench_go2_step.py       # per-stage GPU/host time
-uv run python scripts/bench_physics_vs_others.py ...                         # this repo / Isaac Lab / Genesis
+uv run python scripts/bench_physics_vs_others.py ...                         # this repo / MuJoCo Warp / Isaac Lab / Genesis
 uv run python scripts/bench_camera_vs_isaac.py             # camera vs Isaac Lab TiledCamera
 PYTHONPATH=<torch-cu126> uv run python scripts/bench_camera_rl.py --camera front --envs 64 256 1024 4096 --sizes 64 128
 uv run python scripts/examples/go2/compare_cpu_gpu_go2.py               # 1-step difference vs MuJoCo C
